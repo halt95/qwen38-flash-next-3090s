@@ -1,0 +1,779 @@
+From 7404823a26f62bb57666203c8f2526a58ea689d0 Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Mon, 7 Sep 2026 21:40:46 -0400
+Subject: [PATCH 1/6] qsa: FP8 E4M3 KV reader for sm_86 with static K/V scale
+ sidecar (VLLM_QSA_KV_SCALES)
+
+Applies on vllm v0.28.0 + the eight release/qwen38next_offload commits (patches/upstream/):
+the ple_layer.py hunk sits at the top of _get_ple_embedding_quant_method, ahead of the
+upstream Fp8Config / ModelOptNvFp4Config dispatch, which is preserved unchanged after the
+VLLM_PLE_FP8_GLOBAL_SCALE gate.
+---
+ vllm/models/qwen4_exp/nvidia/model.py     |  47 +++-
+ vllm/models/qwen4_exp/nvidia/ops/qsa.py   | 209 ++++++++++++++++--
+ vllm/models/qwen4_exp/nvidia/ple_layer.py |  10 +
+ vllm/models/qwen4_exp/nvidia/qsa.py       | 252 ++++++++++++++++++++--
+ 4 files changed, 483 insertions(+), 35 deletions(-)
+
+diff --git a/vllm/models/qwen4_exp/nvidia/model.py b/vllm/models/qwen4_exp/nvidia/model.py
+index 6ae206df1..deb5d6e26 100644
+--- a/vllm/models/qwen4_exp/nvidia/model.py
++++ b/vllm/models/qwen4_exp/nvidia/model.py
+@@ -5,6 +5,8 @@
+ from collections.abc import Iterable
+ from itertools import islice
+ 
++import os
++
+ import torch
+ from torch import nn
+ 
+@@ -70,6 +72,7 @@ from vllm.tokenizers.registry import cached_tokenizer_from_config
+ from vllm.transformers_utils.configs.qwen4_exp import (
+     Qwen4ExpTextConfig,
+ )
++from vllm.logger import init_logger
+ from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+ from vllm.v1.kv_cache_interface import MambaSpec
+ 
+@@ -77,7 +80,9 @@ from ..config import Qwen4ExpConfig
+ from .hyperconnection import GatedResidual, HyperConnectionConfig
+ from .low_latency_gemm import enable_qwen4_exp_low_latency_gemm
+ from .ple_layer import Qwen4ExpPLELayer
+-from .qsa import Qwen4ExpQSAAttention
++from .qsa import Qwen4ExpQSAAttention, load_qsa_static_kv_scales
++
++logger = init_logger(__name__)
+ 
+ 
+ def without_modelopt_fp4(
+@@ -812,6 +817,42 @@ class Qwen4ExpProcessingInfo(Qwen3VLProcessingInfo):
+         return self.ctx.get_hf_config(Qwen4ExpConfig)
+ 
+ 
++_QSA_KV_SCALES_ENV = "VLLM_QSA_KV_SCALES"
++
++
++def _maybe_load_qsa_static_kv_scales(model: nn.Module) -> None:
++    """Apply a static QSA K/V scale sidecar when VLLM_QSA_KV_SCALES names one.
++
++    ``load_qsa_static_kv_scales()`` shipped with no call site anywhere, so every
++    FP8 KV deployment ran at the vLLM default scale of 1.0 with no supported way
++    to change it -- a loader nothing invokes is not an integration, it is dead
++    code that reads like one. This is the call site, placed where the loader's
++    own docstring requires: after checkpoint weights are loaded, before
++    profiling, warmup or cudagraph capture.
++
++    Unset env var -> no-op, and the attention layer logs the default 1.0 per
++    layer so the uncalibrated state stays visible. Set but unusable -> the
++    exception propagates rather than being swallowed: a calibration that was
++    requested and silently not applied is worse than one never requested,
++    because the operator then believes scales are in force that are not.
++    """
++    path = os.environ.get(_QSA_KV_SCALES_ENV, "").strip()
++    if not path:
++        return
++    # strict: every QSA layer of the target model must be in the sidecar. An empty or
++    # partial file silently leaving layers at scale 1.0 is exactly the failure this
++    # call site exists to prevent.
++    applied = load_qsa_static_kv_scales(model, path, strict=True)
++    shown = ", ".join(sorted(applied)[:4])
++    logger.info(
++        "Qwen4Exp QSA: applied static K/V scales from %s to %d layer(s): %s%s",
++        path,
++        len(applied),
++        shown,
++        " ..." if len(applied) > 4 else "",
++    )
++
++
+ @MULTIMODAL_REGISTRY.register_processor(
+     Qwen3VLMultiModalProcessor,
+     info=Qwen4ExpProcessingInfo,
+@@ -996,7 +1037,9 @@ class Qwen4ExpForConditionalGeneration(
+             skip_substrs=["mtp."],
+             ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
+         )
+-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
++        loaded = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
++        _maybe_load_qsa_static_kv_scales(self)
++        return loaded
+ 
+     @classmethod
+     def get_mamba_state_dtype_from_config(
+diff --git a/vllm/models/qwen4_exp/nvidia/ops/qsa.py b/vllm/models/qwen4_exp/nvidia/ops/qsa.py
+index d6aa06f3a..079acb417 100644
+--- a/vllm/models/qwen4_exp/nvidia/ops/qsa.py
++++ b/vllm/models/qwen4_exp/nvidia/ops/qsa.py
+@@ -189,11 +189,38 @@ def _expand_qsa_indices_kernel(
+     )
+ 
+ 
++@triton.jit
++def _decode_e4m3_to_bf16(b):
++    # Shifting the 7 magnitude bits left by 7 lands the E4M3 exponent in the
++    # FP16 exponent field and the 3 mantissa bits at the top of the FP16
++    # mantissa field, giving the right number under the wrong exponent bias
++    # (E4M3 7 vs FP16 15). That is a constant factor of 2^8. E4M3 subnormals
++    # land on FP16 subnormals and the same factor renormalizes them, which is
++    # only true because sm_86 does not flush FP16 subnormals -- verified on
++    # device, not assumed (probes/e4m3_shiftmul_probe.py).
++    #
++    # Bit-exact against torch on all 254 finite codepoints: every E4M3 value
++    # fits in BF16's 7 mantissa bits, and x256 is exact in FP16.
++    #
++    # This replaced a branchless-but-long decoder (~18 ops, 8 nested selects)
++    # that sat in both the K and the V tile load and cost ~half of prefill
++    # throughput on sm_86.
++    #
++    # Deviation: 0x7F/0xFF are NaN in e4m3fn but decode to +-480 here. The CUDA
++    # writer clamps to +-448 and never emits them, so this is unreachable from
++    # a cache written by reshape_and_cache_flash.
++    b = b.to(tl.uint16)
++    bits = ((b & 0x80) << 8) | ((b & 0x7F) << 7)
++    return (bits.to(tl.uint16).to(tl.float16, bitcast=True) * 256.0).to(tl.bfloat16)
++
++
+ @triton.jit
+ def _qsa_sparse_paged_gqa_splitk_kernel(
+     q_ptr,
+     k_cache_ptr,
+     v_cache_ptr,
++    k_scale_ptr,
++    v_scale_ptr,
+     indices_ptr,
+     block_table_ptr,
+     token_to_req_ptr,
+@@ -223,6 +250,7 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
+     NUM_QUERY_HEADS: tl.constexpr,
+     NUM_SPLITS: tl.constexpr,
+     NUM_TILES: tl.constexpr,
++    KV_DTYPE: tl.constexpr,
+     BLOCK_M: tl.constexpr,
+     BLOCK_N: tl.constexpr,
+ ) -> None:
+@@ -250,6 +278,10 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
+     accumulator = tl.zeros((BLOCK_M, HEAD_DIM), dtype=tl.float32)
+     softmax_scale_log2: tl.constexpr = (HEAD_DIM**-0.5) * 1.4426950408889634
+ 
++    if KV_DTYPE != 0:
++        k_scale_value = tl.load(k_scale_ptr)
++        v_scale_value = tl.load(v_scale_ptr)
++
+     # Dynamic bounds avoid padded main-loop iterations for uneven splits.
+     split_tile_start = split_id * NUM_TILES // NUM_SPLITS
+     split_tile_end = (split_id + 1) * NUM_TILES // NUM_SPLITS
+@@ -279,33 +311,88 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
+         valid &= (physical_page >= 0) & (physical_page < num_cache_blocks)
+         # physical_page * block stride can overflow int32 for large caches.
+         safe_page = tl.maximum(physical_page, 0).to(tl.int64)
+-        keys = tl.load(
+-            k_cache_ptr
+-            + safe_page[None, :] * stride_k_block
+-            + page_offset[None, :] * stride_k_token
+-            + kv_head * stride_k_head
+-            + dim_offsets[:, None],
+-            mask=valid[None, :],
+-            other=0.0,
+-        )
+-        values = tl.load(
+-            v_cache_ptr
+-            + safe_page[:, None] * stride_v_block
+-            + page_offset[:, None] * stride_v_token
+-            + kv_head * stride_v_head
+-            + dim_offsets[None, :],
+-            mask=valid[:, None],
+-            other=0.0,
+-        )
++        if KV_DTYPE == 0:
++            keys = tl.load(
++                k_cache_ptr
++                + safe_page[None, :] * stride_k_block
++                + page_offset[None, :] * stride_k_token
++                + kv_head * stride_k_head
++                + dim_offsets[:, None],
++                mask=valid[None, :],
++                other=0.0,
++            )
++            values = tl.load(
++                v_cache_ptr
++                + safe_page[:, None] * stride_v_block
++                + page_offset[:, None] * stride_v_token
++                + kv_head * stride_v_head
++                + dim_offsets[None, :],
++                mask=valid[:, None],
++                other=0.0,
++            )
++        elif KV_DTYPE == 1:
++            key_bytes = tl.load(
++                k_cache_ptr
++                + safe_page[None, :] * stride_k_block
++                + page_offset[None, :] * stride_k_token
++                + kv_head * stride_k_head
++                + dim_offsets[:, None],
++                mask=valid[None, :],
++                other=0,
++            )
++            # UNSCALED: k_scale is folded into the score scaling below.
++            keys = _decode_e4m3_to_bf16(key_bytes)
++        else:
++            keys = tl.load(
++                k_cache_ptr
++                + safe_page[None, :] * stride_k_block
++                + page_offset[None, :] * stride_k_token
++                + kv_head * stride_k_head
++                + dim_offsets[:, None],
++                mask=valid[None, :],
++                other=0.0,
++            ).to(tl.bfloat16)
+         scores = tl.dot(query, keys)
+         # Scaling scores avoids re-quantizing a scaled query to BF16.
+-        scores *= softmax_scale_log2
++        if KV_DTYPE == 0:
++            scores *= softmax_scale_log2
++        else:
++            # k_scale is a scalar, so scaling each SCORE is equivalent to
++            # scaling every key element -- but costs one multiply per score
++            # instead of one per element, and skips the fp32 round trip and
++            # the BF16 re-quantization of the scaled key (which for a
++            # non-power-of-two scale also lost mantissa bits). Strictly fewer
++            # roundings than the per-element form it replaces.
++            scores *= softmax_scale_log2 * k_scale_value
+         scores = tl.where(valid[None, :], scores, -1.0e20)
+         next_max = tl.maximum(max_value, tl.max(scores, axis=1))
+         alpha = tl.math.exp2(max_value - next_max)
+         probabilities = tl.where(
+             valid[None, :], tl.math.exp2(scores - next_max[:, None]), 0.0
+         )
++        if KV_DTYPE == 1:
++            value_bytes = tl.load(
++                v_cache_ptr
++                + safe_page[:, None] * stride_v_block
++                + page_offset[:, None] * stride_v_token
++                + kv_head * stride_v_head
++                + dim_offsets[None, :],
++                mask=valid[:, None],
++                other=0,
++            )
++            # UNSCALED: v_scale is folded into the epilogue below.
++            values = _decode_e4m3_to_bf16(value_bytes)
++        elif KV_DTYPE == 2:
++            values = tl.load(
++                v_cache_ptr
++                + safe_page[:, None] * stride_v_block
++                + page_offset[:, None] * stride_v_token
++                + kv_head * stride_v_head
++                + dim_offsets[None, :],
++                mask=valid[:, None],
++                other=0.0,
++            ).to(tl.bfloat16)
++
+         accumulator = tl.dot(
+             probabilities.to(values.dtype),
+             values,
+@@ -320,6 +407,13 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
+         accumulator / tl.maximum(normalizer[:, None], 1.0e-20),
+         0.0,
+     )
++    if KV_DTYPE != 0:
++        # v_scale folded out of the per-element V decode: the attention output
++        # is linear in V, so one multiply per output element replaces one per
++        # cache element per tile. Safe under split-K too -- every partial is
++        # scaled by the same constant before the LSE merge, which is itself
++        # linear in the partial outputs.
++        normalized_output *= v_scale_value
+     output_mask = head_offsets[:, None] < GROUP_SIZE
+     if NUM_SPLITS == 1:
+         tl.store(
+@@ -817,8 +911,24 @@ def qsa_sparse_paged_attention(
+     block_table: torch.Tensor,
+     token_to_req: torch.Tensor,
+     out: torch.Tensor | None = None,
++    k_scale: torch.Tensor | None = None,
++    v_scale: torch.Tensor | None = None,
++    _force_num_warps: int | None = None,
+ ) -> torch.Tensor:
+-    """Run sparse GQA directly over paged BF16 K/V caches."""
++    """Run sparse GQA over paged BF16 or FP8 K/V caches.
++
++    ``_force_num_warps`` overrides the tuned launch profile. It exists only so the
++    warp-count equivalence test can compare 2-warp and 4-warp lowerings of the same
++    shape against a reference; production callers must leave it None.
++
++    NOTE ON POLICY: this function is an UNCHECKED INTERNAL PRIMITIVE with respect to
++    hardware support. The "E4M3 only on CUDA sm_86" policy is enforced once, at
++    Qwen4ExpQSAAttention/Qwen4ExpQSAFlashAttentionImpl construction. A direct caller
++    can pass an FP8 cache on any device and it will run: the integer decode is
++    arch-independent, so it will not fault, but it has only been validated on sm_86.
++    Enforcing the check again per call would cost a device query on every launch;
++    callers outside the model must do their own gating.
++    """
+ 
+     if not q.is_cuda or not HAS_TRITON:
+         raise RuntimeError("paged QSA sparse attention requires CUDA and Triton")
+@@ -836,7 +946,26 @@ def qsa_sparse_paged_attention(
+         raise ValueError("QSA sparse attention requires valid grouped-query heads")
+     head_dim = q.shape[2]
+     assert head_dim >= 16 and (head_dim & (head_dim - 1)) == 0
+-    assert q.dtype == k_cache.dtype == v_cache.dtype == torch.bfloat16
++    if q.dtype != torch.bfloat16:
++        raise ValueError("QSA sparse attention requires BF16 queries")
++    if k_cache.dtype != v_cache.dtype:
++        raise ValueError("QSA sparse attention requires matching K/V dtypes")
++    fp8_dtype = current_platform.fp8_dtype()
++    if k_cache.dtype == torch.bfloat16:
++        kv_dtype = 0
++    elif k_cache.dtype in (torch.uint8, fp8_dtype):
++        kv_dtype = 1
++        # Present platform E4M3 storage as bytes so Triton never materializes
++        # the unsupported fp8e4nv type on SM86.
++        if k_cache.dtype == fp8_dtype:
++            k_cache = k_cache.view(torch.uint8)
++            v_cache = v_cache.view(torch.uint8)
++    elif k_cache.dtype == torch.float8_e5m2:
++        kv_dtype = 2
++    else:
++        raise ValueError(
++            "QSA supports only BF16, uint8/E4M3, and E5M2 K/V caches"
++        )
+     assert logical_indices.dtype == block_table.dtype == torch.int32
+     assert token_to_req.dtype == torch.int32
+     assert q.device == k_cache.device == v_cache.device
+@@ -854,6 +983,29 @@ def qsa_sparse_paged_attention(
+     if not q.shape[0]:
+         return out
+ 
++    if kv_dtype == 0:
++        # Scale pointers are compile-time dead in the unchanged BF16 kernel.
++        k_scale_ptr = q
++        v_scale_ptr = q
++    else:
++        if k_scale is None:
++            k_scale = torch.tensor(1.0, dtype=torch.float32, device=q.device)
++        if v_scale is None:
++            v_scale = torch.tensor(1.0, dtype=torch.float32, device=q.device)
++        if (
++            k_scale.numel() != 1
++            or v_scale.numel() != 1
++            or k_scale.dtype != torch.float32
++            or v_scale.dtype != torch.float32
++            or k_scale.device != q.device
++            or v_scale.device != q.device
++        ):
++            raise ValueError(
++                "QSA K/V scales must be scalar float32 tensors on the query device"
++            )
++        k_scale_ptr = k_scale
++        v_scale_ptr = v_scale
++
+     group_size = q.shape[1] // k_cache.shape[2]
+     block_m = triton.next_power_of_2(group_size)
+     base_programs = q.shape[0] * k_cache.shape[2]
+@@ -872,6 +1024,18 @@ def qsa_sparse_paged_attention(
+     else:
+         block_n, target_splits, partial_warps = 64, 1, 2
+ 
++    # NOTE: an earlier revision pinned the wide profiles to 4 warps for kv_dtype
++    # != 0, because the first E4M3 decoder (~18 ops, 8 nested selects) hit the
++    # 255-register ceiling at BLOCK_N=64 and spilled 150 bytes. The shift-mul
++    # decoder removed that: all three w2 profiles now measure 239/239/242 regs
++    # with ZERO spills (probes/kernel_regs_probe.py), and at the production
++    # top-k (config indexer_budget=2048) 2 warps beats 4 on 25/27 interleaved
++    # head-to-head pairs by 8-22% (harness/10_warp_decision.py). The pin is
++    # therefore removed and the inherited profile is used unchanged.
++
++    if _force_num_warps is not None:
++        partial_warps = _force_num_warps
++
+     num_tiles = triton.cdiv(logical_indices.shape[1], block_n)
+     # Avoid empty splits when the selection width is smaller than the profile.
+     max_useful_splits = 1 << (num_tiles.bit_length() - 1)
+@@ -898,6 +1062,8 @@ def qsa_sparse_paged_attention(
+         q,
+         k_cache,
+         v_cache,
++        k_scale_ptr,
++        v_scale_ptr,
+         logical_indices,
+         block_table,
+         token_to_req,
+@@ -927,6 +1093,7 @@ def qsa_sparse_paged_attention(
+         NUM_QUERY_HEADS=q.shape[1],
+         NUM_SPLITS=num_splits,
+         NUM_TILES=num_tiles,
++        KV_DTYPE=kv_dtype,
+         BLOCK_M=block_m,
+         BLOCK_N=block_n,
+         num_warps=partial_warps,
+diff --git a/vllm/models/qwen4_exp/nvidia/ple_layer.py b/vllm/models/qwen4_exp/nvidia/ple_layer.py
+index 5cf831c70..111d837e0 100644
+--- a/vllm/models/qwen4_exp/nvidia/ple_layer.py
++++ b/vllm/models/qwen4_exp/nvidia/ple_layer.py
+@@ -3,6 +3,7 @@
+ """GPU-resident Qwen4Exp position-learning enhancement layers."""
+ 
+ import math
++import os
+ from collections.abc import Iterable, Sequence
+ 
+ import torch
+@@ -302,6 +303,15 @@ def _get_ple_embedding_quant_method(
+ ) -> QuantizeMethodBase | None:
+     """Select a packed PLE embedding method for quantized checkpoint shards."""
+ 
++    if os.environ.get("VLLM_PLE_FP8_GLOBAL_SCALE") == "1":
++        # Checkpoints pairing quantized experts with a global-scale FP8 PLE
++        # table (e.g. the RadixArk Flash-Next table grafted onto a
++        # CompressedTensors checkpoint) list the PLE under exclude_modules, so
++        # the FP8-ness is visible only in the tensors' dtype, not the quant
++        # config. Explicit opt-in; the fp8 method's lookup path dequantizes
++        # via the retained global weight_scale. Upstream dispatch follows.
++        return Qwen4ExpPLEFp8EmbeddingMethod()
++
+     if isinstance(quant_config, Fp8Config):
+         if not quant_config.is_checkpoint_fp8_serialized:
+             return None
+diff --git a/vllm/models/qwen4_exp/nvidia/qsa.py b/vllm/models/qwen4_exp/nvidia/qsa.py
+index d894b893d..77a91ff07 100644
+--- a/vllm/models/qwen4_exp/nvidia/qsa.py
++++ b/vllm/models/qwen4_exp/nvidia/qsa.py
+@@ -4,6 +4,10 @@
+ 
+ from __future__ import annotations
+ 
++import json
++import math
++from collections.abc import Mapping
++from pathlib import Path
+ from typing import ClassVar, cast
+ 
+ import torch
+@@ -20,6 +24,7 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+ from vllm.model_executor.layers.layernorm import GemmaRMSNorm
+ from vllm.model_executor.layers.linear import QKVParallelLinear, RowParallelLinear
+ from vllm.model_executor.layers.quantization import QuantizationConfig
++from vllm.logger import init_logger
+ from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding, get_rope
+ from vllm.model_executor.models.qwen3_next import Qwen3NextAttention
+ from vllm.platforms import current_platform
+@@ -57,6 +62,40 @@ from . import model
+ from .indexer_qsa import QSAIndexer
+ 
+ 
++logger = init_logger(__name__)
++
++_QSA_FP8_CACHE_DTYPES = ("fp8", "fp8_e4m3")
++_QSA_SUPPORTED_CACHE_DTYPES = ("auto", "bfloat16", *_QSA_FP8_CACHE_DTYPES)
++
++
++def _is_qsa_fp8_cache_dtype(cache_dtype: str) -> bool:
++    return cache_dtype in _QSA_FP8_CACHE_DTYPES
++
++
++def _validated_qsa_fp8_dtype(cache_dtype: str) -> torch.dtype | None:
++    """Return the platform E4M3 dtype after enforcing the validated HW gate."""
++
++    if not _is_qsa_fp8_cache_dtype(cache_dtype):
++        return None
++    if not current_platform.is_cuda():
++        raise ValueError(
++            "Qwen4Exp QSA E4M3 KV cache is supported only on CUDA; "
++            "ROCm and other platforms have not been validated"
++        )
++
++    capability = current_platform.get_device_capability()
++    if capability is None or capability.to_int() != 86:
++        cap_str = (
++            capability.as_version_str() if capability is not None else "unknown"
++        )
++        raise ValueError(
++            "Qwen4Exp QSA E4M3 KV cache is validated only on SM86, but "
++            f"{current_platform.get_device_name()} has compute capability "
++            f"{cap_str}. Re-run with --kv-cache-dtype bfloat16."
++        )
++    return current_platform.fp8_dtype()
++
++
+ class Qwen4ExpQSAMetadataBuilder(FlashAttentionMetadataBuilder):
+     """Flash metadata supporting uniform decode and target-verify graphs."""
+ 
+@@ -67,7 +106,12 @@ class Qwen4ExpQSAFlashAttentionBackend(FlashAttentionBackend):
+     """FullAttentionSpec backend used by the merged QSA owner."""
+ 
+     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.bfloat16]
+-    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = ["auto", "bfloat16"]
++    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
++        "auto",
++        "bfloat16",
++        "fp8",
++        "fp8_e4m3",
++    ]
+ 
+     @staticmethod
+     def get_name() -> str:
+@@ -97,15 +141,36 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
+     supports_pcp: bool = False
+ 
+     def __init__(self, *args, **kwargs) -> None:
++        # QSA never dispatches to a FlashAttention kernel: attention runs through
++        # forward_qsa -> qsa_sparse_paged_attention (our Triton sparse-GQA kernel)
++        # and the cache write goes through the CUDA reshape_and_cache_flash op.
++        # FlashAttentionImpl.__init__ nevertheless rejects any quantized KV dtype
++        # that FA itself cannot read, and sm_86 has no FP8 FA kernel. Present
++        # "auto" to the base class, then restore the real dtype. The only other
++        # kv_cache_dtype use in that constructor is an SM90/FA4 dequant path that
++        # cannot trigger here, and supports_quant_query_input is set below anyway.
++        requested_kv_cache_dtype = None
++        if "kv_cache_dtype" in kwargs:
++            requested_kv_cache_dtype = kwargs["kv_cache_dtype"]
++            kwargs = {**kwargs, "kv_cache_dtype": "auto"}
++        elif len(args) > 6:
++            requested_kv_cache_dtype = args[6]
++            args = (*args[:6], "auto", *args[7:])
+         super().__init__(*args, **kwargs)
++        if requested_kv_cache_dtype is not None:
++            self.kv_cache_dtype = requested_kv_cache_dtype
+         if not is_flash_attn_varlen_func_available():
+             raise NotImplementedError("Qwen4Exp QSA requires FlashAttention")
+         if self.dcp_world_size != 1:
+             raise NotImplementedError(
+                 "Qwen4Exp QSA does not support decode context parallelism"
+             )
+-        if self.kv_cache_dtype not in ("auto", "bfloat16"):
+-            raise NotImplementedError("Qwen4Exp QSA requires a BF16 main KV cache")
++        if self.kv_cache_dtype not in _QSA_SUPPORTED_CACHE_DTYPES:
++            raise NotImplementedError(
++                "Qwen4Exp QSA supports BF16 or static per-tensor E4M3 main "
++                f"KV caches, not {self.kv_cache_dtype!r}"
++            )
++        self.qsa_fp8_dtype = _validated_qsa_fp8_dtype(self.kv_cache_dtype)
+         self.supports_quant_query_input = False
+ 
+     def forward_qsa(
+@@ -142,11 +207,42 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
+         key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
+         key_cache = canonicalize_singleton_dim_strides(key_cache)
+         value_cache = canonicalize_singleton_dim_strides(value_cache)
+-        if key_cache.dtype != torch.bfloat16 or query.dtype != torch.bfloat16:
+-            raise NotImplementedError("Qwen4Exp QSA requires BF16 Q/K/V")
++        if query.dtype != torch.bfloat16:
++            raise NotImplementedError("Qwen4Exp QSA requires a BF16 query")
++        if key_cache.dtype != value_cache.dtype:
++            raise TypeError("Qwen4Exp QSA K and V cache dtypes must match")
++        if _is_qsa_fp8_cache_dtype(self.kv_cache_dtype):
++            if self.qsa_fp8_dtype is None:
++                raise RuntimeError("QSA FP8 dtype was not initialized")
++            if key_cache.dtype not in (torch.uint8, self.qsa_fp8_dtype):
++                raise NotImplementedError(
++                    "Qwen4Exp QSA E4M3 cache storage must use raw uint8 or "
++                    f"the platform FP8 dtype, not {key_cache.dtype}"
++                )
++        elif key_cache.dtype != torch.bfloat16:
++            raise NotImplementedError(
++                "Qwen4Exp QSA BF16 mode requires a BF16 main KV cache"
++            )
+ 
+         from .ops.qsa import qsa_sparse_paged_attention
+ 
++        # Announce the effective scales once per layer. load_qsa_static_kv_scales()
++        # is an explicit integration call, so a deployment that forgets it runs at
++        # the vLLM default of 1.0 -- which is a legitimate configuration but must
++        # never be a silent one. This makes the actual values greppable per rank.
++        if _is_qsa_fp8_cache_dtype(self.kv_cache_dtype) and not getattr(
++            self, "_qsa_scales_logged", False
++        ):
++            self._qsa_scales_logged = True
++            logger.info(
++                "Qwen4Exp QSA E4M3 KV active on %s: k_scale=%.6g v_scale=%.6g%s",
++                getattr(layer, "layer_name", "<unnamed>"),
++                float(layer._k_scale),
++                float(layer._v_scale),
++                "" if float(layer._k_scale) != 1.0 or float(layer._v_scale) != 1.0
++                else "  (DEFAULT 1.0 -- no static calibration loaded)",
++            )
++
+         qsa_sparse_paged_attention(
+             query[:num_tokens],
+             key_cache,
+@@ -154,7 +250,9 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
+             logical_indices,
+             attn_metadata.block_table,
+             token_to_req,
+-            output[:num_tokens],
++            out=output[:num_tokens],
++            k_scale=layer._k_scale,
++            v_scale=layer._v_scale,
+         )
+         return output
+ 
+@@ -181,10 +279,20 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
+             raise ValueError("Qwen4Exp QSA requires a paged KV cache")
+         if model_config.dtype != torch.bfloat16:
+             raise NotImplementedError("Qwen4Exp QSA currently requires BF16")
+-        if cache_config.cache_dtype not in ("auto", "bfloat16"):
+-            raise NotImplementedError("Qwen4Exp QSA requires a BF16 main KV cache")
+-        if getattr(quant_config, "kv_cache_scheme", None) is not None:
+-            raise NotImplementedError("Qwen4Exp QSA does not support KV quantization")
++        if cache_config.cache_dtype not in _QSA_SUPPORTED_CACHE_DTYPES:
++            raise NotImplementedError(
++                "Qwen4Exp QSA supports BF16 or static per-tensor E4M3 main "
++                f"KV caches, not {cache_config.cache_dtype!r}"
++            )
++        qsa_fp8_dtype = _validated_qsa_fp8_dtype(cache_config.cache_dtype)
++        kv_cache_scheme = getattr(quant_config, "kv_cache_scheme", None)
++        if kv_cache_scheme is not None:
++            raise NotImplementedError(
++                "Qwen4Exp QSA does not implement kv_cache_scheme variants. "
++                "Dynamic, per-head, per-token, and other non-scalar KV scales "
++                "are unsupported; use static scalar per-layer K/V scales from "
++                "load_qsa_static_kv_scales()."
++            )
+         parallel_config = vllm_config.parallel_config
+         if (
+             parallel_config.prefill_context_parallel_size > 1
+@@ -276,10 +384,23 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
+         self.kv_cache_torch_dtype = kv_cache_dtype_str_to_dtype(
+             self.kv_cache_dtype, model_config
+         )
+-        if self.kv_cache_torch_dtype != torch.bfloat16:
+-            raise NotImplementedError("Qwen4Exp QSA requires BF16 cache storage")
++        if _is_qsa_fp8_cache_dtype(self.kv_cache_dtype):
++            if qsa_fp8_dtype is None:
++                raise RuntimeError("QSA FP8 dtype was not initialized")
++            if self.kv_cache_torch_dtype not in (torch.uint8, qsa_fp8_dtype):
++                raise NotImplementedError(
++                    "Qwen4Exp QSA E4M3 cache storage resolved to unsupported "
++                    f"dtype {self.kv_cache_torch_dtype}"
++                )
++        elif self.kv_cache_torch_dtype != torch.bfloat16:
++            raise NotImplementedError(
++                "Qwen4Exp QSA BF16 mode requires BF16 cache storage"
++            )
+         self.kv_sharing_target_layer_name = None
+         self.kv_cache = torch.tensor([])
++        # The checkpoint has no KV scale scheme. These registered scalar
++        # buffers therefore remain 1.0 unless explicitly replaced after
++        # weight loading by load_qsa_static_kv_scales().
+         set_default_quant_scales(self, register_buffer=True)
+ 
+         self.attn_backend = Qwen4ExpQSAFlashAttentionBackend
+@@ -427,6 +548,112 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
+         return output
+ 
+ 
++def load_qsa_static_kv_scales(
++    layers: nn.Module | Mapping[str, nn.Module],
++    sidecar_path: str | Path,
++    *,
++    strict: bool = True,
++) -> list[str]:
++    """Load static scalar QSA K/V scales into already-loaded model layers.
++
++    Call this on every model worker after checkpoint weight loading finishes
++    and before any profiling, warmup, or cudagraph capture. ``layers`` may be
++    the loaded root module or ``compilation_config.static_forward_context``.
++
++    The JSON schema is::
++
++        {
++          "model.layers.3.self_attn.attn": {
++            "k_scale": 0.25,
++            "v_scale": 2.0
++          }
++        }
++
++    ``strict=False`` permits a deliberate subset; omitted layers keep the
++    vLLM default scale of 1.0. Unknown names and non-scalar values are always
++    errors.
++    """
++
++    path = Path(sidecar_path)
++    raw = json.loads(path.read_text(encoding="utf-8"))
++    if not isinstance(raw, dict):
++        raise ValueError(f"{path} must contain a JSON object keyed by layer name")
++
++    if isinstance(layers, nn.Module):
++        qsa_layers = {
++            layer.layer_name: layer
++            for layer in layers.modules()
++            if isinstance(layer, Qwen4ExpQSAAttention)
++        }
++    else:
++        qsa_layers = {
++            name: layer
++            for name, layer in layers.items()
++            if isinstance(name, str)
++            and isinstance(layer, Qwen4ExpQSAAttention)
++        }
++
++    if not qsa_layers:
++        raise ValueError("No Qwen4Exp QSA attention layers were supplied")
++    non_fp8_layers = sorted(
++        name
++        for name, layer in qsa_layers.items()
++        if not _is_qsa_fp8_cache_dtype(layer.kv_cache_dtype)
++    )
++    if non_fp8_layers:
++        raise ValueError(
++            "Static QSA KV scales may only be injected into E4M3 layers; "
++            f"non-FP8 layers: {non_fp8_layers}"
++        )
++
++    unknown = sorted(name for name in raw if name not in qsa_layers)
++    if unknown:
++        raise ValueError(f"Unknown QSA layer names in {path}: {unknown}")
++    missing = sorted(name for name in qsa_layers if name not in raw)
++    if strict and missing:
++        raise ValueError(f"Missing QSA layer scales in {path}: {missing}")
++
++    validated: dict[str, tuple[float, float]] = {}
++    for layer_name, entry in raw.items():
++        if not isinstance(entry, dict):
++            raise ValueError(f"{layer_name} scales must be a JSON object")
++        if set(entry) != {"k_scale", "v_scale"}:
++            raise ValueError(
++                f"{layer_name} must contain exactly k_scale and v_scale"
++            )
++
++        values: list[float] = []
++        for field in ("k_scale", "v_scale"):
++            value = entry[field]
++            if type(value) not in (int, float):
++                raise ValueError(
++                    f"{layer_name}.{field} must be a scalar JSON number"
++                )
++            scale = float(value)
++            if not math.isfinite(scale) or scale <= 0.0:
++                raise ValueError(
++                    f"{layer_name}.{field} must be finite and positive"
++                )
++            values.append(scale)
++
++        layer = qsa_layers[layer_name]
++        for field in ("_k_scale", "_v_scale"):
++            tensor = getattr(layer, field, None)
++            if not isinstance(tensor, torch.Tensor) or tensor.numel() != 1:
++                raise ValueError(
++                    f"{layer_name}.{field} must be an existing scalar tensor"
++                )
++        validated[layer_name] = (values[0], values[1])
++
++    with torch.no_grad():
++        for layer_name, (k_scale, v_scale) in validated.items():
++            layer = qsa_layers[layer_name]
++            layer._k_scale.fill_(k_scale)
++            layer._v_scale.fill_(v_scale)
++
++    return sorted(validated)
++
++
+ def qwen4_exp_qsa_with_output(
+     hidden_states: torch.Tensor,
+     positions: torch.Tensor,
+@@ -477,5 +704,6 @@ __all__ = [
+     "Qwen4ExpQSAAttention",
+     "Qwen4ExpQSAFlashAttentionBackend",
+     "Qwen4ExpQSAFlashAttentionImpl",
++    "load_qsa_static_kv_scales",
+     "qwen4_exp_qsa_with_output",
+ ]

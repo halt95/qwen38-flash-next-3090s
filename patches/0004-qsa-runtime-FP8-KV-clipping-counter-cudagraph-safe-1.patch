@@ -1,0 +1,138 @@
+From 186c3726359b9f9784083bb7ea01c9d1cf70d64b Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Mon, 7 Sep 2026 21:40:46 -0400
+Subject: [PATCH 4/6] qsa: runtime FP8 KV clipping counter, cudagraph-safe (#1)
+
+---
+ vllm/models/qwen4_exp/nvidia/qsa.py | 104 ++++++++++++++++++++++++++++
+ 1 file changed, 104 insertions(+)
+
+diff --git a/vllm/models/qwen4_exp/nvidia/qsa.py b/vllm/models/qwen4_exp/nvidia/qsa.py
+index 9d1cffd73..b2aea4648 100644
+--- a/vllm/models/qwen4_exp/nvidia/qsa.py
++++ b/vllm/models/qwen4_exp/nvidia/qsa.py
+@@ -8,6 +8,8 @@ import atexit
+ import json
+ import math
+ import os
++import threading
++import time
+ from collections.abc import Mapping
+ from pathlib import Path
+ from typing import ClassVar, cast
+@@ -118,6 +120,104 @@ def _qsa_collect_absmax(
+         _qsa_collect_dump()
+ # ------------------------------------------------------------------------------
+ 
++# --- FP8 K/V runtime clipping counter (qwen38next-flash issue #1) -------------
++# Under-coverage guard for the calibrated scales sidecar: counts K/V elements
++# that would saturate E4M3 after scaling (|x| > 448 * scale), i.e. inputs that
++# exceed the calibration-time absmax. Active ONLY when VLLM_QSA_KV_CLIP_COUNT
++# is set to a positive read interval in seconds.
++#
++# Graph-safety: unlike the calibration collector above, this MUST work under
++# FULL cudagraph replay, where the Python forward does not run per step. The
++# counters are persistent per-layer GPU int64 tensors allocated on the first
++# (eager, pre-capture) forward; the increment is pure captured GPU ops, so
++# graph replay keeps counting. A daemon reader thread .item()s the counters on
++# a cadence and logs: WARNING on any new clips, INFO heartbeat every 10th pass
++# so a quiet log still proves the instrument is alive.
++_QSA_CLIP_ENV = "VLLM_QSA_KV_CLIP_COUNT"
++_qsa_clip_raw = os.environ.get(_QSA_CLIP_ENV, "").strip()
++try:
++    _qsa_clip_interval = float(_qsa_clip_raw) if _qsa_clip_raw else 0.0
++except ValueError as exc:  # fail closed: a set-but-broken gate must not be silent
++    raise ValueError(
++        f"{_QSA_CLIP_ENV} must be a read interval in seconds, got {_qsa_clip_raw!r}"
++    ) from exc
++if _qsa_clip_raw and not (math.isfinite(_qsa_clip_interval) and _qsa_clip_interval > 0.0):
++    raise ValueError(
++        f"{_QSA_CLIP_ENV} must be a finite positive number of seconds, got {_qsa_clip_raw!r}"
++    )
++_qsa_clip_counters: dict[str, torch.Tensor] = {}
++_qsa_clip_reader_started = False
++_qsa_clip_lock = threading.Lock()
++
++
++def _qsa_clip_reader() -> None:
++    last: dict[str, tuple[int, int]] = {}
++    passes = 0
++    while True:
++        time.sleep(_qsa_clip_interval)
++        passes += 1
++        try:
++            totals_k = totals_v = 0
++            for name, ctr in list(_qsa_clip_counters.items()):
++                k_total = int(ctr[0].item())
++                v_total = int(ctr[1].item())
++                totals_k += k_total
++                totals_v += v_total
++                prev_k, prev_v = last.get(name, (0, 0))
++                if k_total > prev_k or v_total > prev_v:
++                    logger.warning(
++                        "QSA KV CLIPPING on %s: k +%d (total %d), v +%d (total %d)"
++                        " -- inputs exceeded the calibration absmax; the scales"
++                        " sidecar may need re-calibration",
++                        name,
++                        k_total - prev_k,
++                        k_total,
++                        v_total - prev_v,
++                        v_total,
++                    )
++                last[name] = (k_total, v_total)
++            if passes % 10 == 1:
++                logger.info(
++                    "QSA clip counters alive: %d layer(s), totals k=%d v=%d",
++                    len(_qsa_clip_counters),
++                    totals_k,
++                    totals_v,
++                )
++        except Exception:
++            logger.exception("QSA clip reader pass failed; thread continues")
++
++
++def _qsa_clip_count(
++    layer: "Qwen4ExpQSAAttention", key: torch.Tensor, value: torch.Tensor
++) -> None:
++    global _qsa_clip_reader_started
++    ctr = _qsa_clip_counters.get(layer.layer_name)
++    if ctr is None:
++        # First forward is eager (profiling/warmup precede capture), so the
++        # allocation never happens inside cudagraph capture.
++        ctr = torch.zeros(2, dtype=torch.int64, device=key.device)
++        _qsa_clip_counters[layer.layer_name] = ctr
++        with _qsa_clip_lock:
++            if not _qsa_clip_reader_started:
++                _qsa_clip_reader_started = True
++                threading.Thread(
++                    target=_qsa_clip_reader,
++                    name="qsa-clip-reader",
++                    daemon=True,
++                ).start()
++                logger.info(
++                    "QSA clip counter armed (read interval %.0fs)",
++                    _qsa_clip_interval,
++                )
++    # Thresholds are 1-D so the comparison promotes to float32; a 0-dim float32
++    # tensor promotes like a Python scalar and the threshold would be rounded to
++    # the BF16 grid of K/V, undercounting values just above the calibrated ceiling.
++    k_ceiling = (448.0 * layer._k_scale).to(torch.float32).view(1)
++    v_ceiling = (448.0 * layer._v_scale).to(torch.float32).view(1)
++    ctr[0] += (key.detach().abs() > k_ceiling).sum()
++    ctr[1] += (value.detach().abs() > v_ceiling).sum()
++# ------------------------------------------------------------------------------
++
+ _QSA_FP8_CACHE_DTYPES = ("fp8", "fp8_e4m3")
+ _QSA_SUPPORTED_CACHE_DTYPES = ("auto", "bfloat16", *_QSA_FP8_CACHE_DTYPES)
+ 
+@@ -543,6 +643,10 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
+             self.indexer.output_width,
+         ):
+             raise RuntimeError("QSA indexer returned an invalid selection shape")
++        if _qsa_clip_interval > 0.0 and _is_qsa_fp8_cache_dtype(
++            self.kv_cache_dtype
++        ):
++            _qsa_clip_count(self, key, value)
+         impl = cast(Qwen4ExpQSAFlashAttentionImpl, self.impl)
+         impl.do_kv_cache_update(
+             self,

@@ -1,0 +1,126 @@
+From 305bab907acca57a58540ced471ffb3fb69b3e34 Mon Sep 17 00:00:00 2001
+From: "huanghaoyan.hhy" <huanghaoyan.hhy@alibaba-inc.com>
+Date: Sun, 30 Aug 2026 14:15:03 +0800
+Subject: [PATCH 7/8] fix fp8-ple weight loading
+
+Signed-off-by: huanghaoyan.hhy <huanghaoyan.hhy@alibaba-inc.com>
+---
+ tests/models/qwen4_exp/test_ple.py        | 32 +++++++++++++----------
+ vllm/models/qwen4_exp/nvidia/ple_layer.py |  7 ++---
+ 2 files changed, 20 insertions(+), 19 deletions(-)
+
+diff --git a/tests/models/qwen4_exp/test_ple.py b/tests/models/qwen4_exp/test_ple.py
+index 80c58df9239..c0d8a3c1c2e 100644
+--- a/tests/models/qwen4_exp/test_ple.py
++++ b/tests/models/qwen4_exp/test_ple.py
+@@ -163,7 +163,7 @@ def test_ngram_embedding_rejects_mismatched_checkpoint_shard() -> None:
+         module.load_weights([("ngram_embedding.shard_0.weight", torch.zeros(3, 2))])
+ 
+ 
+-def test_ngram_embedding_loads_fp8_shards_and_global_scale() -> None:
++def test_ngram_embedding_loads_fp8_scale_after_shard_group() -> None:
+     module = _make_fp8_ngram_embedding_for_load_test()
+     shard_0 = torch.arange(8, dtype=torch.float32).reshape(4, 2).to(torch.float8_e4m3fn)
+     shard_1 = (
+@@ -171,15 +171,16 @@ def test_ngram_embedding_loads_fp8_shards_and_global_scale() -> None:
+     )
+     weight_scale = torch.tensor([0.25], dtype=torch.bfloat16)
+ 
+-    loaded = module.load_weights(
++    loaded_shards = module.load_weights(
+         [
+             ("ngram_embedding.shard_0.weight", shard_0),
+             ("ngram_embedding.shard_1.weight", shard_1),
+-            ("ngram_embedding.weight_scale", weight_scale),
+         ]
+     )
++    loaded_scale = module.load_weights([("ngram_embedding.weight_scale", weight_scale)])
+ 
+-    assert loaded == {"ngram_embedding.weight", "ngram_embedding.weight_scale"}
++    assert loaded_shards == {"ngram_embedding.weight"}
++    assert loaded_scale == {"ngram_embedding.weight_scale"}
+     assert module.ngram_embedding.weight.dtype == torch.float8_e4m3fn
+     assert torch.equal(
+         module.ngram_embedding.weight.float(),
+@@ -189,7 +190,7 @@ def test_ngram_embedding_loads_fp8_shards_and_global_scale() -> None:
+     assert module.get_offload_output_dtype(torch.bfloat16) == torch.float8_e4m3fn
+ 
+ 
+-def test_ngram_gpu_offload_retains_only_fp8_global_scale(monkeypatch) -> None:
++def test_ngram_gpu_offload_loads_fp8_scale_after_shard_group(monkeypatch) -> None:
+     module = Qwen4ExpNGramEmbedding.__new__(Qwen4ExpNGramEmbedding)
+     nn.Module.__init__(module)
+     module._offload_quant_method = Qwen4ExpPLEFp8EmbeddingMethod()
+@@ -202,21 +203,24 @@ def test_ngram_gpu_offload_retains_only_fp8_global_scale(monkeypatch) -> None:
+         lambda: torch.device("cpu"),
+     )
+ 
+-    loaded = module.load_weights(
+-        [
+-            ("ngram_embedding.shard_0.weight", torch.empty(4, 2)),
+-            ("ngram_embedding.weight_scale", weight_scale),
+-        ]
++    loaded_shards = module.load_weights(
++        [("ngram_embedding.shard_0.weight", torch.empty(4, 2))]
+     )
+ 
+-    assert loaded == {"ngram_embedding.weight_scale"}
+-    assert torch.equal(module._offload_weight_scale, weight_scale)
+-    assert module.get_offload_output_dtype(torch.bfloat16) == torch.float8_e4m3fn
+-
+     ple_layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
+     nn.Module.__init__(ple_layer)
+     ple_layer.ple_embedding = module
+     embeddings = torch.tensor([[4.0, 8.0]]).to(torch.float8_e4m3fn)
++
++    assert not loaded_shards
++    with pytest.raises(RuntimeError, match="missing its global scale"):
++        ple_layer._dequantize_embeddings(embeddings, torch.bfloat16)
++
++    loaded_scale = module.load_weights([("ngram_embedding.weight_scale", weight_scale)])
++
++    assert loaded_scale == {"ngram_embedding.weight_scale"}
++    assert torch.equal(module._offload_weight_scale, weight_scale)
++    assert module.get_offload_output_dtype(torch.bfloat16) == torch.float8_e4m3fn
+     output = ple_layer._dequantize_embeddings(embeddings, torch.bfloat16)
+     torch.testing.assert_close(
+         output,
+diff --git a/vllm/models/qwen4_exp/nvidia/ple_layer.py b/vllm/models/qwen4_exp/nvidia/ple_layer.py
+index 789906b611d..dd76204d879 100644
+--- a/vllm/models/qwen4_exp/nvidia/ple_layer.py
++++ b/vllm/models/qwen4_exp/nvidia/ple_layer.py
+@@ -661,6 +661,8 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+         """Load hash buffers and checkpoint-split embedding rows."""
+ 
++        # Prefix grouping may invoke this method repeatedly for one module.
++        # Treat the global FP8 scale as incrementally loaded state.
+         # GPU workers retain only dequantization metadata. The CPU process owns
+         # the embedding table and transfers quantized lookup rows unchanged.
+         if envs.VLLM_PLE_CPU_OFFLOAD and not is_offload_process():
+@@ -678,8 +680,6 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
+                         persistent=False,
+                     )
+                     retained.add(name)
+-                if not retained:
+-                    raise ValueError("FP8 PLE offload checkpoint is missing its scale")
+             elif isinstance(quant_method, Qwen4ExpPLENVFp4EmbeddingMethod):
+                 outer_scales: dict[int, torch.Tensor] = {}
+                 for name, loaded_weight in weights:
+@@ -725,7 +725,6 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
+         shard_prefix = "ngram_embedding.shard_"
+         quant_method = getattr(self.ngram_embedding, "quant_method", None)
+         nvfp4_runtime = isinstance(quant_method, Qwen4ExpPLENVFp4EmbeddingMethod)
+-        fp8_runtime = isinstance(quant_method, Qwen4ExpPLEFp8EmbeddingMethod)
+         packed_codes: dict[int, torch.Tensor] = {}
+         packed_scales: dict[int, torch.Tensor] = {}
+         packed_outer_scales: dict[int, torch.Tensor] = {}
+@@ -872,8 +871,6 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
+ 
+         if regular_weights:
+             loaded.update(AutoWeightsLoader(self).load_weights(regular_weights))
+-        if fp8_runtime and "ngram_embedding.weight_scale" not in loaded:
+-            raise ValueError("FP8 PLE checkpoint is missing its global scale")
+         return loaded
+ 
+ 

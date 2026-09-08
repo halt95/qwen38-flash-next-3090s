@@ -1,0 +1,91 @@
+From 2c7e70f48850fe1e1a604e425174d94c987b41da Mon Sep 17 00:00:00 2001
+From: "huanghaoyan.hhy" <huanghaoyan.hhy@alibaba-inc.com>
+Date: Thu, 27 Aug 2026 14:00:29 +0800
+Subject: [PATCH 3/8] [BugFix] fix PLE-offload initialization in uniproc
+ executor
+
+Signed-off-by: huanghaoyan.hhy <huanghaoyan.hhy@alibaba-inc.com>
+---
+ tests/v1/executor/test_executor.py   | 34 ++++++++++++++++++++++++++++
+ vllm/v1/executor/uniproc_executor.py |  5 ++++
+ 2 files changed, 39 insertions(+)
+
+diff --git a/tests/v1/executor/test_executor.py b/tests/v1/executor/test_executor.py
+index a21a8dafd32..9c4a92d7819 100644
+--- a/tests/v1/executor/test_executor.py
++++ b/tests/v1/executor/test_executor.py
+@@ -6,6 +6,7 @@ import os
+ from collections.abc import Callable
+ from concurrent.futures import Future
+ from typing import Any
++from unittest.mock import MagicMock
+ 
+ import pytest
+ 
+@@ -16,6 +17,7 @@ from vllm.sampling_params import SamplingParams
+ from vllm.v1.engine.async_llm import AsyncLLM
+ from vllm.v1.engine.llm_engine import LLMEngine
+ from vllm.v1.executor import multiproc_executor as multiproc_executor_module
++from vllm.v1.executor import uniproc_executor as uniproc_executor_module
+ from vllm.v1.executor.abstract import Executor
+ from vllm.v1.executor.multiproc_executor import MultiprocExecutor
+ from vllm.v1.executor.uniproc_executor import (
+@@ -45,6 +47,38 @@ def test_supports_async_scheduling_multiproc_executor():
+     assert MultiprocExecutor.supports_async_scheduling() is True
+ 
+ 
++def test_uniproc_executor_starts_ple_worker_around_model_load(monkeypatch):
++    """PLE worker must start before registration and become ready after load."""
++    driver_worker = MagicMock()
++    monkeypatch.setattr(
++        uniproc_executor_module,
++        "WorkerWrapperBase",
++        MagicMock(return_value=driver_worker),
++    )
++    monkeypatch.setattr(uniproc_executor_module.envs, "VLLM_PLE_CPU_OFFLOAD", True)
++    monkeypatch.setattr(
++        uniproc_executor_module.envs, "VLLM_ELASTIC_EP_SCALE_UP_LAUNCH", False
++    )
++    monkeypatch.setattr(
++        uniproc_executor_module, "set_worker_net_device", lambda *args: None
++    )
++    monkeypatch.setattr(uniproc_executor_module, "current_platform", MagicMock())
++
++    executor = UniProcExecutor.__new__(UniProcExecutor)
++    executor.vllm_config = object()
++    monkeypatch.setattr(executor, "_distributed_args", lambda: ("local://", 0, 0))
++
++    executor._init_executor()
++
++    assert [call[0] for call in driver_worker.method_calls] == [
++        "init_worker",
++        "init_device",
++        "spawn_ple_offload",
++        "load_model",
++        "wait_ple_offload_ready",
++    ]
++
++
+ class _FakeClock:
+     def __init__(self) -> None:
+         self.now = 0.0
+diff --git a/vllm/v1/executor/uniproc_executor.py b/vllm/v1/executor/uniproc_executor.py
+index da1f2c588b6..5d17c148174 100644
+--- a/vllm/v1/executor/uniproc_executor.py
++++ b/vllm/v1/executor/uniproc_executor.py
+@@ -68,10 +68,15 @@ class UniProcExecutor(Executor):
+         self.driver_worker.init_worker(all_kwargs=[kwargs])
+         self.driver_worker.init_device()
+ 
++        if envs.VLLM_PLE_CPU_OFFLOAD:
++            self.driver_worker.spawn_ple_offload()
++
+         if envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH:
+             self.driver_worker.elastic_ep_execute("load_model")
+         else:
+             self.driver_worker.load_model()
++        if envs.VLLM_PLE_CPU_OFFLOAD:
++            self.driver_worker.wait_ple_offload_ready()
+         current_platform.update_block_size_for_backend(self.vllm_config)
+ 
+     def _distributed_args(self) -> tuple[str, int, int]:

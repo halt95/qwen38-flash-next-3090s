@@ -1,0 +1,18 @@
+# The vLLM source this repo builds, exactly as on the reference host:
+#   vllm-project/vllm at release tag v0.28.0
+#   + patches/upstream/0001-0008: the eight commits of peakcrosser7/vllm
+#     release/qwen38next_offload (Qwen3.8-Flash-Next support + PLE offload),
+#     cherry-picked onto that tag; upstream #53896 landed the model support in
+#     vLLM main on 2026-08-31, #53899 (PLE offload) is still open
+#   + patches/0001-0006: ours
+# The files under pinned/ are the tree after the upstream patches, i.e. what
+# patches/0001-0006 were written against; scripts/build.sh checks them.
+repo=https://github.com/vllm-project/vllm.git
+tag=v0.28.0
+commit=2cf0a6915ce544dc493a0990f2ea38d81601128a
+# git tree hash of the source after all patches (build.sh checks it; content-only, so it is stable)
+tree=4a63abc8fca6009b24e4982a45e7a7b617af502a
+# Compiled-ops wheel (VLLM_USE_PRECOMPILED): the 0.28.0 release build for that
+# commit on wheels.vllm.ai (CUDA 13 / cu130 variant), pinned by hash.
+wheel_url=https://wheels.vllm.ai/2cf0a6915ce544dc493a0990f2ea38d81601128a/vllm-0.28.0-cp38-abi3-manylinux_2_28_x86_64.whl
+wheel_sha256=addb0ffdaafd8155d75e9b3f5ddb3da28fdee9e8a7097ede91f7db2e9e1a3889

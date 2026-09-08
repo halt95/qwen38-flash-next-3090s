@@ -1,0 +1,46 @@
+From b59ead018a9598010d6d3685367b3ae071a164a8 Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Mon, 7 Sep 2026 21:40:47 -0400
+Subject: [PATCH 6/6] routed-experts capturer: unwrap UniformTypeKVCacheSpecs
+ full-attention group for hybrid models
+
+Needed by the routing-skew instrument on Qwen3.8-Flash-Next, whose KV spec
+wraps the full-attention group in UniformTypeKVCacheSpecs.
+---
+ .../layers/fused_moe/routed_experts_capturer.py  | 16 ++++++++++++++--
+ 1 file changed, 14 insertions(+), 2 deletions(-)
+
+diff --git a/vllm/model_executor/layers/fused_moe/routed_experts_capturer.py b/vllm/model_executor/layers/fused_moe/routed_experts_capturer.py
+index fa57ea383..e434e7d0c 100644
+--- a/vllm/model_executor/layers/fused_moe/routed_experts_capturer.py
++++ b/vllm/model_executor/layers/fused_moe/routed_experts_capturer.py
+@@ -17,7 +17,11 @@ from vllm.config import VllmConfig
+ from vllm.distributed.parallel_state import get_tp_group
+ from vllm.forward_context import get_forward_context
+ from vllm.platforms import current_platform
+-from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig
++from vllm.v1.kv_cache_interface import (
++    FullAttentionSpec,
++    KVCacheConfig,
++    UniformTypeKVCacheSpecs,
++)
+ from vllm.v1.outputs import RoutedExpertsTensors
+ 
+ logger = logging.getLogger(__name__)
+@@ -307,7 +311,15 @@ def bind_routed_experts_capturer(
+ def get_routed_experts_attn_gid(kv_cache_config: KVCacheConfig) -> int:
+     """Return the full-attention KV cache group used for routed experts."""
+     for gid, group in enumerate(kv_cache_config.kv_cache_groups):
+-        if isinstance(group.kv_cache_spec, FullAttentionSpec):
++        spec = group.kv_cache_spec
++        if isinstance(spec, FullAttentionSpec):
++            return gid
++        # Hybrid (GDN/QSA) models: the full-attention layers arrive merged into a
++        # UniformTypeKVCacheSpecs whose members are FullAttentionSpec; its slot layout
++        # is per-token exactly like a bare FullAttentionSpec group. (fn 2026-09-02)
++        if isinstance(spec, UniformTypeKVCacheSpecs) and spec.kv_cache_specs and all(
++            isinstance(inner, FullAttentionSpec) for inner in spec.kv_cache_specs.values()
++        ):
+             return gid
+     raise ValueError("Routed-experts capture requires a full-attention KV cache group.")
+ 

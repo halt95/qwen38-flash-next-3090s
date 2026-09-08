@@ -1,0 +1,43 @@
+From 0d6dee47ebf2a476e6a7f4c1c03fc52361330c4e Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Mon, 7 Sep 2026 21:40:47 -0400
+Subject: [PATCH 5/6] ple_offload: VLLM_PLE_OFFLOAD_HOME_DEVICE moves worker
+
+---
+ vllm/v1/ple_offload/worker.py | 16 ++++++++++++++++
+ 1 file changed, 16 insertions(+)
+
+diff --git a/vllm/v1/ple_offload/worker.py b/vllm/v1/ple_offload/worker.py
+index 32bdfd5b2..6e43d90ee 100644
+--- a/vllm/v1/ple_offload/worker.py
++++ b/vllm/v1/ple_offload/worker.py
+@@ -21,6 +21,7 @@ Class structure mirrors the GPU worker pattern in multiproc_executor.py:
+ 
+ import contextlib
+ import multiprocessing.process
++import os
+ import pickle
+ import signal
+ import tempfile
+@@ -274,6 +275,21 @@ class PleOffloadWorker:
+             # constructors instead of becoming empty GPU-worker placeholders.
+             mark_as_offload_worker()
+ 
++            # The worker needs a CUDA context on every card (IPC output
++            # buffers, copy streams, semaphores), but incidental allocations
++            # (allocator init, lazy module loads) land on torch's CURRENT
++            # device — cuda:0 by default, measured ~46 MiB heavier than the
++            # other cards. Rank 0's card is the VRAM-tightest (qwen38next
++            # -flash #3), so allow moving that overhead to another device.
++            home_device = os.environ.get(
++                "VLLM_PLE_OFFLOAD_HOME_DEVICE", ""
++            ).strip()
++            if home_device:
++                torch.cuda.set_device(int(home_device))
++                logger.info(
++                    "PLE offload worker home device set to cuda:%s", home_device
++                )
++
+             # Initialize Gloo before installing the real VllmConfig. This keeps
+             # the CPU process in an isolated rank-zero, world-size-one group.
+             _init_offload_distributed()

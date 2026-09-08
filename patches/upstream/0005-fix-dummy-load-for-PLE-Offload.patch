@@ -1,0 +1,163 @@
+From feea4034f3e3933fc8b28e42e83d2cb90585770a Mon Sep 17 00:00:00 2001
+From: "huanghaoyan.hhy" <huanghaoyan.hhy@alibaba-inc.com>
+Date: Fri, 28 Aug 2026 22:25:55 +0800
+Subject: [PATCH 5/8] fix dummy load for PLE-Offload
+
+Signed-off-by: huanghaoyan.hhy <huanghaoyan.hhy@alibaba-inc.com>
+---
+ tests/models/qwen4_exp/test_ple.py            | 20 +++++++++++
+ tests/v1/worker/test_ple_offload_worker.py    | 34 +++++++++++++++++++
+ .../layers/ple_offload_layer.py               |  3 ++
+ vllm/models/qwen4_exp/nvidia/ple_layer.py     | 21 ++++++++++++
+ vllm/v1/ple_offload/connector.py              |  2 ++
+ 5 files changed, 80 insertions(+)
+
+diff --git a/tests/models/qwen4_exp/test_ple.py b/tests/models/qwen4_exp/test_ple.py
+index d188550a070..80c58df9239 100644
+--- a/tests/models/qwen4_exp/test_ple.py
++++ b/tests/models/qwen4_exp/test_ple.py
+@@ -240,6 +240,26 @@ def test_ngram_gpu_offload_accepts_unquantized_embedding(monkeypatch) -> None:
+     assert module.get_offload_output_dim(160) == 160
+ 
+ 
++@pytest.mark.parametrize(
++    "quant_method",
++    [Qwen4ExpPLEFp8EmbeddingMethod(), Qwen4ExpPLENVFp4EmbeddingMethod()],
++)
++def test_ngram_gpu_offload_initializes_dummy_quant_metadata(
++    quant_method: Qwen4ExpPLEFp8EmbeddingMethod | Qwen4ExpPLENVFp4EmbeddingMethod,
++) -> None:
++    module = Qwen4ExpNGramEmbedding.__new__(Qwen4ExpNGramEmbedding)
++    nn.Module.__init__(module)
++    module._offload_quant_method = quant_method
++
++    module.initialize_dummy_offload_metadata(torch.device("cpu"))
++
++    if isinstance(quant_method, Qwen4ExpPLEFp8EmbeddingMethod):
++        assert module._offload_weight_scale.item() == 1.0
++    else:
++        assert module._offload_weight_scale_2.item() == 1.0
++        assert tuple(module._offload_nvfp4_lut.tolist()) == ple_layer_module._FP4_VALUES
++
++
+ def test_ngram_embedding_loads_nvfp4_shards_and_scales() -> None:
+     module = _make_nvfp4_ngram_embedding_for_load_test()
+     codes_0 = torch.arange(32, dtype=torch.uint8).reshape(4, 8)
+diff --git a/tests/v1/worker/test_ple_offload_worker.py b/tests/v1/worker/test_ple_offload_worker.py
+index 0ccfe68c11a..1ecff60295e 100644
+--- a/tests/v1/worker/test_ple_offload_worker.py
++++ b/tests/v1/worker/test_ple_offload_worker.py
+@@ -15,6 +15,7 @@ from vllm.model_executor.layers import ple_offload_layer
+ from vllm.model_executor.layers.ple_offload_layer import PleOffloadLayer
+ from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
+ from vllm.v1.ple_offload import worker as ple_offload_worker
++from vllm.v1.ple_offload.connector import PleOffloadConnector
+ from vllm.v1.worker.gpu_worker import Worker
+ 
+ 
+@@ -37,6 +38,15 @@ class _WeightLoadingPleLayer(_TestPleOffloadLayer):
+         self.bias = torch.nn.Parameter(torch.zeros(2))
+ 
+ 
++class _DummyMetadataPleLayer(_TestPleOffloadLayer):
++    def __init__(self) -> None:
++        super().__init__()
++        self.dummy_metadata_device: torch.device | None = None
++
++    def initialize_dummy_offload_metadata(self, device: torch.device) -> None:
++        self.dummy_metadata_device = device
++
++
+ class _WeightLoadingModel(torch.nn.Module):
+     hf_to_vllm_mapper = WeightsMapper(orig_to_new_prefix={"checkpoint.": ""})
+ 
+@@ -147,6 +157,30 @@ def test_ple_offload_rejects_missing_materialized_parameters(
+         )
+ 
+ 
++@pytest.mark.parametrize("load_format", ["dummy", "auto"])
++def test_ple_connector_initializes_metadata_only_for_dummy_load(
++    load_format: str,
++) -> None:
++    connector = PleOffloadConnector.__new__(PleOffloadConnector)
++    connector.device = torch.device("cpu")
++    model = torch.nn.Module()
++    model.ple = _DummyMetadataPleLayer()
++    vllm_config = SimpleNamespace(
++        load_config=SimpleNamespace(load_format=load_format),
++        model_config=SimpleNamespace(
++            dtype=torch.float32,
++            hf_text_config=SimpleNamespace(ple_embed_dim=2),
++        ),
++        scheduler_config=SimpleNamespace(max_num_batched_tokens=4),
++    )
++
++    layers = connector._setup_layers(vllm_config, model)
++
++    expected_device = connector.device if load_format == "dummy" else None
++    assert model.ple.dummy_metadata_device == expected_device
++    assert list(layers) == ["ple"]
++
++
+ def test_ple_offload_wait_only_waits_for_done(
+     monkeypatch: pytest.MonkeyPatch,
+ ) -> None:
+diff --git a/vllm/model_executor/layers/ple_offload_layer.py b/vllm/model_executor/layers/ple_offload_layer.py
+index 98a71ac84c6..f5bb7f9b824 100644
+--- a/vllm/model_executor/layers/ple_offload_layer.py
++++ b/vllm/model_executor/layers/ple_offload_layer.py
+@@ -231,6 +231,9 @@ class PleOffloadLayer(nn.Module, ABC):
+         """Return the last dimension used by cross-process output buffers."""
+         return default_dim
+ 
++    def initialize_dummy_offload_metadata(self, device: torch.device) -> None:
++        """Initialize metadata needed by dummy offload execution."""
++
+     def setup_cross_process_offload(
+         self,
+         gpu_output_buffer: torch.Tensor,
+diff --git a/vllm/models/qwen4_exp/nvidia/ple_layer.py b/vllm/models/qwen4_exp/nvidia/ple_layer.py
+index db2d9477a9a..789906b611d 100644
+--- a/vllm/models/qwen4_exp/nvidia/ple_layer.py
++++ b/vllm/models/qwen4_exp/nvidia/ple_layer.py
+@@ -637,6 +637,27 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
+             return default_dim // 2 + default_dim // _NVFP4_BLOCK_SIZE
+         return default_dim
+ 
++    def initialize_dummy_offload_metadata(self, device: torch.device) -> None:
++        """Initialize quantization metadata skipped by the dummy loader."""
++        quant_method = self._offload_quant_method
++        if isinstance(quant_method, Qwen4ExpPLEFp8EmbeddingMethod):
++            self.register_buffer(
++                "_offload_weight_scale",
++                torch.ones((), dtype=torch.float32, device=device),
++                persistent=False,
++            )
++        elif isinstance(quant_method, Qwen4ExpPLENVFp4EmbeddingMethod):
++            self.register_buffer(
++                "_offload_weight_scale_2",
++                torch.ones((), dtype=torch.float32, device=device),
++                persistent=False,
++            )
++            self.register_buffer(
++                "_offload_nvfp4_lut",
++                torch.tensor(_FP4_VALUES, dtype=torch.float32, device=device),
++                persistent=False,
++            )
++
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+         """Load hash buffers and checkpoint-split embedding rows."""
+ 
+diff --git a/vllm/v1/ple_offload/connector.py b/vllm/v1/ple_offload/connector.py
+index d3026483f44..367bb43daac 100644
+--- a/vllm/v1/ple_offload/connector.py
++++ b/vllm/v1/ple_offload/connector.py
+@@ -144,6 +144,8 @@ class PleOffloadConnector:
+         config = vllm_config.model_config.hf_text_config
+         max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+         for layer in layers.values():
++            if vllm_config.load_config.load_format == "dummy":
++                layer.initialize_dummy_offload_metadata(self.device)
+             # The CPU worker writes results here through CUDA IPC. The GPU
+             # placeholder waits on the paired cross-process semaphore.
+             output_buffer = torch.empty(
