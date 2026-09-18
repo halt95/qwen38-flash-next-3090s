@@ -33,7 +33,7 @@ have="$(git describe --tags --exact-match 2>/dev/null || git rev-parse --abbrev-
 [ "$have" = "$REPO_REF" ] || { echo "$APP is checked out at $have, not $REPO_REF; remove it or set REPO_REF=$have"; exit 1; }
 BUNDLE_FILE="$(basename "$BUNDLE_URL" .gz)"
 [ -f "$BUNDLE_FILE" ] || curl -fsSL "$BUNDLE_URL" | gunzip > "$BUNDLE_FILE"
-BUNDLE="$APP/$BUNDLE_FILE" scripts/build-v2.sh /opt/vllm-v2 /opt/venv-v2
+BUNDLE="$APP/$BUNDLE_FILE" bash scripts/build-v2.sh /opt/vllm-v2 /opt/venv-v2
 # the checkpoint: one config key, added in place if missing (weights untouched, backup kept)
 CKPT="${CKPT:-/models/Qwen3.8-Flash-Next-W4A16-Merlin}"
 [ -f "$CKPT/config.json" ] || { echo "checkpoint not found at $CKPT (mount it into the container, see pve-create.sh MODELS=)"; exit 1; }

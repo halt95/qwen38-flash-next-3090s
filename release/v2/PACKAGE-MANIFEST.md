@@ -30,7 +30,7 @@ Files in this tree (sha256 of the committed, LF-normalised content — `git show
 | `scripts/docker-entrypoint.sh` | `41f5502f4f20f1a1c0d9be40d7b37d3163a4c8543c85c59cb70f8c47bff58520` |
 | `.dockerignore` | `4febdf68980e9b17408de238c8516365079b79a4eabc51129a8a056853be6e93` |
 | `lxc/pve-create.sh` | `705043e2dac7083f321b7e0c4a32d8212eaa2a9aa413f620fb711faf584fb60b` |
-| `lxc/provision.sh` | `e6402c17443d6ebe59fe48228c96daee311d6a7a23bf257509a49aa6d79bdb5d` |
+| `lxc/provision.sh` | `364c3c8066ffe38b3d5712f73e8b33564dfa7ac1b841d5edfe52d2c867a0f83e` |
 | `lxc/flash-next.service` | `3eaf49b51d981fd540a905c1112ad6a6ef93d9eb76b922144c9d6fb4d7292b7a` |
 | `scales/qsa_kv_scales_262k.json` | `5cbe6ae87ed9d2dc97453a9a7b4967d0e0d32a0e6992ec260dc2c54b96305f67` |
 | `release/v2/requirements-pinned.txt` | `8390c8407106f4440359be1966b29cc3aeb3483490f2f059a83e58abfa057f62` |
