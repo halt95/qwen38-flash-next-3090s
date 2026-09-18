@@ -17,7 +17,7 @@ Files in this tree (sha256 of the committed, LF-normalised content — `git show
 
 | file | sha256 |
 |---|---|
-| `README.md` | `e3af7de1046fbabbbba78da7627a3279af1d21f3f0873f39d873773712bd8c02` |
+| `README.md` | `53f564571fa6a474498871388cab36c93f19a2e36cbd68185b69041785a2c20d` |
 | `NOTICE` | `7e8daa7f156ecc0b60d2e5b6b2c9d88ee52bd64da0dd2d00903f21f531dac44e` |
 | `LICENSE` | `cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30` |
 | `LICENSE.qwen-community-1.0` | `465dcafcac7d3542a0cfc150fc550e0b7228c22ee68c8f1f81db942e7c658cb4` |
@@ -29,7 +29,7 @@ Files in this tree (sha256 of the committed, LF-normalised content — `git show
 | `docker-compose.yml` | `235d7048b119938dec044a44a833802b80a9585226c91a3809d09d34fee2bcfc` |
 | `scripts/docker-entrypoint.sh` | `41f5502f4f20f1a1c0d9be40d7b37d3163a4c8543c85c59cb70f8c47bff58520` |
 | `.dockerignore` | `4febdf68980e9b17408de238c8516365079b79a4eabc51129a8a056853be6e93` |
-| `lxc/pve-create.sh` | `705043e2dac7083f321b7e0c4a32d8212eaa2a9aa413f620fb711faf584fb60b` |
+| `lxc/pve-create.sh` | `45af775fa255d0bfffadad18c5f2bb870d30bc432ffeea3ae65fff2592fe65b9` |
 | `lxc/provision.sh` | `364c3c8066ffe38b3d5712f73e8b33564dfa7ac1b841d5edfe52d2c867a0f83e` |
 | `lxc/flash-next.service` | `74050442960805b69937348991c6c5846b1a0a85385b7a4ea03870f69076d58b` |
 | `scales/qsa_kv_scales_262k.json` | `5cbe6ae87ed9d2dc97453a9a7b4967d0e0d32a0e6992ec260dc2c54b96305f67` |

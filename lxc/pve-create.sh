@@ -53,4 +53,4 @@ pct create "$CTID" "$tpl" \
 i=0
 for d in $NVIDIA_DEVS; do pct set "$CTID" --dev$i "$d"; i=$((i + 1)); done
 echo "created CT $CTID: $CORES cores, $((MEMORY_MB / 1024)) GB, $i NVIDIA device nodes, /models=$MODELS, /cache=$CACHE, unprivileged=$UNPRIVILEGED"
-echo "next: pct start $CTID && pct push $CTID $(dirname "$0")/provision.sh /root/provision.sh && pct exec $CTID -- bash /root/provision.sh"
+echo "next: pct start $CTID && pct push $CTID $(dirname "$0")/provision.sh /root/provision.sh && pct exec $CTID -- env NVIDIA_RUN=/models/NVIDIA-Linux-x86_64-<host version>.run bash /root/provision.sh"
