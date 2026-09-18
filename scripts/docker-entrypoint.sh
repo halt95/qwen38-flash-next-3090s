@@ -37,6 +37,6 @@ mem_kb="$(awk '/^MemTotal:/{print $2}' /proc/meminfo 2>/dev/null)"
 if [ -n "${mem_kb:-}" ] && [ "$mem_kb" -lt 100663296 ]; then
   echo "WARNING: host RAM visible here is $((mem_kb / 1048576)) GB; the qualified configuration is 96 GB"
   echo "         (measured resident floor ~69 GiB: ~48 GiB n-gram table + ~4.2 GiB pinned embeddings + workers)."
-  [ "$mem_kb" -lt 75497472 ] && echo "         Below ~72 GB the model load is expected to OOM."
+  [ "$mem_kb" -lt 72351744 ] && echo "         Below the ~69 GiB resident floor the model load is expected to OOM."
 fi
 exec "$HERE/scripts/serve-v2.sh" "$CKPT" "$@"

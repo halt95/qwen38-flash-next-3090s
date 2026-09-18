@@ -1,15 +1,18 @@
-NOTICE - Flash-Next v2 (vLLM fork)
+NOTICE - Flash-Next v2.0.1 (vLLM fork)
 
 This distribution contains a modified version of vLLM (https://github.com/vllm-project/vllm),
 Copyright (c) the vLLM project contributors, licensed under the Apache License, Version 2.0 (see LICENSE).
-Upstream base commit: e962733e08d10f7ca65dac4df99e116460b8b174. Release: tag v2 = d8ea70ae0e032dc9e45bcda736f9d49a9d5bc9a8.
-Delta bundle: v2-from-upstream-e962733e08.bundle (sha256 63f4ed4b73dc57d7b49aa250309d80b330f769a4eb12b63269ae8c858a82ebd7);
-patch series (reading aid): release/v2/patches/0001..0074.
+Upstream base commit: e962733e08d10f7ca65dac4df99e116460b8b174. Release: tag v2.0.1 = ad5c3c223999de577b04cdb9caeab2dcb76b61b9
+(tree 5426cf19586a66946a1d8f7e68f48bdc7f52d62d).
+Delta bundle: v2.0.1-from-upstream-e962733e08.bundle (sha256 eb2b17399794512d57156fff1e9b2c72af18c8b4dd6c55abd1dd0ed39097e9e3;
+shipped gzipped as v2.0.1-from-upstream-e962733e08.bundle.gz); patch series (reading aid): release/v2/patches/0001..0076;
+combined diff: release/v2/v2.0.1-combined.diff.
 
-Per Apache-2.0 section 4(b): relative to the upstream base commit, 50 files were added and 94 modified
-(144 total; `git diff --name-status e962733e08..v2`, generated 2026-09-17).
+Per Apache-2.0 section 4(b): relative to the upstream base commit, 53 files were added and 103 modified
+(156 total; `git diff --name-status e962733e08..v2.0.1`, generated 2026-09-18). The combined diff counts 112 files because
+it is taken against `e2-base` (the upstream base plus the community and upstream commits named below), not the base commit.
 
-Added (50):
+Added (53):
   benchmarks/kernels/benchmark_hy_v4_ihc.py
   csrc/cpu/cpu_attn_amx_fp8.hpp
   probe/faultcut_gate.py
@@ -41,7 +44,10 @@ Added (50):
   tests/v1/worker/gpu/test_pp_deferred_mamba_gpu.py
   tests/v1/worker/gpu/test_qsa_ring_skip_telemetry.py
   tests/v1/worker/gpu/test_qsa_rope_position_guard.py
+  tests/v1/worker/test_draft_tokens_handler.py
   tests/v1/worker/test_e2_memstats.py
+  tests/v1/worker/test_grammar_fail_closed.py
+  tests/v1/worker/test_grammar_invalid_drafts.py
   tests/v1/worker/test_ple_offload_worker.py
   vllm/model_executor/layers/fused_moe/configs/E=256,N=512,device_name=NVIDIA_A100_80GB_PCIe.json
   vllm/model_executor/layers/ple_offload_layer.py
@@ -61,7 +67,7 @@ Added (50):
   vllm_ple_offload_bootstrap/__main__.py
   vllm_ple_test_fault/__init__.py
 
-Modified (94):
+Modified (103):
   .buildkite/scripts/hardware_ci/run-cpu-test.sh
   CMakeLists.txt
   benchmarks/kernels/cpu/benchmark_cpu_attn.py
@@ -90,6 +96,7 @@ Modified (94):
   tests/v1/core/test_kv_cache_utils.py
   tests/v1/core/test_mamba_align_chunk_split.py
   tests/v1/core/test_prefix_caching.py
+  tests/v1/core/test_scheduler.py
   tests/v1/core/test_single_type_kv_cache_manager.py
   tests/v1/e2e/general/test_mamba_prefix_cache.py
   tests/v1/engine/test_engine_core.py
@@ -141,25 +148,34 @@ Modified (94):
   vllm/v1/core/kv_cache_coordinator.py
   vllm/v1/core/kv_cache_manager.py
   vllm/v1/core/kv_cache_utils.py
+  vllm/v1/core/sched/output.py
   vllm/v1/core/sched/scheduler.py
   vllm/v1/core/single_type_kv_cache_manager.py
   vllm/v1/engine/core.py
+  vllm/v1/executor/abstract.py
   vllm/v1/executor/multiproc_executor.py
   vllm/v1/executor/uniproc_executor.py
   vllm/v1/kv_cache_interface.py
+  vllm/v1/structured_output/utils.py
   vllm/v1/worker/gpu/block_table.py
   vllm/v1/worker/gpu/cudagraph_utils.py
   vllm/v1/worker/gpu/model_runner.py
   vllm/v1/worker/gpu/model_states/interface.py
   vllm/v1/worker/gpu/model_states/mamba_hybrid.py
   vllm/v1/worker/gpu/pp_utils.py
+  vllm/v1/worker/gpu/sample/batch_shard.py
+  vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
+  vllm/v1/worker/gpu/spec_decode/utils.py
+  vllm/v1/worker/gpu_model_runner.py
   vllm/v1/worker/gpu_worker.py
   vllm/v1/worker/mamba_utils.py
   vllm/v1/worker/utils.py
+  vllm/v1/worker/worker_base.py
 
 Some of these changes are upstream vLLM commits applied ahead of the base (prefix-cache chain #53614 #55747
 #53945 #54713 #55450 by ZeldaHuang, yewentao256, akshaver, tobymao, lucamotz; PRs #53899 peakcrosser7,
-#54793 and #54795 saichowdary007; #46994, #54709, #55745 hunks; #57050 port). They keep their authors and licence.
+#54793 and #54795 saichowdary007; #46994, #55745 hunks; #57050 port; and, in v2.0.1, #54442 and #56802, the structured-output
+fix under pipeline parallelism, upstream issue #54437). They keep their authors and licence.
 
 Model weights are not part of this distribution. Qwen3.8-Flash-Next and its quantised derivatives
 (Intel AutoRound experts, RadixArk FP8 PLE table, our in-place packing) carry the Qwen Community License 1.0
@@ -167,5 +183,5 @@ Model weights are not part of this distribution. Qwen3.8-Flash-Next and its quan
 
 Credits: peakcrosser7 (release/qwen38next_offload: Flash-Next model support and PLE offload), Intel (AutoRound),
 RadixArk (FP8 PLE table), aikitoria (P2P driver for consumer Ampere), DominikBucko (MTP INT4 packing recipe),
-alesha-pro and noonghunna/club-3090 (independent
+alesha-pro, noonghunna/club-3090 and tfriedel (independent
 work on the same hardware class).

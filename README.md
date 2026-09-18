@@ -23,7 +23,7 @@ the campaign's close records, which are not published.
 [![Context](https://img.shields.io/badge/context-262K_per_request-ffb000)](#the-kv-budget)
 [![KV pool](https://img.shields.io/badge/KV_pool-806%2C792_tokens-0969da)](#the-kv-budget)
 [![Shape](https://img.shields.io/badge/TP2_x_PP2-%2B_EP-6f42c1)](#stack)
-[![MTP](https://img.shields.io/badge/MTP-K%3D3-6f42c1)](#benchmarks)
+[![MTP](https://img.shields.io/badge/MTP-K%3D3-6f42c1)](#stack)
 [![Checkpoint](https://img.shields.io/badge/%F0%9F%A4%97_checkpoint-Qwen3.8--Flash--Next--W4A16--Merlin-ffd21e)](https://huggingface.co/halt95/Qwen3.8-Flash-Next-W4A16-Merlin)
 
 > **Evidence boundary.** The v2 card is a maintainer measurement on the reference host with a frozen,
@@ -42,14 +42,14 @@ the campaign's close records, which are not published.
 **Structured output now works under concurrency.** In v2, a `response_format` request could fail with HTTP 500 while
 other requests were decoding, because the draft hand-off kept a single unidentified slot that the alternating
 pipeline-parallel microbatch overwrote; the `-1` placeholders left behind gave the grammar bitmask an all-allowed row
-and the unconstrained token then failed the state machine. v2.0.1 ports two upstream changes that fix it at the source:
+and the unconstrained token then failed the state machine. v2.0.1 ports two upstream pull requests (both open upstream at the time of writing) that fix it at the source:
 **PR #54442**, which refuses to leave an unmasked row for a draft slot the scheduler did not schedule, and **PR #56802**,
 which keys draft snapshots by scheduler step so a request is verified against the drafts its own step consumed.
 
 Measured on the reference host with the shipped serve command, 80 structured requests across four load cells (one, two
 and three concurrent decodes with thinking on, and two with thinking off), 10 idle and 10 under load in each:
 
-| Concurrent decodes | Thinking | v2 under load | v2.0.1 under load |
+| Concurrent decodes | Thinking | v2: schema-valid responses of 10, under load | v2.0.1: same |
 |---|---|---|---|
 | 1 | on | 8/10 | 10/10 |
 | 2 | on | 1/10 | 10/10 |
@@ -57,7 +57,7 @@ and three concurrent decodes with thinking on, and two with thinking off), 10 id
 | 2 | off | 6/10 | 10/10 |
 
 Idle was 10/10 in every cell on both. Every v2.0.1 response body validated against its schema; the engine logged no
-grammar rejection and no terminated request anywhere in the run. No throughput regression was measured: on the
+grammar rejection and no terminated request anywhere in the run. No throughput regression was found: on the
 reference host's two-boot ladder across 4K, 32K, 131K and 261K in both thinking modes, v2.0.1 lands between 0.978 and
 1.028 of the v2 median, with median inter-token latency within 0.21 ms and tokens per step unchanged. The
 prefix-cache equivalence block was re-run too and fails identically on v2 and v2.0.1 (same three cells, same cache-hit
@@ -88,7 +88,7 @@ curl -s localhost:8000/v1/chat/completions -H 'Content-Type: application/json'  
 The first start compiles the cudagraphs (about 10 minutes) into the `flash-next-cache` volume; later starts take about
 three minutes. The entrypoint adds the one config key the checkpoint needs if it is missing (see
 [Checkpoint](#checkpoint)). Everything the container does is in `Dockerfile`, `docker-compose.yml` and
-`scripts/docker-entrypoint.sh`; the same three scripts run without Docker ([Build and serve](#build-and-serve)).
+`scripts/docker-entrypoint.sh`; the build and serve scripts run without Docker ([Build and serve](#build-and-serve)).
 **Proxmox instead of Docker.** The reference host runs this as a **privileged** Debian 13 LXC with the four cards passed
 through as device nodes; `lxc/` reproduces that: `lxc/pve-create.sh` (run on the Proxmox host: template, cores, 96 GB,
 the seven `/dev/nvidia*` nodes, checkpoint and cache mounts), `lxc/provision.sh` (run inside: NVIDIA userspace matching the
@@ -103,7 +103,8 @@ Neither survives a host reboot on its own, so the reference host drives both fro
 (which also refuses to start the container while a GPU VM holds the cards).
 
 ```bash
-CTID=201 MODELS=/tank/models lxc/pve-create.sh                      # on the Proxmox host
+git clone https://github.com/halt95/qwen38-flash-next-3090s.git && cd qwen38-flash-next-3090s   # on the Proxmox host
+CTID=201 MODELS=/tank/models lxc/pve-create.sh
 pct start 201 && pct push 201 lxc/provision.sh /root/provision.sh
 pct exec 201 -- env NVIDIA_RUN=/models/NVIDIA-Linux-x86_64-<host version>.run bash /root/provision.sh
 ```
@@ -128,7 +129,7 @@ Read [Known behaviours](#known-behaviours-of-the-qwen38-flash-next-architecture-
 | shape | TP2 × PP2 + expert parallel, MTP K=3 | TP4 + EP, MTP K=3 |
 | KV pool, FP8 tokens, whole box | **806,792** (3.08 × a full-context request; three 262K sessions resident, measured) | 342,912 (1.31 ×) |
 | context per request | 262,144 | 262,144 |
-| concurrent sequences admitted | **8** (3 × 262K, 1 × 262K + 3 × 131K, 5 × 131K, 8 × 65K, 8 × 32K all resident) | 2 |
+| concurrent sequences admitted (`--max-num-seqs`, configured; the shapes listed were measured resident) | **8** (3 × 262K, 1 × 262K + 3 × 131K, 5 × 131K, 8 × 65K, 8 × 32K) | 2 |
 | decode, single stream, thinking on, 4K / 32K / 131K / 261K prompt | **162 / 166 / 169 / 176** tok/s (medians of 5 boots) | 163 / 165 / 172 / 170† |
 | decode, thinking off, same depths | 118 / 123 / 123 / 125 | 124 / 122 / 120 / 125† |
 | median event interval, thinking on, same depths | 18.72 / 18.73 / 19.10 / 19.33 ms | 18.61 / 18.73 / 19.17 / 19.37† ms |
@@ -154,7 +155,7 @@ nor under the served entry's request-logging-off flags). With MTP the honest pai
 |---|---|
 | GPU | 4× NVIDIA GeForce RTX 3090 (Ampere sm_86, 24 GB each), **220 W** power cap, no NVLink |
 | PCIe | Gen4 x16 to every card; P2P over the aikitoria open-kernel-module patch (`VLLM_SKIP_P2P_CHECK=1`, `NCCL_P2P_LEVEL=SYS`) |
-| CPU / RAM | AMD EPYC 7532, 192 GB ECC; the serving container is allocated **96 GB**, the qualified figure. Measured resident floor on the v2.0.1 container: about **69 GiB** = the ~48 GiB FP8 n-gram table (anonymous memory in the offload process) + ~4.2 GiB of pinned embedding tables (1,064 MiB per rank) + ~8 GiB of shared segments + ~8 GiB across the four workers, engine core and API server; the remaining ~34 GB is checkpoint page cache and reclaimable. The boot peak was not measured, so treat 80 GB as the sensible minimum and 64 GB as not enough |
+| CPU / RAM | AMD EPYC 7532, 192 GB ECC; the serving container is allocated **96 GB**, the qualified figure. Measured resident floor on the v2.0.1 container: about **69 GiB** = the ~48 GiB FP8 n-gram table (anonymous memory in the offload process) + ~4.2 GiB of pinned embedding tables (1,064 MiB per rank) + ~8 GiB of shared segments + ~8 GiB across the four workers, engine core and API server; the remaining ~26 GiB up to the 96 GB limit is checkpoint page cache and reclaimable. The boot peak was not measured, so treat the 69 GiB floor as a hard floor (below it the load OOMs), 80 GB as the sensible minimum and 64 GB as not enough |
 | disk, `/dev/shm` | ≥ 250 GB free (the checkpoint is 116 GiB); `/dev/shm` ≥ 1 GB (maintainer-measured peak +30.6 MB per boot; a `Bus error` at boot means it is undersized) |
 | OS / serving | Linux container on Proxmox, vLLM behind llama-swap; the scripts here run the same engine directly |
 
@@ -280,7 +281,7 @@ The same checkpoint as v1, [halt95/Qwen3.8-Flash-Next-W4A16-Merlin](https://hugg
 (Intel AutoRound INT4 g128 experts, the RadixArk FP8 n-gram table, MTP draft experts INT4 and GDN projections
 INT8 packed in place, attention BF16; lineage in its model card), **plus one config key**: v2 keys the FP8
 n-gram table on `ple_embedding_dtype: float8_e4m3fn` inside the `text_config` object of `config.json` (the engine reads its text config, so a top-level key does nothing) instead of the `VLLM_PLE_FP8_GLOBAL_SCALE`
-environment variable v1 used (the env opt-in is still honoured for a checkpoint without the key). `scripts/make-e1-config.py` adds it; every weight file stays byte-identical
+environment variable v1 used (the env opt-in is still honoured for a checkpoint without the key). the checkpoint on Hugging Face carries the key since 2026-09-18; for a download that predates it, `scripts/make-e1-config.py` adds it (and is a no-op otherwise); every weight file stays byte-identical
 (the reference host's serving copy is hard links to the published shards, verified 2026-09-17). Shard hashes are not
 published here; the Hugging Face checkpoint carries them, and the v2 delta is the one config key above.
 
@@ -305,8 +306,8 @@ The KV scale sidecar is **the file v1 shipped**, `scales/qsa_kv_scales_262k.json
 | path | what |
 |---|---|
 | `upstream/PIN-v2` | base commit, bundle prerequisites, tag commit and tree hash, precompiled-wheel identity and hash, artefact tarball hash |
-| `release/v2/patches/0001..0076` | the full series over `e2-base`, for reading; the history has merge commits, so `git am` cannot replay it (it stops at patch 43). Our own commits carry the maintainer's GitHub identity in the tagged history itself, so unlike v2 these copies are byte-identical to the reference package and verify against `SHA256SUMS.v2.0.1`; contributors whose work upstream authored keep their own attribution. The bundle remains the source of truth |
-| `release/v2/v2.0.1-combined.diff` | one `git diff e2-base..v2.0.1` (112 files, text only, 777 KiB): `git apply` it on `e2-base` and you have the tagged source; checked to apply cleanly and to give the tag's tree hash. The way to reproduce the tree from the patches directory without the bundle (`build-v2.sh` itself uses the bundle) |
+| `release/v2/patches/0001..0076` | the full series over `e2-base`, for reading; the history has merge commits, so `git am` cannot replay it (it stops at patch 43). These copies are byte-identical to the reference package and verify against `SHA256SUMS.v2.0.1`; contributors whose work upstream authored keep their own attribution. The bundle remains the source of truth |
+| `release/v2/v2.0.1-combined.diff` | one `git diff e2-base..v2.0.1` (112 files, text only, 777 KiB): `git apply` it on `e2-base` (the release asset `e2-base-src.tar.gz`, sha256 `fcd14214f64faaa4175d62f6a51ca39c7bc09d15bf75c190d4dfcc88846b927f`) and you have the tagged source; checked to apply cleanly and to give the tag's tree hash. The way to reproduce the tree from the patches directory without the bundle (`build-v2.sh` itself uses the bundle) |
 | `release/v2/requirements-pinned.txt`, `build-artifacts.list`, `SHA256SUMS.v2.0.1`, `PACKAGE-MANIFEST.md` | the environment pins, the 22 build products, the hashes of the release assets, the combined diff and the reference patch series (`cd release/v2 && sha256sum -c --ignore-missing SHA256SUMS.v2.0.1` verifies 78 of 81 from a checkout; the other three are the release assets), the file manifest |
 | `scripts/build-v2.sh` | fetch the three prerequisite commits from GitHub + the bundle (release asset), check out `v2.0.1`, assert commit and tree, fresh venv from the pins, compiled ops from the wheel or the tarball, metadata-only install. One prerequisite is a PR-branch head (#53899); if it ever disappears upstream the bundle alone cannot be applied — a full bundle is the fallback |
 | `scripts/serve-v2.sh` | the served entry with every variable exported; port, host, names (default `flash-next-v2 flash-next flash-mtp flash-next-mtp`), PLE home, sidecar and cache dir configurable |
@@ -316,10 +317,11 @@ The KV scale sidecar is **the file v1 shipped**, `scales/qsa_kv_scales_262k.json
 | `scales/qsa_kv_scales_262k.json`, `calib/` | the sidecar and how it was made (unchanged from v1) |
 
 ```bash
-# assets from the release page: v2.0.1-from-upstream-e962733e08.bundle(.gz), optionally build-artifacts-sm86-py313-cu130.tar.gz
+# release assets: v2.0.1-from-upstream-e962733e08.bundle.gz (required), build-artifacts-sm86-py313-cu130.tar.gz (optional),
+# e2-base-src.tar.gz (only for the combined-diff route), build-artifacts.list (already in the tree)
 gunzip v2.0.1-from-upstream-e962733e08.bundle.gz
 BUNDLE=./v2.0.1-from-upstream-e962733e08.bundle scripts/build-v2.sh ./vllm-v2 ./venv-v2
-python scripts/make-e1-config.py /path/to/Qwen3.8-Flash-Next-W4A16-Merlin
+python scripts/make-e1-config.py /path/to/Qwen3.8-Flash-Next-W4A16-Merlin   # no-op if the config already carries the key
 TREE=./vllm-v2 VENV=./venv-v2 HOST=0.0.0.0 scripts/serve-v2.sh /path/to/Qwen3.8-Flash-Next-W4A16-Merlin
 ```
 

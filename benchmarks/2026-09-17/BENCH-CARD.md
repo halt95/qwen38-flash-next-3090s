@@ -21,7 +21,7 @@ v1: vLLM 0.28.0 fn28 tree, TP4.
 | shape | TP2 × PP2 + expert parallel, MTP K=3 | TP4 + EP, MTP K=3 |
 | KV pool, FP8 tokens, whole box | **806,792** (3.08 × a full-context request; three 262K sessions resident, measured) | 342,912 (1.31 ×) |
 | context per request | 262,144 | 262,144 |
-| concurrent sequences admitted | **8** (3 × 262K, 1 × 262K + 3 × 131K, 5 × 131K, 8 × 65K, 8 × 32K all resident) | 2 |
+| concurrent sequences admitted (`--max-num-seqs`, configured; the shapes listed were measured resident) | **8** (3 × 262K, 1 × 262K + 3 × 131K, 5 × 131K, 8 × 65K, 8 × 32K) | 2 |
 | decode, single stream, thinking on, 4K / 32K / 131K / 261K prompt | **162 / 166 / 169 / 176** tok/s (medians of 5 boots) | 163 / 165 / 172 / 170† |
 | decode, thinking off, same depths | 118 / 123 / 123 / 125 | 124 / 122 / 120 / 125† |
 | median event interval, thinking on, same depths | 18.72 / 18.73 / 19.10 / 19.33 ms | 18.61 / 18.73 / 19.17 / 19.37† ms |
@@ -83,7 +83,7 @@ the previous candidate, so it is not the v2 environment. Cause not established.
 | no-think single-stream (r9 protocol) | — | decode ratio 1.015, interval ratio 1.000 | PASS |
 | faults, replacements, empty warm completions over 10 boots | 0 | 0 | PASS |
 
-Fingerprint of the v2 arm (each boot; `${PORT}` per arm):
+Fingerprint of the v2 arm (each boot; the served name `v7final` and `${PORT}` are per-arm harness settings, not shipped names):
 
 ```
 vllm serve Qwen3.8-Flash-Next-W4A16-Merlin(-e1 config) --served-model-name v7final --port 8170 --host 127.0.0.1
