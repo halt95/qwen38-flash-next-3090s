@@ -16,7 +16,7 @@ Files in this tree (sha256 of the committed, LF-normalised content — `git show
 
 | file | sha256 |
 |---|---|
-| `README.md` | `493ddd95feb4b823642679bc01231758eea6ba58fb091422744901b3a50a5990` |
+| `README.md` | `c237aef6a6711c9b683c9f19dff51055637130df017cd374bb12de6fb25a60d9` |
 | `NOTICE` | `ad3a23f32a99e6d5ac404cfdd1100ed180b19a6fb87ab67f91ac0f6e7b489b21` |
 | `LICENSE` | `cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30` |
 | `LICENSE.qwen-community-1.0` | `465dcafcac7d3542a0cfc150fc550e0b7228c22ee68c8f1f81db942e7c658cb4` |
@@ -34,7 +34,7 @@ Files in this tree (sha256 of the committed, LF-normalised content — `git show
 | `scales/qsa_kv_scales_262k.json` | `5cbe6ae87ed9d2dc97453a9a7b4967d0e0d32a0e6992ec260dc2c54b96305f67` |
 | `release/v2/requirements-pinned.txt` | `8390c8407106f4440359be1966b29cc3aeb3483490f2f059a83e58abfa057f62` |
 | `release/v2/build-artifacts.list` | `d26029273f3c50b4983b1c20219152de9b1cf3867977c17189184fc3bd85b6f5` |
-| `benchmarks/2026-09-17/BENCH-CARD.md` | `1bb3794e1225ce5cc0df3b9b3878ba3140d7c3e13558c611f1a2b803afa2f381` |
+| `benchmarks/2026-09-17/BENCH-CARD.md` | `24e289a1920316f483d603f083ab26b787c36f99f9faf071bd87d58d8f472dae` |
 | `release/v2/SHA256SUMS.v2.0.1` | `e651890ffa8dfb4b0bc7b9c4178656de9687adc1f12e5e99759e5167cfe23b8d` |
 | `release/v2/v2.0.1-combined.diff` | `f051b2b6952e2c74229f7a43f1bcb95811361f3c984fa4885e93b0f379f3f888` |
 

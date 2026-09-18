@@ -1,4 +1,4 @@
-# v2 qualification card — 2026-09-17 (G6 run 6, two arms, five boots each)
+# v2 qualification card — 2026-09-17 (two-arm gate, five boots each)
 
 > **Provenance.** This card is the release gate of Flash-Next v2, not a throughput sweep: the same frozen
 > ladder was run on **v2** (tag `v2` = fork `d8ea70ae0e`, the entry `scripts/serve-v2.sh` transcribes) and on
@@ -79,7 +79,7 @@ the previous candidate, so it is not the v2 environment. Cause not established.
 | quality, v-vs-teacher divergence (24 held-out prompts, 4 captures per boot; lower = closer to the BF16 teacher) | a = 0.0378–0.0385 | b = 0.0365–0.0378 | delta −0.0009, U −0.0004 < 0.0015: PASS |
 | tool-call structure, 150 cases (V.8 battery) | reference quant 125/150 | 130/150 | ≥ ref − 2 per family: PASS (parity band) |
 | exact recall, 160 cases (V.8 battery) | 160/160 | 160/160 | PASS |
-| three 262K sessions resident (P3F) | — | interval 8.41 s, peak 302 / 317 blocks, 0 faults | PASS |
+| three 262K sessions resident | — | interval 8.41 s, peak 302 / 317 blocks, 0 faults | PASS |
 | no-think single-stream (r9 protocol) | — | decode ratio 1.015, interval ratio 1.000 | PASS |
 | faults, replacements, empty warm completions over 10 boots | 0 | 0 | PASS |
 

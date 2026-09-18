@@ -13,7 +13,7 @@ parallel 2 × pipeline parallel 2** with expert parallel, the FP8 n-gram table s
 **host-mapped, fail-closed pull transport**, and, the piece that is entirely ours, **the token-embedding tables
 of both the target model and the MTP drafter moved out of VRAM into pinned host memory**, read by a device-mapped
 lookup that runs inside the captured cudagraph. The KV pool goes from 342,912 tokens (1.31 full-context requests) to **806,792 tokens: three 262K sessions
-resident at once**, single-stream decode at parity with the TP4 lane on the thinking lane, prefill 10–26 %
+resident at once**, thinking-on single-stream decode at parity with the TP4 lane (thinking-off at 4K runs 5 % below it, documented), prefill 10–26 %
 faster. The v2-versus-v1 table below comes from the pre-registered two-arm gate that qualified v2
 ([`benchmarks/2026-09-17/BENCH-CARD.md`](benchmarks/2026-09-17/BENCH-CARD.md)); v2.0.1 was requalified against those
 medians (maintainer-reported, below); capacity, memory, fault and prefix-cache figures are maintainer-reported from
@@ -34,7 +34,7 @@ the campaign's close records, which are not published.
 > source tree (commit **and** tree hash, from the public upstream commit plus the bundle shipped as a release
 > asset), the environment (199 pinned packages), the sidecar, and the serve command. Everything else is
 > maintainer-reported. Five behaviours of the architecture's upstream implementation are **documented, not
-> fixed**; tracked issues #18 and #20 remain open — read
+> fixed**; the empty warm completion and the prefix-cache loss remain open — read
 > [Known behaviours](#known-behaviours-of-the-qwen38-flash-next-architecture-in-vllm) before serving.
 
 ## What changed in v2.0.1
@@ -61,7 +61,7 @@ grammar rejection and no terminated request anywhere in the run. No throughput r
 reference host's two-boot ladder across 4K, 32K, 131K and 261K in both thinking modes, v2.0.1 lands between 0.978 and
 1.028 of the v2 median, with median inter-token latency within 0.21 ms and tokens per step unchanged. The
 prefix-cache equivalence block was re-run too and fails identically on v2 and v2.0.1 (same three cells, same cache-hit
-total, 51/51 answers correct on both): that is open issue [#20](#known-behaviours-of-the-qwen38-flash-next-architecture-in-vllm),
+total, 51/51 answers correct on both): that is the open [prefix-cache loss](#known-behaviours-of-the-qwen38-flash-next-architecture-in-vllm),
 unchanged by this fix.
 
 Nothing else about the release changes: same checkpoint, same serve command, same KV budget, same pool of 806,792
@@ -179,7 +179,7 @@ relative to TP4 at the same weights:
   pins fail on the tightest card (3.8e9 was the ceiling before the host-resident embeddings).
 
 Three 262K sessions resident with 302 of 317 blocks in use, three-way qualifying interval 8.41 s, is the
-capacity row of the gate (`P3F`).
+capacity row of the gate.
 
 ## Host-resident embeddings inside the cudagraph
 
@@ -206,9 +206,9 @@ not share an AOT cache entry; patch `0068` registers it, and a pre-fix tree need
 | agent need | as served |
 |---|---|
 | several long sessions at once | 8 sequences admitted; 3 × 262K, 1 × 262K + 3 × 131K, 5 × 131K, 8 × 65K and 8 × 32K all resident (shape ladder) |
-| the same context re-sent every turn | prefix caching on: a repeated 30K prompt reports 25,600 cached tokens, a repeated 131K prompt 124,800, salted controls 0; hits are 3,200-token aligned blocks with the last matched block dropped for the drafter, so prompts under two blocks (~6.4K tokens) cannot hit. See [#20](#known-behaviours-of-the-qwen38-flash-next-architecture-in-vllm) for the case that loses hits |
+| the same context re-sent every turn | prefix caching on: a repeated 30K prompt reports 25,600 cached tokens, a repeated 131K prompt 124,800, salted controls 0; hits are 3,200-token aligned blocks with the last matched block dropped for the drafter, so prompts under two blocks (~6.4K tokens) cannot hit. See [prefix-cache loss](#known-behaviours-of-the-qwen38-flash-next-architecture-in-vllm) for the case that loses hits |
 | tool calls, thinking, images | Qwen3 coder tool parser, Qwen3 reasoning parser with thinking on at low effort, 2 images per request, one OpenAI-compatible front door |
-| a client that expects an answer every time | retry once on `finish_reason == "stop"` with 0 completion tokens ([#18](#known-behaviours-of-the-qwen38-flash-next-architecture-in-vllm)) |
+| a client that expects an answer every time | retry once on `finish_reason == "stop"` with 0 completion tokens ([empty warm completion](#known-behaviours-of-the-qwen38-flash-next-architecture-in-vllm)) |
 | not dying at depth | 14-cut fault campaign on the transport (fail-closed on every cut), stress sequence, memory profiles with three 262K sessions plus a burst, block-5 prefix-cache correctness under forced preemption (51/51 answers correct), all maintainer-run |
 
 ## Benchmarks
@@ -224,7 +224,7 @@ numbers, the event intervals, tokens per step, the fingerprint and the environme
 | decode, thinking off, 32K / 131K | 1.008 / 1.024 — PASS |
 | decode, thinking off, **4K** | **0.952 — FAIL against the 0.97 rule**, shipped documented (a draft-acceptance effect of the shape, not a v2 patch: it is identical with the readers on or off): event interval identical (18.66 vs 18.64 ms), tokens per step 2.14–2.31 vs 2.31, clustered per boot; cause not established |
 | prefill 10K / 100K | +10 % / +26 % — PASS |
-| quality vs teacher | delta −0.0009, well inside the 0.0015 bound — PASS. (The earlier single-capture screen, gate 5, recorded **FAIL** and stays cited as such; G6 replaced it as the instrument) |
+| quality vs teacher | delta −0.0009, well inside the 0.0015 bound — PASS. (An earlier single-capture quality screen recorded **FAIL** and stays cited as such; the two-arm gate replaced it as the instrument) |
 | pool, capacity, tools, no-think, faults | PASS (see card) |
 
 What the earlier candidates looked like: with the two instrumentation reader threads on and the default
@@ -237,12 +237,12 @@ difference (maintainer-measured).
 
 These are behaviours of the Qwen3.8-Flash-Next architecture as implemented upstream in vLLM (the hybrid
 Gated-DeltaNet / sparse-attention / MTP execution path and its hybrid KV manager). They are **not** introduced by
-this checkpoint's quantisation and not by the v2 patches: #18 is an upstream-reported class and was seen on the v1 TP4
-lane; #20 did not move across the five release candidates (v2.0.1 included) when the v2 deltas were bisected (a run on the unmodified
+this checkpoint's quantisation and not by the v2 patches: the empty warm completion is an upstream-reported class and was seen on the v1 TP4
+lane; the prefix-cache loss did not move across the five release candidates (v2.0.1 included) when the v2 deltas were bisected (a run on the unmodified
 upstream base is still owed); the ring-row death is in upstream code. v2 documents them, ships mitigations where
 one exists, and tracks them; none affects the correctness of answers in the gate.
 
-- **#18 — an occasional empty completion on a warm repeat of a long cached prefix** (upstream class: vllm-project/vllm #53912, prefix caching + speculative decoding on hybrid models; seen on the v1 TP4 lane too). HTTP 200,
+- **Empty warm completion — an occasional empty completion on a warm repeat of a long cached prefix** (upstream class: vllm-project/vllm #53912, prefix caching + speculative decoding on hybrid models; seen on the v1 TP4 lane too). HTTP 200,
   `finish_reason: "stop"`, zero tokens: the first sampled token is EOS. Per boot, not per request (roughly one
   boot in three on the no-MTP diagnostic shape; three empty warm completions in 23 gate boots across gate runs 1–4 on
   the rc3/rc4 candidates, two of them on the v1 TP4 arm; none in the 10 boots of the final run). The cached bytes are proven identical between a call that flips and
@@ -250,7 +250,7 @@ one exists, and tracks them; none affects the correctness of answers in the gate
   async scheduling, and async scheduling is required with MTP under PP on this fork. Mitigation shipped: **retry
   once**; it returned the correct answer in every observed case (a mitigation, not a guarantee; the rate on the
   served profile is not measured). Maintainer-reported.
-- **#20 — prefix-cache blocks of sessions that finish while other long sessions are still decoding are dropped**
+- **Prefix-cache loss — prefix-cache blocks of sessions that finish while other long sessions are still decoding are dropped**
   (upstream hybrid KV manager path). Not preemption (reproduced with zero preemptions). The variable that separates the
   arms is the survivors' remaining decode: with 320-token outputs only the first-finished session loses its blocks,
   with 2,048-token outputs every session does, and a single long session plus a burst retains everything. Free-block
@@ -303,7 +303,7 @@ The KV scale sidecar is **the file v1 shipped**, `scales/qsa_kv_scales_262k.json
 | `release/v2/patches/0001..0076` | the full series over `e2-base`, for reading; the history has merge commits, so `git am` cannot replay it (it stops at patch 43). Our own commits carry the maintainer's GitHub identity in the tagged history itself, so unlike v2 these copies are byte-identical to the reference package and verify against `SHA256SUMS.v2.0.1`; contributors whose work upstream authored keep their own attribution. The bundle remains the source of truth |
 | `release/v2/v2.0.1-combined.diff` | one `git diff e2-base..v2.0.1` (112 files, text only, 777 KiB): `git apply` it on `e2-base` and you have the tagged source; checked to apply cleanly and to give the tag's tree hash. The way to reproduce the tree from the patches directory without the bundle (`build-v2.sh` itself uses the bundle) |
 | `release/v2/requirements-pinned.txt`, `build-artifacts.list`, `SHA256SUMS.v2.0.1`, `PACKAGE-MANIFEST.md` | the environment pins, the 22 build products, the hashes of the release assets, the combined diff and the reference patch series (`cd release/v2 && sha256sum -c --ignore-missing SHA256SUMS.v2.0.1` verifies 78 of 81 from a checkout; the other three are the release assets), the file manifest |
-| `scripts/build-v2.sh` | fetch the three prerequisite commits from GitHub + the bundle (release asset), check out `v2.0.1`, assert commit and tree, fresh venv from the pins, compiled ops from the wheel or the tarball, metadata-only install. One prerequisite is a PR-branch head (#53899); if it ever disappears upstream the bundle alone cannot be applied — a full bundle is the fallback and is available on request |
+| `scripts/build-v2.sh` | fetch the three prerequisite commits from GitHub + the bundle (release asset), check out `v2.0.1`, assert commit and tree, fresh venv from the pins, compiled ops from the wheel or the tarball, metadata-only install. One prerequisite is a PR-branch head (#53899); if it ever disappears upstream the bundle alone cannot be applied — a full bundle is the fallback |
 | `scripts/serve-v2.sh` | the served entry with every variable exported; port, host, names, PLE home, sidecar and cache dir configurable |
 | `Dockerfile`, `docker-compose.yml`, `scripts/docker-entrypoint.sh` | the container: `build-v2.sh` at image build (bundle from the release URL or the build context), `serve-v2.sh` as the entrypoint, checkpoint and cache as mounts, the config key added on first start if the mount is writable |
 | `lxc/pve-create.sh`, `lxc/provision.sh`, `lxc/flash-next.service` | the Proxmox LXC form of the same thing: create the container with the device nodes and mounts, provision it (NVIDIA userspace, `build-v2.sh`, config key, systemd unit), serve on boot |
@@ -361,7 +361,7 @@ The three steps that account for the result (maintainer-reported):
 
 ## What ships next (v2.1)
 
-The #20 retention mechanism (the hybrid KV manager's free path under concurrent decode), the #18 racing pair
+The prefix-cache retention mechanism (the hybrid KV manager's free path under concurrent decode), the empty-completion racing pair
 (stream-fence / cloned-relay / all-gather interventions and a consumption-time generation check, plus upstream
 #43650 and #53919), the 4K thinking-off acceptance deficit, the true fix for the ring-row fault, and the
 packers / converter / deep-context harness that produce the checkpoint.
