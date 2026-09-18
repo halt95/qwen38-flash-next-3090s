@@ -76,7 +76,7 @@ for [issue #54437](https://github.com/vllm-project/vllm/issues/54437)) are the i
 The release form of v2 is one image that builds the pinned tree and serves it. Host requirements: four 24 GB Ampere cards
 with peer-to-peer working on your driver, `nvidia-container-toolkit`, host RAM (96 GB is the qualified allocation; the
 measured resident floor is about 69 GiB, see [Hardware](#hardware)), and the checkpoint
-[halt95/Qwen3.8-Flash-Next-W4A16-Merlin](https://huggingface.co/halt95/Qwen3.8-Flash-Next-W4A16-Merlin) on disk (116 GiB).
+[halt95/Qwen3.8-Flash-Next-W4A16-Merlin](https://huggingface.co/halt95/Qwen3.8-Flash-Next-W4A16-Merlin) on disk (115 GiB).
 
 ```bash
 git clone https://github.com/halt95/qwen38-flash-next-3090s.git && cd qwen38-flash-next-3090s
@@ -156,7 +156,7 @@ nor under the served entry's request-logging-off flags). With MTP the honest pai
 | GPU | 4× NVIDIA GeForce RTX 3090 (Ampere sm_86, 24 GB each), **220 W** power cap, no NVLink |
 | PCIe | Gen4 x16 to every card; P2P over the aikitoria open-kernel-module patch (`VLLM_SKIP_P2P_CHECK=1`, `NCCL_P2P_LEVEL=SYS`) |
 | CPU / RAM | AMD EPYC 7532, 192 GB ECC; the serving container is allocated **96 GB**, the qualified figure. Measured resident floor on the v2.0.1 container: about **69 GiB** = the ~48 GiB FP8 n-gram table (anonymous memory in the offload process) + ~4.2 GiB of pinned embedding tables (1,064 MiB per rank) + ~8 GiB of shared segments + ~8 GiB across the four workers, engine core and API server; the remaining ~26 GiB up to the 96 GiB limit (98,304 MiB, what the recipes call "96 GB") is checkpoint page cache and reclaimable. The boot peak was not measured, so treat the 69 GiB floor as a hard floor (below it the load OOMs), 80 GB as the sensible minimum and 64 GB as not enough |
-| disk, `/dev/shm` | ≥ 250 GB free (the checkpoint is 116 GiB); `/dev/shm` ≥ 1 GB (maintainer-measured peak +30.6 MB per boot; a `Bus error` at boot means it is undersized) |
+| disk, `/dev/shm` | ≥ 250 GB free (the checkpoint is 115 GiB); `/dev/shm` ≥ 1 GB (maintainer-measured peak +30.6 MB per boot; a `Bus error` at boot means it is undersized) |
 | OS / serving | Linux container on Proxmox, vLLM behind llama-swap; the scripts here run the same engine directly |
 
 ## The KV budget
@@ -215,7 +215,7 @@ not share an AOT cache entry; patch `0068` registers it, and a pre-fix tree need
 | the same context re-sent every turn | prefix caching on: a repeated 30K prompt reports 25,600 cached tokens, a repeated 131K prompt 124,800, salted controls 0; hits are 3,200-token aligned blocks with the last matched block dropped for the drafter, so prompts under two blocks (~6.4K tokens) cannot hit. See [prefix-cache loss](#known-behaviours-of-the-qwen38-flash-next-architecture-in-vllm) for the case that loses hits |
 | tool calls, thinking, images | Qwen3 coder tool parser, Qwen3 reasoning parser with thinking on at low effort, 2 images per request, one OpenAI-compatible front door |
 | a client that expects an answer every time | retry once on `finish_reason == "stop"` with 0 completion tokens ([empty warm completion](#known-behaviours-of-the-qwen38-flash-next-architecture-in-vllm)) |
-| not dying at depth | 14-cut fault campaign on the transport (fail-closed on every cut), stress sequence, memory profiles with three 262K sessions plus a burst, block-5 prefix-cache correctness under forced preemption (51/51 answers correct), all maintainer-run |
+| not dying at depth | 14-cut fault campaign on the transport (fail-closed on every cut), stress sequence, memory profiles with three 262K sessions plus a burst, prefix-cache correctness under forced preemption (51/51 answers correct), all maintainer-run |
 
 ## Benchmarks
 
@@ -250,8 +250,8 @@ one exists, and tracks them; none affects the correctness of answers in the gate
 
 - **Empty warm completion — an occasional empty completion on a warm repeat of a long cached prefix** (upstream class: vllm-project/vllm #53912, prefix caching + speculative decoding on hybrid models; seen on the v1 TP4 lane too). HTTP 200,
   `finish_reason: "stop"`, zero tokens: the first sampled token is EOS. Per boot, not per request (roughly one
-  boot in three on the no-MTP diagnostic shape; three empty warm completions in 23 gate boots across gate runs 1–4 on
-  the rc3/rc4 candidates, two of them on the v1 TP4 arm; none in the 10 boots of the final run). The cached bytes are proven identical between a call that flips and
+  boot in three on the no-MTP diagnostic shape; three empty warm completions in 23 gate boots of two earlier release candidates, two of them on the v1 TP4 arm;
+  none in the 10 boots of the final run). The cached bytes are proven identical between a call that flips and
   the calls around it; the race is inside the flipping request's own forward, it needs pipeline parallel plus
   async scheduling, and async scheduling is required with MTP under PP on this fork. Mitigation shipped: **retry
   once**; it returned the correct answer in every observed case (a mitigation, not a guarantee; the rate on the
@@ -260,8 +260,8 @@ one exists, and tracks them; none affects the correctness of answers in the gate
   (upstream hybrid KV manager path). Not preemption (reproduced with zero preemptions). The variable that separates the
   arms is the survivors' remaining decode: with 320-token outputs only the first-finished session loses its blocks,
   with 2,048-token outputs every session does, and a single long session plus a burst retains everything. Free-block
-  state during the episode was not sampled, so eviction under pool pressure is not excluded. Reproduced on rc3, rc4 and
-  rc7 (one boot each, one shared compile cache); the one rc5 boot kept the last-finished session; re-run on v2.0.1 with
+  state during the episode was not sampled, so eviction under pool pressure is not excluded. Reproduced on three release candidates
+  (one boot each, one shared compile cache); one boot of a fourth kept the last-finished session; re-run on v2.0.1 with
   an identical failing set, identical cache-hit total and 51/51 answers correct. Cost: first-token latency on that
   session's next turn; the answer is unaffected.
 - **Thinking-off decode at 4K** is 0.92–0.99 of the TP4 lane on every one of the five boots, four of them below the gate's 0.97 rule (above); it is the one cell that makes the judge's machine verdict for the run FAIL.
@@ -272,8 +272,8 @@ one exists, and tracks them; none affects the correctness of answers in the gate
 - **Greedy T=0 is not byte-reproducible** with this architecture (bf16 near-ties resolved differently by the sparse
   indexer's top-k and the expert permutation); documented, accepted.
 - Fixed on the way and worth knowing if you run an older candidate: a worker hang at the end of very long
-  prefills (the instrumentation readers deadlocking under the CUDA context lock; fixed in rc6, readers off
-  in v2) and the upstream Mamba admission-estimate regression (#57050, ported in rc4).
+  prefills (the instrumentation readers deadlocking under the CUDA context lock; fixed before v2, readers off
+  in v2) and the upstream Mamba admission-estimate regression (#57050, ported before v2).
 
 ## Checkpoint
 

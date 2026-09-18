@@ -3,12 +3,11 @@
 > **Provenance.** This card is the release gate of Flash-Next v2, not a throughput sweep: the same frozen
 > ladder was run on **v2** (tag `v2` = fork `d8ea70ae0e`, the entry `scripts/serve-v2.sh` transcribes) and on
 > the **v1 TP4 lane** (the 2026-09-08 card's entry at its 2026-09-10 KV pin 2.9e9), alternating boots
-> A1,B1,…,A5,B5 on the same box under one frozen manifest (`FREEZE v11`, sha256 `e7b89822e5db…`), with the
+> A1,B1,…,A5,B5 on the same box under one frozen manifest (the maintainer's frozen input set, sha256 `e7b89822e5db…`), with the
 > judge, ladder, prompts and reference files pinned by hash. Per boot: three sends per cell, streamed,
 > client-timed, T=0 with `seed`, thinking on ("decode") and off ("decode_off"). Rows are judged as
 > **median over the five v2 boots vs median over the five v1 boots** (rule: ≥ 0.97 and every boot ≥ 0.90).
-> The full judge output is not published. Instrument: `fnbench.py` ladder
-> + `g6_judge.py` (maintainer scripts, not published). The judge's machine verdict for the run is FAIL, driven by the one
+> The full judge output is not published. Instrument: the maintainer's ladder driver and judge scripts (not published). The judge's machine verdict for the run is FAIL, driven by the one
 > thinking-off 4K cell below; every other row passes.
 
 Host: 4× NVIDIA GeForce RTX 3090, driver 610.43.02, 220 W | v2: vLLM fork `d8ea70ae0e` on torch 2.13.0+cu130 |
@@ -56,7 +55,7 @@ The per-boot values behind every cell follow.
 | 131K | 120.4 | 123.3 123.0 123.1 124.8 127.3 | 123.3 | 1.024 | 1.022 | 19.17 / 18.97 | 2.29 / 2.35 |
 | 261K (v2 arm only, per the preregistration) | not run in the gate († 124.6, one boot, 2026-09-18) | 125.9 122.7 125.2 126.3 125.0 | 125.2 | no v1 cell | no v1 cell | († 19.40) / 19.15 | († 2.39) / 2.37 |
 
-The 261K depth was preregistered for the v2 arm only (4.1 posted-decode rule against 173 tok/s; 4.3 prefill rule), so the v1
+The 261K depth was preregistered for the v2 arm only (preregistered rules: decode ≥ 0.90 × 173 tok/s, prefill ≥ 0.90 × 4,900), so the v1
 columns at that depth were empty by design, not because v1 cannot serve it (the † cells were measured after the gate, 2026-09-18, one boot): the v1 lane holds one 262,144-token request
 (pool 342,912) and its own 2026-09-08 card measured 163 tok/s at a 260K prompt under a different protocol (image-bearing
 prompts, served defaults), which is not comparable to this ladder. The 261K event interval and tokens per step (added 09-17 evening from the same boots' streams: thinking on 19.14–19.38 ms and 3.24–3.40 per boot; thinking off 19.13–19.21 ms and 2.33–2.41) follow the 4K–131K trend.
@@ -77,10 +76,10 @@ the previous candidate, so it is not the v2 environment. Cause not established.
 | TTFT by depth, cold salted prompts, s (medians of 5 boots; per-boot spread ≤ 0.05 s): 4K / 32K / 131K / 261K | 0.97 / 7.16 / 31.94 / — | 0.91 / 6.19 / 24.77 / 50.68 | reported (the 261K prompt is 259,587 tokens; that depth was preregistered for the v2 arm only) |
 | KV pool, tokens | 342,912 ×5 | 806,792 ×5 | ≥ 804,247: PASS |
 | quality, v-vs-teacher divergence (24 held-out prompts, 4 captures per boot; lower = closer to the BF16 teacher) | a = 0.0378–0.0385 | b = 0.0365–0.0378 | delta −0.0009, U −0.0004 < 0.0015: PASS |
-| tool-call structure, 150 cases (V.8 battery) | reference quant 125/150 | 130/150 | ≥ ref − 2 per family: PASS (parity band) |
-| exact recall, 160 cases (V.8 battery) | 160/160 | 160/160 | PASS |
+| tool-call structure, 150 cases (the tool-and-recall battery) | reference quant 125/150 | 130/150 | ≥ ref − 2 per family: PASS (parity band) |
+| exact recall, 160 cases (the tool-and-recall battery) | 160/160 | 160/160 | PASS |
 | three 262K sessions resident | — | interval 8.41 s, peak 302 / 317 blocks, 0 faults | PASS |
-| no-think single-stream (r9 protocol) | — | decode ratio 1.015, interval ratio 1.000 | PASS |
+| no-think single-stream (natural-stop protocol, medians over sends) | — | decode ratio 1.015, interval ratio 1.000 | PASS |
 | faults, replacements, empty warm completions over 10 boots | 0 | 0 | PASS |
 
 Fingerprint of the v2 arm (each boot; the served name `v7final` and `${PORT}` are per-arm harness settings, not shipped names):
