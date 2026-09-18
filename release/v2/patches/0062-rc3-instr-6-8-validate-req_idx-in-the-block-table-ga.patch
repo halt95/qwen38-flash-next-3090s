@@ -1,0 +1,328 @@
+From 7db64dd646da47b4a3f19a296567dd472f9dedea Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Tue, 15 Sep 2026 21:04:26 +0000
+Subject: [PATCH 62/76] rc3-instr 6/8: validate req_idx in the block-table
+ gather and the slot mapping  (Luna guards 3 and 4)
+
+Two kernels in vllm/v1/worker/gpu/block_table.py take a request row out of a
+device-side mapping and use it to index a persistent, max_num_reqs-row table
+with no bound:
+
+  _gather_block_tables_kernel   req_idx    = idx_mapping[batch_idx]
+  _compute_slot_mappings_kernel req_state_idx = idx_mapping[batch_idx]
+
+An out-of-range row does not fault on its own in the gather -- it copies
+another request's (or no request's) block ids into this step's working table,
+and every kernel downstream then dereferences those ids. That is the quiet
+version of the S2 failure: the illegal address surfaces later, in attention,
+with metadata that looks internally consistent.
+
+Both bounds come from an argument the launcher already has. The gather bound is
+num_blocks_stride, which IS max_num_reqs, so it needs no new argument; the slot
+mapping takes the same value as a new bt_num_rows.
+
+Fail-soft behaviour follows what each kernel already does for a padded row:
+  * gather: zero the destination row and return (the padded-row path above).
+  * slot mapping: write PAD_ID over this request's token range and return, so
+    no downstream kernel sees a stale slot id.
+
+A second bound in the gather covers num_blocks itself: a count wider than the
+table would run the copy loop past the end of both the source and destination
+rows. It is clamped rather than skipped, so a too-large count still copies the
+part that is real.
+
+Launch-site audit: one launch each (block_table.py:166 and :204), both in this
+file, no warmup registration and no AMD mirror.
+
+ROUND 3: _GUARD_BIAS is bound as tl.constexpr. Round 2 declared it as a plain
+module-level int, which a @triton.jit body cannot read, and the GPU smoke
+failed every guarded-kernel test with "NameError: Cannot access global variable
+_GUARD_BIAS". Checked the other module-level names in this file: none are
+referenced from a jit body.
+
+ROUND 9 -- this commit killed rc3 boot attempt 3, in warmup, at the first real
+gather:
+
+  triton CompilationError at 45:4
+  AssertionError('initial value for `num_blocks` is of type int32[],
+                  but the then block redefines it as int64[]')
+
+`num_blocks` is loaded int32 from num_blocks_ptr; `max_num_blocks` is `stride`,
+loaded from block_table_strides, which is int64. Clamping inside the `if`
+rebound an int32 name to int64, and Triton requires a name to keep its type
+across a branch.
+
+The clamp is now UNCONDITIONAL with an explicit .to(tl.int32), and only the
+recording stays inside the branch. That is better than a cast inside the `if`
+twice over: there is no longer a branch-local redefinition of a live name at
+all, which is the failure CLASS rather than this instance, and it matches the
+shape every other guard in the series already uses -- clamp always, record when
+the value was bad.
+
+Why nothing caught it: the compile gate listed this kernel under "left to the
+suites", and tests/v1/worker/gpu/ contained no block-table test at all, so it
+was left to nobody and its first compile was the first forward of a four-rank
+boot. Both halves are fixed -- the gate now launches gather, slot mapping and
+the zeroer at real shapes, and tests/v1/worker/gpu/test_block_table_guards.py
+launches the real kernels and checks both the legal path (counters must stay
+at zero) and the guarded path (counter fires, destination row zeroed, the
+neighbouring rows untouched).
+
+Draft for Astra review. Not merged into any RC.
+---
+ .../v1/worker/gpu/test_block_table_guards.py  | 118 ++++++++++++++++++
+ vllm/v1/worker/gpu/block_table.py             |  62 +++++++++
+ 2 files changed, 180 insertions(+)
+ create mode 100644 tests/v1/worker/gpu/test_block_table_guards.py
+
+diff --git a/tests/v1/worker/gpu/test_block_table_guards.py b/tests/v1/worker/gpu/test_block_table_guards.py
+new file mode 100644
+index 000000000..8fd8aa5e6
+--- /dev/null
++++ b/tests/v1/worker/gpu/test_block_table_guards.py
+@@ -0,0 +1,118 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Real launches of the three kernels no suite was launching.
++
++rc3 boot attempt 3 died in warmup with a Triton CompilationError in
++`_gather_block_tables_kernel` -- a branch-typing error in guard 6 that nothing
++had ever compiled. The compile gate listed it as "left to the suites" and
++`tests/v1/worker/gpu/` contained no block-table test at all, so it was left to
++nobody: its first compile was the first real forward of a four-rank boot.
++
++These tests launch the real kernels. They are cheap, they are CUDA-gated, and
++their only job is that a signature or typing error in guard 6 or guard 7 costs
++seconds in the suite rather than a boot.
++"""
++
++import pytest
++import torch
++
++from vllm.v1.attention.backends.utils import PAD_SLOT_ID
++from vllm.v1.worker import guard_telemetry
++from vllm.v1.worker.gpu.block_table import BlockTables
++
++pytestmark = pytest.mark.skipif(
++    not torch.cuda.is_available(), reason="CUDA required"
++)
++
++MAX_REQS = 8
++BLOCKS = 4
++BLOCK_SIZE = 16
++NUM_REQS = 4
++NUM_TOKENS = 16
++
++
++def _tables(device):
++    bt = BlockTables(
++        block_sizes=[BLOCK_SIZE],
++        max_num_reqs=MAX_REQS,
++        max_num_batched_tokens=NUM_TOKENS,
++        max_num_blocks_per_group=[BLOCKS],
++        device=device,
++        kernel_block_sizes=[BLOCK_SIZE],
++    )
++    for r in range(NUM_REQS):
++        bt.append_block_ids(r, ([1 + r],), True)
++    bt.apply_staged_writes()
++    return bt
++
++
++def test_gather_and_slot_mapping_launch_and_are_correct():
++    device = torch.device("cuda", torch.cuda.current_device())
++    guard_telemetry.prealloc(device)
++    guard_telemetry.reset_for_test()
++    bt = _tables(device)
++
++    idx = torch.arange(NUM_REQS, dtype=torch.int32, device=device)
++    (gathered,) = bt.gather_block_tables(idx, num_reqs_padded=NUM_REQS)
++    torch.cuda.synchronize()
++    for r in range(NUM_REQS):
++        assert int(gathered[r, 0]) == 1 + r, gathered
++
++    qsl = torch.tensor([0, 4, 8, 12, 16], dtype=torch.int32, device=device)
++    pos = torch.arange(NUM_TOKENS, dtype=torch.int64, device=device)
++    slots = bt.compute_slot_mappings(idx, qsl, pos, num_tokens_padded=NUM_TOKENS)
++    torch.cuda.synchronize()
++    assert slots.shape[-1] == NUM_TOKENS
++
++    # A legal batch must leave both counters at zero. A guard that fires here
++    # is reporting a masked fault on correct metadata, which is worse than no
++    # guard -- see the round-8 row-bound defect.
++    for site in (guard_telemetry.SITE_BT_GATHER,
++                 guard_telemetry.SITE_SLOT_MAPPING):
++        ctr = guard_telemetry.counter(site, device)
++        assert int(ctr[0].item()) == 0, guard_telemetry.snapshot()
++
++
++def test_gather_guard_fires_and_zeroes_the_row():
++    device = torch.device("cuda", torch.cuda.current_device())
++    guard_telemetry.prealloc(device)
++    guard_telemetry.reset_for_test()
++    bt = _tables(device)
++
++    idx = torch.arange(NUM_REQS, dtype=torch.int32, device=device)
++    idx[2] = MAX_REQS + 3          # a request row that does not exist
++    (gathered,) = bt.gather_block_tables(idx, num_reqs_padded=NUM_REQS)
++    torch.cuda.synchronize()
++
++    ctr = guard_telemetry.counter(guard_telemetry.SITE_BT_GATHER, device)
++    assert int(ctr[0].item()) > 0, "the gather guard did not fire"
++    row = int(ctr[1].item()) - guard_telemetry.GUARD_BIAS
++    val = int(ctr[2].item()) - guard_telemetry.GUARD_BIAS
++    assert row == 2, f"recorded batch row {row}, expected 2"
++    assert val == MAX_REQS + 3, f"recorded req_idx {val}"
++    # and the destination row is zeroed rather than filled from a stray row
++    assert int(gathered[2].abs().sum()) == 0, gathered[2]
++    # the rows either side are untouched
++    assert int(gathered[1, 0]) == 2 and int(gathered[3, 0]) == 4
++
++
++def test_slot_mapping_guard_pads_the_bad_request():
++    device = torch.device("cuda", torch.cuda.current_device())
++    guard_telemetry.prealloc(device)
++    guard_telemetry.reset_for_test()
++    bt = _tables(device)
++
++    idx = torch.arange(NUM_REQS, dtype=torch.int32, device=device)
++    idx[1] = -1                    # the freed-slot sentinel
++    qsl = torch.tensor([0, 4, 8, 12, 16], dtype=torch.int32, device=device)
++    pos = torch.arange(NUM_TOKENS, dtype=torch.int64, device=device)
++    slots = bt.compute_slot_mappings(idx, qsl, pos, num_tokens_padded=NUM_TOKENS)
++    torch.cuda.synchronize()
++
++    ctr = guard_telemetry.counter(guard_telemetry.SITE_SLOT_MAPPING, device)
++    assert int(ctr[0].item()) > 0, "the slot-mapping guard did not fire"
++    # request 1 owns tokens 4..7 and they must all be PAD_ID
++    assert torch.equal(
++        slots[0, 4:8],
++        torch.full((4,), PAD_SLOT_ID, dtype=slots.dtype, device=device),
++    ), slots[0, :12]
+diff --git a/vllm/v1/worker/gpu/block_table.py b/vllm/v1/worker/gpu/block_table.py
+index c01895e63..299f74892 100644
+--- a/vllm/v1/worker/gpu/block_table.py
++++ b/vllm/v1/worker/gpu/block_table.py
+@@ -6,6 +6,7 @@ import torch
+ 
+ from vllm.triton_utils import tl, triton
+ from vllm.v1.attention.backends.utils import PAD_SLOT_ID
++from vllm.v1.worker import guard_telemetry
+ from vllm.v1.worker.gpu.buffer_utils import (
+     FusedStagedWriter,
+     StagedWriteTensor,
+@@ -13,6 +14,12 @@ from vllm.v1.worker.gpu.buffer_utils import (
+     _load_ptr,
+ )
+ 
++# Bias so a negative row/index survives atomic_max on a zeroed counter
++# (review B4). MUST be a tl.constexpr: a plain module-level int is not readable
++# from a @triton.jit body -- round 2 shipped one and every guarded kernel died
++# with "NameError: Cannot access global variable _GUARD_BIAS" on the smoke.
++_GUARD_BIAS = tl.constexpr(guard_telemetry.GUARD_BIAS)
++
+ 
+ class BlockTables:
+     def __init__(
+@@ -171,6 +178,9 @@ class BlockTables:
+             self.num_blocks.gpu,
+             self.num_blocks.gpu.stride(0),
+             num_reqs,
++            guard_telemetry.counter(
++                guard_telemetry.SITE_BT_GATHER, idx_mapping.device
++            ),
+             BLOCK_SIZE=1024,  # type: ignore
+         )
+         return tuple(bt[:num_reqs_padded] for bt in out)
+@@ -208,6 +218,10 @@ class BlockTables:
+             positions,
+             self.block_table_ptrs,
+             self.block_table_strides,
++            self.num_blocks.gpu.stride(0),
++            guard_telemetry.counter(
++                guard_telemetry.SITE_SLOT_MAPPING, idx_mapping.device
++            ),
+             self.block_sizes_tensor,
+             self.kernel_block_sizes_tensor,
+             self.slot_mapping_enabled,
+@@ -242,6 +256,7 @@ def _gather_block_tables_kernel(
+     num_blocks_ptr,  # [num_kv_cache_groups, max_num_reqs]
+     num_blocks_stride,
+     num_reqs,  # actual number of requests (for padding)
++    guard_ctr,  # rc3-instr persistent int64[3]
+     BLOCK_SIZE: tl.constexpr,
+ ):
+     # kv cache group id
+@@ -261,8 +276,39 @@ def _gather_block_tables_kernel(
+         return
+ 
+     req_idx = tl.load(batch_idx_to_req_idx + batch_idx)
++    # rc3-instr (Luna guard 3): req_idx indexes both num_blocks_ptr and the
++    # persistent source table, which have max_num_reqs rows. num_blocks_stride
++    # IS max_num_reqs, so the bound needs no new argument. Zero the destination
++    # row and return, mirroring the padded-row path above.
++    if (req_idx < 0) or (req_idx >= num_blocks_stride):
++        tl.atomic_add(guard_ctr, 1)
++        tl.atomic_max(guard_ctr + 1, (batch_idx).to(tl.int64) + _GUARD_BIAS)
++        tl.atomic_max(guard_ctr + 2, (req_idx).to(tl.int64) + _GUARD_BIAS)
++        for i in tl.range(0, max_num_blocks, BLOCK_SIZE):
++            offset = i + tl.arange(0, BLOCK_SIZE)
++            tl.store(dst_row_ptr + offset, 0, mask=offset < max_num_blocks)
++        return
++
+     group_num_blocks_ptr = num_blocks_ptr + group_id * num_blocks_stride
+     num_blocks = tl.load(group_num_blocks_ptr + req_idx)
++    # A row count wider than the table would copy past the end of both rows.
++    #
++    # Clamp UNCONDITIONALLY and record conditionally. Doing the clamp inside
++    # the `if` rebound an int32 name (num_blocks, loaded from num_blocks_ptr)
++    # to int64 (max_num_blocks is `stride`, loaded from block_table_strides),
++    # and Triton requires a name to keep its type across a branch:
++    #   "initial value for `num_blocks` is of type int32[], but the then block
++    #    redefines it as int64[]"
++    # That killed the rc3 boot in warmup, at the first real gather. The
++    # explicit .to(tl.int32) pins the type rather than relying on whatever the
++    # operands promote to.
++    if (num_blocks < 0) or (num_blocks > max_num_blocks):
++        tl.atomic_add(guard_ctr, 1)
++        tl.atomic_max(guard_ctr + 1, (batch_idx).to(tl.int64) + _GUARD_BIAS)
++        tl.atomic_max(guard_ctr + 2, (num_blocks).to(tl.int64) + _GUARD_BIAS)
++    num_blocks = tl.minimum(
++        tl.maximum(num_blocks, 0), max_num_blocks
++    ).to(tl.int32)
+ 
+     src_block_table_ptr = _load_ptr(src_block_table_ptrs + group_id, tl.int32)
+     src_row_ptr = src_block_table_ptr + req_idx * stride
+@@ -281,6 +327,8 @@ def _compute_slot_mappings_kernel(
+     pos,  # [num_tokens]
+     block_table_ptrs,  # [num_kv_cache_groups]
+     block_table_strides,  # [num_kv_cache_groups]
++    bt_num_rows,  # rc3-instr: rows in the persistent block tables
++    guard_ctr,  # rc3-instr persistent int64[3]
+     block_sizes,  # [num_kv_cache_groups]
+     kernel_block_sizes,  # [num_kv_cache_groups]
+     slot_mapping_enabled,  # [num_kv_cache_groups]
+@@ -315,6 +363,20 @@ def _compute_slot_mappings_kernel(
+     mapping_enabled = tl.load(slot_mapping_enabled + group_id)
+ 
+     req_state_idx = tl.load(idx_mapping + batch_idx)
++    # rc3-instr (Luna guard 4): req_state_idx indexes the persistent block table
++    # before any bound is applied. An invalid row writes PAD_ID for this
++    # request rather than reading an arbitrary row.
++    if (req_state_idx < 0) or (req_state_idx >= bt_num_rows):
++        tl.atomic_add(guard_ctr, 1)
++        tl.atomic_max(guard_ctr + 1, (batch_idx).to(tl.int64) + _GUARD_BIAS)
++        tl.atomic_max(guard_ctr + 2, (req_state_idx).to(tl.int64) + _GUARD_BIAS)
++        bad_start = tl.load(query_start_loc + batch_idx)
++        bad_end = tl.load(query_start_loc + batch_idx + 1)
++        for i in range(bad_start, bad_end, TRITON_BLOCK_SIZE):
++            offset = i + tl.arange(0, TRITON_BLOCK_SIZE)
++            tl.store(slot_mapping_ptr + offset, PAD_ID, mask=offset < bad_end)
++        return
++
+     start_idx = tl.load(query_start_loc + batch_idx)
+     end_idx = tl.load(query_start_loc + batch_idx + 1)
+     for i in range(start_idx, end_idx, TRITON_BLOCK_SIZE):
+-- 
+2.47.3
+

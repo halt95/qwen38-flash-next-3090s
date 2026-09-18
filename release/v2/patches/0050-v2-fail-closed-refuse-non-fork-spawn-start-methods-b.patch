@@ -1,0 +1,106 @@
+From 83f1be461df4a4d110e58f489f747a3d27d48007 Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Mon, 14 Sep 2026 15:50:42 +0000
+Subject: [PATCH 50/76] v2 fail-closed: refuse non-fork/spawn start methods
+ before creating vLLM workers (Astra P2: under forkserver the getppid parent
+ check would kill healthy workers); CPU test with a no-create context
+
+Tests: start-method tests 3/3 (forkserver red before), parent-death 3/3, tests/v1/ple_offload 128/128.
+---
+ .../test_multiproc_executor_start_method.py   | 63 +++++++++++++++++++
+ vllm/v1/executor/multiproc_executor.py        |  9 +++
+ 2 files changed, 72 insertions(+)
+ create mode 100644 tests/v1/executor/test_multiproc_executor_start_method.py
+
+diff --git a/tests/v1/executor/test_multiproc_executor_start_method.py b/tests/v1/executor/test_multiproc_executor_start_method.py
+new file mode 100644
+index 000000000..16b43f3a8
+--- /dev/null
++++ b/tests/v1/executor/test_multiproc_executor_start_method.py
+@@ -0,0 +1,63 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Astra P2: the worker factory refuses start methods other than fork/spawn
++before creating any pipe or process (PR_SET_PDEATHSIG + getppid supervision
++would otherwise kill healthy workers under forkserver)."""
++
++import multiprocessing
++import sys
++
++import pytest
++
++import vllm.v1.executor.multiproc_executor as executor_module
++
++
++class _NoCreateContext:
++    """Wraps a real context; any pipe/process creation fails the test."""
++
++    def __init__(self, method: str) -> None:
++        self._method = method
++
++    def get_start_method(self) -> str:
++        return self._method
++
++    def Pipe(self, *args, **kwargs):  # noqa: N802
++        raise AssertionError("pipe creation reached")
++
++    def Process(self, *args, **kwargs):  # noqa: N802
++        raise AssertionError("process creation reached")
++
++
++@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux only")
++def test_forkserver_is_refused_before_creating_workers(monkeypatch):
++    assert "forkserver" in multiprocessing.get_all_start_methods()
++    monkeypatch.setattr(
++        executor_module, "get_mp_context", lambda: _NoCreateContext("forkserver")
++    )
++    with pytest.raises(RuntimeError, match="'fork' or 'spawn'"):
++        executor_module.WorkerProc.make_worker_process(
++            vllm_config=None,
++            local_rank=0,
++            rank=0,
++            distributed_init_method="tcp://127.0.0.1:1",
++            input_shm_handle=None,
++            shared_worker_lock=None,
++            is_driver_worker=True,
++        )
++
++
++@pytest.mark.parametrize("method", ["fork", "spawn"])
++def test_fork_and_spawn_pass_the_guard(monkeypatch, method):
++    monkeypatch.setattr(
++        executor_module, "get_mp_context", lambda: _NoCreateContext(method)
++    )
++    # The guard passes, so creation is attempted and hits the stub.
++    with pytest.raises(AssertionError, match="pipe creation reached"):
++        executor_module.WorkerProc.make_worker_process(
++            vllm_config=None,
++            local_rank=0,
++            rank=0,
++            distributed_init_method="tcp://127.0.0.1:1",
++            input_shm_handle=None,
++            shared_worker_lock=None,
++            is_driver_worker=True,
++        )
+diff --git a/vllm/v1/executor/multiproc_executor.py b/vllm/v1/executor/multiproc_executor.py
+index 03f6888c6..b54ee0361 100644
+--- a/vllm/v1/executor/multiproc_executor.py
++++ b/vllm/v1/executor/multiproc_executor.py
+@@ -757,6 +757,15 @@ class WorkerProc:
+         inherited_fds: list[int] | None = None,
+     ) -> UnreadyWorkerProcHandle:
+         context = get_mp_context()
++        # Workers arm PR_SET_PDEATHSIG against this process and verify it via
++        # getppid(). Under forkserver the OS parent is the forkserver, so a
++        # healthy worker would kill itself; refuse before creating anything.
++        start_method = context.get_start_method()
++        if start_method not in ("fork", "spawn"):
++            raise RuntimeError(
++                "vLLM worker processes require the 'fork' or 'spawn' "
++                f"multiprocessing start method (got {start_method!r})"
++            )
+         # Ready pipe to communicate readiness from child to parent
+         ready_reader, ready_writer = context.Pipe(duplex=False)
+         # Death pipe to let child detect parent process exit
+-- 
+2.47.3
+

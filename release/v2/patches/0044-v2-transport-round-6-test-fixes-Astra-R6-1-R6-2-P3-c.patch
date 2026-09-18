@@ -1,0 +1,77 @@
+From e367235881d809e8f56d2b24dc64354827798bb3 Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Mon, 14 Sep 2026 04:30:57 +0000
+Subject: [PATCH 44/76] v2 transport round 6 test fixes (Astra R6-1, R6-2 P3):
+ cold-start marker polling inside the reaping try/finally; non-string-status
+ test reads rejection, child termination and reader clearing before emergency
+ cleanup (mutation without handle.close now fails)
+
+---
+ tests/v1/ple_offload/test_round5_transport.py | 36 +++++++++++++------
+ 1 file changed, 26 insertions(+), 10 deletions(-)
+
+diff --git a/tests/v1/ple_offload/test_round5_transport.py b/tests/v1/ple_offload/test_round5_transport.py
+index 2a7129525..443c2befd 100644
+--- a/tests/v1/ple_offload/test_round5_transport.py
++++ b/tests/v1/ple_offload/test_round5_transport.py
+@@ -22,13 +22,14 @@ def _run_bounded_child(
+         stderr=subprocess.DEVNULL,
+         start_new_session=os.name == "posix",
+     )
+-    deadline = time.monotonic() + 120
+-    while not marker.exists() and time.monotonic() < deadline:
+-        time.sleep(0.05)
+-    assert marker.exists(), "child did not finish cold startup within 120 seconds"
+-
+     stayed_alive = False
+     try:
++        deadline = time.monotonic() + 120
++        while not marker.exists() and time.monotonic() < deadline:
++            time.sleep(0.05)
++        assert marker.exists(), (
++            "child did not finish cold startup within 120 seconds"
++        )
+         process.wait(timeout=5)
+     except subprocess.TimeoutExpired:
+         stayed_alive = True
+@@ -205,17 +206,32 @@ worker_module._recv_bounded_connection_message = (
+     }
+ )
+ Path(sys.argv[1]).write_text("armed", encoding="utf-8")
++rejected = False
++closed = False
++reader_cleared = False
+ try:
+-    worker_module.PleOffloadWorker.wait_for_ready(handle)
+-except RuntimeError:
+-    pass
++    try:
++        worker_module.PleOffloadWorker.wait_for_ready(handle)
++    except RuntimeError:
++        rejected = True
++    # Postconditions are read before the emergency cleanup below can act.
++    # Stay inside the parent's 5 second bounded wait so a miss reports here.
++    close_deadline = time.monotonic() + 3
++    while sleeper.poll() is None and time.monotonic() < close_deadline:
++        time.sleep(0.05)
++    closed = sleeper.poll() is not None
++    reader_cleared = handle.ready_pipe_reader is None
+ finally:
+     if sleeper.poll() is None:
+-        sleeper.terminate()
++        sleeper.kill()
+         sleeper.wait(timeout=120)
+ 
+-if sleeper.returncode is None or handle.ready_pipe_reader is not None:
++if not rejected:
++    raise AssertionError("invalid response status was not rejected")
++if not closed:
+     raise AssertionError("invalid response did not close the child")
++if not reader_cleared:
++    raise AssertionError("invalid response did not clear the ready reader")
+ """
+     _run_bounded_child(source, tmp_path)
+ 
+-- 
+2.47.3
+

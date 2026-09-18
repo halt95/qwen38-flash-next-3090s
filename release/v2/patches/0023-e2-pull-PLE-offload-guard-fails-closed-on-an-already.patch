@@ -1,0 +1,36 @@
+From 822a0f5361ff7cc34c5aa72a114f0c27720972e4 Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Fri, 11 Sep 2026 15:49:01 +0000
+Subject: [PATCH 23/76] e2-pull: PLE offload guard fails closed on an
+ already-initialized CUDA (Sol R5)
+
+_install_cuda_guard() warned and returned when torch.cuda.is_initialized()
+was already true, letting the offload run with a known context. It now
+raises RuntimeError. Contexts created through C++ paths that leave the flag
+False remain the job of the per-PID sampler.
+---
+ vllm/v1/ple_offload/worker.py | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/vllm/v1/ple_offload/worker.py b/vllm/v1/ple_offload/worker.py
+index 46ff179e8..9b22e0f55 100644
+--- a/vllm/v1/ple_offload/worker.py
++++ b/vllm/v1/ple_offload/worker.py
+@@ -128,8 +128,12 @@ def _install_cuda_guard() -> None:
+     import traceback
+ 
+     if torch.cuda.is_initialized():
+-        logger.warning("CUDA already initialized before the PLE offload guard")
+-        return
++        # Fail closed (Sol R5): a context that already exists would stay on a
++        # stage-0 card for the whole run.
++        raise RuntimeError(
++            "CUDA is already initialized in the PLE offload process before its "
++            "guard; the host-mapped pull offload must stay CUDA-free"
++        )
+ 
+     def _refuse(what: str) -> None:
+         stack = "".join(traceback.format_stack(limit=12)[:-2])
+-- 
+2.47.3
+

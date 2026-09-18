@@ -1,0 +1,61 @@
+From c7c6c7624289af6625ea236c8359e11c27f6b3c7 Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Thu, 10 Sep 2026 19:16:56 +0000
+Subject: [PATCH 04/76] E2: clip counter counts only rows the writer stores
+ (slot_mapping >= 0): padded / stale rows under FULL-graph capture and the V2
+ runner were counted (Astra audit E)
+
+---
+ vllm/models/qwen4_exp/nvidia/qsa.py | 22 ++++++++++++++++++----
+ 1 file changed, 18 insertions(+), 4 deletions(-)
+
+diff --git a/vllm/models/qwen4_exp/nvidia/qsa.py b/vllm/models/qwen4_exp/nvidia/qsa.py
+index cbd77fc17..03ad8123d 100644
+--- a/vllm/models/qwen4_exp/nvidia/qsa.py
++++ b/vllm/models/qwen4_exp/nvidia/qsa.py
+@@ -188,7 +188,10 @@ def _qsa_clip_reader() -> None:
+ 
+ 
+ def _qsa_clip_count(
+-    layer: "Qwen4ExpQSAAttention", key: torch.Tensor, value: torch.Tensor
++    layer: "Qwen4ExpQSAAttention",
++    key: torch.Tensor,
++    value: torch.Tensor,
++    slot_mapping: torch.Tensor | None = None,
+ ) -> None:
+     global _qsa_clip_reader_started
+     ctr = _qsa_clip_counters.get(layer.layer_name)
+@@ -214,8 +217,19 @@ def _qsa_clip_count(
+     # the BF16 grid of K/V, undercounting values just above the calibrated ceiling.
+     k_ceiling = (448.0 * layer._k_scale).to(torch.float32).view(1)
+     v_ceiling = (448.0 * layer._v_scale).to(torch.float32).view(1)
+-    ctr[0] += (key.detach().abs() > k_ceiling).sum()
+-    ctr[1] += (value.detach().abs() > v_ceiling).sum()
++    k_over = key.detach().abs() > k_ceiling
++    v_over = value.detach().abs() > v_ceiling
++    if slot_mapping is not None:
++        # The CUDA writer (reshape_and_cache_flash) skips rows with a negative
++        # slot: padding rows of a captured batch size and, under the V2 model
++        # runner, stale rows of the persistent input buffers. Count only what
++        # is actually written, with fixed-shape masking so the op is capturable.
++        n = min(slot_mapping.shape[0], key.shape[0])
++        written = (slot_mapping[:n] >= 0).view(-1, 1, 1)
++        k_over = k_over[:n] & written
++        v_over = v_over[:n] & written
++    ctr[0] += k_over.sum()
++    ctr[1] += v_over.sum()
+ # ------------------------------------------------------------------------------
+ 
+ _QSA_FP8_CACHE_DTYPES = ("fp8", "fp8_e4m3")
+@@ -658,7 +672,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
+         if _qsa_clip_interval > 0.0 and _is_qsa_fp8_cache_dtype(
+             self.kv_cache_dtype
+         ):
+-            _qsa_clip_count(self, key, value)
++            _qsa_clip_count(self, key, value, main_metadata.slot_mapping)
+         impl = cast(Qwen4ExpQSAFlashAttentionImpl, self.impl)
+         impl.do_kv_cache_update(
+             self,
+-- 
+2.47.3
+

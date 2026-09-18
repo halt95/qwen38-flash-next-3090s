@@ -1,0 +1,64 @@
+From cd610c8613da82ce6e60542a639fe210435c23b3 Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Fri, 11 Sep 2026 08:13:10 +0000
+Subject: [PATCH 15/76] e2-own: vision tower built on the first PP stage only
+ (StageMissingLayer elsewhere); deepstack boundary assertion independent of
+ use_deepstack
+
+---
+ vllm/models/qwen4_exp/nvidia/model.py | 25 ++++++++++++++++++++++++-
+ 1 file changed, 24 insertions(+), 1 deletion(-)
+
+diff --git a/vllm/models/qwen4_exp/nvidia/model.py b/vllm/models/qwen4_exp/nvidia/model.py
+index ad3a0ce22..11a3cb652 100644
+--- a/vllm/models/qwen4_exp/nvidia/model.py
++++ b/vllm/models/qwen4_exp/nvidia/model.py
+@@ -1001,6 +1001,14 @@ class Qwen4ExpForConditionalGeneration(
+         self.model_config = vllm_config.model_config
+         self.multimodal_config = multimodal_config
+         self.language_model_only = multimodal_config.language_model_only
++        # PP ownership (Astra 2026-09-11): the encoder cache and the image
++        # embeddings exist on the first pipeline stage only; later stages
++        # carried an unused vision tower (~0.42 GiB per GPU at TP2). Absence
++        # on a later stage is an ownership decision, not language_model_only:
++        # the multimodal configuration stays global.
++        self._owns_vision_tower = (
++            not self.language_model_only and get_pp_group().is_first_rank
++        )
+         if self.language_model_only:
+             self.use_data_parallel = False
+             self.is_multimodal_pruning_enabled = False
+@@ -1009,6 +1017,12 @@ class Qwen4ExpForConditionalGeneration(
+             self._tokenizer = None
+             self.visual = StageMissingLayer("vision_tower")
+             self._tower_model_names = []
++        elif not self._owns_vision_tower:
++            self.use_data_parallel = multimodal_config.mm_encoder_tp_mode == "data"
++            self._init_video_pruning(multimodal_config)
++            self._tokenizer = cached_tokenizer_from_config(vllm_config.model_config)
++            self.visual = StageMissingLayer("vision_tower")
++            self._tower_model_names = []
+         else:
+             self.use_data_parallel = multimodal_config.mm_encoder_tp_mode == "data"
+             self._init_video_pruning(multimodal_config)
+@@ -1054,7 +1068,16 @@ class Qwen4ExpForConditionalGeneration(
+         self.make_empty_intermediate_tensors = (
+             self.language_model.make_empty_intermediate_tensors
+         )
+-        if not get_pp_group().is_first_rank and self.use_deepstack:
++        # Deepstack levels are injected into the first len(indexes) decoder
++        # layers on the first stage and are not forwarded through PP; keep the
++        # boundary assertion independent of use_deepstack (False on stages
++        # without a tower) so a future checkpoint with deepstack cannot be
++        # split across the boundary silently.
++        if (
++            not get_pp_group().is_first_rank
++            and not self.language_model_only
++            and bool(config.vision_config.deepstack_visual_indexes)
++        ):
+             assert self.language_model.model.start_layer >= len(
+                 config.vision_config.deepstack_visual_indexes
+             ), (
+-- 
+2.47.3
+

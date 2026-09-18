@@ -1,0 +1,29 @@
+From 35739b413ffc149bc8c7f0f75197464a686548e6 Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Fri, 11 Sep 2026 00:24:30 +0000
+Subject: [PATCH 12/76] e2: vllm#55745 - record idx_mapping lifetime on the PP
+ draft-broadcast stream (Astra gate-4 audit, finding 1)
+
+---
+ vllm/v1/worker/gpu/pp_utils.py | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/vllm/v1/worker/gpu/pp_utils.py b/vllm/v1/worker/gpu/pp_utils.py
+index 33386c922..bc3fbaac5 100644
+--- a/vllm/v1/worker/gpu/pp_utils.py
++++ b/vllm/v1/worker/gpu/pp_utils.py
+@@ -174,6 +174,11 @@ class PPHandler:
+                 send, src=self.last_rank, group=self.broadcast_group
+             )
+             send.record_stream(self.broadcast_stream)
++            # vllm#55745: the per-step idx_mapping allocation feeds the gather
++            # above on this side stream; without recording its lifetime the
++            # caching allocator can recycle it while the gather is pending
++            # (device-side index assertion, EngineCore death).
++            input_batch.idx_mapping.record_stream(self.broadcast_stream)
+ 
+     def receive(self, input_batch: InputBatch) -> bool:
+         """Returns True iff sampled tokens need to be gathered from *all*
+-- 
+2.47.3
+

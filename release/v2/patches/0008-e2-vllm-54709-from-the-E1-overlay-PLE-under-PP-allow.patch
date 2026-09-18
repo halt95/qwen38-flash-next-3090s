@@ -1,0 +1,68 @@
+From 79c35243fe7e3d074e354e7bbecd49b1567d4b70 Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Thu, 10 Sep 2026 21:23:18 +0000
+Subject: [PATCH 08/76] e2: vllm#54709 (from the E1 overlay) - PLE under PP
+ allowed when every PLE layer lives on pipeline rank 0; blanket PP=1 gate
+ removed (gate-3 P boot 1)
+
+---
+ vllm/model_executor/models/config.py        | 21 +++++++++++++++++----
+ vllm/models/qwen4_exp/nvidia/model_state.py |  8 +-------
+ 2 files changed, 18 insertions(+), 11 deletions(-)
+
+diff --git a/vllm/model_executor/models/config.py b/vllm/model_executor/models/config.py
+index 485d15354..1b7f4a9ae 100644
+--- a/vllm/model_executor/models/config.py
++++ b/vllm/model_executor/models/config.py
+@@ -876,12 +876,25 @@ class Qwen4ExpForConditionalGenerationConfig(Qwen3_5ForConditionalGenerationConf
+             )
+         # Checked again in Qwen4ExpModelState; rejecting it here keeps the
+         # engine from loading weights first.
++        # vllm#54709: PLE only needs raw input_ids on the rank that owns a PLE
++        # layer. Allow PP>1 as long as every PLE layer lives on pipeline rank 0.
+         if text_config.ple_layer_ids and parallel_config.pipeline_parallel_size > 1:
+-            raise NotImplementedError(
+-                "Qwen4Exp N-gram PLE embedding requires pipeline_parallel_size=1 "
+-                "because non-first pipeline ranks do not receive the raw input_ids "
+-                "it needs. Please run with PP=1."
++            from vllm.distributed.utils import get_pp_indices
++
++            rank0_start, rank0_end = get_pp_indices(
++                int(text_config.num_hidden_layers),
++                0,
++                parallel_config.pipeline_parallel_size,
+             )
++            ple_idx = [int(i) - 1 for i in text_config.ple_layer_ids]
++            if min(ple_idx) < rank0_start or max(ple_idx) >= rank0_end:
++                raise NotImplementedError(
++                    "Qwen4Exp N-gram PLE embedding requires every PLE layer to "
++                    f"live on pipeline rank 0 (layers {rank0_start}.."
++                    f"{rank0_end - 1}), but PLE layers are at {ple_idx}. Give "
++                    "rank 0 more layers via VLLM_PP_LAYER_PARTITION, or run "
++                    "with PP=1."
++                )
+         multimodal_config = vllm_config.model_config.multimodal_config
+         if multimodal_config is not None and multimodal_config.language_model_only:
+             _strip_qwen4_exp_mrope(vllm_config.model_config)
+diff --git a/vllm/models/qwen4_exp/nvidia/model_state.py b/vllm/models/qwen4_exp/nvidia/model_state.py
+index ec2a0fef8..0bbb482e9 100644
+--- a/vllm/models/qwen4_exp/nvidia/model_state.py
++++ b/vllm/models/qwen4_exp/nvidia/model_state.py
+@@ -32,13 +32,7 @@ class Qwen4ExpModelState(MambaHybridModelState):
+             self.ngram_eos_token_id = 0
+             return
+ 
+-        if vllm_config.parallel_config.pipeline_parallel_size > 1:
+-            raise RuntimeError(
+-                "N-gram PLE embedding currently requires "
+-                "pipeline_parallel_size=1 because non-first pipeline ranks do "
+-                "not receive the raw input_ids required by PLE. Please run "
+-                "with PP=1."
+-            )
++        # vllm#54709: PP gate moved to config.py (placement-based).
+ 
+         self.ngram_context_len = int(config.ngram_size) - 1
+         if self.ngram_context_len <= 0:
+-- 
+2.47.3
+

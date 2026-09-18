@@ -1,0 +1,38 @@
+From aa298ed66e869ee09c694ba71de2dfee085e383b Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Wed, 16 Sep 2026 06:55:48 +0000
+Subject: [PATCH 68/76] v2: register VLLM_HOST_EMBED_TABLE as a compile-cache
+ factor (the UVA and non-UVA MTP-drafter graphs shared one torch AOT cache
+ entry; rc3 v3rest A-boot AttributeError _uva_weight); operator ruling R.21
+
+---
+ vllm/envs.py | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/vllm/envs.py b/vllm/envs.py
+index f4709a73f..ec0eeca68 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -300,6 +300,11 @@ if TYPE_CHECKING:
+     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
+     VLLM_USE_V2_MODEL_RUNNER: bool | None = None
+     VLLM_PLE_CPU_OFFLOAD: bool = False
++    # Compile-cache factor (v2 P.1 host-embed): the pinned-host UVA embedding
++    # table changes the traced MTP-drafter graph (reads _uva_weight instead of
++    # embed_tokens.weight). Registered here so envs.compile_factors() keys the
++    # AOT cache on it; the layer itself still reads os.environ directly.
++    VLLM_HOST_EMBED_TABLE: bool = False
+     VLLM_PLE_OFFLOAD_READY_TIMEOUT: float = 600.0
+     VLLM_LOG_MODEL_INSPECTION: bool = False
+     VLLM_DEBUG_MFU_METRICS: bool = False
+@@ -2076,6 +2081,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     "VLLM_PLE_CPU_OFFLOAD": lambda: (
+         os.getenv("VLLM_PLE_CPU_OFFLOAD", "False").lower() in ("true", "1")
+     ),
++    "VLLM_HOST_EMBED_TABLE": lambda: os.getenv("VLLM_HOST_EMBED_TABLE", "") == "1",
+     # Timeout for PLE weight loading and TP worker registration.
+     "VLLM_PLE_OFFLOAD_READY_TIMEOUT": lambda: float(
+         os.getenv("VLLM_PLE_OFFLOAD_READY_TIMEOUT", "600")
+-- 
+2.47.3
+

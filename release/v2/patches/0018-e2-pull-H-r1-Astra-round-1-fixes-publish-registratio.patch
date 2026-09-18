@@ -1,0 +1,226 @@
+From 78ebf82907b900886c83c5ccb2a6e34d5bfd5c7d Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Fri, 11 Sep 2026 13:29:56 +0000
+Subject: [PATCH 18/76] e2-pull H r1: Astra round-1 fixes (publish registration
+ after mapping; host pointer for the DMA + bounds check; publication fence;
+ bounded fatal release wait with step diagnostics; duplicate DP request fatal)
+
+---
+ .../layers/ple_offload_layer.py               | 15 ++++--
+ vllm/v1/ple_offload/connector.py              | 36 +++++++++-----
+ vllm/v1/ple_offload/worker.py                 | 48 +++++++++++++++----
+ 3 files changed, 74 insertions(+), 25 deletions(-)
+
+diff --git a/vllm/model_executor/layers/ple_offload_layer.py b/vllm/model_executor/layers/ple_offload_layer.py
+index 726ac0e3f..5313e10fe 100644
+--- a/vllm/model_executor/layers/ple_offload_layer.py
++++ b/vllm/model_executor/layers/ple_offload_layer.py
+@@ -223,6 +223,13 @@ def _ple_offload_wait_copy_impl(
+     num_tokens: int,
+ ) -> None:
+     """Wait for the host-side result, then DMA it into the GPU buffer."""
++    if int(num_tokens) > gpu_output_buffer.shape[0] or int(row_bytes) != (
++        gpu_output_buffer.shape[1] * gpu_output_buffer.element_size()
++    ):
++        raise RuntimeError(
++            f"PLE wait_copy out of bounds: {num_tokens} rows x {row_bytes} B vs "
++            f"GPU buffer {tuple(gpu_output_buffer.shape)} {gpu_output_buffer.dtype}"
++        )
+     stream = cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream)
+     _cuda_check(
+         cuda_driver.cuStreamWaitValue32(
+@@ -235,14 +242,16 @@ def _ple_offload_wait_copy_impl(
+     )
+     nbytes = int(num_tokens) * int(row_bytes)
+     if nbytes > 0:
++        # host_ptr is this worker's host address of page-locked (registered)
++        # memory, so the copy is a true async DMA and is capturable.
+         _cuda_check(
+-            cuda_driver.cuMemcpyAsync(
++            cuda_driver.cuMemcpyHtoDAsync(
+                 cuda_driver.CUdeviceptr(gpu_output_buffer.data_ptr()),
+-                cuda_driver.CUdeviceptr(host_ptr),
++                host_ptr,
+                 nbytes,
+                 stream,
+             ),
+-            "cuMemcpyAsync(PLE host -> GPU)",
++            "cuMemcpyHtoDAsync(PLE host -> GPU)",
+         )
+ 
+ 
+diff --git a/vllm/v1/ple_offload/connector.py b/vllm/v1/ple_offload/connector.py
+index d33fcd94b..5a2438d1c 100644
+--- a/vllm/v1/ple_offload/connector.py
++++ b/vllm/v1/ple_offload/connector.py
+@@ -118,18 +118,19 @@ class PleOffloadConnector:
+             self._zmq_ctx = zmq.Context()
+             self._registration_socket = self._zmq_ctx.socket(zmq.PUSH)
+             self._registration_socket.connect(ipc_addr)
+-            self._register_with_offload_worker(vllm_config, ipc_addr)
++            payload = self._serialize_registration(vllm_config)
+ 
+-            # ForkingPickler may replace CPU storage while converting its
+-            # sharing strategy, so page-lock and map only the final addresses.
+-            # No request can reach the offload process before every worker has
+-            # registered and this constructor has returned.
++            # Serialising moved the shared storages to their final addresses.
++            # Page-lock/map exactly those, THEN publish, so a received
++            # registration always means "storage usable" (Astra 09-11 #7).
+             with torch.accelerator.device_index(self.device.index):
+                 self._map_host_outputs(vllm_config)
++                if self.tp_rank == 0:
++                    self._pin_input_buffers()
++            self._send_registration(payload, ipc_addr)
+ 
+             if self.tp_rank == 0:
+                 with torch.accelerator.device_index(self.device.index):
+-                    self._pin_input_buffers()
+                     self._d2h_event_pool = queue.Queue(
+                         maxsize=vllm_config.max_concurrent_batches
+                     )
+@@ -194,10 +195,19 @@ class PleOffloadConnector:
+                 "cuMemHostGetDevicePointer(PLE host output)",
+             )[1]
+             row_bytes = host_out.shape[1] * host_out.element_size()
++            gpu_buf = self._gpu_output_bufs[name]
++            if (
++                gpu_buf.shape[0] != host_out.shape[0]
++                or gpu_buf.shape[1] * gpu_buf.element_size() != row_bytes
++            ):
++                raise RuntimeError(f"PLE host/GPU buffer geometry mismatch for {name}")
++            # Stream memops use the flag's DEVICE pointer; the H2D copy uses
++            # this worker's HOST pointer (Astra 09-11: no raw addresses cross
++            # processes; the offload writes through its own mapping).
+             layer.setup_cross_process_offload(
+-                self._gpu_output_bufs[name],
++                gpu_buf,
+                 CpuGpuSemaphore.from_host_mapped(host_flag, int(flag_dev_ptr)),
+-                host_output_ptr=int(out_dev_ptr),
++                host_output_ptr=host_out.data_ptr(),
+                 host_row_bytes=row_bytes,
+             )
+             logger.info(
+@@ -252,10 +262,8 @@ class PleOffloadConnector:
+                 logger.exception("Failed to unregister a PLE input buffer")
+         self._pinned_input_buffers.clear()
+ 
+-    def _register_with_offload_worker(
+-        self, vllm_config: VllmConfig, ipc_addr: str
+-    ) -> None:
+-        """Register shared host outputs/flags and shared CPU inputs."""
++    def _serialize_registration(self, vllm_config: VllmConfig) -> Any:
++        """Build and serialise the registration (may move shared storages)."""
+         # Each GPU worker owns distinct host output buffers and flags, while
+         # TP0's shared inputs become the request source for its DP rank.
+         registration = PleOffloadRegistration(
+@@ -281,6 +289,10 @@ class PleOffloadConnector:
+             payload = ForkingPickler.dumps(registration)
+         finally:
+             torch_mp.set_sharing_strategy(original_strategy)
++        return payload
++
++    def _send_registration(self, payload: Any, ipc_addr: str) -> None:
++        """Publish the serialised registration (storages already mapped)."""
+         assert self._registration_socket is not None
+         self._registration_socket.send(payload)
+ 
+diff --git a/vllm/v1/ple_offload/worker.py b/vllm/v1/ple_offload/worker.py
+index 39921d886..06f6ad516 100644
+--- a/vllm/v1/ple_offload/worker.py
++++ b/vllm/v1/ple_offload/worker.py
+@@ -69,6 +69,23 @@ from vllm.v1.utils import record_function_or_nullcontext
+ 
+ logger = init_logger(__name__)
+ 
++# Publication fence for the host-mapped pull: a locked read-modify-write (the
++# uncontended lock acquire) is a full barrier on x86 and also drains
++# write-combining buffers, so every row store of a result is globally visible
++# before the flag store that tells the GPU to DMA it (Astra 09-11: do not rely
++# on "memcpy uses no non-temporal stores at this size").
++_PUBLISH_FENCE = threading.Lock()
++
++
++def _publish_fence() -> None:
++    with _PUBLISH_FENCE:
++        pass
++
++
++# Bounded wait for the GPU to release a result (seconds). A timed-out ownership
++# transfer is fatal: the offload process raises and exits, never overwrites.
++_PLE_WAIT_TIMEOUT_S = float(os.environ.get("VLLM_PLE_OFFLOAD_WAIT_TIMEOUT", "120"))
++
+ 
+ @dataclass
+ class PleOffloadOutputTarget:
+@@ -388,6 +405,7 @@ class PleOffloadRunner:
+         # shared host buffer. Nothing in this process is pinned or on a GPU.
+         self._scratch_bufs: dict[int, dict[str, torch.Tensor]] = {}
+         self._shutdown_event: threading.Event | None = None
++        self._step = 0  # number of handled request batches (diagnostics)
+         # Shared-memory inputs are registered once per DP rank by TP rank zero.
+         self._input_bufs: dict[int, PleOffloadInputBuffers] = {}
+         self._load_weights()
+@@ -699,12 +717,15 @@ class PleOffloadRunner:
+                 )
+                 continue
+             if request.dp_rank in requests_by_dp:
+-                logger.warning(
+-                    "Duplicate PLE request for dp_rank=%d; skipping duplicate.",
+-                    request.dp_rank,
++                # One input slot and one output slot per DP rank: a second
++                # request in the same batch would alias them. Fatal, never
++                # silently dropped (Astra 09-11).
++                raise RuntimeError(
++                    f"Two PLE requests for dp_rank={request.dp_rank} in one batch "
++                    f"(step {self._step}); the single-slot protocol is violated"
+                 )
+-                continue
+             requests_by_dp[request.dp_rank] = request
++        self._step += 1
+ 
+         # Speculative placeholders are not vocabulary IDs. Normalize each DP
+         # input once before all PLE layers consume the shared buffer.
+@@ -741,8 +762,7 @@ class PleOffloadRunner:
+                 for target in targets:
+                     self._wait_flag_released(target, layer_name, dp_rank)
+                     target.host_output_buffer[slices].copy_(result[slices])
+-                    # Plain store after the row stores (x86 TSO keeps them in
+-                    # order for the GPU's flag observation + DMA read).
++                    _publish_fence()
+                     target.host_flag[0] = 1
+ 
+     def _wait_flag_released(
+@@ -757,17 +777,25 @@ class PleOffloadRunner:
+         start = time.monotonic()
+         while int(flag[0]) != 0:
+             spins += 1
++            if self._shutdown_event is not None and self._shutdown_event.is_set():
++                raise RuntimeError("PLE offload shutting down while waiting for GPU")
+             if spins > 200:
+                 time.sleep(0.0001)
+-                if self._shutdown_event is not None and self._shutdown_event.is_set():
+-                    raise RuntimeError("PLE offload shutting down while waiting for GPU")
+-                if not warned and time.monotonic() - start > 5.0:
++                waited = time.monotonic() - start
++                if not warned and waited > 5.0:
+                     warned = True
+                     logger.warning(
+                         "PLE offload waited >5 s for the GPU to release %s "
+-                        "(dp=%d, tp=%d); flag=%d",
++                        "(dp=%d, tp=%d, step %d); flag=%d",
+                         layer_name,
+                         dp_rank,
+                         target.tp_rank,
++                        self._step,
+                         int(flag[0]),
+                     )
++                if waited > _PLE_WAIT_TIMEOUT_S:
++                    raise RuntimeError(
++                        f"PLE offload: GPU did not release {layer_name} (dp={dp_rank}, "
++                        f"tp={target.tp_rank}, step {self._step}) within "
++                        f"{_PLE_WAIT_TIMEOUT_S:.0f} s; refusing to overwrite"
++                    )
+-- 
+2.47.3
+

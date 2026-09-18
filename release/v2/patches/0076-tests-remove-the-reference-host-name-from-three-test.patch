@@ -1,0 +1,57 @@
+From ad5c3c223999de577b04cdb9caeab2dcb76b61b9 Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Fri, 18 Sep 2026 05:36:20 +0000
+Subject: [PATCH 76/76] tests: remove the reference host name from three test
+ comments
+
+The name of the machine the timings were measured on appeared in comment and
+docstring text in three of our own tests. Comment-only; no executed code, no
+behaviour, no public interface changes.
+---
+ tests/v1/ple_offload/test_fatal_rpc.py            | 2 +-
+ tests/v1/ple_offload/test_progress_deadline.py    | 2 +-
+ tests/v1/worker/gpu/test_pp_deferred_mamba_gpu.py | 2 +-
+ 3 files changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/tests/v1/ple_offload/test_fatal_rpc.py b/tests/v1/ple_offload/test_fatal_rpc.py
+index 9c1554e64..1c86f9bea 100644
+--- a/tests/v1/ple_offload/test_fatal_rpc.py
++++ b/tests/v1/ple_offload/test_fatal_rpc.py
+@@ -100,7 +100,7 @@ def test_ple_exception_kills_workerproc_style_rpc(
+         args=(where, successor_count),
+     )
+     process.start()
+-    # Spawned children import vLLM cold (measured 4-8 s on bfgpu); the bound is
++    # Spawned children import vLLM cold (measured 4-8 s on the reference host); the bound is
+     # about start-up, not the fatal path, which exits immediately.
+     process.join(timeout=120)
+     assert not process.is_alive()
+diff --git a/tests/v1/ple_offload/test_progress_deadline.py b/tests/v1/ple_offload/test_progress_deadline.py
+index a02809c61..5e7ca19d7 100644
+--- a/tests/v1/ple_offload/test_progress_deadline.py
++++ b/tests/v1/ple_offload/test_progress_deadline.py
+@@ -76,7 +76,7 @@ def test_progress_deadline_terminates_alive_silent_worker(
+         args=(block_input, started),
+     )
+     process.start()
+-    # Cold vLLM import in the spawned child takes 4-8 s on bfgpu; the deadline
++    # Cold vLLM import in the spawned child takes 4-8 s on the reference host; the deadline
+     # itself (0.2 s) is only charged after `started` is set.
+     assert started.wait(timeout=120)
+     process.join(timeout=10)
+diff --git a/tests/v1/worker/gpu/test_pp_deferred_mamba_gpu.py b/tests/v1/worker/gpu/test_pp_deferred_mamba_gpu.py
+index 91bec0eee..d46292ab6 100644
+--- a/tests/v1/worker/gpu/test_pp_deferred_mamba_gpu.py
++++ b/tests/v1/worker/gpu/test_pp_deferred_mamba_gpu.py
+@@ -22,7 +22,7 @@ possible coordinates resolve to four different physical blocks:
+     gathered[batch_idx=0]    rc1         -> r2's blocks (the victim)
+     gathered[req_idx=5]      wrong both  -> never written, block 0
+ 
+-Requires CUDA **and** an explicit opt-in: set ``VLLM_E2_GPU_TESTS=1``. bfgpu
++Requires CUDA **and** an explicit opt-in: set ``VLLM_E2_GPU_TESTS=1``. The reference host
+ always reports CUDA available, and the box spends most of its time running
+ qualification boots and sanitizer ladders that should not share a device with a
+ test suite, so `torch.cuda.is_available()` is not a sufficient gate here. Run
+-- 
+2.47.3
+

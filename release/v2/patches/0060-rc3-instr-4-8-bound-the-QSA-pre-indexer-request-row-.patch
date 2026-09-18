@@ -1,0 +1,108 @@
+From f6c6e0865ae42b12f9eb85f3fbb1eecfb0731f11 Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Tue, 15 Sep 2026 21:04:26 +0000
+Subject: [PATCH 60/76] rc3-instr 4/8: bound the QSA pre-indexer request row
+ (Luna guard 2)
+
+_qsa_pre_indexer_kernel splits its work-metadata entry into (request,
+work_in_request) and returns only on request < 0. That rejects exactly one
+value: the -1 sentinel the metadata builder writes for inactive work items. Any
+other corrupted request index went straight into
+
+    tl.load(query_start_loc_ptr + request)
+    tl.load(query_start_loc_ptr + request + 1)
+    tl.load(state_table_ptr + request * state_table_stride_req)
+
+with no bound. query_start_loc has num_requests + 1 entries -- 8 bytes for a
+single-request decode batch -- and the logical_positions read below derives its
+index from the query_end that comes out of it, so one bad row walks two
+tensors.
+
+The bound passed is min(query_start_loc.numel() - 1, state_block_table
+.shape[0]), the tighter of the two tensors the index reaches.
+
+Launch-site audit: one launch, qsa_pre_indexer.py:460. No .warmup()
+registration and no AMD mirror -- vllm/models/qwen4_exp/amd/ops/ contains only
+hc.py and qsa.py, and the AMD qsa.py already bounds its page ids.
+
+Positive control (see GUARDS.md round 2, section "positive controls"): write
+num_requests into a k_work_metadata row on a live decode batch and assert a
+guard count of exactly the number of CTAs mapped to that row.
+
+ROUND 3: _GUARD_BIAS is bound as tl.constexpr. Round 2 declared it as a plain
+module-level int, which a @triton.jit body cannot read, and the GPU smoke
+failed every guarded-kernel test with "NameError: Cannot access global variable
+_GUARD_BIAS". Checked the other module-level names in this file: none are
+referenced from a jit body.
+
+Draft for Astra review. Not merged into any RC.
+---
+ .../qwen4_exp/nvidia/ops/qsa_pre_indexer.py   | 24 +++++++++++++++++++
+ 1 file changed, 24 insertions(+)
+
+diff --git a/vllm/models/qwen4_exp/nvidia/ops/qsa_pre_indexer.py b/vllm/models/qwen4_exp/nvidia/ops/qsa_pre_indexer.py
+index d996f3977..777b1ad8a 100644
+--- a/vllm/models/qwen4_exp/nvidia/ops/qsa_pre_indexer.py
++++ b/vllm/models/qwen4_exp/nvidia/ops/qsa_pre_indexer.py
+@@ -5,6 +5,14 @@
+ import torch
+ 
+ from vllm.triton_utils import tl, triton
++from vllm.v1.worker import guard_telemetry
++
++# Bias so a negative row/index survives atomic_max on a zeroed counter
++# (review B4). MUST be a tl.constexpr: a plain module-level int is not readable
++# from a @triton.jit body -- round 2 shipped one and every guarded kernel died
++# with "NameError: Cannot access global variable _GUARD_BIAS" on the smoke.
++_GUARD_BIAS = tl.constexpr(guard_telemetry.GUARD_BIAS)
++
+ 
+ 
+ @triton.jit
+@@ -86,6 +94,7 @@ def _norm_rope(
+         "num_state_blocks",
+         "num_compressed_blocks",
+         "num_k_work",
++        "num_requests",
+     ]
+ )
+ def _qsa_pre_indexer_kernel(
+@@ -120,6 +129,8 @@ def _qsa_pre_indexer_kernel(
+     num_state_blocks,
+     num_compressed_blocks,
+     num_k_work,
++    num_requests,  # rc3-instr
++    guard_ctr,  # rc3-instr persistent int64[3]
+     HQ: tl.constexpr,
+     D: tl.constexpr,
+     TILE_T_Q: tl.constexpr,
+@@ -200,6 +211,17 @@ def _qsa_pre_indexer_kernel(
+         request, work_in_request = tl.split(work_metadata)
+         if request < 0:
+             return
++        # rc3-instr (Luna guard 2): the early return above rejects only the -1
++        # sentinel the builder writes for inactive work items. Any other
++        # corrupted value was loaded straight out of query_start_loc, which has
++        # num_requests + 1 entries -- 8 bytes for a single-request batch. The
++        # chunk_end load below derives its index from query_end, so a bad row
++        # also walked logical_positions; returning here stops both.
++        if request >= num_requests:
++            tl.atomic_add(guard_ctr, 1)
++            tl.atomic_max(guard_ctr + 1, (request).to(tl.int64) + _GUARD_BIAS)
++            tl.atomic_max(guard_ctr + 2, (work_in_request).to(tl.int64) + _GUARD_BIAS)
++            return
+ 
+         query_start = tl.load(query_start_loc_ptr + request)
+         query_end = tl.load(query_start_loc_ptr + request + 1)
+@@ -489,6 +511,8 @@ def qsa_pre_indexer(
+         state_cache.shape[0],
+         compressed_cache.shape[0],
+         num_k_work,
++        min(query_start_loc.numel() - 1, state_block_table.shape[0]),
++        guard_telemetry.counter(guard_telemetry.SITE_QSA_PRE_INDEXER, q.device),
+         HQ=num_q_heads,
+         D=head_dim,
+         TILE_T_Q=TILE_T_Q,
+-- 
+2.47.3
+

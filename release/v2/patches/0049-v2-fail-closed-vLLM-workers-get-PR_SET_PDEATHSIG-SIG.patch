@@ -1,0 +1,451 @@
+From 8718a13356eca6e3f26a440bef76194dfc414a26 Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Mon, 14 Sep 2026 14:43:26 +0000
+Subject: [PATCH 49/76] v2 fail-closed: vLLM workers get
+ PR_SET_PDEATHSIG(SIGKILL) against their EngineCore parent (with getppid race
+ check), so workers cannot outlive a killed EngineCore when the API process
+ manager SIGKILLs it before executor worker teardown (V.3 campaign-2
+ exc_async_output orphan, 2/4 repro); parent-death subprocess tests (fork
+ busy-spin, spawn sleep, graceful SIGTERM) (Sol draft, Fable applied/tested)
+
+Tests: new executor parent-death tests 3/3 (2 red on d8ceefc65a); tests/v1/ple_offload 128/128.
+---
+ .../test_multiproc_executor_parent_death.py   | 350 ++++++++++++++++++
+ vllm/v1/executor/multiproc_executor.py        |  43 +++
+ 2 files changed, 393 insertions(+)
+ create mode 100644 tests/v1/executor/test_multiproc_executor_parent_death.py
+
+diff --git a/tests/v1/executor/test_multiproc_executor_parent_death.py b/tests/v1/executor/test_multiproc_executor_parent_death.py
+new file mode 100644
+index 000000000..c39718fa7
+--- /dev/null
++++ b/tests/v1/executor/test_multiproc_executor_parent_death.py
+@@ -0,0 +1,350 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++import multiprocessing as mp
++import os
++import selectors
++import signal
++import subprocess
++import sys
++import time
++from contextlib import suppress
++from pathlib import Path
++from types import SimpleNamespace
++
++import pytest
++
++_PARENT_DEATH_EXIT_BOUND_S = 5.0
++_STARTUP_TIMEOUT_S = 180.0
++_TEST_FILE = Path(__file__).resolve()
++
++pytestmark = [
++    pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux only"),
++    pytest.mark.timeout(240),
++]
++
++
++def _proc_identity(pid: int) -> tuple[str, str] | None:
++    try:
++        stat = Path(f"/proc/{pid}/stat").read_text()
++    except FileNotFoundError:
++        return None
++    closing_paren = stat.rfind(")")
++    fields = stat[closing_paren + 2 :].split()
++    # fields starts at proc(5)'s field 3: state; starttime is field 22.
++    return fields[0], fields[19]
++
++
++def _run_fake_worker_main(
++    ready_pipe,
++    workload_entered_pipe,
++    death_pipe,
++    inherited_fds: list[int],
++    expected_parent_pid: int,
++    block_mode: str,
++) -> None:
++    import vllm.v1.executor.multiproc_executor as executor_module
++
++    real_worker_proc = executor_module.WorkerProc
++    worker_main = real_worker_proc.worker_main
++
++    class FakeMessageQueue:
++        def export_handle(self):
++            identity = _proc_identity(os.getpid())
++            assert identity is not None
++            return os.getpid(), identity[1]
++
++        def wait_until_ready(self):
++            pass
++
++        def shutdown(self):
++            pass
++
++    class FakeWorkerProc:
++        READY_STR = real_worker_proc.READY_STR
++
++        def __init__(self, *args, **kwargs):
++            self.rank = 0
++            self.rpc_broadcast_mq = None
++            self.worker_response_mq = FakeMessageQueue()
++            self.peer_response_handles = []
++
++        def monitor_death_pipe(self, pipe, shutdown_requested):
++            return real_worker_proc.monitor_death_pipe(
++                self, pipe, shutdown_requested
++            )
++
++        def worker_busy_loop(self):
++            if block_mode == "gil-spin":
++                # Model a C extension that holds the GIL while polling.
++                sys.setswitchinterval(1000.0)
++                workload_entered_pipe.send(block_mode)
++                workload_entered_pipe.close()
++                while True:
++                    pass
++            if block_mode == "sleep":
++                workload_entered_pipe.send(block_mode)
++                workload_entered_pipe.close()
++                while True:
++                    time.sleep(3600)
++            raise AssertionError(f"unknown block mode: {block_mode}")
++
++        def shutdown(self):
++            pass
++
++    executor_module.WorkerProc = FakeWorkerProc
++    executor_module.maybe_init_worker_tracer = lambda **kwargs: None
++    executor_module.set_worker_net_device = lambda *args, **kwargs: None
++    config = SimpleNamespace(
++        parallel_config=SimpleNamespace(
++            assigned_physical_gpu_ids=None,
++            numa_bind=False,
++        )
++    )
++    worker_main(
++        vllm_config=config,
++        ready_pipe=ready_pipe,
++        death_pipe=death_pipe,
++        inherited_fds=inherited_fds,
++        expected_parent_pid=expected_parent_pid,
++    )
++
++
++def _worker_like_child(
++    ready_pipe,
++    workload_entered_pipe,
++    death_pipe,
++    inherited_fds: list[int],
++    expected_parent_pid: int,
++    block_mode: str,
++) -> None:
++    _run_fake_worker_main(
++        ready_pipe,
++        workload_entered_pipe,
++        death_pipe,
++        inherited_fds,
++        expected_parent_pid,
++        block_mode,
++    )
++
++
++def _orphan_parent(start_method: str, block_mode: str) -> None:
++    context = mp.get_context(start_method)
++    ready_reader, ready_writer = context.Pipe(duplex=False)
++    workload_reader, workload_writer = context.Pipe(duplex=False)
++    death_reader, death_writer = context.Pipe(duplex=False)
++    inherited_fds = []
++    if start_method == "fork":
++        inherited_fds.extend(
++            (
++                ready_reader.fileno(),
++                workload_reader.fileno(),
++                death_writer.fileno(),
++            )
++        )
++
++    proc = context.Process(
++        target=_worker_like_child,
++        args=(
++            ready_writer,
++            workload_writer,
++            death_reader,
++            inherited_fds,
++            os.getpid(),
++            block_mode,
++        ),
++        daemon=True,
++    )
++    proc.start()
++    ready_writer.close()
++    workload_writer.close()
++    death_reader.close()
++
++    if not ready_reader.poll(_STARTUP_TIMEOUT_S):
++        raise TimeoutError("worker-like child did not become ready")
++    response = ready_reader.recv()
++    ready_reader.close()
++    if not workload_reader.poll(_STARTUP_TIMEOUT_S):
++        raise TimeoutError("worker-like child did not enter its workload")
++    assert workload_reader.recv() == block_mode
++    workload_reader.close()
++    child_pid, start_time = response["handle"]
++    print(f"READY {child_pid} {start_time}", flush=True)
++
++    # Keep the death-pipe writer open until the test SIGKILLs this process.
++    assert death_writer is not None
++    while True:
++        signal.pause()
++
++
++class _StdoutReadyPipe:
++    def send(self, response) -> None:
++        child_pid, start_time = response["handle"]
++        print(f"READY {child_pid} {start_time}", flush=True)
++
++    def close(self) -> None:
++        pass
++
++
++class _UnusedWorkloadPipe:
++    def send(self, value) -> None:
++        pass
++
++    def close(self) -> None:
++        pass
++
++
++def _graceful_child() -> None:
++    _run_fake_worker_main(
++        _StdoutReadyPipe(),
++        _UnusedWorkloadPipe(),
++        death_pipe=None,
++        inherited_fds=[],
++        expected_parent_pid=os.getppid(),
++        block_mode="sleep",
++    )
++
++
++def _run_cli() -> None:
++    if sys.argv[1] == "orphan-parent":
++        _orphan_parent(sys.argv[2], sys.argv[3])
++    elif sys.argv[1] == "graceful-child":
++        _graceful_child()
++    else:
++        raise AssertionError(f"unknown command: {sys.argv[1]}")
++
++
++def _start_cli(*args: str) -> subprocess.Popen:
++    return subprocess.Popen(
++        [sys.executable, str(_TEST_FILE), *args],
++        stdout=subprocess.PIPE,
++        stderr=subprocess.STDOUT,
++        start_new_session=True,
++    )
++
++
++def _wait_for_ready(proc: subprocess.Popen) -> tuple[int, str]:
++    assert proc.stdout is not None
++    selector = selectors.DefaultSelector()
++    selector.register(proc.stdout, selectors.EVENT_READ)
++    deadline = time.monotonic() + _STARTUP_TIMEOUT_S
++    buffered = b""
++    try:
++        while time.monotonic() < deadline:
++            timeout = min(
++                1.0,
++                max(0.0, deadline - time.monotonic()),
++            )
++            if not selector.select(timeout):
++                if proc.poll() is not None:
++                    raise AssertionError(
++                        f"launcher exited before readiness: {proc.returncode}"
++                    )
++                continue
++            chunk = os.read(proc.stdout.fileno(), 4096)
++            if not chunk:
++                raise AssertionError("launcher closed stdout before readiness")
++            buffered += chunk
++            while b"\n" in buffered:
++                line, buffered = buffered.split(b"\n", 1)
++                if line.startswith(b"READY "):
++                    _, pid, start_time = line.split()
++                    return int(pid), start_time.decode()
++        raise AssertionError("timed out waiting for worker-like child readiness")
++    finally:
++        selector.close()
++
++
++def _wait_for_state(
++    pid: int, start_time: str, expected_state: str, deadline: float
++) -> bool:
++    while time.monotonic() < deadline:
++        identity = _proc_identity(pid)
++        if identity is None or identity[1] != start_time:
++            return False
++        if identity[0] == expected_state:
++            return True
++        time.sleep(0.01)
++    return False
++
++
++def _wait_for_exit(pid: int, start_time: str, deadline: float) -> float | None:
++    while time.monotonic() < deadline:
++        identity = _proc_identity(pid)
++        if (
++            identity is None
++            or identity[0] in {"X", "Z"}
++            or identity[1] != start_time
++        ):
++            return time.monotonic()
++        time.sleep(0.01)
++    return None
++
++
++def _kill_process_group(proc: subprocess.Popen) -> None:
++    with suppress(ProcessLookupError):
++        os.killpg(proc.pid, signal.SIGKILL)
++    with suppress(subprocess.TimeoutExpired):
++        proc.wait(timeout=10)
++    if proc.stdout is not None:
++        proc.stdout.close()
++
++
++@pytest.mark.parametrize(
++    ("start_method", "block_mode", "expected_state"),
++    [("fork", "gil-spin", "R"), ("spawn", "sleep", "S")],
++)
++def test_worker_dies_when_engine_core_parent_is_sigkilled(
++    start_method: str, block_mode: str, expected_state: str
++):
++    launcher = _start_cli("orphan-parent", start_method, block_mode)
++    try:
++        child_pid, start_time = _wait_for_ready(launcher)
++        assert _wait_for_state(
++            child_pid,
++            start_time,
++            expected_state,
++            time.monotonic() + 10,
++        ), f"worker {child_pid} did not enter {block_mode} state"
++        assert launcher.poll() is None
++
++        killed_at = time.monotonic()
++        os.kill(launcher.pid, signal.SIGKILL)
++        launcher.wait(timeout=_PARENT_DEATH_EXIT_BOUND_S)
++        exited_at = _wait_for_exit(
++            child_pid,
++            start_time,
++            killed_at + _PARENT_DEATH_EXIT_BOUND_S,
++        )
++
++        assert launcher.returncode == -signal.SIGKILL
++        assert exited_at is not None, (
++            f"worker {child_pid} survived its parent by more than "
++            f"{_PARENT_DEATH_EXIT_BOUND_S:.1f}s"
++        )
++        assert exited_at - killed_at <= _PARENT_DEATH_EXIT_BOUND_S
++    finally:
++        _kill_process_group(launcher)
++
++
++def test_sigterm_with_live_parent_uses_worker_system_exit_path():
++    worker = _start_cli("graceful-child")
++    try:
++        child_pid, start_time = _wait_for_ready(worker)
++        assert child_pid == worker.pid
++        assert _proc_identity(child_pid) is not None
++
++        os.kill(worker.pid, signal.SIGTERM)
++        worker.wait(timeout=10)
++
++        # WorkerProc's SIGTERM handler raises and re-raises SystemExit, so this
++        # is a clean Python exit rather than default signal termination (-15).
++        assert worker.returncode == 0
++        identity = _proc_identity(child_pid)
++        assert identity is None or identity[1] != start_time
++    finally:
++        _kill_process_group(worker)
++
++
++if __name__ == "__main__":
++    _run_cli()
+diff --git a/vllm/v1/executor/multiproc_executor.py b/vllm/v1/executor/multiproc_executor.py
+index 1a14b6499..03f6888c6 100644
+--- a/vllm/v1/executor/multiproc_executor.py
++++ b/vllm/v1/executor/multiproc_executor.py
+@@ -5,6 +5,7 @@ import os
+ import pickle
+ import queue
+ import signal
++import sys
+ import threading
+ import time
+ import traceback
+@@ -75,6 +76,44 @@ from vllm.v1.worker.worker_base import WorkerWrapperBase
+ logger = init_logger(__name__)
+ 
+ 
++_WORKER_PARENT_DEATH_SIGNAL = signal.SIGKILL
++_PR_SET_PDEATHSIG = 1
++
++
++def _install_worker_parent_death_signal(expected_parent_pid: int) -> None:
++    """Have Linux kill this worker if its EngineCore parent exits."""
++    if not sys.platform.startswith("linux"):
++        return
++
++    import ctypes
++
++    libc = ctypes.CDLL(None, use_errno=True)
++    prctl = libc.prctl
++    prctl.argtypes = [
++        ctypes.c_int,
++        ctypes.c_ulong,
++        ctypes.c_ulong,
++        ctypes.c_ulong,
++        ctypes.c_ulong,
++    ]
++    prctl.restype = ctypes.c_int
++    if prctl(
++        _PR_SET_PDEATHSIG,
++        int(_WORKER_PARENT_DEATH_SIGNAL),
++        0,
++        0,
++        0,
++    ) != 0:
++        error_number = ctypes.get_errno()
++        raise OSError(error_number, os.strerror(error_number))
++
++    # The parent can exit between spawning this process and the prctl call.
++    # Once prctl is installed, a later exit is covered by the kernel.
++    if os.getppid() != expected_parent_pid:
++        os.kill(os.getpid(), _WORKER_PARENT_DEATH_SIGNAL)
++        os._exit(1)
++
++
+ class FutureWrapper(Future):
+     def __init__(
+         self,
+@@ -726,6 +765,7 @@ class WorkerProc:
+             inherited_fds = inherited_fds.copy()
+             inherited_fds.extend((ready_reader.fileno(), death_writer.fileno()))
+         process_kwargs = {
++            "expected_parent_pid": os.getpid(),
+             "vllm_config": vllm_config,
+             "local_rank": local_rank,
+             "rank": rank,
+@@ -859,6 +899,9 @@ class WorkerProc:
+         """Worker initialization and execution loops.
+         This runs a background process"""
+ 
++        expected_parent_pid = kwargs.pop("expected_parent_pid")
++        _install_worker_parent_death_signal(expected_parent_pid)
++
+         # Signal handler used for graceful termination.
+         # SystemExit exception is only raised once to allow this and worker
+         # processes to terminate without error
+-- 
+2.47.3
+

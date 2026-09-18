@@ -1,0 +1,189 @@
+From d1fdecc26f5a0900317edf0b4dfabeb56ec32c3f Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Tue, 15 Sep 2026 21:04:26 +0000
+Subject: [PATCH 63/76] rc3-instr 7/8: pool-bound the KV block zeroer, and
+ check ownership host-side  (Luna guard 5)
+
+_zero_kv_blocks_kernel takes a block id straight from the scheduler's list and
+turns it into an offset:
+
+    block_id = tl.load(block_ids_ptr + block_index)
+    block_offset = block_id.to(tl.int64) * block_stride_el.to(tl.int64)
+
+The only masking in this kernel is WITHIN a segment page, so an out-of-pool id
+does not reliably fault -- it writes zeros somewhere else inside the KV
+allocation, which is how a corrupted id turns into a silently wrong answer in
+an unrelated request several steps later. The kernel now bounds the id against
+the pool size and returns.
+
+This guard can only fire on corruption. Every group's cache tensor is asserted
+to be an exact multiple of kv_cache_config.num_blocks (worker/utils.py:171-175
+and :696-699), so a legitimate pool id is always in range. A non-zero count
+here means the scheduler handed the worker a block id that is not a pool index.
+
+The host-side companion, behind VLLM_E2_ZERO_OWNERSHIP_CHECK=1, tests the
+precondition the kernel's own comment relies on: that a block about to be
+zeroed is referenced by exactly one live request. Ownership is only visible in
+the scheduler process, so the check lives there. More than one owner means a
+stale reference survived into the zeroing and the kernel is about to destroy
+state another request still points at -- OPUS-S2-CRASH.md hypothesis C.1. It is
+off by default and O(live blocks) per step when on.
+
+Launch-site audit: one launch, utils.py:242. No warmup registration, no AMD
+mirror.
+
+Not done, deliberately: the reshape_and_cache_flash slot bound. It is an
+upstream CUDA kernel, so bounding it means editing C++/CUDA and rebuilding the
+extension, which is not a one-liner and not in scope for an instrumentation
+series. The local QSA helper that does carry the check (nvidia/qsa.py:318-352)
+is not the active writer.
+
+ROUND 3: _GUARD_BIAS is bound as tl.constexpr. Round 2 declared it as a plain
+module-level int, which a @triton.jit body cannot read, and the GPU smoke
+failed every guarded-kernel test with "NameError: Cannot access global variable
+_GUARD_BIAS". Checked the other module-level names in this file: none are
+referenced from a jit body.
+
+Draft for Astra review. Not merged into any RC.
+---
+ vllm/v1/core/sched/scheduler.py | 38 +++++++++++++++++++++++++++++++++
+ vllm/v1/worker/utils.py         | 26 ++++++++++++++++++++++
+ 2 files changed, 64 insertions(+)
+
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index c31630ad5..c343354fb 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import itertools
++import os
+ import time
+ from collections import defaultdict, deque
+ from collections.abc import Iterable
+@@ -76,6 +77,10 @@ from vllm.v1.utils import record_function_or_nullcontext
+ 
+ logger = init_logger(__name__)
+ 
++# rc3-instr: verify KVBlockZeroer's exclusive-ownership precondition before a
++# block is zeroed. Off by default, so it costs nothing.
++_ZERO_OWNERSHIP_CHECK = os.getenv("VLLM_E2_ZERO_OWNERSHIP_CHECK") == "1"
++
+ 
+ class Scheduler(SchedulerInterface):
+     def __init__(
+@@ -1464,8 +1469,41 @@ class Scheduler(SchedulerInterface):
+             new_block_ids_to_zero = [b for b in new_block_ids_to_zero if b not in skip]
+             skip.clear()
+ 
++        if new_block_ids_to_zero and _ZERO_OWNERSHIP_CHECK:
++            self._check_zero_block_ownership(new_block_ids_to_zero)
++
+         return new_block_ids_to_zero or None
+ 
++    def _check_zero_block_ownership(self, block_ids: list[int]) -> None:
++        """Test KVBlockZeroer's stated precondition, host side, off by default.
++
++        worker/utils.py justifies zeroing a whole tile with "block IDs are
++        global pool indices and a newly allocated block owns its whole tile".
++        Ownership is visible only here, in the scheduler process, so the check
++        lives here rather than in the zeroer. A block about to be zeroed should
++        be referenced by exactly one live request. More than one means a stale
++        reference survived into the zeroing, and the kernel is about to destroy
++        state another request still points at -- the S2 hypothesis C.1 shape.
++
++        VLLM_E2_ZERO_OWNERSHIP_CHECK=1. O(live blocks) per step.
++        """
++        pending = set(block_ids)
++        owners: dict[int, set[str]] = {}
++        for mgr in self.kv_cache_manager.coordinator.single_type_managers:
++            for req_id, blocks in mgr.req_to_blocks.items():
++                for blk in blocks:
++                    if blk.block_id in pending:
++                        owners.setdefault(blk.block_id, set()).add(req_id)
++        for block_id, req_ids in sorted(owners.items()):
++            if len(req_ids) > 1:
++                logger.warning(
++                    "KV zeroing ownership violation: block %d is about to be "
++                    "zeroed but is referenced by %d live requests (%s).",
++                    block_id,
++                    len(req_ids),
++                    ", ".join(sorted(req_ids)[:4]),
++                )
++
+     def _preempt_request(
+         self, request: Request, timestamp: float, drop_stale_output: bool = False
+     ) -> None:
+diff --git a/vllm/v1/worker/utils.py b/vllm/v1/worker/utils.py
+index 067a2b0d2..217ed7e00 100644
+--- a/vllm/v1/worker/utils.py
++++ b/vllm/v1/worker/utils.py
+@@ -39,10 +39,17 @@ from vllm.v1.kv_cache_interface import (
+     UniformTypeKVCacheSpecs,
+     create_kv_cache_views,
+ )
++from vllm.v1.worker import guard_telemetry
+ from vllm.v1.worker.block_table import get_block_table_width
+ 
+ logger = init_logger(__name__)
+ 
++# Bias so a negative row/index survives atomic_max on a zeroed counter
++# (review B4). MUST be a tl.constexpr: a plain module-level int is not readable
++# from a @triton.jit body -- round 2 shipped one and every guarded kernel died
++# with "NameError: Cannot access global variable _GUARD_BIAS" on the smoke.
++_GUARD_BIAS = tl.constexpr(guard_telemetry.GUARD_BIAS)
++
+ 
+ def raise_if_nan_logits(num_nans_in_logits: Mapping[str, int]) -> None:
+     if not any(num_nans_in_logits.values()):
+@@ -62,6 +69,8 @@ def _zero_kv_blocks_kernel(
+     seg_block_strides_ptr,
+     seg_page_sizes_ptr,
+     block_ids_ptr,
++    num_pool_blocks,  # rc3-instr
++    guard_ctr,  # rc3-instr persistent int64[3]
+     BLOCK_SIZE: tl.constexpr,
+ ):
+     """Zero KV cache blocks across all segments in a single launch.
+@@ -91,6 +100,17 @@ def _zero_kv_blocks_kernel(
+     if chunk_offset >= page_size_el:
+         return
+     block_id = tl.load(block_ids_ptr + block_index)
++    # rc3-instr (Luna guard 5): block_id goes straight into
++    # block_id * block_stride_el with no pool bound, and this kernel masks only
++    # WITHIN a segment page, so a corrupt id writes zeros elsewhere in the KV
++    # allocation instead of faulting visibly. A valid pool id is always in
++    # range (every group's tensor is asserted to be an exact multiple of
++    # kv_cache_config.num_blocks), so this can only fire on corruption.
++    if (block_id < 0) or (block_id >= num_pool_blocks):
++        tl.atomic_add(guard_ctr, 1)
++        tl.atomic_max(guard_ctr + 1, (block_index).to(tl.int64) + _GUARD_BIAS)
++        tl.atomic_max(guard_ctr + 2, (block_id).to(tl.int64) + _GUARD_BIAS)
++        return
+     seg_addr = tl.load(seg_addrs_ptr + seg_index)
+     ptr = tl.cast(seg_addr, tl.pointer_type(tl.int32))
+     block_offset = block_id.to(tl.int64) * block_stride_el.to(tl.int64)
+@@ -138,6 +158,8 @@ class KVBlockZeroer:
+         Only AttentionSpec layers are processed; Mamba layers are skipped.
+         """
+         self.device = device
++        # rc3-instr: pool bound for the guard in _zero_kv_blocks_kernel.
++        self._num_pool_blocks = int(num_blocks)
+         self._meta: (
+             tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int, int] | None
+         ) = None
+@@ -244,6 +266,10 @@ class KVBlockZeroer:
+             seg_block_strides,
+             seg_page_sizes,
+             idx,
++            self._num_pool_blocks,
++            guard_telemetry.counter(
++                guard_telemetry.SITE_KV_ZEROER, self.device
++            ),
+             BLOCK_SIZE=blk_size,
+         )
+ 
+-- 
+2.47.3
+

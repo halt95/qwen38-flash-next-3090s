@@ -1,0 +1,87 @@
+From 77323ded535c3c3f360f43ad1c882cde00f98525 Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Fri, 11 Sep 2026 14:09:37 +0000
+Subject: [PATCH 20/76] e2-pull H r3: Astra round-3 fix #1 (releases
+ synchronous whenever dummy/capture work ran since the last real forward;
+ stage-0 TP barrier at every dummy->real transition before TP0 publishes; this
+ tree runs real-path warm-ups before capture)
+
+---
+ vllm/v1/ple_offload/connector.py | 39 ++++++++++++++++++++------------
+ 1 file changed, 25 insertions(+), 14 deletions(-)
+
+diff --git a/vllm/v1/ple_offload/connector.py b/vllm/v1/ple_offload/connector.py
+index 6b836ed09..c1e78b2d9 100644
+--- a/vllm/v1/ple_offload/connector.py
++++ b/vllm/v1/ple_offload/connector.py
+@@ -109,10 +109,15 @@ class PleOffloadConnector:
+         # captured graphs: never unregistered while the process lives (Astra
+         # 09-11 R2 #2: unregistering under a pending graph wait unmaps it).
+         self._mapped_host_buffers: list[torch.Tensor] = []
+-        # Until the first real forward, every release is synchronous, so each
+-        # rank's final startup reset has EXECUTED before the executor's
+-        # all-rank init barrier returns and serving can publish (R2 #1).
+-        self._serving = False
++        # True while dummy/capture work (seeds, dummy forwards, capture
++        # cleanup resets) has run since the last real forward. Releases in
++        # that state complete synchronously, and the next real forward first
++        # passes a TP barrier, so no rank can publish a real request while
++        # another rank still has a dummy/cleanup reset pending (Astra 09-11
++        # R2 #1 / R3 #1). In this tree real-path kernel warm-ups run BEFORE
++        # capture and capture adds seeds/resets after them, so this must hold
++        # at every dummy->real transition, not only at the first real one.
++        self._after_dummy = True
+         self._request_queue: queue.Queue[_PendingPleOffloadRequest | None] = (
+             queue.Queue(maxsize=vllm_config.max_concurrent_batches)
+         )
+@@ -462,11 +467,16 @@ class PleOffloadConnector:
+         if dummy_run:
+             self.signal_dummy_outputs(num_tokens)
+             return
+-        if not self._serving:
+-            self._serving = True
++        if self._after_dummy:
++            # Every dummy/cleanup reset on THIS rank already completed
++            # (synchronous releases); the barrier extends that to every
++            # stage-0 TP rank before TP0 can publish (CPU group, no GPU work;
++            # all TP ranks run the same forwards in the same order).
++            get_tp_group().barrier()
++            self._after_dummy = False
+             logger.info(
+-                "PleOffload: first real forward (dp_rank=%d, tp_rank=%d); "
+-                "startup releases were synchronous",
++                "PleOffload: dummy->real transition (dp_rank=%d, tp_rank=%d): "
++                "releases were synchronous, TP barrier passed",
+                 self.dp_rank,
+                 self.tp_rank,
+             )
+@@ -476,6 +486,7 @@ class PleOffloadConnector:
+         """Locally satisfy PLE waits for dummy and capture forwards."""
+         # Dummy and capture forwards do not send CPU requests, but every PLE
+         # placeholder still waits for a completed output semaphore.
++        self._after_dummy = True
+         stream = torch.cuda.current_stream(self.device)
+         for layer in self._layers.values():
+             layer._gpu_output_buffer[:num_tokens].zero_()
+@@ -488,12 +499,12 @@ class PleOffloadConnector:
+         stream = torch.cuda.current_stream(self.device)
+         for layer in self._layers.values():
+             layer.release_offloaded_output(stream)
+-        # Startup only (profile, capture warm-ups, adaptive-verification dummy
+-        # replays, capture cleanup): complete the reset before returning, so
+-        # no startup reset can still be pending on this rank when another
+-        # rank's first real request lets the offload publish (R2 #1). Never
+-        # inside a stream capture.
+-        if not self._serving and not torch.cuda.is_current_stream_capturing():
++        # After dummy/capture work (profile, warm-up sizes, capture seed,
++        # adaptive-verification dummy replays, capture cleanup): complete the
++        # reset before returning, so it cannot still be pending when a real
++        # request lets the offload publish. Real-forward releases stay async.
++        # Never inside a stream capture.
++        if self._after_dummy and not torch.cuda.is_current_stream_capturing():
+             stream.synchronize()
+ 
+     def close(self) -> None:
+-- 
+2.47.3
+

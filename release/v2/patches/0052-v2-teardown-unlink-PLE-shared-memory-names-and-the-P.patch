@@ -1,0 +1,706 @@
+From 67061cb9acc04d47051dedd519e284a9926c32bf Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Mon, 14 Sep 2026 18:43:08 +0000
+Subject: [PATCH 52/76] v2 teardown: unlink PLE shared-memory names and the
+ PLE-owned ipc socket on graceful shutdown
+
+Baseline boots (record flashnext-v2-teardown-leak-baseline-2026-09-14) show the frozen fork
+d7755c6c and the RC 3f1572af95 both leave 7 /dev/shm/torch_<pid>_* names (the connector's
+share_memory_() tensors shared to the offload child under the file_system strategy) and the
+PLE registration ipc socket after a clean SIGINT stop; the leak is inherited, not a v2 change.
+
+connector.py: release_host_storage() unlinks the shm names of the seven filename-shared CPU
+storages while keeping tensors, mappings and CUDA registrations alive; close() calls it last,
+after request-thread join, ZMQ teardown and progress close; the deferred branch (thread did not
+stop) does not unlink. worker.py: the offload child unlinks the ipc endpoint it bound after
+socket close + context term; PleOffloadWorkerHandle keeps ipc_addr and unlinks as a fallback
+after a confirmed child exit (SIGKILLed child). Non-graceful paths (fatal os._exit, SIGKILL,
+PDEATHSIG) leak by design. The 17 upstream VLLM_RPC_BASE_PATH uuid sockets per boot are out
+of scope (launch profile uses a per-boot tmpdir).
+
+Tests: tests/v1/ple_offload/test_shm_unlink.py, test_shutdown_order.py (extended),
+test_ipc_socket_unlink.py - red on 3f1572af95 (7 failed / 2 passed), green 9/9; full
+tests/v1/ple_offload 135 passed / 1 skipped (logs <maintainer log path>).
+Sol draft (sol-shm-fix), Fable applied/tested.
+---
+ .../v1/ple_offload/test_ipc_socket_unlink.py  | 133 +++++++++++++++
+ tests/v1/ple_offload/test_shm_unlink.py       | 158 ++++++++++++++++++
+ tests/v1/ple_offload/test_shutdown_order.py   | 138 ++++++++++++++-
+ vllm/v1/ple_offload/connector.py              |  88 +++++++++-
+ vllm/v1/ple_offload/worker.py                 |  28 ++++
+ 5 files changed, 535 insertions(+), 10 deletions(-)
+ create mode 100644 tests/v1/ple_offload/test_ipc_socket_unlink.py
+ create mode 100644 tests/v1/ple_offload/test_shm_unlink.py
+
+diff --git a/tests/v1/ple_offload/test_ipc_socket_unlink.py b/tests/v1/ple_offload/test_ipc_socket_unlink.py
+new file mode 100644
+index 000000000..92fbc4279
+--- /dev/null
++++ b/tests/v1/ple_offload/test_ipc_socket_unlink.py
+@@ -0,0 +1,133 @@
++# SPDX-License-Identifier: Apache-2.0
++
++import contextlib
++import os
++from pathlib import Path
++import signal
++import subprocess
++import sys
++import tempfile
++import time
++
++import pytest
++
++from vllm.v1.ple_offload.worker import PleOffloadWorkerHandle
++
++
++pytestmark = pytest.mark.skipif(
++    sys.platform != "linux", reason="requires Linux filesystem ipc sockets"
++)
++
++
++_STUB_CHILD = r"""
++import pathlib
++import signal
++import sys
++import threading
++
++import zmq
++
++from vllm.v1.ple_offload.worker import _unlink_ipc_socket
++
++ipc_addr, mode, marker = sys.argv[1:]
++stopping = threading.Event()
++if mode == "graceful":
++    signal.signal(signal.SIGTERM, lambda _signum, _frame: stopping.set())
++else:
++    signal.signal(signal.SIGTERM, signal.SIG_IGN)
++
++context = zmq.Context()
++socket = context.socket(zmq.PULL)
++socket.bind(ipc_addr)
++try:
++    stopping.wait()
++finally:
++    socket.close(linger=0)
++    context.term()
++    if mode == "graceful":
++        _unlink_ipc_socket(ipc_addr)
++        pathlib.Path(marker).touch()
++"""
++
++
++def _start_stub(ipc_addr: str, mode: str, marker: Path) -> subprocess.Popen:
++    return subprocess.Popen(
++        [sys.executable, "-c", _STUB_CHILD, ipc_addr, mode, str(marker)],
++        stdout=subprocess.DEVNULL,
++        stderr=subprocess.PIPE,
++        text=True,
++    )
++
++
++def _wait_for_socket(proc: subprocess.Popen, path: Path) -> None:
++    deadline = time.monotonic() + 30
++    while time.monotonic() < deadline:
++        if path.exists():
++            return
++        if proc.poll() is not None:
++            stderr = proc.stderr.read() if proc.stderr is not None else ""
++            pytest.fail(f"stub child exited before bind: {stderr}")
++        time.sleep(0.01)
++    pytest.fail("stub child did not bind its ipc socket")
++
++
++def _cleanup_process(proc: subprocess.Popen, socket_path: Path) -> None:
++    if proc.poll() is None:
++        proc.kill()
++        proc.wait(timeout=5)
++    with contextlib.suppress(FileNotFoundError):
++        os.unlink(socket_path)
++    if proc.stderr is not None:
++        proc.stderr.close()
++
++
++def test_handle_graceful_close_removes_child_bound_socket() -> None:
++    with tempfile.TemporaryDirectory(prefix="ple-ipc-", dir="/tmp") as temp_dir:
++        socket_path = Path(temp_dir) / "owned.sock"
++        marker = Path(temp_dir) / "child-cleaned"
++        ipc_addr = f"ipc://{socket_path}"
++        proc = _start_stub(ipc_addr, "graceful", marker)
++        try:
++            handle = PleOffloadWorkerHandle(
++                proc=proc,
++                death_writer=None,
++                ready_pipe_reader=None,
++                launch_deadline=time.monotonic() + 30,
++                ipc_addr=ipc_addr,
++            )
++            _wait_for_socket(proc, socket_path)
++
++            handle.close()
++
++            assert proc.returncode == 0
++            assert marker.exists(), "the child ran its post-context unlink"
++            assert not socket_path.exists()
++        finally:
++            _cleanup_process(proc, socket_path)
++
++
++def test_handle_close_removes_socket_after_child_sigkill() -> None:
++    with tempfile.TemporaryDirectory(prefix="ple-ipc-", dir="/tmp") as temp_dir:
++        socket_path = Path(temp_dir) / "owned.sock"
++        marker = Path(temp_dir) / "unused"
++        ipc_addr = f"ipc://{socket_path}"
++        proc = _start_stub(ipc_addr, "park", marker)
++        try:
++            handle = PleOffloadWorkerHandle(
++                proc=proc,
++                death_writer=None,
++                ready_pipe_reader=None,
++                launch_deadline=time.monotonic() + 30,
++                ipc_addr=ipc_addr,
++            )
++            _wait_for_socket(proc, socket_path)
++            proc.kill()
++            proc.wait(timeout=5)
++            assert proc.returncode == -signal.SIGKILL
++            assert socket_path.exists()
++
++            handle.close()
++
++            assert not socket_path.exists()
++        finally:
++            _cleanup_process(proc, socket_path)
+diff --git a/tests/v1/ple_offload/test_shm_unlink.py b/tests/v1/ple_offload/test_shm_unlink.py
+new file mode 100644
+index 000000000..0073a4f5e
+--- /dev/null
++++ b/tests/v1/ple_offload/test_shm_unlink.py
+@@ -0,0 +1,158 @@
++# SPDX-License-Identifier: Apache-2.0
++
++import os
++from multiprocessing.reduction import ForkingPickler
++from pathlib import Path
++
++import pytest
++import torch
++import torch.multiprocessing as torch_mp
++
++from vllm.v1.ple_offload import connector as connector_module
++from vllm.v1.ple_offload.connector import PleOffloadConnector
++from vllm.v1.ple_offload.protocol import PleOffloadRegistration
++
++
++def _require_file_system_shm() -> None:
++    if (
++        os.name != "posix"
++        or not os.path.isdir("/dev/shm")
++        or not os.access("/dev/shm", os.W_OK)
++    ):
++        pytest.skip("POSIX /dev/shm is unavailable")
++    if "file_system" not in torch_mp.get_all_sharing_strategies():
++        pytest.skip("torch file_system sharing is unavailable")
++
++
++def _shm_path(tensor: torch.Tensor) -> Path:
++    _, filename, _ = tensor.untyped_storage()._share_filename_cpu_()
++    return Path("/dev/shm") / os.fsdecode(filename).lstrip("/")
++
++
++def _cleanup_paths(paths: list[Path]) -> None:
++    # Keep red runs against the unpatched tree from leaking their test names.
++    for path in paths:
++        try:
++            os.unlink(path)
++        except FileNotFoundError:
++            pass
++
++
++def _make_connector_storage() -> tuple[PleOffloadConnector, list[torch.Tensor]]:
++    original_strategy = torch_mp.get_sharing_strategy()
++    torch_mp.set_sharing_strategy("file_system")
++    try:
++        host_outputs = {
++            "layer.0": torch.arange(12, dtype=torch.float32)
++            .reshape(3, 4)
++            .share_memory_(),
++            "layer.1": torch.arange(8, dtype=torch.float32)
++            .reshape(2, 4)
++            .share_memory_(),
++        }
++        host_flags = {
++            name: torch.zeros(16, dtype=torch.int32).share_memory_()
++            for name in host_outputs
++        }
++        input_ids = torch.arange(16, dtype=torch.int32).share_memory_()
++        query_start_loc = torch.arange(5, dtype=torch.int32).share_memory_()
++        ngram_context = torch.arange(12, dtype=torch.int32).reshape(4, 3)
++        ngram_context.share_memory_()
++
++        registration = PleOffloadRegistration(
++            worker_id=0,
++            tp_rank=0,
++            dp_rank=0,
++            host_output_buffers=host_outputs,
++            host_flag_tensors=host_flags,
++            input_ids_buf=input_ids,
++            query_start_loc_buf=query_start_loc,
++            ngram_context_buf=ngram_context,
++        )
++        # Match PleOffloadConnector._serialize_registration: this is what
++        # fixes each file_system storage's final shared-memory name.
++        assert ForkingPickler.dumps(registration)
++    finally:
++        torch_mp.set_sharing_strategy(original_strategy)
++
++    connector = PleOffloadConnector.__new__(PleOffloadConnector)
++    connector._host_output_bufs = host_outputs
++    connector._host_flags = host_flags
++    connector._input_ids_buf = input_ids
++    connector._query_start_loc_buf = query_start_loc
++    connector._ngram_context_buf = ngram_context
++    tensors = [
++        *host_outputs.values(),
++        *host_flags.values(),
++        input_ids,
++        query_start_loc,
++        ngram_context,
++    ]
++    assert len(tensors) == 7
++    return connector, tensors
++
++
++def test_release_host_storage_unlinks_names_but_keeps_mappings() -> None:
++    _require_file_system_shm()
++    connector, tensors = _make_connector_storage()
++    paths: list[Path] = []
++    try:
++        for tensor in tensors:
++            paths.append(_shm_path(tensor))
++        before = [tensor.clone() for tensor in tensors]
++        assert len(set(paths)) == 7
++        assert all(path.exists() for path in paths)
++
++        connector.release_host_storage()
++
++        assert all(not path.exists() for path in paths)
++        for tensor, expected in zip(tensors, before):
++            assert torch.equal(tensor, expected)
++            tensor.add_(1)
++            assert torch.equal(tensor, expected + 1)
++    finally:
++        _cleanup_paths(paths)
++
++
++def test_without_release_helper_names_remain(monkeypatch) -> None:
++    _require_file_system_shm()
++    connector, tensors = _make_connector_storage()
++    paths: list[Path] = []
++    try:
++        for tensor in tensors:
++            paths.append(_shm_path(tensor))
++        with monkeypatch.context() as patch:
++            patch.setattr(
++                connector_module,
++                "_unlink_filename_shared_storage",
++                lambda _tensor: None,
++            )
++            connector.release_host_storage()
++
++        assert all(path.exists() for path in paths)
++    finally:
++        _cleanup_paths(paths)
++
++
++def test_release_host_storage_does_not_convert_fd_shared_storage() -> None:
++    if "file_descriptor" not in torch_mp.get_all_sharing_strategies():
++        pytest.skip("torch file_descriptor sharing is unavailable")
++    original_strategy = torch_mp.get_sharing_strategy()
++    torch_mp.set_sharing_strategy("file_descriptor")
++    try:
++        fd_tensor = torch.arange(8, dtype=torch.int32).share_memory_()
++    finally:
++        torch_mp.set_sharing_strategy(original_strategy)
++
++    connector = PleOffloadConnector.__new__(PleOffloadConnector)
++    connector._host_output_bufs = {"layer.0": fd_tensor}
++    connector._host_flags = {}
++    connector._input_ids_buf = torch.arange(2, dtype=torch.int32)
++    connector._query_start_loc_buf = torch.arange(2, dtype=torch.int32)
++    connector._ngram_context_buf = None
++    expected = fd_tensor.clone()
++
++    connector.release_host_storage()
++
++    assert fd_tensor.untyped_storage()._get_shared_fd() >= 0
++    assert torch.equal(fd_tensor, expected)
+diff --git a/tests/v1/ple_offload/test_shutdown_order.py b/tests/v1/ple_offload/test_shutdown_order.py
+index 7775e0cbb..101c3dabc 100644
+--- a/tests/v1/ple_offload/test_shutdown_order.py
++++ b/tests/v1/ple_offload/test_shutdown_order.py
+@@ -1,7 +1,11 @@
+ # SPDX-License-Identifier: Apache-2.0
+ 
++import contextlib
+ from types import SimpleNamespace
++from typing import Any
+ 
++from vllm.v1.ple_offload.connector import PleOffloadConnector
++from vllm.v1.ple_offload import worker as ple_worker
+ from vllm.v1.worker import gpu_worker
+ 
+ 
+@@ -13,6 +17,7 @@ def test_shutdown_marks_ple_stopping_before_teardown(monkeypatch) -> None:
+     def record(name: str):
+         def call() -> None:
+             order.append((name, worker._ple_offload_stopping))
++
+         return call
+ 
+     monkeypatch.setattr(gpu_worker.gc, "unfreeze", record("gc"))
+@@ -34,18 +39,133 @@ def test_shutdown_marks_ple_stopping_before_teardown(monkeypatch) -> None:
+ 
+     worker.profiler = None
+     worker.weight_transfer_engine = None
+-    worker.elastic_ep_executor = SimpleNamespace(
+-        shutdown=record("elastic")
+-    )
+-    worker._ple_offload_worker_handle = SimpleNamespace(
+-        close=record("offload")
+-    )
+-    worker.model_runner = SimpleNamespace(
+-        shutdown=record("runner")
+-    )
++    worker.elastic_ep_executor = SimpleNamespace(shutdown=record("elastic"))
++    worker._ple_offload_worker_handle = SimpleNamespace(close=record("offload"))
++    worker.model_runner = SimpleNamespace(shutdown=record("runner"))
+ 
+     worker.shutdown()
+ 
+     assert order
+     assert all(stopping for _, stopping in order)
+     assert [name for name, _ in order][:2] == ["gc", "kv"]
++
++
++class _RequestThread:
++    def __init__(self, order: list[str], *, stops: bool) -> None:
++        self.order = order
++        self.stops = stops
++        self.alive = True
++
++    def is_alive(self) -> bool:
++        return self.alive
++
++    def join(self, timeout: float) -> None:
++        self.order.append("thread.join")
++        if self.stops:
++            self.alive = False
++
++
++def _record(order: list[str], name: str):
++    def call(*_args: Any, **_kwargs: Any) -> None:
++        order.append(name)
++
++    return call
++
++
++def _make_connector_for_close(
++    order: list[str], *, thread_stops: bool
++) -> PleOffloadConnector:
++    connector = PleOffloadConnector.__new__(PleOffloadConnector)
++    connector._request_thread = _RequestThread(order, stops=thread_stops)
++    connector._request_queue = SimpleNamespace(put=_record(order, "queue.stop"))
++    connector._pinned_input_buffers = []
++    connector._mapped_host_buffers = []
++    connector._d2h_event_pool = object()
++    connector._registration_socket = SimpleNamespace(
++        close=_record(order, "socket.close")
++    )
++    connector._zmq_ctx = SimpleNamespace(term=_record(order, "context.term"))
++    connector._progress = SimpleNamespace(close=_record(order, "progress.close"))
++    connector.release_host_storage = _record(order, "storage.release")
++    return connector
++
++
++def test_connector_close_releases_storage_last() -> None:
++    order: list[str] = []
++    connector = _make_connector_for_close(order, thread_stops=True)
++
++    connector.close()
++
++    assert order[-1] == "storage.release"
++    assert order.index("thread.join") < order.index("context.term")
++    assert order.index("context.term") < order.index("storage.release")
++
++
++def test_connector_close_defers_storage_release_if_thread_does_not_stop() -> None:
++    order: list[str] = []
++    connector = _make_connector_for_close(order, thread_stops=False)
++
++    connector.close()
++
++    assert "storage.release" not in order
++    assert "socket.close" not in order
++    assert "context.term" not in order
++    assert order[-1] == "progress.close"
++
++
++def test_offload_child_unlinks_owned_ipc_after_context_term(monkeypatch) -> None:
++    order: list[str] = []
++    ipc_addr = "ipc:///tmp/ple-owned-test.sock"
++    pull_socket = SimpleNamespace(
++        bind=_record(order, "socket.bind"),
++        close=_record(order, "socket.close"),
++    )
++    zmq_context = SimpleNamespace(
++        socket=lambda _kind: pull_socket,
++        term=_record(order, "context.term"),
++    )
++
++    class FakeRunner:
++        layer_names: list[str] = []
++
++        def __init__(self, _config: object) -> None:
++            pass
++
++        def accept_registrations(self, _socket: object, _count: int) -> None:
++            order.append("registrations.accept")
++
++        def busy_loop(self, _socket: object, _event: object) -> None:
++            order.append("runner.busy_loop")
++
++    ready_pipe = SimpleNamespace(
++        send_bytes=_record(order, "ready.send"),
++        close=_record(order, "ready.close"),
++    )
++    monkeypatch.setattr(ple_worker, "decorate_logs", lambda _name: None)
++    monkeypatch.setattr(ple_worker, "mark_as_offload_worker", lambda: None)
++    monkeypatch.setattr(ple_worker, "_prepare_cuda_free_process", lambda: None)
++    monkeypatch.setattr(ple_worker, "_init_offload_distributed", lambda: None)
++    monkeypatch.setattr(
++        ple_worker,
++        "set_current_vllm_config",
++        lambda _config: contextlib.nullcontext(),
++    )
++    monkeypatch.setattr(ple_worker, "PleOffloadRunner", FakeRunner)
++    monkeypatch.setattr(ple_worker.zmq, "Context", lambda: zmq_context)
++    monkeypatch.setattr(ple_worker.signal, "signal", lambda *_args: None)
++    monkeypatch.setattr(ple_worker.torch.cuda, "is_initialized", lambda: False)
++    monkeypatch.setattr(
++        ple_worker,
++        "_unlink_ipc_socket",
++        lambda address: order.append(f"ipc.unlink:{address}"),
++    )
++
++    ple_worker.PleOffloadWorker.proc_main(
++        SimpleNamespace(),
++        num_workers=1,
++        ipc_addr=ipc_addr,
++        ready_pipe=ready_pipe,
++    )
++
++    assert order.index("socket.close") < order.index("context.term")
++    assert order[-1] == f"ipc.unlink:{ipc_addr}"
+diff --git a/vllm/v1/ple_offload/connector.py b/vllm/v1/ple_offload/connector.py
+index 085bec67a..6629b40ae 100644
+--- a/vllm/v1/ple_offload/connector.py
++++ b/vllm/v1/ple_offload/connector.py
+@@ -40,6 +40,69 @@ logger = init_logger(__name__)
+ _PROCESS_LIFETIME_REGISTERED_STORAGE: list[torch.Tensor] = []
+ 
+ 
++def _torch_shm_unlink(filename: bytes) -> bool:
++    """Use a torch shm-unlink helper when the installed build exposes one."""
++    for namespace in (torch, torch._C):
++        for helper_name in ("_shm_unlink", "_unlink_shm", "_unlink_shared_memory"):
++            helper = getattr(namespace, helper_name, None)
++            if helper is None:
++                continue
++            try:
++                helper(filename)
++            except FileNotFoundError:
++                return True
++            except OSError as error:
++                logger.warning(
++                    "Torch failed to unlink PLE shared memory %r: %s; "
++                    "falling back to os.unlink",
++                    filename,
++                    error,
++                )
++                return False
++            except (RuntimeError, TypeError):
++                # Private helper signatures vary; the filesystem fallback
++                # below has the same Linux shm_unlink namespace effect.
++                return False
++            return True
++    return False
++
++
++def _unlink_filename_shared_storage(tensor: torch.Tensor) -> None:
++    """Best-effort unlink of one already filename-shared CPU storage."""
++    try:
++        storage = tensor.untyped_storage()
++        if storage.device.type != "cpu" or not storage.is_shared():
++            return
++        try:
++            storage._get_shared_fd()
++        except RuntimeError:
++            # Filename-shared storages do not expose a shared fd. Only now is
++            # it safe to query the filename: doing so on ordinary or fd-shared
++            # storage would convert it to a new filename-backed allocation.
++            pass
++        else:
++            return
++        _, filename, _ = storage._share_filename_cpu_()
++        if not isinstance(filename, bytes):
++            filename = os.fsencode(filename)
++        path = os.path.join("/dev/shm", os.fsdecode(filename).lstrip("/"))
++    except Exception:
++        logger.warning(
++            "Failed to inspect a PLE shared-memory storage during teardown",
++            exc_info=True,
++        )
++        return
++
++    if _torch_shm_unlink(filename):
++        return
++    try:
++        os.unlink(path)
++    except FileNotFoundError:
++        pass
++    except OSError as error:
++        logger.warning("Failed to unlink PLE shared memory %s: %s", path, error)
++
++
+ @dataclass(frozen=True)
+ class _PendingPleOffloadRequest:
+     """Bind request metadata to its MRV2 D2H completion event."""
+@@ -718,8 +781,21 @@ class PleOffloadConnector:
+         if self._after_dummy and not torch.cuda.is_current_stream_capturing():
+             stream.synchronize()
+ 
++    def release_host_storage(self) -> None:
++        """Unlink host-storage names while retaining mappings and tensors."""
++        buffers = [
++            *self._host_output_bufs.values(),
++            *self._host_flags.values(),
++            self._input_ids_buf,
++            self._query_start_loc_buf,
++        ]
++        if self._ngram_context_buf is not None:
++            buffers.append(self._ngram_context_buf)
++        for buffer in buffers:
++            _unlink_filename_shared_storage(buffer)
++
+     def close(self) -> None:
+-        """Stop transport without releasing process-lifetime host storage."""
++        """Stop transport and unlink names, retaining host mappings."""
+         request_thread = self._request_thread
+         if request_thread is not None and request_thread.is_alive():
+             try:
+@@ -729,6 +805,8 @@ class PleOffloadConnector:
+             request_thread.join(timeout=5)
+         if request_thread is not None and request_thread.is_alive():
+             # The thread may still access the registered buffers or ZMQ context.
++            # It may also still race another process opening a shared name, so
++            # this deferred-cleanup branch must not unlink host storage.
+             logger.error("PLE request thread did not stop; deferring resource cleanup")
+             self._progress.close()
+             return
+@@ -751,3 +829,11 @@ class PleOffloadConnector:
+             self._zmq_ctx.term()
+             self._zmq_ctx = None
+         self._progress.close()
++
++        # NOTE: Graceful shutdown unlinks the PLE shared-memory names and the
++        # PLE ipc socket. The remaining 17 /tmp UUID sockets per boot are
++        # upstream vLLM VLLM_RPC_BASE_PATH behaviour; a tmpfiles/launch-profile
++        # sweep is recommended.
++        # Keep this last: unlinking preserves every existing CPU/CUDA mapping,
++        # but no transport user may still need to open a name at this point.
++        self.release_host_storage()
+diff --git a/vllm/v1/ple_offload/worker.py b/vllm/v1/ple_offload/worker.py
+index 290f54e80..ff937c0c5 100644
+--- a/vllm/v1/ple_offload/worker.py
++++ b/vllm/v1/ple_offload/worker.py
+@@ -86,6 +86,23 @@ logger = init_logger(__name__)
+ _PUBLISH_FENCE = threading.Lock()
+ 
+ 
++def _unlink_ipc_socket(ipc_addr: str) -> None:
++    """Best-effort unlink of the exact filesystem IPC endpoint PLE owns."""
++    if not ipc_addr.startswith("ipc://"):
++        return
++    path = ipc_addr.removeprefix("ipc://")
++    # PLE receives an absolute UUID path from get_open_zmq_ipc_path(). Avoid
++    # treating abstract or relative ZMQ addresses as filesystem ownership.
++    if not os.path.isabs(path):
++        return
++    try:
++        os.unlink(path)
++    except FileNotFoundError:
++        pass
++    except OSError as error:
++        logger.warning("Failed to unlink PLE IPC socket %s: %s", path, error)
++
++
+ def _publish_fence() -> None:
+     with _PUBLISH_FENCE:
+         pass
+@@ -425,6 +442,7 @@ class PleOffloadWorkerHandle:
+     death_writer: Connection | None
+     ready_pipe_reader: Connection | None
+     launch_deadline: float
++    ipc_addr: str | None = None
+ 
+     def close(self, *, graceful: bool = True) -> None:
+         """Release all process resources. Safe to call more than once."""
+@@ -455,6 +473,11 @@ class PleOffloadWorkerHandle:
+                 self.proc.wait(timeout=5)
+             except subprocess.TimeoutExpired:
+                 pass
++        # The child normally removes the endpoint in proc_main's finally.
++        # Once it has exited, this exact PLE-owned address is safe to remove as
++        # a fallback for SIGKILL or an interrupted child cleanup.
++        if self.proc.poll() is not None and self.ipc_addr is not None:
++            _unlink_ipc_socket(self.ipc_addr)
+ 
+ 
+ def _init_offload_distributed() -> None:
+@@ -554,6 +577,7 @@ class PleOffloadWorker:
+             death_writer=death_writer,
+             ready_pipe_reader=ready_reader,
+             launch_deadline=launch_deadline,
++            ipc_addr=ipc_addr,
+         )
+         try:
+             config_for_launch: bytes | _FaultReconstructionPayload = config_payload
+@@ -662,6 +686,7 @@ class PleOffloadWorker:
+ 
+         zmq_context: zmq.Context | None = None
+         pull_socket: zmq.Socket | None = None
++        owns_ipc_socket = False
+         try:
+             # The flag lets PleOffloadLayer subclasses execute their complete
+             # constructors instead of becoming empty GPU-worker placeholders.
+@@ -696,6 +721,7 @@ class PleOffloadWorker:
+             zmq_context = zmq.Context()
+             pull_socket = zmq_context.socket(zmq.PULL)
+             pull_socket.bind(ipc_addr)
++            owns_ipc_socket = True
+             logger.info(
+                 "Bound IPC address %s; waiting for %d GPU worker registration(s).",
+                 ipc_addr,
+@@ -733,6 +759,8 @@ class PleOffloadWorker:
+                 pull_socket.close(linger=0)
+             if zmq_context is not None:
+                 zmq_context.term()
++            if owns_ipc_socket:
++                _unlink_ipc_socket(ipc_addr)
+             if ready_writer is not None:
+                 ready_writer.close()
+ 
+-- 
+2.47.3
+

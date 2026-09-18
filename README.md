@@ -1,321 +1,395 @@
-# Qwen3.8-Flash-Next at 262K on 4× RTX 3090
+# Qwen3.8-Flash-Next at 806K KV on 4× RTX 3090
+
+*v2.0.1: an 806,792-token KV pool with 262,144-token requests — three full-context sessions resident on four consumer cards — and structured output that holds under concurrency.*
 
 Qwen3.8-Flash-Next (125B MoE, ~6B activated per token, plus a 51B n-gram embedding table and a 4B MTP
 head; Gated DeltaNet linear attention, 512 experts, vision tower) served with vLLM at its **full
 262,144-token context** on four consumer Ampere cards, as the daily model behind a
-[hermes](https://github.com/NousResearch/hermes-agent) agent: long tool-calling sessions, an orchestrator
-plus a subagent in flight, images in the context.
+[hermes](https://github.com/NousResearch/hermes-agent) agent.
 
-Two things make it work. A calibrated **FP8 E4M3 KV path for the sparse-attention layers that Ampere
-can actually run**, holding **307K tokens of KV** next to 18.5 GiB of weights per card; BF16 KV at this pin
-was not measured, and the 1.48× ratio measured at 32K puts it short of one 262K request. And a decode step made to carry more tokens: full cudagraph coverage plus
-three-token speculative decoding, so single-stream decode is **163–174 tok/s and flat from 4K to 260K
-prompt tokens**.
+**v2.0.1** (2026-09-18) is the v2 shape plus one engine fix, [structured output under concurrency](#what-changed-in-v201). **v2** (2026-09-17) keeps everything the [v1 release](#v1-the-tp4-lane) established (calibrated FP8 KV for the
+sparse-attention layers, full cudagraphs, three-token speculative decoding) and changes the shape: **tensor
+parallel 2 × pipeline parallel 2** with expert parallel, the FP8 n-gram table served to the GPUs over a
+**host-mapped, fail-closed pull transport**, and, the piece that is entirely ours, **the token-embedding tables
+of both the target model and the MTP drafter moved out of VRAM into pinned host memory**, read by a device-mapped
+lookup that runs inside the captured cudagraph. The KV pool goes from 342,912 tokens (1.31 full-context requests) to **806,792 tokens: three 262K sessions
+resident at once**, single-stream decode at parity with the TP4 lane on the thinking lane, prefill 10–26 %
+faster. The v2-versus-v1 table below comes from the pre-registered two-arm gate that qualified v2
+([`benchmarks/2026-09-17/BENCH-CARD.md`](benchmarks/2026-09-17/BENCH-CARD.md)); v2.0.1 was requalified against those
+medians (maintainer-reported, below); capacity, memory, fault and prefix-cache figures are maintainer-reported from
+the campaign's close records, which are not published.
 
 [![GPU](https://img.shields.io/badge/GPU-4x_RTX_3090-76B900?logo=nvidia&logoColor=white)](#hardware)
-[![Context](https://img.shields.io/badge/context-262K_served-ffb000)](#the-kv-budget)
-[![KV cache](https://img.shields.io/badge/KV-FP8_E4M3_calibrated-0969da)](#the-kv-budget)
+[![Context](https://img.shields.io/badge/context-262K_per_request-ffb000)](#the-kv-budget)
+[![KV pool](https://img.shields.io/badge/KV_pool-806%2C792_tokens-0969da)](#the-kv-budget)
+[![Shape](https://img.shields.io/badge/TP2_x_PP2-%2B_EP-6f42c1)](#stack)
 [![MTP](https://img.shields.io/badge/MTP-K%3D3-6f42c1)](#benchmarks)
-[![Vision](https://img.shields.io/badge/Vision-on-6f42c1)](#stack)
 [![Checkpoint](https://img.shields.io/badge/%F0%9F%A4%97_checkpoint-Qwen3.8--Flash--Next--W4A16--Merlin-ffd21e)](https://huggingface.co/halt95/Qwen3.8-Flash-Next-W4A16-Merlin)
 
-> **Evidence boundary.** The bench cards (`benchmarks/2026-09-05/`, `benchmarks/2026-09-08/`) are maintainer
-> measurements with live fingerprints; the drivers, raw streams and gate logs are not included. What you can
-> reproduce independently is the sidecar (`calib/dumps-…`; the merge reproduces the file) and the build.
-> Every other number (prefix-cache timings, needle depths, quality tables, packing steps, gate results,
-> build timings) is maintainer-reported from runs whose logs are not in this release. The checkpoint is
-> on Hugging Face: [halt95/Qwen3.8-Flash-Next-W4A16-Merlin](https://huggingface.co/halt95/Qwen3.8-Flash-Next-W4A16-Merlin);
-> the packers and the deep-context harness are not yet published.
+> **Evidence boundary.** The v2 card is a maintainer measurement on the reference host with a frozen,
+> hash-pinned manifest; the bench card is published, the underlying close records, raw streams and boot logs are
+> not (as for v1). The v2.0.1
+> requalification figures are maintainer-reported and their record is not published; the two upstream pull
+> requests the fix ports are public and can be read independently. What you can reproduce independently: the
+> source tree (commit **and** tree hash, from the public upstream commit plus the bundle shipped as a release
+> asset), the environment (199 pinned packages), the sidecar, and the serve command. Everything else is
+> maintainer-reported. Five behaviours of the architecture's upstream implementation are **documented, not
+> fixed**; tracked issues #18 and #20 remain open — read
+> [Known behaviours](#known-behaviours-of-the-qwen38-flash-next-architecture-in-vllm) before serving.
+
+## What changed in v2.0.1
+
+**Structured output now works under concurrency.** In v2, a `response_format` request could fail with HTTP 500 while
+other requests were decoding, because the draft hand-off kept a single unidentified slot that the alternating
+pipeline-parallel microbatch overwrote; the `-1` placeholders left behind gave the grammar bitmask an all-allowed row
+and the unconstrained token then failed the state machine. v2.0.1 ports two upstream changes that fix it at the source:
+**PR #54442**, which refuses to leave an unmasked row for a draft slot the scheduler did not schedule, and **PR #56802**,
+which keys draft snapshots by scheduler step so a request is verified against the drafts its own step consumed.
+
+Measured on the reference host with the shipped serve command, 80 structured requests across four load cells (one, two
+and three concurrent decodes with thinking on, and two with thinking off), 10 idle and 10 under load in each:
+
+| Concurrent decodes | Thinking | v2 under load | v2.0.1 under load |
+|---|---|---|---|
+| 1 | on | 8/10 | 10/10 |
+| 2 | on | 1/10 | 10/10 |
+| 3 | on | 2/10 | 10/10 |
+| 2 | off | 6/10 | 10/10 |
+
+Idle was 10/10 in every cell on both. Every v2.0.1 response body validated against its schema; the engine logged no
+grammar rejection and no terminated request anywhere in the run. No throughput regression was measured: on the
+reference host's two-boot ladder across 4K, 32K, 131K and 261K in both thinking modes, v2.0.1 lands between 0.978 and
+1.028 of the v2 median, with median inter-token latency within 0.21 ms and tokens per step unchanged. The
+prefix-cache equivalence block was re-run too and fails identically on v2 and v2.0.1 (same three cells, same cache-hit
+total, 51/51 answers correct on both): that is open issue [#20](#known-behaviours-of-the-qwen38-flash-next-architecture-in-vllm),
+unchanged by this fix.
+
+Nothing else about the release changes: same checkpoint, same serve command, same KV budget, same pool of 806,792
+tokens. Upstream PR #43650 is deliberately **not** ported, because this tree's cache coordinator already caps a Mamba
+cache hit at the attention groups' post-drop length and dropping again would shrink every warm hit for no gain.
+The requalification record is not published; the two upstream pull requests
+([#54442](https://github.com/vllm-project/vllm/pull/54442), [#56802](https://github.com/vllm-project/vllm/pull/56802),
+for [issue #54437](https://github.com/vllm-project/vllm/issues/54437)) are the independently readable evidence.
+
+## Quick start (container)
+
+The release form of v2 is one image that builds the pinned tree and serves it. Host requirements: four 24 GB Ampere cards
+with peer-to-peer working on your driver, `nvidia-container-toolkit`, host RAM (96 GB is the qualified allocation; the
+measured resident floor is about 69 GiB, see [Hardware](#hardware)), and the checkpoint
+[halt95/Qwen3.8-Flash-Next-W4A16-Merlin](https://huggingface.co/halt95/Qwen3.8-Flash-Next-W4A16-Merlin) on disk (116 GiB).
+
+```bash
+git clone https://github.com/halt95/qwen38-flash-next-3090s.git && cd qwen38-flash-next-3090s
+docker build -t qwen38-flash-next-3090s:v2.0.1 .      # fetches the v2.0.1 bundle + the pinned wheel; no compiler, no CUDA toolkit
+MODEL_DIR=/path/to/Qwen3.8-Flash-Next-W4A16-Merlin docker compose up -d
+curl -s localhost:8000/v1/chat/completions -H 'Content-Type: application/json'   -d '{"model":"flash-next","messages":[{"role":"user","content":"hello"}],"max_tokens":64}'
+```
+
+The first start compiles the cudagraphs (about 10 minutes) into the `flash-next-cache` volume; later starts take about
+three minutes. The entrypoint adds the one config key the checkpoint needs if it is missing (see
+[Checkpoint](#checkpoint)). Everything the container does is in `Dockerfile`, `docker-compose.yml` and
+`scripts/docker-entrypoint.sh`; the same three scripts run without Docker ([Build and serve](#build-and-serve)).
+**Proxmox instead of Docker.** The reference host runs this as a **privileged** Debian 13 LXC with the four cards passed
+through as device nodes; `lxc/` reproduces that: `lxc/pve-create.sh` (run on the Proxmox host: template, cores, 96 GB,
+the seven `/dev/nvidia*` nodes, checkpoint and cache mounts), `lxc/provision.sh` (run inside: NVIDIA userspace matching the
+host module, the pinned build, the config key, a systemd unit) and `lxc/flash-next.service`.
+
+Two things about the LXC route are easy to get wrong. The container is privileged on purpose: in an unprivileged one
+root is mapped to a high uid and `/dev/nvidia-uvm-tools` is `0660 root:root`, so the container cannot open it even
+though the cgroup rule allows the device. And the `/dev/nvidia*` nodes must already exist **on the Proxmox host**
+before the container starts, because the kernel module lives there and only its userspace goes inside; running
+`nvidia-smi -L` once as root creates the full set, while `nvidia-modprobe -u -c0` alone leaves out the uvm nodes.
+Neither survives a host reboot on its own, so the reference host drives both from a Proxmox pre-start hookscript
+(which also refuses to start the container while a GPU VM holds the cards).
+
+```bash
+CTID=201 MODELS=/tank/models lxc/pve-create.sh                      # on the Proxmox host
+pct start 201 && pct push 201 lxc/provision.sh /root/provision.sh
+pct exec 201 -- env NVIDIA_RUN=/models/NVIDIA-Linux-x86_64-<host version>.run bash /root/provision.sh
+```
+
+**If you already have a vLLM checkout, do not start the server next to it.** vLLM inspects the model registry in a
+child process started with `python -m`, which puts the current directory ahead of `PYTHONPATH` on `sys.path`. A
+`vllm/` directory beside you therefore wins over the tree you built, and the failure surfaces much later as
+something unrelated, typically `AttributeError: '_ModelInfo' object has no attribute ...`. `scripts/serve-v2.sh`
+now refuses to start in that situation and tells you what to do; the container form cannot hit it at all.
+
+Read [Known behaviours](#known-behaviours-of-the-qwen38-flash-next-architecture-in-vllm) before putting it in front of clients.
 
 ## At a glance
 
-Both columns are the reference host's llama-swap entries, measured 2026-09-08 through the front door,
-the served entry on the shipped sidecar.
-
-| | served entry: MTP K=3, Merlin checkpoint | no-MTP fallback entry (VnimanieAI-lineage checkpoint) |
+| | **v2** | v1 TP4 build (same gate, same box; † see the note under the table) |
 |---|---|---|
-| context | **262,144** | 262,144 |
-| KV pool, FP8 tokens, whole box | **307,487** (1.17× a full-context request) | 284,359 |
-| decode, single stream, 4K / 32K / 131K / 260K prompt | **166 / 174 / 172 / 163** tok/s | 78 / 78 / 77 / 78 |
-| time to first token, same depths | 0.9 / 7.0 / 32.0 / 75.7 s | 0.8 / 6.5 / 30.5 / 72.7 s |
-| same 100K prompt again (prefix cache, 2026-09-02) | 1.6 s instead of 41 s | 0.7 s |
-| needle retrieved exactly at | 259K (2026-09-03 K=2 gate); 207,495 tokens in the shipped-sidecar gate | 259K (2026-09-03 K=2 gate) |
-| concurrent sequences (`max-num-seqs`; the pool holds ~1.2 full-context requests, not 2 or 4) | 2 | 4 |
+| shape | TP2 × PP2 + expert parallel, MTP K=3 | TP4 + EP, MTP K=3 |
+| KV pool, FP8 tokens, whole box | **806,792** (3.08 × a full-context request; three 262K sessions resident, measured) | 342,912 (1.31 ×) |
+| context per request | 262,144 | 262,144 |
+| concurrent sequences admitted | **8** (3 × 262K, 1 × 262K + 3 × 131K, 5 × 131K, 8 × 65K, 8 × 32K all resident) | 2 |
+| decode, single stream, thinking on, 4K / 32K / 131K / 261K prompt | **162 / 166 / 169 / 176** tok/s (medians of 5 boots) | 163 / 165 / 172 / 170† |
+| decode, thinking off, same depths | 118 / 123 / 123 / 125 | 124 / 122 / 120 / 125† |
+| median event interval, thinking on, same depths | 18.72 / 18.73 / 19.10 / 19.33 ms | 18.61 / 18.73 / 19.17 / 19.37† ms |
+| MTP tokens per step, thinking on, same depths | 3.02 / 3.07 / 3.13 / 3.28 | 3.00 / 3.04 / 3.17 / 3.24† |
+| prefill, 10K / 100K / 261K prompt | **4,944 / 5,282 / 5,122** tok/s | 4,498 / 4,194 / — |
+| time to first token, cold, 4K / 32K / 131K / 261K | 0.91 / 6.19 / 24.77 / 50.68 s | 0.97 / 7.16 / 31.94 / — s |
+| quality vs the BF16 teacher (24 held-out prompts, 5 boots; lower is closer) | 0.0365–0.0378 | 0.0378–0.0385 |
+| tool-call structure (150 cases) / exact recall (160 cases) | 130/150 / 160/160 | reference quant 125/150 / 160/160 (parity band, ≥ ref − 2) |
 | vision | on, 2 images per request | on |
-| weights per card | 18.5 GiB | 18.1 GiB (the packed VnimanieAI checkpoint, measured on its MTP launch) |
 
-Decode is the decode-window rate, (tokens − 1) ÷ (last token − first token), client-timed over a streamed
-completion of up to 256 tokens, three repeats, a fresh nonce per prompt so nothing is cached, the entry's
-own sampling and thinking defaults.
+† v1 at 261K was measured on 2026-09-18, after the gate, in one boot with three sends (170.1 / 124.6 tok/s; median event
+interval 19.37 / 19.40 ms; 3.24 / 2.39 tokens per step, thinking on / off). Every other v1 cell is a median of five boots;
+the 261K depth was preregistered for the v2 arm only, so v1 prefill and time to first token at that depth are not measured.
+
+Decode is the streamed event rate over the answer, client-timed at T=0 with a fixed seed (the gate's protocol; the
+served entry defaults to T=1.0 / top-p 0.95 / top-k 20 and the numbers were not re-measured under those defaults,
+nor under the served entry's request-logging-off flags). With MTP the honest pair is the **median event interval** (v2 18.7 / 18.7 / 19.1 ms vs v1 18.6 / 18.7 / 19.2 at 4K / 32K /
+131K) and **tokens per step** (3.02 / 3.07 / 3.13 vs 3.00 / 3.04 / 3.17), both in the card.
 
 ## Hardware
 
-This is a 3090 system. Every number in this repo comes from this box.
-
-| resource | this box |
+| resource | reference host |
 |---|---|
-| GPU | 4× NVIDIA GeForce RTX 3090 (Ampere sm_86, 24 GB each), **220 W** power cap, no NVLink bridge |
-| motherboard | HUANANZHI H12D-8D V2.0 (AMD SP3, four PCIe 4.0 x16 slots), AMI BIOS 2.2 (2026-01) |
-| CPU / RAM | AMD EPYC 7532 (32-core Rome), 192 GB ECC RDIMM; the serving container is limited to 96 GB, and the ~48 GiB FP8 PLE table lives in that host RAM |
-| PCIe | Gen4 x16 to every card (`LnkSta: 16GT/s x16` on all four) |
-| driver | NVIDIA 610.43.02 with the open-kernel-module P2P patch, hence `VLLM_SKIP_P2P_CHECK=1` / `NCCL_P2P_LEVEL=SYS` in the launch |
-| OS / serving | Linux container on a Proxmox host, vLLM behind llama-swap; the scripts here run the same engine directly |
+| GPU | 4× NVIDIA GeForce RTX 3090 (Ampere sm_86, 24 GB each), **220 W** power cap, no NVLink |
+| PCIe | Gen4 x16 to every card; P2P over the aikitoria open-kernel-module patch (`VLLM_SKIP_P2P_CHECK=1`, `NCCL_P2P_LEVEL=SYS`) |
+| CPU / RAM | AMD EPYC 7532, 192 GB ECC; the serving container is allocated **96 GB**, the qualified figure. Measured resident floor on the v2.0.1 container: about **69 GiB** = the ~48 GiB FP8 n-gram table (anonymous memory in the offload process) + ~4.2 GiB of pinned embedding tables (1,064 MiB per rank) + ~8 GiB of shared segments + ~8 GiB across the four workers, engine core and API server; the remaining ~34 GB is checkpoint page cache and reclaimable. The boot peak was not measured, so treat 80 GB as the sensible minimum and 64 GB as not enough |
+| disk, `/dev/shm` | ≥ 250 GB free (the checkpoint is 116 GiB); `/dev/shm` ≥ 1 GB (maintainer-measured peak +30.6 MB per boot; a `Bus error` at boot means it is undersized) |
+| OS / serving | Linux container on Proxmox, vLLM behind llama-swap; the scripts here run the same engine directly |
 
 ## The KV budget
 
-One full-context request plus room to breathe. Where each card's ~23.6 GiB goes on the served entry:
+**806,792 tokens** at `--kv-cache-memory 4100000000` per rank, measured on every qualification boot. The
+per-request limit stays 262,144; the pool is the aggregate over concurrent requests. Where the room came from
+relative to TP4 at the same weights:
 
-| per card | GiB | note |
-|---|---:|---|
-| weights (experts INT4 g128, attention BF16, draft experts INT4, GDN projections INT8) | 18.5 | TP=4 + EP |
-| KV cache, pinned | 2.42 | `--kv-cache-memory 2600000000`; the profiler's own choice OOMs under concurrent deep prompts |
-| CUDA graphs | ~0.6 | FULL_AND_PIECEWISE, captures [1, 4, 8] |
-| PLE offload worker context | ~0.3 | the offload worker holds a context on every card |
-| prefill transients, headroom | ~1.7 | `--max-num-batched-tokens 2048`; 4096 engine-killed at a 207K prefill on an earlier budget and at 262K survived only with the KV pin lowered, peaking at 24.1 of 24 GiB |
+- **PP2 halves what each card duplicates.** With tensor parallel alone every card holds a slice of every
+  layer plus the whole non-sharded state; with two pipeline stages each pair of cards holds 25 / 23 of the 48
+  layers. The stage-0 pair keeps the vision tower and the target embedding, the stage-1 pair the MTP drafter and
+  the LM head, each built once instead of on all four (0.59 GiB per copy at TP2).
+- **The 51B n-gram (PLE) table is host-mapped.** The FP8 table stays in host RAM; a pull transport gives the
+  GPUs the rows they need per step through a pinned slot, with a fail-closed ownership protocol (a transport
+  fault kills the engine with a named cause rather than serving stale rows). The policy is wider than the transport:
+  on a PLE boot, any exception that escapes a worker's model step or sampling hard-kills that worker (`os._exit(1)`
+  with the cause on stderr) and its peers stop at the NCCL watchdog, where upstream would surface an engine error
+  and keep the process. The offload process keeps itself CUDA-free by patching torch internals
+  (`torch.cuda._lazy_init`, `torch.cuda.Stream.__new__`, `torch.Tensor.pin_memory`); a torch upgrade could disable
+  that guard silently, which is one more reason the pins are pins. Its cost is decode-neutral in the
+  card; its price was most of the engineering of the campaign.
+- **Token embeddings in pinned host memory** (`VLLM_HOST_EMBED_TABLE=1`, [our design, below](#host-resident-embeddings-inside-the-cudagraph)):
+  608 MiB of device memory freed per rank, the lever that lifted the pin from 3.8e9 (pool 748,255)
+  to 4.1e9 (pool 806,792).
+- The 4.1e9 pin is the highest that boots with a complete clean row set (measured on the qualification boots); 24/24 layer partitions and higher
+  pins fail on the tightest card (3.8e9 was the ceiling before the host-resident embeddings).
 
-FP8 KV versus BF16, measured on the 2026-08-27 lane at 32K with each dtype at its own profiler-chosen pin:
-FP8 391,955 tokens versus BF16 264,932, **1.48×**. A BF16 pool at the served pin was not measured; that ratio would
-put it near 208K, short of one full-context request. The 1.7× bytes-per-token figure is real but does not
-convert into a pool that holds up. Three things make the FP8 path serve rather than merely boot:
+Three 262K sessions resident with 302 of 317 blocks in use, three-way qualifying interval 8.41 s, is the
+capacity row of the gate (`P3F`).
 
-1. **A reader Ampere can run.** Triton on sm_86 has no `fp8e4nv` type; the dequant is integer bit
-   manipulation in registers plus FP16/BF16 arithmetic for the scale, ~5% decode cost. Against the BF16-KV
-   teacher, 1,495 teacher-forced tokens sat inside the BF16-vs-BF16 noise floor, and at 32K the FP8-KV + MTP
-   arm matched BF16-KV/no-MTP on HumanEval (156 vs 154 of 164), exact recall (160/160) and tool structure
-   (150/150).
-2. **Calibrated per-layer scales**, collected at the 262K shape and shipped as a sidecar. Without it the
-   FP8 path runs at scale 1.0.
-3. **A runtime clip counter inside the captured graph** (a Python-side counter is a silent no-op under
-   FULL cudagraph replay). On an earlier sidecar and counter revision, real traffic showed tens of clipped elements out of
-   ~10⁸ after a 207K prefill, while a known-bad sidecar fires thousands per layer within seconds; the
-   shipped sidecar's counts are in the gate table below.
+## Host-resident embeddings inside the cudagraph
+
+This is the v2 change that is ours end to end (patches `0037` and `0039` in `release/v2/patches/`, branch
+`v2-host-embed`; designed, reviewed and redesigned during the campaign). The model carries two bf16 token-embedding tables of
+248,320 × 2,560, one for the target and one for the MTP drafter; sharded over TP2 that is 0.59 GiB per copy per
+card, and at TP4 the copies were part of what capped the pool. v2 keeps both tables in **pinned host memory** and
+gives each rank a **device-mapped (UVA) lookup** over its shard: the same TP sharding, id masking and all-reduce as
+the device path, invalid ids yield zero rows, and the output is **bytewise identical** to the device table, signed
+zeros included (tests: real shard loader with no CUDA transient, TP2 bytewise masking + reduction, GPU capture and
+replay with three lookups in one graph).
+
+Why the obvious version does not work: the drafter's lookup sits **inside the FULL cudagraph of the draft step**, so a
+CPU-side gather (the first draft) cannot run there and was rejected in review; the lookup has to be a device
+operation over host-mapped memory that the graph can replay. The cost is a 1,064 MiB host allocation per rank
+(maintainer-measured)
+and a PCIe read per looked-up row; the card shows no decode penalty against the TP4 lane. It is on by default
+(`VLLM_HOST_EMBED_TABLE=1`) and can be turned off, which costs the 608 MiB per card back. One consequence worth
+knowing if you build from source: the flag is a torch compile-cache factor (the UVA and device drafter graphs must
+not share an AOT cache entry; patch `0068` registers it, and a pre-fix tree needs separate `VLLM_CACHE_ROOT`s per mode).
 
 ## Serving an agent
 
 | agent need | as served |
 |---|---|
-| a long session that keeps growing | 262,144 context; needle exact at 259K (2026-09-03 gate) and at 207,495 tokens in the shipped-sidecar gate; a cold 260K prompt reaches first token in ~76 s (prefill ~3,300–4,000 tok/s at depth) and decodes at the 4K rate |
-| the same context re-sent every turn | prefix caching on: a repeated 100K prompt returned in 1.6 s instead of 41 s (2026-09-02 entry). On the sibling Qwen3.8-27B lane, hits land in ~1.2K-token aligned blocks, so short shared prefixes did not hit in that test; expected here, not measured on this model |
-| an orchestrator and a subagent at once | 2 sequences admitted (the pool covers both only while their combined context fits ~307K tokens); generation aggregate 211–240 tok/s at 8K prompts, 217–233 at 16K, zero errors |
-| four subagents at shorter context | the same MTP K=3 checkpoint relaunched at `--max-num-seqs 4` with captures `[1,4,8,12,16,20]` (not the shipped entry, which admits 2): 386–403 tok/s at 8K, 389–393 at 16K, near-linear, zero errors, acceptance 2.40 on that greedy probe. The no-MTP entry at four streams reads ~255 |
-| tool calls, thinking, images | Qwen3 coder tool parser, Qwen3 reasoning parser with thinking on, 2 images per request, one OpenAI-compatible front door |
-| not dying at depth | a deep battery (text, 1–2 images, a needle at 200–259K depending on the run, two-stream decode) ran before each documented promotion; three configurations that passed every shallow test died at 200K+ prompt tokens and the battery caught them (maintainer-reported). An earlier K=2 served configuration once stalled for ~44 min on a ~260K request; fresh-process reruns completed normally and the cause is unknown; not reproduced on the shipped K=3 entry |
+| several long sessions at once | 8 sequences admitted; 3 × 262K, 1 × 262K + 3 × 131K, 5 × 131K, 8 × 65K and 8 × 32K all resident (shape ladder) |
+| the same context re-sent every turn | prefix caching on: a repeated 30K prompt reports 25,600 cached tokens, a repeated 131K prompt 124,800, salted controls 0; hits are 3,200-token aligned blocks with the last matched block dropped for the drafter, so prompts under two blocks (~6.4K tokens) cannot hit. See [#20](#known-behaviours-of-the-qwen38-flash-next-architecture-in-vllm) for the case that loses hits |
+| tool calls, thinking, images | Qwen3 coder tool parser, Qwen3 reasoning parser with thinking on at low effort, 2 images per request, one OpenAI-compatible front door |
+| a client that expects an answer every time | retry once on `finish_reason == "stop"` with 0 completion tokens ([#18](#known-behaviours-of-the-qwen38-flash-next-architecture-in-vllm)) |
+| not dying at depth | 14-cut fault campaign on the transport (fail-closed on every cut), stress sequence, memory profiles with three 262K sessions plus a burst, block-5 prefix-cache correctness under forced preemption (51/51 answers correct), all maintainer-run |
 
 ## Benchmarks
 
-As served on 2026-09-08, through the front door, no per-request overrides (thinking on at low effort, the
-entry's own sampling, an image in every depth prompt), the MTP entry on the shipped sidecar, which is the
-configuration `scripts/serve.sh` transcribes. Full card with CVs, live fingerprints and the integrity
-panel: [`benchmarks/2026-09-08/BENCH-CARD.md`](benchmarks/2026-09-08/BENCH-CARD.md). Zero errors on both
-entries. The clip counter logged 2 warning lines on the MTP entry over the whole run and none on the no-MTP
-entry, whose recorded environment has no counter enabled, so that zero means "not instrumented". Per-window
-acceptance was 2.43 on these image-bearing prompts, against 2.78 lifetime on text.
+The gate ran **five boots per arm, alternating v2 and v1 on the same box**, one frozen manifest, three sends
+per cell, judged as medians with a 0.97 rule per depth and a 0.90 floor per boot. Full card with every boot's
+numbers, the event intervals, tokens per step, the fingerprint and the environment:
+[`benchmarks/2026-09-17/BENCH-CARD.md`](benchmarks/2026-09-17/BENCH-CARD.md).
 
-The same protocol on 2026-09-05, before the sidecar was recalibrated, is in
-[`benchmarks/2026-09-05/BENCH-CARD.md`](benchmarks/2026-09-05/BENCH-CARD.md): the previous sidecar logged 38
-clip lines on the MTP entry (the later gate showed it clipping on most target layers), acceptance 2.37, and
-decode 163–174 tok/s across the depths. The two cards broadly agree; the deepest row moved from 174.4 to
-162.5 tok/s, more than either card's CV, and three repeats do not establish equivalence.
+| cell | verdict |
+|---|---|
+| decode, thinking on, 4K / 32K / 131K | 0.997 / 1.009 / 0.988 of v1 — **PASS** at every depth |
+| decode, thinking off, 32K / 131K | 1.008 / 1.024 — PASS |
+| decode, thinking off, **4K** | **0.952 — FAIL against the 0.97 rule**, shipped documented (a draft-acceptance effect of the shape, not a v2 patch: it is identical with the readers on or off): event interval identical (18.66 vs 18.64 ms), tokens per step 2.14–2.31 vs 2.31, clustered per boot; cause not established |
+| prefill 10K / 100K | +10 % / +26 % — PASS |
+| quality vs teacher | delta −0.0009, well inside the 0.0015 bound — PASS. (The earlier single-capture screen, gate 5, recorded **FAIL** and stays cited as such; G6 replaced it as the instrument) |
+| pool, capacity, tools, no-think, faults | PASS (see card) |
 
-### Decode does not fall with depth
+What the earlier candidates looked like: with the two instrumentation reader threads on and the default
+NCCL protocol, the thinking-on rows sat at 0.949 / 0.962 of v1 (event interval 19.10 vs 18.56 ms at 4K). The
+readers (a bounds-guard telemetry reader and the KV clip counter, each polling every 50 ms) cost ~0.3–0.5 ms
+per step on the pipeline's critical path; v2 ships them off and `NCCL_PROTO=LL` on, which is the whole
+difference (maintainer-measured).
 
-| prompt tokens | served MTP K=3: TTFT / decode | no-MTP: TTFT / decode | alesha-pro reference (no MTP): TTFT / decode |
-|---:|---|---|---|
-| ~4K | 0.9 s / **166** | 0.8 s / 78 | 2.1 s / 66 |
-| ~32K | 7.0 s / **174** | 6.5 s / 78 | 16.7 s / 65 |
-| ~131K | 32.0 s / **172** | 30.5 s / 77 | 71.3 s / 69 |
-| ~260K | 75.7 s / **163** | 72.7 s / 78 | 162 s / 66 |
+## Known behaviours of the Qwen3.8-Flash-Next architecture in vLLM
 
-Reference rows: `alesha-pro/qwen38-flash-next-4x3090`, `benchmarks/2026-08-28/raw/b5-decode`, PCIe Gen3,
-FULL_DECODE_ONLY, that project's own instrument (window closed at stream end, temperature 0), so a
-cross-configuration comparison.
+These are behaviours of the Qwen3.8-Flash-Next architecture as implemented upstream in vLLM (the hybrid
+Gated-DeltaNet / sparse-attention / MTP execution path and its hybrid KV manager). They are **not** introduced by
+this checkpoint's quantisation and not by the v2 patches: #18 is an upstream-reported class and was seen on the v1 TP4
+lane; #20 did not move across the five release candidates (v2.0.1 included) when the v2 deltas were bisected (a run on the unmodified
+upstream base is still owed); the ring-row death is in upstream code. v2 documents them, ships mitigations where
+one exists, and tracks them; none affects the correctness of answers in the gate.
 
-### Parallel streams
-
-Generation-only aggregate over the window in which every stream is decoding. The 1K column is the bench
-card's as-served protocol; the 8K/16K probes set their own sampling (thinking off, fixed 256–512 tokens)
-and are maintainer-reported. Rows are not one configuration: 1 and 2 streams are the served MTP K=3 entry;
-the 4-stream 8K/16K cells are that checkpoint relaunched at 4 sequences with captures `[1,4,8,12,16,20]`,
-which this repo does not ship; the 1K column is the 2026-09-08 card, entry named per cell.
-
-| streams | 8K prompt | 16K prompt | 1K prompt (2026-09-08 card, 512 out) |
-|---|---|---|---|
-| 1 | 120–128 | 119–130 | 123 |
-| 2 | 211–240 | 217–233 | **233** (114 per stream) |
-| 4 | **386–403** (4-seq relaunch) | **389–393** | 256 on the no-MTP entry (64 per stream) |
-
-The capture list must cover `seqs × (K + 1)`: on the earlier K=2 entry, captures [1, 3] left the 6-token
-two-stream step without a graph and throughput dropped to 18 tok/s per stream until [1, 3, 6] was served.
-
-### Draft length
-
-Swept on the served checkpoint, each arm alone, graph sizes [1, K+1, 2(K+1)] for K=3 and K=4; the K=2 arm
-was the then-served [1, 3] configuration. Maintainer-reported; ranges over three runs, not paired.
-
-| draft tokens K | accepted per step | KV pool | decode 4K / 32K / 131K | 2 streams | needle at 250K |
-|---|---|---|---|---|---|
-| 2 | 2.36 | 314K | 140–147 / 148 / 155–170 | 18 per stream (no 6-token graph) | exact |
-| **3 (served)** | 2.78 | 307K | **152–173 / 164–184 / 172–175** | 220 | exact |
-| 4 | 3.01 | 298K | 156–181 / 171–176 / 171–182 | 213 | exact |
-
-K=3 over K=2, comparing the ranges (bounds from unpaired ranges, not a confidence interval): about +3–24%
-at 4K, +11–24% at 32K, +1–13% at 131K, for 2% of the pool. K=4 raised acceptance with no clear speed
-advantage in these samples.
-
-### Quality, paired
-
-The 2026-09-03 gate compared the packed VnimanieAI lineage and the packed Intel lineage at the then-served
-shape (MTP K=2, captures [1, 3, 6], FP8 KV), paired per question, thinking off, temperature 0, McNemar on
-the disagreements. All three point estimates favoured Intel; none was individually significant
-(p = 0.11 / 0.34 / 0.44).
-
-| experts | weights per card | GSM8K-1319 | ARC-Challenge-1172 | MMLU-1000 | needle at 259K |
-|---|---|---|---|---|---|
-| VnimanieAI W4A16 g128, packed | 18.1 GiB | 95.68% | 96.93% | 86.60% | exact |
-| **Intel AutoRound W4A16 g128, packed (served)** | 18.5 GiB | 96.44% (+0.76) | 97.27% (+0.34) | 87.30% (+0.70) | exact |
-
-A cyankiwi AWQ g32 checkpoint was also tried: 20.9 GiB per card packed, out of memory at a 60K prefill,
-so it could not be gated at this shape.
+- **#18 — an occasional empty completion on a warm repeat of a long cached prefix** (upstream class: vllm-project/vllm #53912, prefix caching + speculative decoding on hybrid models; seen on the v1 TP4 lane too). HTTP 200,
+  `finish_reason: "stop"`, zero tokens: the first sampled token is EOS. Per boot, not per request (roughly one
+  boot in three on the no-MTP diagnostic shape; three empty warm completions in 23 gate boots across gate runs 1–4 on
+  the rc3/rc4 candidates, two of them on the v1 TP4 arm; none in the 10 boots of the final run). The cached bytes are proven identical between a call that flips and
+  the calls around it; the race is inside the flipping request's own forward, it needs pipeline parallel plus
+  async scheduling, and async scheduling is required with MTP under PP on this fork. Mitigation shipped: **retry
+  once**; it returned the correct answer in every observed case (a mitigation, not a guarantee; the rate on the
+  served profile is not measured). Maintainer-reported.
+- **#20 — prefix-cache blocks of sessions that finish while other long sessions are still decoding are dropped**
+  (upstream hybrid KV manager path). Not preemption (reproduced with zero preemptions). The variable that separates the
+  arms is the survivors' remaining decode: with 320-token outputs only the first-finished session loses its blocks,
+  with 2,048-token outputs every session does, and a single long session plus a burst retains everything. Free-block
+  state during the episode was not sampled, so eviction under pool pressure is not excluded. Reproduced on rc3, rc4 and
+  rc7 (one boot each, one shared compile cache); the one rc5 boot kept the last-finished session; re-run on v2.0.1 with
+  an identical failing set, identical cache-hit total and 51/51 answers correct. Cost: first-token latency on that
+  session's next turn; the answer is unaffected.
+- **Thinking-off decode at 4K** is 0.92–0.99 of the TP4 lane on every one of the five boots, four of them below the gate's 0.97 rule (above); it is the one cell that makes the judge's machine verdict for the run FAIL.
+- **A rare illegal-address engine death** (upstream sparse-attention code path; two occurrences over the whole campaign;
+  mechanism: a re-claimed, never-zeroed ring row read as a RoPE position). Bounds guards turn a recurrence into a named, counted failure when their reader is on;
+  the reader is **off by default**, so a masked fault at an always-fatal site is counted but never read or raised (`GUARD=warn` in `serve-v2.sh` turns the reader on at the cost
+  above). Not fixed; no rate is claimed.
+- **Greedy T=0 is not byte-reproducible** with this architecture (bf16 near-ties resolved differently by the sparse
+  indexer's top-k and the expert permutation); documented, accepted.
+- Fixed on the way and worth knowing if you run an older candidate: a worker hang at the end of very long
+  prefills (#17, the instrumentation readers deadlocking under the CUDA context lock; fixed in rc6, readers off
+  in v2) and the upstream Mamba admission-estimate regression (#57050, ported in rc4).
 
 ## Checkpoint
 
-Published at [halt95/Qwen3.8-Flash-Next-W4A16-Merlin](https://huggingface.co/halt95/Qwen3.8-Flash-Next-W4A16-Merlin)
-with the sidecar and its model card. It is assembled, not trained:
+The same checkpoint as v1, [halt95/Qwen3.8-Flash-Next-W4A16-Merlin](https://huggingface.co/halt95/Qwen3.8-Flash-Next-W4A16-Merlin)
+(Intel AutoRound INT4 g128 experts, the RadixArk FP8 n-gram table, MTP draft experts INT4 and GDN projections
+INT8 packed in place, attention BF16; lineage in its model card), **plus one config key**: v2 keys the FP8
+n-gram table on `ple_embedding_dtype: float8_e4m3fn` inside the `text_config` object of `config.json` (the engine reads its text config, so a top-level key does nothing) instead of the `VLLM_PLE_FP8_GLOBAL_SCALE`
+environment variable v1 used (the env opt-in is still honoured for a checkpoint without the key). `scripts/make-e1-config.py` adds it; every weight file stays byte-identical
+(the reference host's serving copy is hard links to the published shards, verified 2026-09-17). Shard hashes are not
+published here; the Hugging Face checkpoint carries them, and the v2 delta is the one config key above.
 
-1. experts from [Intel/Qwen3.8-Flash-Next-W4A16-AutoRound](https://huggingface.co/Intel/Qwen3.8-Flash-Next-W4A16-AutoRound)
-   (INT4 g128 symmetric), converted losslessly from `auto_round:auto_gptq` to compressed-tensors;
-   attention projections kept BF16 as Intel shipped them;
-2. the ~48 GiB FP8 n-gram (PLE) embedding table from
-   [RadixArk/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/RadixArk/Qwen3.8-Flash-Next-NVFP4), replacing
-   Intel's 102 GB BF16 shard, CPU-offloaded;
-3. **in-place packing of the BF16 tensors both leave behind**: the MTP draft experts to INT4 g128 and the
-   Gated DeltaNet projections (`in_proj_qkv`, `in_proj_z`, `out_proj`) to INT8 per-channel, −1.3 GiB per
-   card, packing gate non-inferior on task accuracy and needle (earlier lineage), greedy agreement 98.1 → 97.4%. Each pack has a fail-closed
-   audit through the consumer library's own unpacker (a self-consistent round-trip through our own code
-   once served noise: compressed-tensors nibbles are offset-unsigned, not two's complement);
-4. calibrated FP8 KV scales for the 12 sparse-attention layers, collected at the 262K shape.
-
-No VnimanieAI tensors are in it; that lineage is the baseline it replaced. The 117 self-attention tensors
-stay BF16: packing them would buy ~0.37 GiB per card on a lane that already holds its design point, was
-not evaluated for speed or quality, and could introduce error on the one path every token takes.
+The KV scale sidecar is **the file v1 shipped**, `scales/qsa_kv_scales_262k.json` (Merlin-calibrated, margin
+1.10, sha256 `5cbe6ae8…`); the reference host serves the same bytes under the name
+`qsa_kv_scales_262k_merlin_v3_m110.json`. One file ships.
 
 ## Stack
 
-| component | setting |
+| piece | v2 |
 |---|---|
-| engine | vLLM v0.28.0 + the eight `peakcrosser7` Flash-Next commits + the six patches here |
-| parallelism | tensor parallel 4 + expert parallel |
-| KV cache | FP8 E4M3 with calibrated per-layer scales, pinned at 2.6 GB per card |
-| speculative decoding | MTP head, 3 draft tokens, probabilistic draft sampling |
-| CUDA graphs | `FULL_AND_PIECEWISE`, captures `[1, 4, 8]` (`seqs × (K+1)`) |
-| prefill | chunked, 2,048 tokens per step |
-| prefix caching | on |
-| vision | on, 2 images per request |
-| tool calls / reasoning | Qwen3 coder tool parser, Qwen3 reasoning parser, thinking on |
-| PLE | FP8 table in host RAM; offload worker homed on GPU 3, off rank 0's card, which was the FULL-capture OOM site at 262K |
+| vLLM | fork tag **`v2.0.1`** = `ad5c3c223999de577b04cdb9caeab2dcb76b61b9`: public nightly `e962733e08` (2026-09-10) + the peakcrosser7 PLE-offload branch (#53899) + #54793 / #54795 + 76 patches over `e2-base`, 71 ours and 5 carried upstream commits (`release/v2/patches/`, reading aid; build from the bundle); `release/v2/v2.0.1-combined.diff` is the same delta as one applyable diff |
+| compiled ops | upstream's at `f2e2936f9` (no C++ change in v2): the precompiled cu130 wheel `0.28.1rc1.dev450+gf2e2936f9` or the reference host's 22 extracted build products, both hash-pinned in `upstream/PIN-v2` |
+| environment | Python 3.13, torch 2.13.0+cu130, flashinfer 0.6.18.post1, 199 pins in `release/v2/requirements-pinned.txt`; CUDA runtime from the venv wheels (no toolkit needed to serve) |
+| shape | TP2 × PP2 + EP, `VLLM_PP_LAYER_PARTITION=25,23`, MTP K=3 probabilistic, FULL_AND_PIECEWISE cudagraphs with captures to 32, `max-num-seqs 8`, prefill chunk 1,024, KV pin 4.1e9, fp8_e4m3 KV with the sidecar, prefix caching, `NCCL_PROTO=LL`, `--shutdown-timeout 60` |
+| PLE table | host-mapped pull transport, home GPU 0, fail-closed (`VLLM_PLE_CPU_OFFLOAD=1`, `VLLM_PLE_OFFLOAD_HOME_DEVICE=0`) |
+| embeddings | pinned host tables on both stages (`VLLM_HOST_EMBED_TABLE=1`) |
+| instrumentation | bounds guards + KV clip counter compiled in, **off** in the served profile |
 
 ## Build and serve
 
-Everything needed to build the engine is here; the packers that produce the checkpoint follow later.
-
 | path | what |
 |---|---|
-| `upstream/PIN` + `upstream/pinned/` | the base: `vllm-project/vllm` at tag **v0.28.0**, the patched-tree hash, the compiled-ops wheel URL and its sha256; the files our patches touch, vendored as they stand after the upstream patches |
-| `patches/upstream/0001..0008` | the community Flash-Next support + PLE-offload commits, unchanged, with their authors |
-| `patches/0001..0006` | ours, `git am`-clean on that base: FP8 QSA reader + strict scale-sidecar loader, absmax collector, Ampere csrc declaration guard, clip counter, PLE home-device, routed-experts capturer |
-| `scripts/build.sh` | clone the tag, apply 8 + 6 patches, verify the vendored files and tree hash, download the pinned wheel and check its hash, install the tree against it, rebuild the sm_86 GDN decode kernel and assert its schema (`--no-csrc` to skip) |
-| `scripts/serve.sh` | the served entry with every variable exported; port, host and model aliases configurable; `NO_MTP=1` for a no-speculation entry |
-| `scales/qsa_kv_scales_262k.json` | the calibrated K/V scales for this checkpoint, 12 target-model layers, margin 1.10 |
-| `calib/` | how that sidecar was made: calibration launch, traffic script, rank-dump merge, and the four rank dumps |
+| `upstream/PIN-v2` | base commit, bundle prerequisites, tag commit and tree hash, precompiled-wheel identity and hash, artefact tarball hash |
+| `release/v2/patches/0001..0076` | the full series over `e2-base`, for reading; the history has merge commits, so `git am` cannot replay it (it stops at patch 43). Our own commits carry the maintainer's GitHub identity in the tagged history itself, so unlike v2 these copies are byte-identical to the reference package and verify against `SHA256SUMS.v2.0.1`; contributors whose work upstream authored keep their own attribution. The bundle remains the source of truth |
+| `release/v2/v2.0.1-combined.diff` | one `git diff e2-base..v2.0.1` (112 files, text only, 777 KiB): `git apply` it on `e2-base` and you have the tagged source; checked to apply cleanly and to give the tag's tree hash. The way to reproduce the tree from the patches directory without the bundle (`build-v2.sh` itself uses the bundle) |
+| `release/v2/requirements-pinned.txt`, `build-artifacts.list`, `SHA256SUMS.v2.0.1`, `PACKAGE-MANIFEST.md` | the environment pins, the 22 build products, the hashes of the release assets, the combined diff and the reference patch series (`cd release/v2 && sha256sum -c --ignore-missing SHA256SUMS.v2.0.1` verifies 78 of 81 from a checkout; the other three are the release assets), the file manifest |
+| `scripts/build-v2.sh` | fetch the three prerequisite commits from GitHub + the bundle (release asset), check out `v2.0.1`, assert commit and tree, fresh venv from the pins, compiled ops from the wheel or the tarball, metadata-only install. One prerequisite is a PR-branch head (#53899); if it ever disappears upstream the bundle alone cannot be applied — a full bundle is the fallback and is available on request |
+| `scripts/serve-v2.sh` | the served entry with every variable exported; port, host, names, PLE home, sidecar and cache dir configurable |
+| `Dockerfile`, `docker-compose.yml`, `scripts/docker-entrypoint.sh` | the container: `build-v2.sh` at image build (bundle from the release URL or the build context), `serve-v2.sh` as the entrypoint, checkpoint and cache as mounts, the config key added on first start if the mount is writable |
+| `lxc/pve-create.sh`, `lxc/provision.sh`, `lxc/flash-next.service` | the Proxmox LXC form of the same thing: create the container with the device nodes and mounts, provision it (NVIDIA userspace, `build-v2.sh`, config key, systemd unit), serve on boot |
+| `scripts/make-e1-config.py` | adds the one config key to the published checkpoint, inside `text_config`, and re-parses the result to prove it landed where the engine reads it |
+| `scales/qsa_kv_scales_262k.json`, `calib/` | the sidecar and how it was made (unchanged from v1) |
 
 ```bash
-scripts/build.sh ./vllm-src ./venv
-VENV=./venv HOST=0.0.0.0 scripts/serve.sh /path/to/Qwen3.8-Flash-Next-W4A16-Merlin
+# assets from the release page: v2.0.1-from-upstream-e962733e08.bundle(.gz), optionally build-artifacts-sm86-py313-cu130.tar.gz
+gunzip v2.0.1-from-upstream-e962733e08.bundle.gz
+BUNDLE=./v2.0.1-from-upstream-e962733e08.bundle scripts/build-v2.sh ./vllm-v2 ./venv-v2
+python scripts/make-e1-config.py /path/to/Qwen3.8-Flash-Next-W4A16-Merlin
+TREE=./vllm-v2 VENV=./venv-v2 HOST=0.0.0.0 scripts/serve-v2.sh /path/to/Qwen3.8-Flash-Next-W4A16-Merlin
 ```
 
-Requirements: Linux x86-64, git, curl, Python 3.10–3.14 with venv, CUDA 13 toolkit, gcc ≥ 11.3 (vLLM's
-CMake floor), and working GPU peer-to-peer on your driver, which the scripts assume and do not validate.
-The source and the compiled-ops wheel are pinned; python packages resolved by pip are not locked. The
-reference build resolved torch 2.13.0 and triton 3.7.1; the GDN decode kernel is rebuilt because the branch changed
-its signature. Maintainer-reported reproduction on the reference host from a fresh clone of the release tree: `build.sh`
-on an empty venv took 1,115 s and the server it produced passed the sidecar gate (4/4, 0 increments); the
-final patch revision was then rebuilt and gated again (row two below).
+Four known deltas between the gate command and the shipped one: the gate ran with `--enable-log-requests
+--enable-request-id-headers` (request logging on; the served entry has it off; no throughput effect is claimed either
+way); the served entry adds `--override-generation-config` (T=1.0 / top-p 0.95 / top-k 20) and
+`--default-chat-template-kwargs` (thinking on, low effort), which the gate did not pass (it sent T=0 with a seed per request);
+`serve-v2.sh` also exports `HF_DATASETS_OFFLINE=1`; and the reference host exports `LD_LIBRARY_PATH=/usr/local/cuda-13.3/...`, which is inert: every CUDA library the
+processes map comes from the venv wheels (`/proc/<pid>/maps` checked on a qualification boot), so `serve-v2.sh` does
+not set it.
 
-In `serve.sh`, the QSA variables, `VLLM_PLE_FP8_GLOBAL_SCALE` and `VLLM_PLE_OFFLOAD_HOME_DEVICE` come from
-the patches, the P2P/NCCL pair from the reference host's driver setup, and the explicit sampling override
-is the served entry's; the rest is stock vLLM. Do not set `PYTORCH_CUDA_ALLOC_CONF=expandable_segments`:
-in a memory-matched A/B on the no-MTP entry (2026-08-28), removing it took single-stream from 38.1 to
-43.2 tok/s and four-stream aggregate from 112.7 to 154.7.
+Requirements: Linux x86-64, git, curl, Python 3.13 with venv, four visible 24 GB NVIDIA GPUs with working
+peer-to-peer on your driver (assumed, not validated), host RAM (96 GB qualified; ~69 GiB measured floor), `/dev/shm` ≥ 1 GB. The first boot
+compiles the graphs (~10 min); later boots reuse `CACHE_ROOT`. (The reference host's qualification arms shared one compile cache across candidates; give production a v2-named cache root.) Reproduction on the reference host from the
+bundle: commit and tree equal to the tagged worktree, package hashes verified, fresh venv, one qualification
+boot 17/17 rows (maintainer-reported).
 
-### The scale sidecar
+Never reuse an existing venv for this tree, and do not set `PYTORCH_CUDA_ALLOC_CONF=expandable_segments`
+(v1 measured it at −27 % four-stream aggregate).
 
-`scales/qsa_kv_scales_262k.json` was calibrated on this checkpoint on 2026-09-08 with `calib/`: eager,
-no MTP, text at 1,971 / 7,989 / 31,975 / 127,805 / 199,888 / 254,875 prompt tokens plus image prompts
-at 2,848 and 8,841 tokens, then a flush phase so the collector's last dump (every 2,000 layer calls, not
-a timer) lands after the deepest request. The four rank dumps are in `calib/dumps-2026-09-08-merlin/`;
-merged at `--margin 1.10` they reproduce the shipped file byte for byte. A collection without the flush
-gave per-layer maxima within −6.0% to +6.3% of these (flush run against the no-flush run).
+Process model: the workers set `PR_SET_PDEATHSIG(SIGKILL)` so an engine-core death takes them with it, and non-fork
+start methods are refused. The death signal fires when the *thread* that spawned the workers exits, so an embedded
+engine must build its executor from a thread that outlives serving (the `vllm serve` path does). The port of the
+upstream MTP-under-PP change (#46994) carries the PR's code without its tests.
 
-Gated at the served shape (MTP K=3, FULL graphs, 262K, prefix caching on, served sampling), each arm a
-fresh server: single-stream 4K / 32K / 131K / 250K ×3, N=1 and N=2 ladder ×3, and the daily lane check
-(text, 1 image, 2 images, needle at 207,495 tokens with thinking on). Three alternatives got the same gate.
+Allocator warnings you may see: with several long sessions growing at once, the log can show
+`CUDACachingAllocator ... memory allocation failed with OOM on device N while trying to allocate <70–270 MB>` lines.
+They are warnings, not failures: the upstream sparse-attention indexer's prefill logits buffer (256 rows × context
+length × fp32, so 1 KiB per token of context, 268 MB at 262K) asked for a contiguous block the caching allocator
+could not find, the allocator flushed its cache and the retry succeeded. Maintainer-observed on the reference host (no shipped record) with three
+sessions climbing from 50K to 170K tokens: 22 lines, no request failed, device free dipped to 18–34 MB at the
+moment of the warning, and the lines stopped once the cache had been flushed at each size. If a retry ever fails, that is
+the non-KV headroom (about 1 GB per card at the shipped pin) being exhausted, and the KV pin is the knob.
 
-| sidecar | daily check | clip-counter increments during the gate | decode 4K / 32K / 131K / 250K, tok/s, 3 runs |
-|---|---|---|---|
-| **this file** (Merlin, margin 1.10, with flush) | **4/4** | **24**: layer 47 V +20, layer 3 V +2, layer 35 K +2 | 158–171 / 163–172 / 164–169 / 157–180 |
-| **this file**, served by a build from this repo (`build.sh` on a clean venv, final patch revision: strict loader, float32 clip ceilings) | **4/4** | **0** | 151–178 / 157–168 / 158–167 / 139–176 |
-| Merlin, margin 1.10, no flush | 4/4 | 6: layer 47 V | 157–169 / 160–172 / 160–182 / 164–176 |
-| Merlin, margin 1.0 | 4/4 | 210 across 9 of 12 layers | 158–172 / 170–179 / 161–166 / 167–172 |
-| previous sidecar (calibrated on the VnimanieAI lineage) | 3/4 once (needle answered empty); three rerun batteries 4/4, but the rerun needles were prefix-cache hits after the first, so one independent prefill per arm; cause undetermined | 496 across 9 layers (47 V +148, 35 K +66, 15 K/V +52/+48) | 163–170 / 162–178 / 158–165 / 156–178 |
+## How v2 got there
 
-Reading it: the counter increments per clipped element over every row the kernel touches, padded rows
-included, so a small residual is reported, not explained; hundreds across most layers versus a few dozen on
-three is the signal. Raw K/V absmax on this checkpoint differs from the VnimanieAI lineage's by −39% to
-+12% per layer, so the old sidecar's ceiling sat below this checkpoint's activations on several layers.
-Decode showed no resolved difference between arms at three samples per depth. The old sidecar's one empty
-needle answer did not reproduce; cause undetermined. The draft head's own attention layer is not in the
-sidecar and runs at scale 1.0.
+The three steps that account for the result (maintainer-reported):
 
-## How it got there
-
-Author's working record; the per-step numbers come from runs whose logs are not in this release, from
-different stages and configurations, some as wall throughput including prefill (earlier rows), some as
-decode-window throughput (later rows). They explain the configuration; they are not one controlled
-cumulative experiment.
-
-| step | decode | what it turned out to be |
+| step | result | what it turned out to be |
 |---|---|---|
-| FP8 KV reader for the sparse-attention layers | 43 tok/s | 1.48× more KV per card, ~5% decode cost |
-| remove one allocator env var | +13%, +37% at 4 streams | `expandable_segments` had drifted into the config |
-| profile the step with nsys | — | read as ~87% GPU idle, over half the busy time NCCL spin-waiting, by kernel-row summation; that instrument undercounts graph replays, and a 2026-09-05 re-measure put the lane at 91–93% GPU-busy |
-| vLLM 0.28 + full cudagraphs | **77** (+92%) | graph capture removed the launch jitter |
-| MTP head with full graphs | **110–120** (+51%) | first attempt passed every shallow test and died at 207K prompt tokens |
-| restore 262K | 112–125 | PLE worker context moved off the tightest card, prefill chunk halved |
-| pack draft experts INT4 + GDN INT8 | +4%, pool 262K → 314K | −1.3 GiB/card; two-stream collapse fixed by the capture list |
-| Intel AutoRound experts | −5% decode, +0.3–0.8 points paired | first conversion served garbage (nibble offset) |
-| three draft tokens per step | **154–169** (record headline +15–20%; ranges give +3–24% at 4K) | acceptance 2.36 → 2.78 |
+| PLE host-mapped **pull** transport | decode +4–10 % vs push on the complete re-run, pool **806,792** at 4.1e9 | the push transport paid a PCIe round trip per step; the pull transport's first cut leaked a 322 MiB CUDA context into the offload process (an aux stream bypassing lazy init), fixed |
+| **pinned-host token embeddings (ours)** | 608 MiB freed per rank → pin 3.8e9 → 4.1e9, pool 748K → 806,792 | the drafter lookup sits inside a full cudagraph, so a CPU gather was rejected; a device-mapped UVA lookup, bytewise-identical to the device table, ships instead |
+| the decode gap to TP4 (0.95–0.96) | closed: 0.997 / 1.009 / 0.988 | the two 50 ms reader threads on the PP1 critical path + NCCL protocol; the pipeline itself is serial (stage 0 computes ~9.4 ms then waits in the token broadcast; stage 1 waits ~7.8 ms then computes ~13.3 ms) |
 
-## What ships next
+## What ships next (v2.1)
 
-The in-place packers (MTP experts INT4, GDN projections INT8), the AutoRound-to-compressed-tensors
-converter, and the 16-gate deep-context harness.
+The #20 retention mechanism (the hybrid KV manager's free path under concurrent decode), the #18 racing pair
+(stream-fence / cloned-relay / all-gather interventions and a consumption-time generation check, plus upstream
+#43650 and #53919), the 4K thinking-off acceptance deficit, the true fix for the ring-row fault, and the
+packers / converter / deep-context harness that produce the checkpoint.
+
+## v1, the TP4 lane
+
+The v1 files stay in this repository as shipped (`scripts/build.sh`, `scripts/serve.sh`, `patches/`, `upstream/PIN`,
+`benchmarks/2026-09-05`, `benchmarks/2026-09-08`): vLLM v0.28.0 + the eight community commits + six patches,
+TP4 + EP, MTP K=3, KV pin 2.6e9 (2.9e9 = pool 342,912 since 2026-09-10). It remains the fallback entry on the
+reference host.
 
 ## Credit
 
 - Model: [Qwen/Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)
-- vLLM model support: the [`peakcrosser7` Flash-Next branch](https://github.com/peakcrosser7/vllm/commits/release/qwen38next_offload)
-  behind vLLM PRs [#53896](https://github.com/vllm-project/vllm/pull/53896) (merged 2026-08-31) and
-  [#53899](https://github.com/vllm-project/vllm/pull/53899) (PLE offload, open)
-- Quantised experts: [Intel/Qwen3.8-Flash-Next-W4A16-AutoRound](https://huggingface.co/Intel/Qwen3.8-Flash-Next-W4A16-AutoRound)
-  (served), [VnimanieAI/Qwen3.8-Flash-Next-W4A16](https://huggingface.co/VnimanieAI/Qwen3.8-Flash-Next-W4A16)
-  (no-MTP entry); FP8 PLE table from [RadixArk/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/RadixArk/Qwen3.8-Flash-Next-NVFP4);
-  MTP INT4 packing recipe adapted from [DominikBucko/qwen38-flash-next-2x3090](https://github.com/DominikBucko/qwen38-flash-next-2x3090)
-- Independent work on the same hardware class:
-  [alesha-pro/qwen38-flash-next-4x3090](https://github.com/alesha-pro/qwen38-flash-next-4x3090),
-  [noonghunna/club-3090](https://github.com/noonghunna/club-3090),
-  [tfriedel/qwen3.6-rtx3090-lab](https://github.com/tfriedel/qwen3.6-rtx3090-lab)
+- vLLM model support and PLE offload: the [`peakcrosser7` Flash-Next branch](https://github.com/peakcrosser7/vllm/commits/release/qwen38next_offload)
+  behind vLLM PRs [#53896](https://github.com/vllm-project/vllm/pull/53896) and [#53899](https://github.com/vllm-project/vllm/pull/53899);
+  upstream fixes carried ahead of the base: #54793 / #54795 (saichowdary007), the prefix-cache chain
+  #53614 #55747 #53945 #54713 #55450 (ZeldaHuang, yewentao256, akshaver, tobymao, lucamotz), #46994, #54709, #55745, #57050
+- Quantised experts: [Intel/Qwen3.8-Flash-Next-W4A16-AutoRound](https://huggingface.co/Intel/Qwen3.8-Flash-Next-W4A16-AutoRound);
+  FP8 PLE table: [RadixArk/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/RadixArk/Qwen3.8-Flash-Next-NVFP4);
+  MTP INT4 packing recipe adapted from [DominikBucko/qwen38-flash-next-2x3090](https://github.com/DominikBucko/qwen38-flash-next-2x3090);
+  P2P on consumer Ampere: aikitoria's open-kernel-module patch
+- Independent work on the same hardware class: [alesha-pro/qwen38-flash-next-4x3090](https://github.com/alesha-pro/qwen38-flash-next-4x3090),
+  [noonghunna/club-3090](https://github.com/noonghunna/club-3090), [tfriedel/qwen3.6-rtx3090-lab](https://github.com/tfriedel/qwen3.6-rtx3090-lab)
 
 ## License
 
-Code in this repository: Apache-2.0. Model weights follow the licences of Qwen and of the quantised
-sources credited above.
+Code in this repository (patches, scripts, calibration tooling, harness): Apache-2.0 (`LICENSE`); the vLLM
+fork is Apache-2.0 with the modified files listed in `NOTICE`. Model weights, including the quantised
+derivatives credited above, carry the Qwen Community License 1.0 (`LICENSE.qwen-community-1.0`); they are not
+part of this repository.

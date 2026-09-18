@@ -1,0 +1,538 @@
+From 5b7fd0e4c3d569c0045e12fbc13fd7d83bc50fcc Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Mon, 14 Sep 2026 19:06:57 +0000
+Subject: [PATCH 53/76] v2 teardown: reserve the shared counter before
+ unlinking PLE shm names (Astra P1); balanced-lifetime subprocess test (Astra
+ P2)
+
+Astra review of 3a407727ab (record flashnext-v2-teardown-fix-astra-r1-2026-09-14): after our
+manual unlink, RefcountedMapAllocator::close() still calls shm_unlink when a storage's shared
+counter reaches zero and raises on ENOENT - a C++ exception in a destructor, so a worker could
+abort at storage destruction (TP!=0 input buffers are not process-lifetime pinned). Reproduced:
+the round-2 balanced tests against the 3a407727ab connector abort the test process
+("Fatal Python error: Aborted", testlogs/shmfix-r2-red-on-3a407727ab.log).
+
+connector.py: _unlink_filename_shared_storage() now takes a per-connector reserved-filename set,
+calls storage._shared_incref() once per backing name before os.unlink (kept on success or ENOENT;
+rolled back with _shared_decref() on any other OSError; an incref failure returns without
+unlinking); repeated close()/release_host_storage() cannot reserve twice; the guessed torch
+helper-name probe is removed. Shutdown ordering, CUDA registrations and tensor references are
+unchanged; one reservation per backing allocation is deliberately left until process exit.
+
+tests/v1/ple_offload/test_shm_unlink.py: fixtures balance ForkingPickler dumps with loads;
+new test_close_balanced_filename_storage_lifetime_exits_cleanly runs the real close() ordering
+in a subprocess, drops every reference, collects, requires exit 0 and a repeated release;
+reservation-once and rollback tests on a fake storage (rollback assertion corrected by Fable:
+aliases retry a rolled-back name within one pass, so increfs == decrefs, nothing reserved).
+Green 12/12 focused; full tests/v1/ple_offload 138 passed / 1 skipped.
+Sol draft (sol-shm-fix-r2), Fable applied/tested.
+---
+ tests/v1/ple_offload/test_shm_unlink.py | 323 +++++++++++++++++++++---
+ vllm/v1/ple_offload/connector.py        |  78 +++---
+ 2 files changed, 328 insertions(+), 73 deletions(-)
+
+diff --git a/tests/v1/ple_offload/test_shm_unlink.py b/tests/v1/ple_offload/test_shm_unlink.py
+index 0073a4f5e..600a7bb7e 100644
+--- a/tests/v1/ple_offload/test_shm_unlink.py
++++ b/tests/v1/ple_offload/test_shm_unlink.py
+@@ -3,6 +3,8 @@
+ import os
+ from multiprocessing.reduction import ForkingPickler
+ from pathlib import Path
++import subprocess
++import sys
+ 
+ import pytest
+ import torch
+@@ -29,15 +31,6 @@ def _shm_path(tensor: torch.Tensor) -> Path:
+     return Path("/dev/shm") / os.fsdecode(filename).lstrip("/")
+ 
+ 
+-def _cleanup_paths(paths: list[Path]) -> None:
+-    # Keep red runs against the unpatched tree from leaking their test names.
+-    for path in paths:
+-        try:
+-            os.unlink(path)
+-        except FileNotFoundError:
+-            pass
+-
+-
+ def _make_connector_storage() -> tuple[PleOffloadConnector, list[torch.Tensor]]:
+     original_strategy = torch_mp.get_sharing_strategy()
+     torch_mp.set_sharing_strategy("file_system")
+@@ -69,15 +62,20 @@ def _make_connector_storage() -> tuple[PleOffloadConnector, list[torch.Tensor]]:
+             query_start_loc_buf=query_start_loc,
+             ngram_context_buf=ngram_context,
+         )
+-        # Match PleOffloadConnector._serialize_registration: this is what
+-        # fixes each file_system storage's final shared-memory name.
+-        assert ForkingPickler.dumps(registration)
++        # Match producer serialization and worker reconstruction. loads()
++        # consumes the transfer reference added by dumps(), leaving storage
++        # destruction able to reach the allocator's zero-counter branch.
++        payload = ForkingPickler.dumps(registration)
++        rebuilt_registration = ForkingPickler.loads(payload)
++        assert isinstance(rebuilt_registration, PleOffloadRegistration)
++        del rebuilt_registration
+     finally:
+         torch_mp.set_sharing_strategy(original_strategy)
+ 
+     connector = PleOffloadConnector.__new__(PleOffloadConnector)
+     connector._host_output_bufs = host_outputs
+     connector._host_flags = host_flags
++    connector._reserved_host_storage_filenames = set()
+     connector._input_ids_buf = input_ids
+     connector._query_start_loc_buf = query_start_loc
+     connector._ngram_context_buf = ngram_context
+@@ -95,43 +93,37 @@ def _make_connector_storage() -> tuple[PleOffloadConnector, list[torch.Tensor]]:
+ def test_release_host_storage_unlinks_names_but_keeps_mappings() -> None:
+     _require_file_system_shm()
+     connector, tensors = _make_connector_storage()
+-    paths: list[Path] = []
+-    try:
+-        for tensor in tensors:
+-            paths.append(_shm_path(tensor))
+-        before = [tensor.clone() for tensor in tensors]
+-        assert len(set(paths)) == 7
+-        assert all(path.exists() for path in paths)
++    paths = [_shm_path(tensor) for tensor in tensors]
++    before = [tensor.clone() for tensor in tensors]
++    assert len(set(paths)) == 7
++    assert all(path.exists() for path in paths)
+ 
+-        connector.release_host_storage()
++    connector.release_host_storage()
++    connector.release_host_storage()
+ 
+-        assert all(not path.exists() for path in paths)
+-        for tensor, expected in zip(tensors, before):
+-            assert torch.equal(tensor, expected)
+-            tensor.add_(1)
+-            assert torch.equal(tensor, expected + 1)
+-    finally:
+-        _cleanup_paths(paths)
++    assert all(not path.exists() for path in paths)
++    for tensor, expected in zip(tensors, before):
++        assert torch.equal(tensor, expected)
++        tensor.add_(1)
++        assert torch.equal(tensor, expected + 1)
+ 
+ 
+ def test_without_release_helper_names_remain(monkeypatch) -> None:
+     _require_file_system_shm()
+     connector, tensors = _make_connector_storage()
+-    paths: list[Path] = []
+-    try:
+-        for tensor in tensors:
+-            paths.append(_shm_path(tensor))
+-        with monkeypatch.context() as patch:
+-            patch.setattr(
+-                connector_module,
+-                "_unlink_filename_shared_storage",
+-                lambda _tensor: None,
+-            )
+-            connector.release_host_storage()
+-
+-        assert all(path.exists() for path in paths)
+-    finally:
+-        _cleanup_paths(paths)
++    paths = [_shm_path(tensor) for tensor in tensors]
++
++    with monkeypatch.context() as patch:
++        patch.setattr(
++            connector_module,
++            "_unlink_filename_shared_storage",
++            lambda _tensor, _reservations: None,
++        )
++        connector.release_host_storage()
++
++    # Do not manually unlink these while their unreserved storages are live.
++    # Normal storage destruction removes them after the test frame is released.
++    assert all(path.exists() for path in paths)
+ 
+ 
+ def test_release_host_storage_does_not_convert_fd_shared_storage() -> None:
+@@ -147,6 +139,7 @@ def test_release_host_storage_does_not_convert_fd_shared_storage() -> None:
+     connector = PleOffloadConnector.__new__(PleOffloadConnector)
+     connector._host_output_bufs = {"layer.0": fd_tensor}
+     connector._host_flags = {}
++    connector._reserved_host_storage_filenames = set()
+     connector._input_ids_buf = torch.arange(2, dtype=torch.int32)
+     connector._query_start_loc_buf = torch.arange(2, dtype=torch.int32)
+     connector._ngram_context_buf = None
+@@ -156,3 +149,249 @@ def test_release_host_storage_does_not_convert_fd_shared_storage() -> None:
+ 
+     assert fd_tensor.untyped_storage()._get_shared_fd() >= 0
+     assert torch.equal(fd_tensor, expected)
++
++
++class _FakeFilenameStorage:
++    def __init__(self, filename: bytes) -> None:
++        self.device = torch.device("cpu")
++        self.filename = filename
++        self.increfs = 0
++        self.decrefs = 0
++
++    def is_shared(self) -> bool:
++        return True
++
++    def _get_shared_fd(self) -> int:
++        raise RuntimeError("filename-backed storage has no shared fd")
++
++    def _share_filename_cpu_(self) -> tuple[bytes, bytes, int]:
++        return b"manager", self.filename, 4
++
++    def _shared_incref(self) -> None:
++        self.increfs += 1
++
++    def _shared_decref(self) -> "_FakeFilenameStorage":
++        self.decrefs += 1
++        return self
++
++
++class _FakeTensor:
++    def __init__(self, storage: _FakeFilenameStorage) -> None:
++        self.storage = storage
++
++    def untyped_storage(self) -> _FakeFilenameStorage:
++        return self.storage
++
++
++def _make_fake_connector(tensor: _FakeTensor) -> PleOffloadConnector:
++    connector = PleOffloadConnector.__new__(PleOffloadConnector)
++    # Repeat the same storage in several connector positions to cover aliases.
++    connector._host_output_bufs = {"layer.0": tensor}
++    connector._host_flags = {"layer.0": tensor}
++    connector._reserved_host_storage_filenames = set()
++    connector._input_ids_buf = tensor
++    connector._query_start_loc_buf = tensor
++    connector._ngram_context_buf = None
++    return connector
++
++
++def test_release_host_storage_reserves_each_name_once(monkeypatch) -> None:
++    storage = _FakeFilenameStorage(b"/ple-test-reservation")
++    connector = _make_fake_connector(_FakeTensor(storage))
++    unlinked: list[str] = []
++    monkeypatch.setattr(connector_module.os, "unlink", unlinked.append)
++
++    connector.release_host_storage()
++    connector.release_host_storage()
++
++    assert storage.increfs == 1
++    assert storage.decrefs == 0
++    assert unlinked == ["/dev/shm/ple-test-reservation"]
++
++
++def test_release_host_storage_rolls_back_on_unlink_failure(monkeypatch) -> None:
++    storage = _FakeFilenameStorage(b"/ple-test-rollback")
++    connector = _make_fake_connector(_FakeTensor(storage))
++
++    def fail_unlink(_path: str) -> None:
++        raise PermissionError("test unlink failure")
++
++    monkeypatch.setattr(connector_module.os, "unlink", fail_unlink)
++
++    connector.release_host_storage()
++
++    # The fake connector aliases one storage in four positions. A rolled-back
++    # reservation is retried by the next alias in the same pass (by design: the
++    # name is still present), so every reservation must be balanced by a
++    # rollback and nothing may stay reserved.
++    assert storage.increfs >= 1
++    assert storage.increfs == storage.decrefs
++    assert connector._reserved_host_storage_filenames == set()
++
++
++_BALANCED_LIFETIME_SCRIPT = r"""
++import gc
++import os
++from multiprocessing.reduction import ForkingPickler
++from pathlib import Path
++
++import torch
++import torch.multiprocessing as torch_mp
++
++from vllm.v1.ple_offload.connector import (
++    PleOffloadConnector,
++    _PROCESS_LIFETIME_REGISTERED_STORAGE,
++)
++from vllm.v1.ple_offload.protocol import PleOffloadRegistration
++
++
++def shm_path(tensor):
++    _, filename, _ = tensor.untyped_storage()._share_filename_cpu_()
++    return Path("/dev/shm") / os.fsdecode(filename).lstrip("/")
++
++
++class Progress:
++    def close(self):
++        pass
++
++
++original_strategy = torch_mp.get_sharing_strategy()
++torch_mp.set_sharing_strategy("file_system")
++try:
++    host_outputs = {
++        "layer.0": torch.arange(12, dtype=torch.float32)
++        .reshape(3, 4)
++        .share_memory_(),
++        "layer.1": torch.arange(8, dtype=torch.float32)
++        .reshape(2, 4)
++        .share_memory_(),
++    }
++    host_flags = {
++        name: torch.zeros(16, dtype=torch.int32).share_memory_()
++        for name in host_outputs
++    }
++    input_ids = torch.arange(16, dtype=torch.int32).share_memory_()
++    query_start_loc = torch.arange(5, dtype=torch.int32).share_memory_()
++    ngram_context = torch.arange(12, dtype=torch.int32).reshape(4, 3)
++    ngram_context.share_memory_()
++
++    registration = PleOffloadRegistration(
++        worker_id=1,
++        tp_rank=1,
++        dp_rank=0,
++        host_output_buffers=host_outputs,
++        host_flag_tensors=host_flags,
++        input_ids_buf=input_ids,
++        query_start_loc_buf=query_start_loc,
++        ngram_context_buf=ngram_context,
++    )
++    payload = ForkingPickler.dumps(registration)
++    rebuilt_registration = ForkingPickler.loads(payload)
++finally:
++    torch_mp.set_sharing_strategy(original_strategy)
++
++connector = PleOffloadConnector.__new__(PleOffloadConnector)
++connector._host_output_bufs = host_outputs
++connector._host_flags = host_flags
++connector._reserved_host_storage_filenames = set()
++connector._input_ids_buf = input_ids
++connector._query_start_loc_buf = query_start_loc
++connector._ngram_context_buf = ngram_context
++
++# Exercise the production close ordering without CUDA or transport setup.
++connector._request_thread = None
++connector._pinned_input_buffers = []
++connector._mapped_host_buffers = []
++connector._d2h_event_pool = object()
++connector._registration_socket = None
++connector._zmq_ctx = None
++connector._progress = Progress()
++
++tensors = [
++    *host_outputs.values(),
++    *host_flags.values(),
++    input_ids,
++    query_start_loc,
++    ngram_context,
++]
++assert len(tensors) == 7
++assert len({tensor.untyped_storage()._weak_ref() for tensor in tensors}) == 7
++
++# TP != 0 creates and serializes its input buffers without CUDA registration
++# or the process-lifetime reference used by TP0.
++unpinned_tp_input = input_ids
++assert not connector._pinned_input_buffers
++assert all(
++    unpinned_tp_input is not registered
++    for registered in _PROCESS_LIFETIME_REGISTERED_STORAGE
++)
++
++paths = [shm_path(tensor) for tensor in tensors]
++before = [tensor.clone() for tensor in tensors]
++assert all(path.exists() for path in paths)
++
++connector.close()
++connector.close()
++
++assert all(not path.exists() for path in paths)
++for tensor, expected in zip(tensors, before):
++    assert torch.equal(tensor, expected)
++    tensor.add_(1)
++    assert torch.equal(tensor, expected + 1)
++del tensor, expected
++
++# Remove every original and reconstructed tensor reference. With an unreserved
++# allocator this reaches counter zero after manual unlink and aborts the child.
++connector._host_output_bufs = {}
++connector._host_flags = {}
++connector._input_ids_buf = None
++connector._query_start_loc_buf = None
++connector._ngram_context_buf = None
++del connector
++del rebuilt_registration
++del registration
++del payload
++del unpinned_tp_input
++del tensors
++del before
++del host_outputs
++del host_flags
++del input_ids
++del query_start_loc
++del ngram_context
++gc.collect()
++
++assert all(not path.exists() for path in paths)
++"""
++
++
++def test_close_balanced_filename_storage_lifetime_exits_cleanly() -> None:
++    _require_file_system_shm()
++
++    # Resolve from the connector actually imported by this pytest process. This
++    # lets the red command run this patched test against an unpatched worktree.
++    import_root = Path(connector_module.__file__).resolve().parents[3]
++    env = os.environ.copy()
++    inherited_pythonpath = env.get("PYTHONPATH")
++    env["PYTHONPATH"] = (
++        os.pathsep.join((str(import_root), inherited_pythonpath))
++        if inherited_pythonpath
++        else str(import_root)
++    )
++
++    completed = subprocess.run(
++        [sys.executable, "-c", _BALANCED_LIFETIME_SCRIPT],
++        cwd=import_root,
++        env=env,
++        capture_output=True,
++        text=True,
++        timeout=60,
++        check=False,
++    )
++
++    assert completed.returncode == 0, (
++        "balanced PLE storage destruction failed "
++        f"(exit code {completed.returncode})\n"
++        f"stdout:\n{completed.stdout}\n"
++        f"stderr:\n{completed.stderr}"
++    )
+diff --git a/vllm/v1/ple_offload/connector.py b/vllm/v1/ple_offload/connector.py
+index 6629b40ae..d4b60407b 100644
+--- a/vllm/v1/ple_offload/connector.py
++++ b/vllm/v1/ple_offload/connector.py
+@@ -40,35 +40,11 @@ logger = init_logger(__name__)
+ _PROCESS_LIFETIME_REGISTERED_STORAGE: list[torch.Tensor] = []
+ 
+ 
+-def _torch_shm_unlink(filename: bytes) -> bool:
+-    """Use a torch shm-unlink helper when the installed build exposes one."""
+-    for namespace in (torch, torch._C):
+-        for helper_name in ("_shm_unlink", "_unlink_shm", "_unlink_shared_memory"):
+-            helper = getattr(namespace, helper_name, None)
+-            if helper is None:
+-                continue
+-            try:
+-                helper(filename)
+-            except FileNotFoundError:
+-                return True
+-            except OSError as error:
+-                logger.warning(
+-                    "Torch failed to unlink PLE shared memory %r: %s; "
+-                    "falling back to os.unlink",
+-                    filename,
+-                    error,
+-                )
+-                return False
+-            except (RuntimeError, TypeError):
+-                # Private helper signatures vary; the filesystem fallback
+-                # below has the same Linux shm_unlink namespace effect.
+-                return False
+-            return True
+-    return False
+-
+-
+-def _unlink_filename_shared_storage(tensor: torch.Tensor) -> None:
+-    """Best-effort unlink of one already filename-shared CPU storage."""
++def _unlink_filename_shared_storage(
++    tensor: torch.Tensor,
++    reserved_filenames: set[bytes],
++) -> None:
++    """Reserve and unlink one already filename-shared CPU storage."""
+     try:
+         storage = tensor.untyped_storage()
+         if storage.device.type != "cpu" or not storage.is_shared():
+@@ -93,13 +69,44 @@ def _unlink_filename_shared_storage(tensor: torch.Tensor) -> None:
+         )
+         return
+ 
+-    if _torch_shm_unlink(filename):
++    # RefcountedMapAllocator unlinks the name when its shared counter reaches
++    # zero. Reserve one count before manual unlink so later storage destruction
++    # cannot try to unlink the already-removed name. The filename identifies
++    # the shared counter and also deduplicates tensor aliases and repeated close.
++    if filename in reserved_filenames:
++        return
++    try:
++        storage._shared_incref()
++    except Exception:
++        logger.warning(
++            "Failed to reserve the PLE shared-memory counter for %s",
++            path,
++            exc_info=True,
++        )
+         return
++    reserved_filenames.add(filename)
++
+     try:
+         os.unlink(path)
+     except FileNotFoundError:
++        # Another teardown participant already removed the name. Retain the
++        # reservation because this allocator must still avoid a later unlink.
+         pass
+     except OSError as error:
++        # The name remains available, so restore the allocator's original
++        # counter and permit a later release attempt to retry.
++        try:
++            storage._shared_decref()
++        except Exception:
++            # The reservation state is uncertain after a failed private call.
++            # Keep it marked to avoid adding another reservation on retry.
++            logger.warning(
++                "Failed to roll back the PLE shared-memory counter for %s",
++                path,
++                exc_info=True,
++            )
++        else:
++            reserved_filenames.discard(filename)
+         logger.warning("Failed to unlink PLE shared memory %s: %s", path, error)
+ 
+ 
+@@ -148,6 +155,7 @@ class PleOffloadConnector:
+         # the shared storage to a new address.
+         self._host_output_bufs: dict[str, torch.Tensor] = {}
+         self._host_flags: dict[str, torch.Tensor] = {}
++        self._reserved_host_storage_filenames: set[bytes] = set()
+         self._gpu_output_bufs: dict[str, torch.Tensor] = {}
+         self._layers = self._setup_layers(vllm_config, model)
+         self._progress = PleProgressMonitor.from_environment(
+@@ -792,7 +800,10 @@ class PleOffloadConnector:
+         if self._ngram_context_buf is not None:
+             buffers.append(self._ngram_context_buf)
+         for buffer in buffers:
+-            _unlink_filename_shared_storage(buffer)
++            _unlink_filename_shared_storage(
++                buffer,
++                self._reserved_host_storage_filenames,
++            )
+ 
+     def close(self) -> None:
+         """Stop transport and unlink names, retaining host mappings."""
+@@ -830,6 +841,11 @@ class PleOffloadConnector:
+             self._zmq_ctx = None
+         self._progress.close()
+ 
++        # __init__'s failure handler can reach here before the child has rebuilt
++        # a registration. Startup is already failing in that case; if a payload
++        # was sent, a late rebuild may also observe the removed name. Successful
++        # startup accepts every registration before an external close begins.
++        #
+         # NOTE: Graceful shutdown unlinks the PLE shared-memory names and the
+         # PLE ipc socket. The remaining 17 /tmp UUID sockets per boot are
+         # upstream vLLM VLLM_RPC_BASE_PATH behaviour; a tmpfiles/launch-profile
+-- 
+2.47.3
+

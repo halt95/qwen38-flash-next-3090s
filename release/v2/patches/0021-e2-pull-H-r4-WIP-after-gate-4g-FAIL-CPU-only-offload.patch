@@ -1,0 +1,102 @@
+From 3e078502a09a327c203382d7470856da7faa62aa Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Fri, 11 Sep 2026 14:57:24 +0000
+Subject: [PATCH 21/76] e2-pull H r4 WIP (after gate 4g FAIL, CPU-only):
+ offload CUDA guard (torch CUDA init raises; FLA and FlashInfer fall back) +
+ meta device for explicit current_platform.current_device() during offload
+ meta construction; driver-level context (CUTLASS cudaFree(0) suspect) still
+ open
+
+---
+ vllm/v1/ple_offload/worker.py | 61 ++++++++++++++++++++++++++++++++++-
+ 1 file changed, 60 insertions(+), 1 deletion(-)
+
+diff --git a/vllm/v1/ple_offload/worker.py b/vllm/v1/ple_offload/worker.py
+index fcfb5ea61..225560fa4 100644
+--- a/vllm/v1/ple_offload/worker.py
++++ b/vllm/v1/ple_offload/worker.py
+@@ -82,6 +82,60 @@ def _publish_fence() -> None:
+         pass
+ 
+ 
++def _install_cuda_guard() -> None:
++    """Make torch-level CUDA initialization raise in the PLE offload process.
++
++    Gate 4g (2026-09-11) found the host-mapped pull still got a 322 MiB context
++    on its home card: importing the Qwen4Exp model imports the vendored FLA
++    ops, whose utils call triton's ``get_current_target()`` at import time,
++    i.e. ``torch.cuda.current_device()`` -> lazy init. FLA catches
++    ``RuntimeError`` and falls back to "cpu" (and then skips its Hopper
++    probe), so raising here keeps this process context-free. Any other call
++    site fails loudly at offload startup with its stack logged, instead of
++    silently taking VRAM on a stage-0 card. The GPU workers are untouched.
++    """
++    import traceback
++
++    if torch.cuda.is_initialized():
++        logger.warning("CUDA already initialized before the PLE offload guard")
++        return
++
++    def _blocked_lazy_init() -> None:
++        stack = "".join(traceback.format_stack(limit=12)[:-1])
++        logger.info(
++            "PLE offload CUDA guard: blocked a CUDA initialization attempt "
++            "(the caller must fall back to CPU or fail); call site:\n%s",
++            stack,
++        )
++        raise RuntimeError(
++            "CUDA is disabled in the PLE offload process (host-mapped pull)"
++        )
++
++    torch.cuda._lazy_init = _blocked_lazy_init  # type: ignore[assignment]
++    logger.info("PLE offload CUDA guard installed (torch CUDA init raises)")
++
++
++@contextlib.contextmanager
++def _platform_device_is_meta():
++    """During the offload's meta-model construction, report the meta device.
++
++    Some layer constructors pass an explicit ``current_platform.current_device()``
++    (e.g. the GDN output norm in qwen_gdn_linear_attn.py), which overrides the
++    ``torch.device("meta")`` context and would allocate on CUDA. In the offload
++    process nothing but the CPU PLE layers is ever materialized, so those
++    tensors belong on meta too. The patch is an instance attribute removed on
++    exit, restoring the platform's own method.
++    """
++    from vllm.platforms import current_platform
++
++    current_platform.current_device = lambda *args, **kwargs: torch.device("meta")
++    try:
++        yield
++    finally:
++        with contextlib.suppress(AttributeError):
++            del current_platform.current_device
++
++
+ # Bounded wait for the GPU to release a result (seconds). A timed-out ownership
+ # transfer is fatal: the offload process raises and exits, never overwrites.
+ _PLE_WAIT_TIMEOUT_S = float(os.environ.get("VLLM_PLE_OFFLOAD_WAIT_TIMEOUT", "120"))
+@@ -309,6 +363,7 @@ class PleOffloadWorker:
+             # CUDA_VISIBLE_DEVICES) rather than hiding all devices: an empty
+             # CUDA_VISIBLE_DEVICES makes vLLM's platform helpers raise during
+             # model construction. Never call set_device here.
++            _install_cuda_guard()
+             home_device = os.environ.get("VLLM_PLE_OFFLOAD_HOME_DEVICE", "").strip()
+             if home_device:
+                 parent_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+@@ -433,7 +488,11 @@ class PleOffloadRunner:
+         # memory. All transformer, MoE, and vision parameters remain on meta.
+         logger.info("Initializing model structure for PLE weight discovery ...")
+         model_dtype = cast(torch.dtype, model_config.dtype)
+-        with set_default_torch_dtype(model_dtype), torch.device("meta"):
++        with (
++            set_default_torch_dtype(model_dtype),
++            torch.device("meta"),
++            _platform_device_is_meta(),
++        ):
+             model = initialize_model(
+                 vllm_config=self.vllm_config,
+                 model_config=model_config,
+-- 
+2.47.3
+

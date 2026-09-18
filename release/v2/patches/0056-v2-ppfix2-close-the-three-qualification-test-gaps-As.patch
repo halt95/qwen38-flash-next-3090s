@@ -1,0 +1,615 @@
+From 3d19630898c025477e63326c684eeef92330d821 Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Tue, 15 Sep 2026 10:38:55 +0000
+Subject: [PATCH 56/76] v2-ppfix2: close the three qualification-test gaps
+ Astra R2 found (tests only)
+
+Astra round 2 returned MERGE-READY for the production change, with three
+corrections owed on the GPU suite before its coverage claims can be credited.
+No vllm/ file changes in this commit -- tests only.
+
+1. THE SELF-COPY RESET WAS UNOBSERVABLE. The test seeded num_accepted = 1 and
+   then asserted 1, so deleting the reset store at mamba_utils.py:473-475 would
+   have passed. Reseeded to (num_accepted=2, state_idx=1,
+   new_num_computed=33): aligned=32, running=32, needs_copy true, bias=0,
+   dst_col=1, src_col=1 -- same early-exit shape, but the 2 -> 1 store is now
+   the thing being measured.
+
+   Astra also noted that unchanged bytes cannot distinguish an early exit from
+   an identical self-copy. They cannot, and the docstring now says so instead of
+   implying otherwise. What can be made observable without touching the kernel
+   is the *conjunction*: a new case seeds (num_accepted=4, state_idx=1,
+   new_num_computed=33) -> bias=2 with src_block_idx still == dest_block_idx, so
+   the guard must NOT fire. conv takes the same-block memmove branch
+   (mamba_utils.py:320-336) and temporal reads src_col + bias = column 3, a
+   different physical block, so both are observable. Same column with zero bias
+   moves nothing; same column with positive bias moves bytes.
+
+2. THE FREED-SLOT TEST DID NOT ESTABLISH GUARD SENSITIVITY. Astra is right that
+   a hand-written -1 has no connection to decisions seeded at some other slot:
+   removing the guard would read *before* the decision arrays, not at slot 3.
+   Two replacements.
+
+   (a) Poison where a missing guard would actually look. The block tables and
+   every per-req decision array are now views one row/element into a backing
+   tensor, so pointer index -1 lands on real memory this test owns. Index -1 of
+   the decision arrays holds (num_accepted=4, state_idx=0,
+   new_num_computed=48) -- a copy with bias 3 into dst_col 2 -- and block-table
+   row -1 points column 2 at CANARY_DST and everything else at CANARY_SRC. A
+   kernel that failed to reject req_idx < 0 would therefore write CANARY_DST
+   from CANARY_SRC, and both canaries are inside the "every other block is
+   unchanged" sweep.
+
+   (b) Exercise the real masking. `mask_from_generation_change` in the CPU
+   sibling drives `PPHandler.get_prev_sampled_outputs` (pp_utils.py:132-140)
+   with a slot whose generation counter moved between receive and consumption,
+   and returns the mapping the handler computes; a new CPU test pins
+   [5,1,2] + reuse at row 1 -> [5,-1,2], both rows reused -> [-1,1,-1], and no
+   reuse -> unchanged. The GPU suite then feeds that produced mapping to the
+   kernel, with the reused slot carrying copy-shaped decisions.
+
+   (c) Rejection before any negative-index load, verified on CPU without a
+   device: a new test parses the kernel with ast and asserts that the
+   `if req_idx < 0: return` guard precedes every `<ptr> + req_idx` expression.
+   Non-vacuous on this tree -- guard at kernel-relative line 81, seven
+   req_idx-indexed accesses at 87-115.
+
+3. INTEGER-VIEW COMPARISONS. Every "bit-identical" claim now goes through
+   `_assert_bitwise`, which compares the int16 view with torch.equal. A
+   zero-tolerance float compare establishes numeric equality, not bit identity:
+   +0.0 == -0.0 and NaN != NaN. These are byte copies, so the integer view is
+   the right instrument. No torch.testing.assert_close remains in the file.
+
+Astra's two qualifications on round 2's wording, recorded: "unconditional"
+means every *dispatched* align kernel -- the zero-request and uninitialised
+early returns at the top of `run_fused_postprocess_align` remain, so it is not
+every method invocation; and "mutates nothing" applies to the failing launcher
+itself, not to the caller, which can already have scattered acceptance counts
+via `postprocess_state` before reaching it.
+
+A process correction, since it changes what earlier test reports meant. Rounds
+1 and 2 described `tests/v1/worker/test_mamba_utils.py`,
+`test_mamba_hybrid_model_state.py` and `test_gpu_block_table.py` as CPU suites.
+They are not: `TestPostprocessMambaFusedKernel` is gated on
+`torch.cuda.is_available()` and the other two on `current_platform.is_cuda()`,
+both true on the reference host, so those tests executed on the GPU in every earlier run.
+The round-2 report disclosed six accidental GPU tests; the real number was
+larger. Every run in this commit sets CUDA_VISIBLE_DEVICES="" so
+`torch.cuda.is_available()` is False and nothing can reach a device, and
+`test_gpu_block_table.py` (module-gated on the platform rather than the device,
+and unrelated to this change) is excluded rather than run.
+
+Test runs (CUDA_VISIBLE_DEVICES="", the reference host):
+  tests/v1/worker/gpu ................................ 9 passed, 8 skipped
+  + test_mamba_utils + test_pp_utils
+  + test_mamba_hybrid_model_state (2 CUDA tests deselected)
+                                     ................ 23 passed, 43 skipped
+
+The 43 skips are the CUDA-gated tests this mode correctly refuses to run. No
+vllm/ file changed, so the heavier suites (tests/v1/ple_offload,
+worker -k "pp or mamba") are unchanged from the previous commit and were not
+re-run under a busy box.
+
+Still owed, unchanged from Astra R2: a deliberate isolated run of the GPU suite
+under VLLM_E2_GPU_TESTS=1, multi-group coverage, PCP, CUDA-graph operation, the
+block-lifetime investigation, the probe boot pair, and V.3/V.7 re-qualification.
+The GPU suite in this commit has not been executed in any form.
+---
+ .../gpu/test_pp_deferred_mamba_block_table.py | 121 +++++++++
+ .../worker/gpu/test_pp_deferred_mamba_gpu.py  | 257 +++++++++++++-----
+ 2 files changed, 308 insertions(+), 70 deletions(-)
+
+diff --git a/tests/v1/worker/gpu/test_pp_deferred_mamba_block_table.py b/tests/v1/worker/gpu/test_pp_deferred_mamba_block_table.py
+index 120046854..c2f7a388f 100644
+--- a/tests/v1/worker/gpu/test_pp_deferred_mamba_block_table.py
++++ b/tests/v1/worker/gpu/test_pp_deferred_mamba_block_table.py
+@@ -27,6 +27,7 @@ import inspect
+ from types import SimpleNamespace
+ from unittest.mock import MagicMock
+ 
++import numpy as np
+ import pytest
+ import torch
+ 
+@@ -583,3 +584,123 @@ def test_precopy_still_works_without_persistent_tables(
+     bound.apply_defaults()
+     ptr = _ptr_to_int(int(bound.arguments["block_table_ptrs_ptr"][0]))
+     assert scenario.tables_by_ptr[ptr][0] == "gathered"
++
++
++# ---------------------------------------------------- generation masking (CPU)
++
++
++def mask_from_generation_change(
++    idx_mapping: list[int],
++    reused_slot_rows: list[int],
++) -> list[int]:
++    """Run the real generation masking and return the mapping it produces.
++
++    Drives ``PPHandler.get_prev_sampled_outputs`` (pp_utils.py:132-140) rather
++    than hand-writing a -1: a slot whose generation counter moved between
++    ``receive`` and consumption has been freed and handed to a new request, and
++    the handler must replace its row with -1 so the kernel skips it
++    (mamba_utils.py:441-442).
++
++    Exported so the GPU suite can consume a mapping that a real reuse produced.
++    """
++    from collections import deque
++
++    from vllm.v1.worker.gpu import pp_utils as pp_utils_mod
++
++    num_reqs = len(idx_mapping)
++    idx_np = np.asarray(idx_mapping, dtype=np.intp)
++
++    handler = object.__new__(pp_utils_mod.PPHandler)
++    handler.device = torch.device("cpu")
++    handler.main_stream = SimpleNamespace(wait_event=lambda event: None)
++    # Slot generation counters as they stand now.
++    handler.req_idx_gen_np = np.zeros(max(int(idx_np.max()) + 1, 1), dtype=np.int32)
++    # Snapshot taken at receive time; a reused slot has since been bumped.
++    gen_at_receive = handler.req_idx_gen_np[idx_np].copy()
++    for row in reused_slot_rows:
++        handler.req_idx_gen_np[idx_np[row]] += 1
++
++    slot = pp_utils_mod.PendingRecv(
++        event=object(),
++        sampled_tokens=torch.zeros(num_reqs, 1, dtype=torch.int64),
++        num_sampled=torch.ones(num_reqs, dtype=torch.int32),
++        num_rejected=torch.zeros(num_reqs, dtype=torch.int32),
++        idx_mapping=torch.as_tensor(idx_np, dtype=torch.int32),
++        idx_mapping_np=idx_np,
++        need_sampled_mask=np.ones(num_reqs, dtype=bool),
++        gen_at_receive_np=gen_at_receive,
++    )
++    handler.queue = deque([slot])
++
++    captured: dict[str, object] = {}
++
++    def fake_async_copy_to_gpu(array, device=None):
++        captured["np"] = np.asarray(array).copy()
++        return torch.as_tensor(np.asarray(array), dtype=torch.int32)
++
++    original = pp_utils_mod.async_copy_to_gpu
++    pp_utils_mod.async_copy_to_gpu = fake_async_copy_to_gpu
++    try:
++        outputs = handler.get_prev_sampled_outputs()
++    finally:
++        pp_utils_mod.async_copy_to_gpu = original
++
++    assert outputs is not None, "the whole batch was excluded"
++    return [int(v) for v in outputs["idx_mapping"].tolist()]
++
++
++def test_generation_change_masks_only_the_reused_row():
++    """A slot handed to a new request between capture and use becomes -1."""
++    assert mask_from_generation_change([5, 1, 2], [1]) == [5, -1, 2]
++    assert mask_from_generation_change([5, 1, 2], [0, 2]) == [-1, 1, -1]
++    # No reuse: the handler returns the original tensor untouched.
++    assert mask_from_generation_change([5, 1, 2], []) == [5, 1, 2]
++
++
++def test_kernel_rejects_negative_req_idx_before_any_load_that_uses_it():
++    """Structural check: the guard precedes every load indexed by req_idx.
++
++    ``mamba_utils.py:441-442`` returns on ``req_idx < 0``; the decision loads at
++    ``:445-446`` index by ``req_idx``. If a future edit reordered them, a masked
++    row would dereference index -1 before being rejected. The GPU suite plants
++    poison at index -1 to catch that at runtime; this catches it on CPU, in the
++    source, with no device.
++    """
++    import ast
++    import textwrap
++
++    source = textwrap.dedent(
++        inspect.getsource(mamba_utils_mod.postprocess_mamba_fused_kernel.fn)
++    )
++    tree = ast.parse(source)
++    func = tree.body[0]
++
++    guard_lines = [
++        node.lineno
++        for node in ast.walk(func)
++        if isinstance(node, ast.If)
++        and isinstance(node.test, ast.Compare)
++        and isinstance(node.test.left, ast.Name)
++        and node.test.left.id == "req_idx"
++        and any(isinstance(op, ast.Lt) for op in node.test.ops)
++        and any(isinstance(stmt, ast.Return) for stmt in node.body)
++    ]
++    assert guard_lines, "no `if req_idx < 0: return` guard found in the kernel"
++    guard_line = min(guard_lines)
++
++    # Every expression that adds req_idx to a pointer, i.e. every load or store
++    # that would dereference a negative index.
++    uses = [
++        node.lineno
++        for node in ast.walk(func)
++        if isinstance(node, ast.BinOp)
++        and isinstance(node.op, ast.Add)
++        and isinstance(node.right, ast.Name)
++        and node.right.id == "req_idx"
++    ]
++    assert uses, "no pointer arithmetic on req_idx found; has the kernel moved?"
++    assert min(uses) > guard_line, (
++        f"a req_idx-indexed access at line {min(uses)} precedes the "
++        f"`req_idx < 0` guard at line {guard_line} (offsets are relative to the "
++        f"kernel body)"
++    )
+diff --git a/tests/v1/worker/gpu/test_pp_deferred_mamba_gpu.py b/tests/v1/worker/gpu/test_pp_deferred_mamba_gpu.py
+index 8fe24d35b..aa1911265 100644
+--- a/tests/v1/worker/gpu/test_pp_deferred_mamba_gpu.py
++++ b/tests/v1/worker/gpu/test_pp_deferred_mamba_gpu.py
+@@ -61,6 +61,18 @@ pytestmark = [
+ MAX_NUM_REQS = 8
+ BLOCKS_PER_REQ = 6
+ NUM_PHYS_BLOCKS = MAX_NUM_REQS * BLOCKS_PER_REQ
++# Two extra physical blocks, reachable only through the block-table guard row
++# that a negative req_idx would address: CANARY_DST sits at the poison
++# destination column and CANARY_SRC everywhere else, so a negative-index load
++# would produce a visible copy between them. See _build()'s backing tensors.
++CANARY_DST = NUM_PHYS_BLOCKS
++CANARY_SRC = NUM_PHYS_BLOCKS + 1
++TOTAL_BLOCKS = NUM_PHYS_BLOCKS + 2
++# Decision values planted at index -1 of every per-req array. They describe a
++# copy (new=48, a=4 -> aligned=48, running=45, bias=3, dst_col=2, src_col=0),
++# so a missing `req_idx < 0` guard is a write, not a silent no-op.
++POISON = (4, 0, 48)  # (num_accepted, state_idx, new_num_computed)
++POISON_DST_COL = 2
+ MAMBA_BLOCK_SIZE = 16
+ NUM_SPEC_BLOCKS = 3
+ CONV_WIDTH = 4
+@@ -105,7 +117,7 @@ def _make_kv_cache_config() -> KVCacheConfig:
+         num_speculative_blocks=NUM_SPEC_BLOCKS,
+     )
+     return KVCacheConfig(
+-        num_blocks=NUM_PHYS_BLOCKS,
++        num_blocks=TOTAL_BLOCKS,
+         kv_cache_tensors=[],
+         kv_cache_groups=[KVCacheGroupSpec(["layer_0"], spec)],
+     )
+@@ -140,23 +152,33 @@ def _build(slot_mapping=(5, 1, 2), t1_mapping=(2,)) -> _Fixture:
+     torch.manual_seed(1234)
+ 
+     conv = torch.randn(
+-        NUM_PHYS_BLOCKS, CONV_WIDTH, CONV_INNER, dtype=DTYPE, device=device
+-    )
+-    temporal = torch.randn(
+-        NUM_PHYS_BLOCKS, TEMPORAL_DIM, dtype=DTYPE, device=device
++        TOTAL_BLOCKS, CONV_WIDTH, CONV_INNER, dtype=DTYPE, device=device
+     )
++    temporal = torch.randn(TOTAL_BLOCKS, TEMPORAL_DIM, dtype=DTYPE, device=device)
+     attention = MagicMock()
+     attention.kv_cache = [conv, temporal]
+ 
+-    persistent = torch.zeros(
+-        MAX_NUM_REQS, BLOCKS_PER_REQ, dtype=torch.int32, device=device
++    # The block tables and the per-req decision arrays each get one extra
++    # leading row/element that the kernel is never supposed to reach. Because
++    # the real tensors are views starting one row/element in, index -1 in
++    # pointer arithmetic lands on that guard row -- so a kernel that failed to
++    # reject req_idx < 0 would load the poison decisions below and write into
++    # canaries. See test_freed_slot_is_rejected_before_any_negative_index_load.
++    persistent_backing = torch.zeros(
++        MAX_NUM_REQS + 1, BLOCKS_PER_REQ, dtype=torch.int32, device=device
+     )
++    persistent_backing[0, :] = CANARY_SRC
++    persistent_backing[0, POISON_DST_COL] = CANARY_DST
++    persistent = persistent_backing[1:]
+     for r in range(MAX_NUM_REQS):
+         for c in range(BLOCKS_PER_REQ):
+             persistent[r, c] = phys(r, c)
+     num_blocks = [BLOCKS_PER_REQ] * MAX_NUM_REQS
+ 
+-    gathered = torch.zeros_like(persistent)
++    gathered_backing = torch.zeros_like(persistent_backing)
++    gathered_backing[0, :] = CANARY_SRC
++    gathered_backing[0, POISON_DST_COL] = CANARY_DST
++    gathered = gathered_backing[1:]
+     slot_mapping = [s for s in slot_mapping if s >= 0]
+     _gather_rows(persistent, num_blocks, slot_mapping, len(slot_mapping) + 1, gathered)
+     _gather_rows(
+@@ -198,9 +220,19 @@ def _launch(fx: _Fixture, mapping, per_slot):
+     ``per_slot`` maps req slot -> (num_accepted, state_idx, new_num_computed).
+     """
+     device = fx.device
+-    num_accepted = torch.ones(MAX_NUM_REQS, dtype=torch.int32, device=device)
+-    state_idx = torch.zeros(MAX_NUM_REQS, dtype=torch.int32, device=device)
+-    new_computed = torch.zeros(MAX_NUM_REQS, dtype=torch.int32, device=device)
++
++    def backed(fill: int, poison: int) -> torch.Tensor:
++        """A [MAX_NUM_REQS] view whose index -1 holds ``poison``."""
++        backing = torch.full(
++            (MAX_NUM_REQS + 1,), fill, dtype=torch.int32, device=device
++        )
++        backing[0] = poison
++        return backing[1:]
++
++    poison_acc, poison_sidx, poison_computed = POISON
++    num_accepted = backed(1, poison_acc)
++    state_idx = backed(0, poison_sidx)
++    new_computed = backed(0, poison_computed)
+     for slot, (acc, sidx, computed) in per_slot.items():
+         num_accepted[slot] = acc
+         state_idx[slot] = sidx
+@@ -216,21 +248,34 @@ def _launch(fx: _Fixture, mapping, per_slot):
+     return num_accepted
+ 
+ 
++def _assert_bitwise(actual: torch.Tensor, expected: torch.Tensor, what: str) -> None:
++    """Compare the integer view, so "bit-identical" means what it says.
++
++    A zero-tolerance float compare establishes numeric equality, not bit
++    identity: +0.0 and -0.0 compare equal and NaN payloads compare unequal.
++    These are byte copies, so the integer view is the right instrument
++    (Astra R2).
++    """
++    assert actual.dtype == expected.dtype
++    lhs = actual.contiguous().view(torch.int16)
++    rhs = expected.contiguous().view(torch.int16)
++    assert torch.equal(lhs, rhs), (
++        f"{what}: {int((lhs != rhs).sum().item())} of {lhs.numel()} 16-bit "
++        f"words differ"
++    )
++
++
+ def _assert_only_blocks_changed(fx: _Fixture, changed: set[int]) -> None:
+-    """Every physical block outside ``changed`` must be bit-identical."""
+-    for block in range(NUM_PHYS_BLOCKS):
++    """Every physical block outside ``changed`` must be bit-identical.
++
++    The canary blocks (``CANARY_DST``, ``CANARY_SRC``) are included: they are
++    only reachable through the guard row a negative ``req_idx`` would select.
++    """
++    for block in range(TOTAL_BLOCKS):
+         if block in changed:
+             continue
+-        torch.testing.assert_close(
+-            fx.conv[block], fx.conv0[block], rtol=0, atol=0, msg=f"conv[{block}]"
+-        )
+-        torch.testing.assert_close(
+-            fx.temporal[block],
+-            fx.temporal0[block],
+-            rtol=0,
+-            atol=0,
+-            msg=f"temporal[{block}]",
+-        )
++        _assert_bitwise(fx.conv[block], fx.conv0[block], f"conv[{block}]")
++        _assert_bitwise(fx.temporal[block], fx.temporal0[block], f"temporal[{block}]")
+ 
+ 
+ @pytest.mark.skipif(
+@@ -253,30 +298,22 @@ def test_positive_bias_copy_lands_on_the_requests_own_blocks():
+     temporal_src = phys(5, 3)
+ 
+     # conv: state[bt[src_col], bias:] -> state[bt[dst_col], :width - bias]
+-    torch.testing.assert_close(
+-        fx.conv[dst][: CONV_WIDTH - 3], fx.conv0[conv_src][3:], rtol=0, atol=0
+-    )
++    _assert_bitwise(fx.conv[dst][: CONV_WIDTH - 3], fx.conv0[conv_src][3:], "conv dst")
+     # the tail of the destination conv window is not written
+-    torch.testing.assert_close(
+-        fx.conv[dst][CONV_WIDTH - 3 :], fx.conv0[dst][CONV_WIDTH - 3 :], rtol=0, atol=0
++    _assert_bitwise(
++        fx.conv[dst][CONV_WIDTH - 3 :], fx.conv0[dst][CONV_WIDTH - 3 :], "conv tail"
+     )
+     # temporal: state[bt[src_col + bias]] -> state[bt[dst_col]]
+-    torch.testing.assert_close(
+-        fx.temporal[dst], fx.temporal0[temporal_src], rtol=0, atol=0
+-    )
++    _assert_bitwise(fx.temporal[dst], fx.temporal0[temporal_src], "temporal dst")
+ 
+     # Nothing else moved -- in particular not the victim r2 (the rc1 row) and
+     # not r0 (the "persistent table but batch row" mistake).
+     _assert_only_blocks_changed(fx, {dst})
+     victim = phys(2, 2)  # gathered[batch row 0] column 2 -- the rc1 destination
+-    torch.testing.assert_close(fx.conv[victim], fx.conv0[victim], rtol=0, atol=0)
+-    torch.testing.assert_close(
+-        fx.temporal[victim], fx.temporal0[victim], rtol=0, atol=0
+-    )
++    _assert_bitwise(fx.conv[victim], fx.conv0[victim], "victim conv")
++    _assert_bitwise(fx.temporal[victim], fx.temporal0[victim], "victim temporal")
+     wrong_row = phys(0, 2)  # persistent[batch row 0] column 2
+-    torch.testing.assert_close(
+-        fx.conv[wrong_row], fx.conv0[wrong_row], rtol=0, atol=0
+-    )
++    _assert_bitwise(fx.conv[wrong_row], fx.conv0[wrong_row], "wrong-row conv")
+ 
+ 
+ @pytest.mark.skipif(
+@@ -294,21 +331,31 @@ def test_zero_bias_migration_copies_the_whole_window():
+ 
+     dst = phys(5, 2)
+     src = phys(5, 0)
+-    torch.testing.assert_close(fx.conv[dst], fx.conv0[src], rtol=0, atol=0)
+-    torch.testing.assert_close(fx.temporal[dst], fx.temporal0[src], rtol=0, atol=0)
++    _assert_bitwise(fx.conv[dst], fx.conv0[src], "conv dst")
++    _assert_bitwise(fx.temporal[dst], fx.temporal0[src], "temporal dst")
+     _assert_only_blocks_changed(fx, {dst})
+ 
+ 
+ def test_self_copy_exits_without_touching_state_and_resets_num_accepted():
+     """src_block_idx == dest_block_idx and bias == 0 -> return (mamba_utils:478).
+ 
+-    new=32, a=1 -> aligned=32, running=32, needs_copy true, bias=0, dst_col=1;
+-    state_idx=1 makes src == dst. The kernel must still write
+-    num_accepted_tokens_out[req] = 1 (mamba_utils.py:473-475) and move no bytes.
++    new=33, a=2 -> aligned=32, running=32, needs_copy true, bias=0, dst_col=1;
++    state_idx=1 makes src == dst. Seeding num_accepted at 2 rather than 1 is
++    what makes the reset store observable: the kernel must write
++    num_accepted_tokens_out[req] = 1 (mamba_utils.py:473-475) *before* the early
++    return, so deleting that store now fails the test. (Round 2 seeded 1 and
++    asserted 1, which a deleted store would have passed -- Astra R2 finding.)
++
++    Limit, stated rather than papered over: unchanged bytes cannot distinguish
++    "returned at the guard" from "fell through and memcpy'd a block onto
++    itself", because those are byte-identical by construction. What the reset
++    store does establish is that the kernel got past `needs_copy` and evaluated
++    `src == dst`, so it is the *guard* that stopped it and not an earlier
++    return. The conjunction itself is covered by the next test.
+     """
+     fx = _build()
+     num_accepted = _launch(
+-        fx, [5, 1, 2], {5: (1, 1, 32), 1: (2, 0, 40), 2: (2, 0, 40)}
++        fx, [5, 1, 2], {5: (2, 1, 33), 1: (2, 0, 40), 2: (2, 0, 40)}
+     )
+ 
+     _assert_only_blocks_changed(fx, set())
+@@ -319,29 +366,103 @@ def test_self_copy_exits_without_touching_state_and_resets_num_accepted():
+     is_conv_state_dim_first(),
+     reason="expected-bytes model assumes the SD conv layout",
+ )
+-def test_freed_slot_is_skipped_and_does_not_shift_the_other_rows():
+-    """A -1 row must copy nothing, and must not displace the rows after it.
++def test_same_column_with_positive_bias_copies_and_still_resets():
++    """The early-exit guard is a conjunction, and this is the other conjunct.
++
++    new=33, a=4 -> aligned=32, running=30, needs_copy; bias = 4-1-1 = 2;
++    dst_col = 1; state_idx = 1, so src_block_idx == dest_block_idx but
++    token_bias != 0. The kernel must NOT return: conv takes the same-block
++    memmove branch (mamba_utils.py:320-336) and temporal reads
++    ``src_col + token_bias`` = column 3, a different physical block.
++
++    Together with the previous test this makes the exit observable in both
++    directions: same column and zero bias moves nothing, same column and
++    positive bias moves bytes.
++    """
++    fx = _build()
++    num_accepted = _launch(
++        fx, [5, 1, 2], {5: (4, 1, 33), 1: (2, 0, 40), 2: (2, 0, 40)}
++    )
++
++    blk = phys(5, 1)  # both the conv source and the destination
++    temporal_src = phys(5, 3)  # src_col + bias = 3
+ 
+-    pp_utils.py:139-140 masks a freed/reused slot to -1 and
+-    mamba_utils.py:441-442 returns before reading any decision array. Slot 3 is
+-    given decisions that *would* copy, so a missing guard shows up as a write
+-    into r3's blocks.
++    # conv, same block, shifted left by token_bias = 2
++    _assert_bitwise(fx.conv[blk][: CONV_WIDTH - 2], fx.conv0[blk][2:], "conv shift")
++    _assert_bitwise(
++        fx.conv[blk][CONV_WIDTH - 2 :], fx.conv0[blk][CONV_WIDTH - 2 :], "conv tail"
++    )
++    # temporal, from a different block
++    _assert_bitwise(fx.temporal[blk], fx.temporal0[temporal_src], "temporal dst")
++
++    _assert_only_blocks_changed(fx, {blk})
++    # The reset store fires here too: it is guarded only on src == dst.
++    assert int(num_accepted[5].item()) == 1
++
++
++@pytest.mark.skipif(
++    is_conv_state_dim_first(),
++    reason="expected-bytes model assumes the SD conv layout",
++)
++def test_freed_slot_is_rejected_before_any_negative_index_load():
++    """A -1 row must be rejected *before* the decision arrays are read.
++
++    ``mamba_utils.py:441-442`` returns on ``req_idx < 0`` before the loads at
++    ``:445-446``. Round 2's version of this test seeded decisions at some other
++    slot, which the kernel would never have touched either way, so it proved
++    nothing about the guard (Astra R2 finding). This one plants the poison
++    where a missing guard would actually look: index -1 of every per-req array
++    and row -1 of the block table, which are real memory owned by the backing
++    tensors in ``_build``.
++
++    If the guard were deleted, the kernel would read
++    ``num_accepted=4, state_idx=0, new_num_computed=48`` -> a copy with bias 3
++    into block-table row -1, writing CANARY_DST from CANARY_SRC. Both canaries
++    are covered by ``_assert_only_blocks_changed``, so that write fails the
++    test.
++
++    The row after the -1 must also still copy correctly, which is the
++    positioning check.
+     """
+     fx = _build(slot_mapping=(5, 1, 2))
+-    _launch(
+-        fx,
+-        [-1, 5, 2],
+-        {3: (4, 0, 48), 5: (4, 0, 48), 2: (2, 0, 40)},
+-    )
++    _launch(fx, [-1, 5, 2], {5: (4, 0, 48), 2: (2, 0, 40)})
+ 
+     dst = phys(5, 2)
+-    torch.testing.assert_close(
+-        fx.conv[dst][: CONV_WIDTH - 3], fx.conv0[phys(5, 0)][3:], rtol=0, atol=0
++    _assert_bitwise(
++        fx.conv[dst][: CONV_WIDTH - 3], fx.conv0[phys(5, 0)][3:], "conv dst"
+     )
+-    torch.testing.assert_close(
+-        fx.temporal[dst], fx.temporal0[phys(5, 3)], rtol=0, atol=0
++    _assert_bitwise(fx.temporal[dst], fx.temporal0[phys(5, 3)], "temporal dst")
++    _assert_only_blocks_changed(fx, {dst})
++
++
++def test_generation_masked_reuse_is_skipped_end_to_end():
++    """The -1 above, but produced by the real generation masking.
++
++    ``mask_from_generation_change`` in the CPU sibling test drives
++    ``PPHandler.get_prev_sampled_outputs`` (pp_utils.py:132-140) and returns
++    the mapping it computes; here that mapping is fed to the kernel. Slot 1 is
++    the one whose generation moved -- it was freed and its slot handed to a new
++    request between capture and use -- so its row must copy nothing even though
++    slot 1 now carries decisions that would copy.
++    """
++    from tests.v1.worker.gpu.test_pp_deferred_mamba_block_table import (
++        mask_from_generation_change,
++    )
++
++    mapping = mask_from_generation_change(
++        idx_mapping=[5, 1, 2], reused_slot_rows=[1]
+     )
+-    # r3's blocks are untouched even though its decision arrays say "copy".
++    assert mapping == [5, -1, 2], mapping
++
++    fx = _build(slot_mapping=(5, 1, 2))
++    _launch(fx, mapping, {5: (4, 0, 48), 1: (4, 0, 48), 2: (2, 0, 40)})
++
++    dst = phys(5, 2)
++    _assert_bitwise(
++        fx.conv[dst][: CONV_WIDTH - 3], fx.conv0[phys(5, 0)][3:], "conv dst"
++    )
++    _assert_bitwise(fx.temporal[dst], fx.temporal0[phys(5, 3)], "temporal dst")
++    # Slot 1's own blocks are untouched despite its copy-shaped decisions.
+     _assert_only_blocks_changed(fx, {dst})
+ 
+ 
+@@ -358,12 +479,10 @@ def test_same_step_identity_mapping_is_unaffected():
+     _launch(fx, [0, 1, 2], {0: (4, 0, 48), 1: (2, 0, 40), 2: (2, 0, 40)})
+ 
+     dst = phys(0, 2)
+-    torch.testing.assert_close(
+-        fx.conv[dst][: CONV_WIDTH - 3], fx.conv0[phys(0, 0)][3:], rtol=0, atol=0
+-    )
+-    torch.testing.assert_close(
+-        fx.temporal[dst], fx.temporal0[phys(0, 3)], rtol=0, atol=0
++    _assert_bitwise(
++        fx.conv[dst][: CONV_WIDTH - 3], fx.conv0[phys(0, 0)][3:], "conv dst"
+     )
++    _assert_bitwise(fx.temporal[dst], fx.temporal0[phys(0, 3)], "temporal dst")
+     _assert_only_blocks_changed(fx, {dst})
+ 
+ 
+@@ -371,11 +490,9 @@ def test_align_launch_raises_without_persistent_tables():
+     """Fail closed on real hardware too, before any kernel is enqueued."""
+     device = torch.device("cuda:0")
+     conv = torch.randn(
+-        NUM_PHYS_BLOCKS, CONV_WIDTH, CONV_INNER, dtype=DTYPE, device=device
+-    )
+-    temporal = torch.randn(
+-        NUM_PHYS_BLOCKS, TEMPORAL_DIM, dtype=DTYPE, device=device
++        TOTAL_BLOCKS, CONV_WIDTH, CONV_INNER, dtype=DTYPE, device=device
+     )
++    temporal = torch.randn(TOTAL_BLOCKS, TEMPORAL_DIM, dtype=DTYPE, device=device)
+     attention = MagicMock()
+     attention.kv_cache = [conv, temporal]
+     gathered = torch.zeros(
+@@ -411,4 +528,4 @@ def test_align_launch_raises_without_persistent_tables():
+             idx_mapping=torch.tensor([5], dtype=torch.int32, device=device),
+         )
+     torch.accelerator.synchronize()
+-    torch.testing.assert_close(conv, snapshot, rtol=0, atol=0)
++    _assert_bitwise(conv, snapshot, "conv unchanged")
+-- 
+2.47.3
+

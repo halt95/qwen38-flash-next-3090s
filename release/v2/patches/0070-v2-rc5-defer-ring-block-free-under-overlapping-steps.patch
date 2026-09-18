@@ -1,0 +1,571 @@
+From 40e9f940d53cd5d1fbd199150732261a9e3d902c Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Wed, 16 Sep 2026 20:32:43 +0000
+Subject: [PATCH 70/76] v2-rc5: defer ring-block free under overlapping steps;
+ count skipped ring commits (T.1c)
+
+rc5 = rc4 (b75d0fe00e) + the two pre-fix commits of the v2.1 ring-row work
+(T.1c), pulled into v2 by the operator on 2026-09-16.
+
+1. Scheduler: enable defer_block_free whenever max_concurrent_batches > 1
+   and any KV group carries a CircularBufferSpec layer (the QSA raw-key
+   ring, one block per request, rewritten every step). Before, deferral
+   needed a KV-consumer connector, so under TP2xPP2 a preempted/finished
+   request's ring block could be handed to a new request while an in-flight
+   step was still committing the old request's suffix rows (T.1a candidate
+   C2). Same fence and drain as the connector gate.
+
+   Review finding (Luna, P1): with deferral, a preempted victim returns no
+   blocks until its step is processed, so the running-queue allocate loop
+   retried, preempted the next victim, and with every running request in
+   flight emptied the whole batch, requester included. The loop now stops
+   after one deferred victim; the requester stays running, unscheduled,
+   and retries after the drain. test_deferred_victim_stops_the_preemption_
+   cascade fails on the previous loop ("the cascade reached the requester")
+   and passes here.
+
+2. Pre-indexer telemetry: a live token whose state slot is < 0 or beyond the
+   ring capacity had its suffix commit silently masked away (T.1a candidate
+   C1). The writer loop now counts those tokens into the new guard-telemetry
+   site SITE_QSA_RING_SKIP (10; NUM_SITES 11; warn only, not fatal; slot 1 =
+   max token index, slot 2 = max offending slot value). The skip itself is
+   unchanged - the reconciliation is v2.1 T.1b.
+
+Tests: tests/v1/core/test_deferred_block_free.py +5 (ring gate on/off,
+dense-without-connector off, ring preempt withholds the block until the
+fence, the cascade); tests/v1/worker/gpu/test_qsa_ring_skip_telemetry.py
+(site declared/named/not fatal, launcher wiring, GPU negative control, three
+positive controls at slot -1 / capacity / past capacity checking the whole
+row, two-token accumulation). Box CPU run: 21 passed, 12 GPU tests deferred
+to the rc5 re-qualification; test_scheduler.py + test_async_scheduler.py
+failure set identical before/after (pre-existing venv config issue).
+---
+ tests/v1/core/test_deferred_block_free.py     | 154 +++++++++++++
+ .../gpu/test_qsa_ring_skip_telemetry.py       | 204 ++++++++++++++++++
+ .../qwen4_exp/nvidia/ops/qsa_pre_indexer.py   |  15 ++
+ vllm/v1/core/sched/scheduler.py               |  33 +++
+ vllm/v1/worker/guard_telemetry.py             |  10 +-
+ 5 files changed, 415 insertions(+), 1 deletion(-)
+ create mode 100644 tests/v1/worker/gpu/test_qsa_ring_skip_telemetry.py
+
+diff --git a/tests/v1/core/test_deferred_block_free.py b/tests/v1/core/test_deferred_block_free.py
+index 13789a396..7e371f199 100644
+--- a/tests/v1/core/test_deferred_block_free.py
++++ b/tests/v1/core/test_deferred_block_free.py
+@@ -17,8 +17,11 @@ from unittest.mock import PropertyMock, patch
+ 
+ import pytest
+ 
++import torch
++
+ from vllm.config import VllmConfig
+ from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
++from vllm.v1.kv_cache_interface import CircularBufferSpec
+ from vllm.v1.core.sched.output import SchedulerOutput
+ from vllm.v1.outputs import ModelRunnerOutput
+ from vllm.v1.request import RequestStatus
+@@ -474,3 +477,154 @@ def test_cow_retentions_deferred_until_copy_step_processed():
+     assert not scheduler.deferred_frees
+     out2 = scheduler.schedule()
+     assert [r.req_id for r in out2.scheduled_new_reqs] == ["late"]
++
++
++# --------------------------------------------------------------------------
++# v2-rc5 (T.1c): the ring gate. A CircularBufferSpec group (the QSA raw-key
++# ring, one block per request, rewritten every step) enables deferral under
++# overlapping batches WITHOUT a KV connector.
++# --------------------------------------------------------------------------
++
++def _ring_spec(block_size: int = 16) -> CircularBufferSpec:
++    return CircularBufferSpec(
++        block_size=block_size, num_kv_heads=1, head_size=1, dtype=torch.float32
++    )
++
++
++def test_gate_enabled_for_ring_group_with_overlapping_batches():
++    # Overlap is forced the same way test_gate_enabled_for_async_consumer
++    # forces it: async scheduling is disabled on CPU and PP needs GPUs.
++    with patch.object(
++        VllmConfig,
++        "max_concurrent_batches",
++        new_callable=PropertyMock,
++        return_value=2,
++    ):
++        scheduler = create_scheduler(
++            model=MODEL, async_scheduling=True, kv_cache_spec=_ring_spec()
++        )
++    assert scheduler.defer_block_free
++
++
++def test_gate_disabled_for_ring_group_without_overlap():
++    # One batch in flight at a time: nothing can race the free. The gate must
++    # stay off so the single-step path keeps immediate frees. Overlap is
++    # forced to 1 explicitly: whether async scheduling survives on the test
++    # platform is not the property under test.
++    with patch.object(
++        VllmConfig,
++        "max_concurrent_batches",
++        new_callable=PropertyMock,
++        return_value=1,
++    ):
++        scheduler = create_scheduler(
++            model=MODEL, async_scheduling=True, kv_cache_spec=_ring_spec()
++        )
++    assert not scheduler.defer_block_free
++
++
++def test_gate_disabled_for_non_ring_group_without_connector():
++    # The pre-rc5 negative case, restated under the new gate: full attention
++    # + overlap + no connector must still be off.
++    with patch.object(
++        VllmConfig,
++        "max_concurrent_batches",
++        new_callable=PropertyMock,
++        return_value=2,
++    ):
++        scheduler = create_scheduler(model=MODEL, async_scheduling=True)
++    assert not scheduler.defer_block_free
++
++
++def test_ring_preempt_withholds_the_ring_block_until_the_fence():
++    """The property rc5 buys: a preempted request's ring block does not
++    return to the pool while a step that may still write it is in flight,
++    and it does return once the newest in-flight step's output is processed.
++    """
++    with patch.object(
++        VllmConfig,
++        "max_concurrent_batches",
++        new_callable=PropertyMock,
++        return_value=2,
++    ):
++        scheduler = create_scheduler(
++            model=MODEL, async_scheduling=True, kv_cache_spec=_ring_spec()
++        )
++    assert scheduler.defer_block_free  # via the ring gate, nothing forced
++    pool = scheduler.kv_cache_manager.block_pool
++    num_free_initially = pool.get_num_free_blocks()
++
++    request, out0, out1 = _setup_request_with_inflight_step(scheduler)
++    num_free_running = pool.get_num_free_blocks()
++    # the ring is one block per request for its whole lifetime
++    assert num_free_running == num_free_initially - 1
++
++    scheduler.running.remove(request)
++    scheduler._preempt_request(request, time.monotonic())
++    assert request.status == RequestStatus.PREEMPTED
++    assert len(scheduler.deferred_frees) == 1
++    assert pool.get_num_free_blocks() == num_free_running
++    for manager in scheduler.kv_cache_manager.coordinator.single_type_managers:
++        assert request.request_id not in manager.req_to_blocks
++
++    scheduler.update_from_output(out0, _make_model_runner_output(out0))
++    assert len(scheduler.deferred_frees) == 1
++    assert pool.get_num_free_blocks() == num_free_running
++    scheduler.update_from_output(out1, _make_model_runner_output(out1))
++    assert not scheduler.deferred_frees
++    assert pool.get_num_free_blocks() == num_free_initially
++
++
++def test_deferred_victim_stops_the_preemption_cascade():
++    """Review P1: under deferred free a preempted victim returns no blocks
++    until its in-flight step is processed, so the allocation retry must not
++    keep preempting. Two 48-token requests fill a 6-block pool; the first
++    request's speculative decode (token 49) needs a 4th block. Expected: exactly ONE
++    victim (the last running request), the requester stays RUNNING and
++    unscheduled, and after the in-flight step is processed it gets its block.
++    On rc4 this preempts both requests in one schedule() call.
++    """
++    with patch.object(
++        VllmConfig,
++        "max_concurrent_batches",
++        new_callable=PropertyMock,
++        return_value=2,
++    ):
++        # 7 blocks = 6 usable (block 0 is the null block); ring gate irrelevant
++        # here, the cascade is the scheduler's -- force deferral as the
++        # upstream tests do.
++        scheduler = create_scheduler(
++            model=MODEL, async_scheduling=True, num_blocks=7, block_size=16
++        )
++    scheduler.defer_block_free = True
++    pool = scheduler.kv_cache_manager.block_pool
++    assert pool.get_num_free_blocks() == 6
++
++    reqs = create_requests(
++        num_requests=2, num_tokens=48, max_tokens=8, stop_token_ids=[STOP_TOKEN_ID]
++    )
++    for r in reqs:
++        scheduler.add_request(r)
++    out0 = scheduler.schedule()
++    assert sorted(out0.num_scheduled_tokens.values()) == [48, 48]
++    assert pool.get_num_free_blocks() == 0
++
++    # step 2 (step 1 in flight): the first request's decode crosses into a
++    # 4th block -> allocation fails -> the loop preempts the LAST running one.
++    first, second = scheduler.running[0], scheduler.running[1]
++    out1 = scheduler.schedule()
++    assert second.status == RequestStatus.PREEMPTED
++    assert first.status == RequestStatus.RUNNING, "the cascade reached the requester"
++    assert first in scheduler.running
++    assert len(scheduler.deferred_frees) == 1
++    assert pool.get_num_free_blocks() == 0
++    assert first.request_id not in out1.num_scheduled_tokens
++
++    # step 1's output processed: the victim's blocks drain, the requester
++    # is scheduled on the next call.
++    scheduler.update_from_output(out0, _make_model_runner_output(out0))
++    assert not scheduler.deferred_frees
++    assert pool.get_num_free_blocks() == 3
++    out2 = scheduler.schedule()
++    assert first.request_id in out2.num_scheduled_tokens
++    assert first.status == RequestStatus.RUNNING
+diff --git a/tests/v1/worker/gpu/test_qsa_ring_skip_telemetry.py b/tests/v1/worker/gpu/test_qsa_ring_skip_telemetry.py
+new file mode 100644
+index 000000000..72f43019b
+--- /dev/null
++++ b/tests/v1/worker/gpu/test_qsa_ring_skip_telemetry.py
+@@ -0,0 +1,204 @@
++# SPDX-License-Identifier: Apache-2.0
++"""v2-rc5 (T.1c): the ring-skip telemetry site of the QSA pre-indexer.
++
++The suffix-commit loop stores one ring row per retained token, every store
++masked by ``valid_slot``. A live token whose state slot is < 0 or beyond the
++ring capacity is therefore NOT written and nothing said so (T.1a candidate C1
++for the raw-key ring crash class). rc5 counts those tokens into
++``SITE_QSA_RING_SKIP``; the write stays skipped. These tests prove the wiring
++(CPU) and that the count moves for exactly the skipped tokens (GPU).
++
++Helpers mirror tests/v1/worker/gpu/test_qsa_rope_position_guard.py on purpose:
++the two files must stay independently runnable.
++"""
++
++import inspect
++
++import pytest
++import torch
++
++from vllm.models.qwen4_exp.nvidia.ops import qsa_pre_indexer as qpi
++from vllm.v1.worker import guard_telemetry
++
++COMPRESS_RATIO = 4
++HEAD_DIM = 128
++N_HEADS = 4
++STATE_SIZE = 8          # ring capacity
++ROW_WIDTH = 140         # head dim + the int64 position triple in the tail
++MAX_MODEL_LEN = 4096
++NUM_BLOCKS = 8
++RING_CAPACITY = NUM_BLOCKS * STATE_SIZE
++
++
++class _Recorder:
++    """Stands in for the Triton kernel and keeps the launch arguments."""
++
++    def __init__(self):
++        self.launches = []
++
++    def __getitem__(self, grid):
++        def launch(*args, **kwargs):
++            self.launches.append((grid, args, kwargs))
++
++        return launch
++
++
++def _inputs(device, num_tokens=4):
++    q = torch.randn(num_tokens, N_HEADS * HEAD_DIM, dtype=torch.bfloat16, device=device)
++    k = torch.randn(num_tokens, HEAD_DIM, dtype=torch.bfloat16, device=device)
++    positions = (
++        torch.arange(num_tokens, dtype=torch.int64, device=device)
++        .unsqueeze(0)
++        .expand(3, -1)
++        .contiguous()
++    )
++    cos_sin = torch.randn(
++        MAX_MODEL_LEN, HEAD_DIM // 2, dtype=torch.bfloat16, device=device
++    )
++    ones = torch.ones(HEAD_DIM, dtype=torch.bfloat16, device=device)
++    q_out = torch.empty(num_tokens, N_HEADS, HEAD_DIM, dtype=torch.bfloat16, device=device)
++    state_cache = torch.zeros(
++        NUM_BLOCKS, STATE_SIZE, 1, ROW_WIDTH, dtype=torch.bfloat16, device=device
++    )
++    state_slots = torch.arange(num_tokens, dtype=torch.int32, device=device)
++    state_table = torch.zeros(1, 1, dtype=torch.int32, device=device)
++    qsl = torch.tensor([0, num_tokens], dtype=torch.int32, device=device)
++    logical = torch.arange(num_tokens, dtype=torch.int32, device=device)
++    comp_cache = torch.zeros(
++        NUM_BLOCKS, 800, 1, HEAD_DIM, dtype=torch.bfloat16, device=device
++    )
++    comp_slots = torch.zeros(num_tokens, dtype=torch.int32, device=device)
++    kwb = torch.zeros(
++        max(num_tokens // COMPRESS_RATIO, 1), 2, dtype=torch.int32, device=device
++    )
++    return dict(
++        q=q, k=k, positions=positions, cos_sin_cache=cos_sin,
++        q_norm_weight=ones, k_norm_weight=ones, eps=1e-6, q_out=q_out,
++        state_cache=state_cache, state_slots=state_slots,
++        state_block_table=state_table, query_start_loc=qsl,
++        logical_positions=logical, compressed_cache=comp_cache,
++        compressed_slots=comp_slots, k_work_metadata=kwb,
++    )
++
++
++def _launch(kw):
++    qpi.qsa_pre_indexer(
++        kw["q"], kw["k"], kw["positions"], kw["cos_sin_cache"],
++        kw["q_norm_weight"], kw["k_norm_weight"], kw["eps"], kw["q_out"],
++        kw["state_cache"], kw["state_slots"], kw["state_block_table"],
++        kw["query_start_loc"], kw["logical_positions"], kw["compressed_cache"],
++        kw["compressed_slots"], kw["k_work_metadata"],
++        compress_ratio=COMPRESS_RATIO, mrope_section=(11, 11, 10),
++        rope_pos_offset=HEAD_DIM,
++    )
++
++
++def test_site_is_declared_named_and_not_fatal():
++    """A site that exists but is unnamed reports as a bare integer; a site
++    that is fatal would abort a boot on the pre-rc5 behaviour it merely
++    observes. Both are the wrong instrument."""
++    site = guard_telemetry.SITE_QSA_RING_SKIP
++    assert site == 10 and guard_telemetry.NUM_SITES == 11
++    assert site in guard_telemetry.SITE_NAMES
++    assert "SKIPPED" in guard_telemetry.SITE_NAMES[site]
++    assert site not in guard_telemetry._ALWAYS_FATAL_SITES
++    # the counter store is sized by NUM_SITES: the new site must have a row
++    ctr = guard_telemetry.counter(site, torch.device("cpu"))
++    assert ctr.dtype == torch.int64 and ctr.numel() == guard_telemetry.SLOTS_PER_SITE
++
++
++def test_launcher_passes_the_ring_skip_counter(monkeypatch):
++    """The kernel parameter must be the persistent SITE_QSA_RING_SKIP buffer
++    and must differ from the two counters the kernel already takes (the
++    rope-guard series shipped a declared-but-never-written site once; the
++    inverted assertion below is the same defence)."""
++    device = torch.device("cpu")
++    sig = inspect.signature(qpi._qsa_pre_indexer_kernel.fn)
++    assert "ring_skip_ctr" in sig.parameters
++    rec = _Recorder()
++    monkeypatch.setattr(qpi, "_qsa_pre_indexer_kernel", rec)
++    _launch(_inputs(device))
++
++    assert len(rec.launches) == 1
++    _grid, args, kwargs = rec.launches[0]
++    kwargs = {k: v for k, v in kwargs.items()
++              if k not in ("num_warps", "num_stages", "num_ctas", "grid")}
++    bound = sig.bind(*args, **kwargs)
++    bound.apply_defaults()
++    skip_ctr = bound.arguments["ring_skip_ctr"]
++    assert skip_ctr.dtype == torch.int64 and skip_ctr.numel() == 3
++    assert skip_ctr.data_ptr() == guard_telemetry.counter(
++        guard_telemetry.SITE_QSA_RING_SKIP, device
++    ).data_ptr()
++    for other in ("rope_guard_ctr", "guard_ctr"):
++        assert bound.arguments[other].data_ptr() != skip_ctr.data_ptr()
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
++def test_negative_control_valid_slots_count_zero():
++    device = torch.device("cuda", torch.cuda.current_device())
++    guard_telemetry.prealloc(device)
++    guard_telemetry.reset_for_test()
++    kw = _inputs(device)
++    _launch(kw)
++    torch.cuda.synchronize()
++    ctr = guard_telemetry.counter(guard_telemetry.SITE_QSA_RING_SKIP, device)
++    assert ctr.tolist() == [0, 0, 0]
++    # and the commit happened: every token's raw key and position tail
++    for t in range(kw["k"].shape[0]):
++        row = kw["state_cache"][0, t, 0, :]
++        assert torch.equal(row[:HEAD_DIM], kw["k"][t])
++        tail = row[HEAD_DIM:HEAD_DIM + 12].contiguous().view(torch.int64)
++        assert tail.tolist() == [t, t, t]
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
++@pytest.mark.parametrize(
++    "bad_index,bad_slot",
++    [(2, -1), (1, RING_CAPACITY), (3, RING_CAPACITY + 5)],
++    ids=["negative-slot", "at-capacity", "past-capacity"],
++)
++def test_positive_control_one_skipped_token_is_counted_and_located(bad_index, bad_slot):
++    """Exactly the skipped token is counted; slot 1 names the token, slot 2
++    carries the offending state slot value; the other rows are still written
++    and the bad token's row is not."""
++    device = torch.device("cuda", torch.cuda.current_device())
++    guard_telemetry.prealloc(device)
++    guard_telemetry.reset_for_test()
++    kw = _inputs(device)
++    kw["state_slots"][bad_index] = bad_slot
++    _launch(kw)
++    torch.cuda.synchronize()
++
++    ctr = guard_telemetry.counter(guard_telemetry.SITE_QSA_RING_SKIP, device)
++    n, row, val = ctr.tolist()
++    assert n == 1, f"expected one skipped token, counter says {n}"
++    assert row - guard_telemetry.GUARD_BIAS == bad_index
++    assert val - guard_telemetry.GUARD_BIAS == bad_slot
++    # neighbours committed (key AND int64 position tail), the bad token's
++    # own ring row untouched over its WHOLE width -- the crash class lives
++    # in the tail, so a key-only check would miss a stray tail write.
++    for t in range(kw["k"].shape[0]):
++        row = kw["state_cache"][0, t, 0, :]
++        if t == bad_index:
++            assert torch.count_nonzero(row) == 0, "skipped row was written"
++        else:
++            assert torch.equal(row[:HEAD_DIM], kw["k"][t])
++            tail = row[HEAD_DIM:HEAD_DIM + 12].contiguous().view(torch.int64)
++            assert tail.tolist() == [t, t, t]
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
++def test_positive_control_two_skipped_tokens_accumulate():
++    device = torch.device("cuda", torch.cuda.current_device())
++    guard_telemetry.prealloc(device)
++    guard_telemetry.reset_for_test()
++    kw = _inputs(device)
++    kw["state_slots"][0] = -1
++    kw["state_slots"][3] = RING_CAPACITY + 1
++    _launch(kw)
++    torch.cuda.synchronize()
++    n, row, val = guard_telemetry.counter(guard_telemetry.SITE_QSA_RING_SKIP, device).tolist()
++    assert n == 2
++    assert row - guard_telemetry.GUARD_BIAS == 3          # max token index
++    assert val - guard_telemetry.GUARD_BIAS == RING_CAPACITY + 1  # max slot value
+diff --git a/vllm/models/qwen4_exp/nvidia/ops/qsa_pre_indexer.py b/vllm/models/qwen4_exp/nvidia/ops/qsa_pre_indexer.py
+index 0e0623578..6de825990 100644
+--- a/vllm/models/qwen4_exp/nvidia/ops/qsa_pre_indexer.py
++++ b/vllm/models/qwen4_exp/nvidia/ops/qsa_pre_indexer.py
+@@ -201,6 +201,7 @@ def _qsa_pre_indexer_kernel(
+     num_k_work,
+     num_requests,  # rc3-instr
+     guard_ctr,  # rc3-instr persistent int64[3]
++    ring_skip_ctr,  # v2-rc5 T.1c persistent int64[3], SITE_QSA_RING_SKIP
+     HQ: tl.constexpr,
+     D: tl.constexpr,
+     TILE_T_Q: tl.constexpr,
+@@ -454,6 +455,19 @@ def _qsa_pre_indexer_kernel(
+                 valid_slot = (
+                     valid_token & (slot >= 0) & (slot < num_state_blocks * STATE_SIZE)
+                 )
++                # v2-rc5 (T.1c): a live token whose slot fails the range check
++                # has its ring row silently NOT written (every store below is
++                # masked by valid_slot). That token's raw key is then absent
++                # from the ring the next step reads (T.1a candidate C1). Count
++                # it -- the write stays skipped, the reconciliation is T.1b.
++                skipped = valid_token & ~valid_slot
++                tl.atomic_add(ring_skip_ctr, 1, mask=skipped)
++                tl.atomic_max(
++                    ring_skip_ctr + 1, token.to(tl.int64) + _GUARD_BIAS, mask=skipped
++                )
++                tl.atomic_max(
++                    ring_skip_ctr + 2, slot.to(tl.int64) + _GUARD_BIAS, mask=skipped
++                )
+                 safe_slot = tl.maximum(slot, 0)
+                 state_row = (
+                     state_cache_ptr
+@@ -589,6 +603,7 @@ def qsa_pre_indexer(
+         num_k_work,
+         min(query_start_loc.numel() - 1, state_block_table.shape[0]),
+         guard_telemetry.counter(guard_telemetry.SITE_QSA_PRE_INDEXER, q.device),
++        guard_telemetry.counter(guard_telemetry.SITE_QSA_RING_SKIP, q.device),
+         HQ=num_q_heads,
+         D=head_dim,
+         TILE_T_Q=TILE_T_Q,
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index c343354fb..72f41c8fa 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -56,10 +56,12 @@ from vllm.v1.core.sched.request_queue import (
+ from vllm.v1.core.sched.utils import check_stop, remove_all
+ from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
+ from vllm.v1.kv_cache_interface import (
++    CircularBufferSpec,
+     KVCacheConfig,
+     MambaSpec,
+     get_mamba_prefill_checkpoint_position,
+     is_mamba_prefill_checkpoint_valid,
++    iter_layer_specs,
+ )
+ from vllm.v1.metrics.perf import ModelMetrics, PerfStats
+ from vllm.v1.metrics.stats import (
+@@ -179,6 +181,26 @@ class Scheduler(SchedulerInterface):
+ 
+             self.requires_kv_delivery = self.connector.requires_kv_delivery
+ 
++        # v2-rc5 (T.1c): the QSA ring block (CircularBufferSpec) is rewritten
++        # by every step that touches the request, so with overlapping batches
++        # (async scheduling or PP) an in-flight step may still be committing a
++        # freed/preempted request's suffix rows when the scheduler hands that
++        # block to another request. A KV connector is not the only writer that
++        # can race the stale in-flight write; the next request's own first
++        # step is. Defer the return of freed blocks to the pool until the
++        # newest scheduled step's output has been processed whenever a ring
++        # group exists. Same mechanism and fence as the connector gate above.
++        if (
++            not self.defer_block_free
++            and self.vllm_config.max_concurrent_batches > 1
++            and any(
++                isinstance(spec, CircularBufferSpec)
++                for group in kv_cache_config.kv_cache_groups
++                for spec in iter_layer_specs(group.kv_cache_spec)
++            )
++        ):
++            self.defer_block_free = True
++
+         self.kv_event_publisher = EventPublisherFactory.create(
+             self.kv_events_config,
+             self.parallel_config.data_parallel_index,
+@@ -772,6 +794,7 @@ class Scheduler(SchedulerInterface):
+                     else:
+                         preempted_req = self.running.pop()
+ 
++                    num_deferred_before = len(self.deferred_frees)
+                     self._preempt_request(
+                         preempted_req,
+                         scheduled_timestamp,
+@@ -781,6 +804,16 @@ class Scheduler(SchedulerInterface):
+                     if preempted_req == request:
+                         # No more request to preempt. Cannot schedule this request.
+                         break
++                    if len(self.deferred_frees) > num_deferred_before:
++                        # v2-rc5 (T.1c, review P1): the victim's blocks are fenced
++                        # behind its in-flight step and return to the pool only
++                        # when that step's output is processed, so retrying the
++                        # allocation now cannot succeed on their account and would
++                        # preempt the next request for nothing -- with every running
++                        # request in flight (PP / async) the whole batch. Stop at one
++                        # deferred victim; this request stays running, unscheduled,
++                        # and retries next step after the drain.
++                        break
+ 
+             if new_blocks is None:
+                 # Cannot schedule this request.
+diff --git a/vllm/v1/worker/guard_telemetry.py b/vllm/v1/worker/guard_telemetry.py
+index e8f4a4690..aa0edd91a 100644
+--- a/vllm/v1/worker/guard_telemetry.py
++++ b/vllm/v1/worker/guard_telemetry.py
+@@ -85,7 +85,12 @@ SITE_SLOT_MAPPING = 6
+ SITE_KV_ZEROER = 7
+ SITE_GDN_RECURRENT_STATE = 8
+ SITE_QSA_ROPE_POS = 9
+-NUM_SITES = 10
++# v2-rc5 (T.1c): NOT a masked fault -- a suffix-commit row the writer
++# skipped because the token's state slot was < 0 or >= ring capacity.
++# The skip itself is the pre-rc5 behaviour; the count is the instrument
++# for the v2.1 ring-row reconciliation (T.1b). Telemetry only: warn.
++SITE_QSA_RING_SKIP = 10
++NUM_SITES = 11
+ 
+ SITE_NAMES = {
+     SITE_MAMBA_COPY: "_copy_mamba_state_block (block-table row/column)",
+@@ -101,6 +106,9 @@ SITE_NAMES = {
+     "(ssm_state_indices column)",
+     SITE_QSA_ROPE_POS: "_norm_rope in _qsa_pre_indexer_kernel "
+     "(rope position vs cos/sin table rows; slot 2 = axis 0=t 1=h 2=w)",
++    SITE_QSA_RING_SKIP: "_qsa_pre_indexer_kernel suffix commit SKIPPED "
++    "(state slot < 0 or >= ring capacity; slot 1 = token index, "
++    "slot 2 = state slot value)",
+ }
+ 
+ 
+-- 
+2.47.3
+

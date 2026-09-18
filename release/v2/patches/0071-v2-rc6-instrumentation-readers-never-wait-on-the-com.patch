@@ -1,0 +1,433 @@
+From 9576dd80192af42e0658b009affa538225b7902d Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Thu, 17 Sep 2026 02:41:21 +0000
+Subject: [PATCH 71/76] v2-rc6: instrumentation readers never wait on the
+ compute stream (fixes qwen38next-flash#17)
+
+Root cause (py-spy dumps, 2026-09-17 02:28 UTC, block 5 r5 on rc5; same signature as the
+V.5 run 3 hang on rc4): the rc3 guard-telemetry cadence reader called buf.tolist() every
+50 ms from its thread - a synchronous pageable device-to-host copy on the compute stream.
+The CUDA driver services such a copy holding the context lock until the stream drains.
+The compute stream held the PLE pull transport GPU-side wait; its producer needs the
+same lock (the connector thread event.synchronize() and the main thread next
+cuLaunchKernel, both found blocked on the lock). Circular wait; the executor timeout
+(300 s) then killed the engine. The QSA clip reader (.item() per interval) shares the
+pattern.
+
+Fix: NonBlockingReader - per registered counter tensor a pinned host mirror, a dedicated
+side CUDA stream, a non-blocking copy and event.query() polling; nothing in the reader
+waits on the GPU. Registration happens in prealloc() before capture or lazily from the
+reader thread (never from an allocating thread that may be capturing; register() raises
+under is_current_stream_capturing). A count rise seen in one copy is reported from the
+next (the kernels write the count before the maxima; the copy is not a coherent
+snapshot). The shutdown drain reads through the mirror after the device synchronize.
+Both readers use it.
+
+Tests: tests/v1/worker/gpu/test_guard_reader_nonblocking.py - a reader tick must return
+< 0.25 s while torch.cuda._sleep is parked on the compute stream (main-thread and
+reader-thread variants; the pre-fix reader waits for the kernel), capture refusal,
+confirming-tick reporting, no-loss after a stall.
+
+Luna rounds 1-2 applied (capture-safe registration, confirming tick, drain via mirror,
+QSA registration moved to the reader thread).
+---
+ .../gpu/test_guard_reader_nonblocking.py      | 133 +++++++++++++++
+ vllm/models/qwen4_exp/nvidia/qsa.py           |  21 ++-
+ vllm/v1/worker/guard_telemetry.py             | 161 +++++++++++++++++-
+ 3 files changed, 310 insertions(+), 5 deletions(-)
+ create mode 100644 tests/v1/worker/gpu/test_guard_reader_nonblocking.py
+
+diff --git a/tests/v1/worker/gpu/test_guard_reader_nonblocking.py b/tests/v1/worker/gpu/test_guard_reader_nonblocking.py
+new file mode 100644
+index 000000000..8c5759b0a
+--- /dev/null
++++ b/tests/v1/worker/gpu/test_guard_reader_nonblocking.py
+@@ -0,0 +1,133 @@
++# SPDX-License-Identifier: Apache-2.0
++"""v2-rc6 (qwen38next-flash#17): the instrumentation readers must never wait on the compute stream.
++
++The rc3 cadence reader did a synchronous pageable ``tolist()`` from its thread; the driver held the CUDA context lock
++while that copy waited for the stream, and a pending PLE pull-transport wait on the stream (whose producer needs the
++same lock) deadlocked the worker. These tests park a kernel on the current (compute) stream and require a reader tick
++to return while it is still running. On the pre-fix reader the first GPU test blocks for the kernel's duration.
++"""
++import threading
++import time
++
++import pytest
++import torch
++
++from vllm.v1.worker import guard_telemetry
++
++SLEEP_CYCLES = 4_000_000_000  # ~2 s on a 3090 (torch.cuda._sleep spins for this many cycles)
++
++
++def test_cpu_tensor_reads_directly():
++    r = guard_telemetry.NonBlockingReader()
++    t = torch.tensor([[1, 2, 3]], dtype=torch.int64)
++    r.register("cpu", t)
++    assert r.poll_one("cpu") == [[1, 2, 3]]
++    t[0, 0] = 7
++    assert r.poll()["cpu"] == [[7, 2, 3]]
++
++
++def test_register_refuses_to_run_inside_a_capture(monkeypatch):
++    """Luna r1 P1: creating the side stream inside a cudagraph capture is not capture-safe."""
++    r = guard_telemetry.NonBlockingReader()
++    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
++    if not torch.cuda.is_available():
++        pytest.skip("CUDA required for the cuda-tensor branch")
++    t = torch.zeros(2, dtype=torch.int64, device="cuda")
++    with pytest.raises(RuntimeError, match="during cudagraph capture"):
++        r.register("x", t)
++
++
++def test_report_waits_for_the_confirming_tick_cpu():
++    """Luna r1 P1: a count rise seen in copy k is reported from copy k+1 (maxima current by then)."""
++    device = torch.device("cpu")
++    guard_telemetry.reset_for_test()
++    buf = guard_telemetry.counter(0, device)  # allocates the cpu buffer
++    full = guard_telemetry._buffers[device]
++    site = guard_telemetry.SITE_MAMBA_COPY
++    full[site, 0] = 2                       # count written, maxima not yet
++    guard_telemetry._poll_once()            # rise seen -> pending, nothing reported
++    assert guard_telemetry._seen.get((device, site), 0) == 0
++    full[site, 1] = 9 + guard_telemetry.GUARD_BIAS   # maxima land before the next tick
++    guard_telemetry._poll_once()            # confirming tick reports count 2 with row 9
++    assert guard_telemetry._seen.get((device, site), 0) == 2
++    snap = guard_telemetry.snapshot()
++    key = f"{device}:{guard_telemetry.SITE_NAMES[site]}"
++    assert snap[key][:2] == [2, 9]
++    guard_telemetry.reset_for_test()
++
++
++def test_module_reader_is_the_non_blocking_kind():
++    assert isinstance(guard_telemetry._nb_reader, guard_telemetry.NonBlockingReader)
++    src = open(guard_telemetry.__file__, encoding="utf-8").read()
++    body = src[src.index("def _poll_once"):src.index("def _arm(")]
++    assert ".tolist()" not in body.replace("host.tolist()", ""), "the cadence reader must not read the device buffer synchronously"
++    assert "poll_one(" in body
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
++def test_reader_tick_returns_while_the_compute_stream_is_busy():
++    device = torch.device("cuda", torch.cuda.current_device())
++    guard_telemetry.prealloc(device)
++    guard_telemetry.reset_for_test()
++    torch.cuda.synchronize(device)
++    # prime: one poll starts the first copy (nothing to report yet)
++    guard_telemetry._poll_once()
++    torch.cuda.synchronize(device)
++
++    # Park a long kernel on the compute (current) stream, then tick the reader.
++    torch.cuda._sleep(SLEEP_CYCLES)
++    t0 = time.monotonic()
++    guard_telemetry._poll_once()
++    tick = time.monotonic() - t0
++    # Prove the stream really was busy: the sync must take a while.
++    t1 = time.monotonic()
++    torch.cuda.synchronize(device)
++    busy = time.monotonic() - t1
++    assert busy > 0.5, f"control failed: the parked kernel finished in {busy:.3f}s, the test cannot discriminate"
++    assert tick < 0.25, f"reader tick took {tick:.3f}s while the compute stream was busy for {busy:.3f}s: it waited on the stream"
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
++def test_reader_tick_from_a_thread_returns_while_the_compute_stream_is_busy():
++    """The production shape: the tick runs on the reader thread while the main thread owns the stream."""
++    device = torch.device("cuda", torch.cuda.current_device())
++    guard_telemetry.prealloc(device)
++    guard_telemetry.reset_for_test()
++    guard_telemetry._poll_once()
++    torch.cuda.synchronize(device)
++    torch.cuda._sleep(SLEEP_CYCLES)
++    done = threading.Event()
++    elapsed = {}
++
++    def tick():
++        t0 = time.monotonic()
++        guard_telemetry._poll_once()
++        elapsed["tick"] = time.monotonic() - t0
++        done.set()
++
++    threading.Thread(target=tick, name="test-guard-reader", daemon=True).start()
++    finished = done.wait(timeout=1.0)
++    torch.cuda.synchronize(device)
++    assert finished, "the reader tick did not return within 1 s while the compute stream was busy (deadlock class #17)"
++    assert elapsed["tick"] < 0.25
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
++def test_hits_written_before_a_stall_are_still_reported():
++    """Non-blocking must not mean lossy: a count written on the compute stream is reported once the copy lands."""
++    device = torch.device("cuda", torch.cuda.current_device())
++    guard_telemetry.prealloc(device)
++    guard_telemetry.reset_for_test()
++    buf = guard_telemetry._buffers[device]
++    site = guard_telemetry.SITE_MAMBA_COPY
++    buf[site, 0] += 3  # a "masked access" count, written on the compute stream
++    buf[site, 1] = 5 + guard_telemetry.GUARD_BIAS
++    torch.cuda._sleep(SLEEP_CYCLES // 4)
++    torch.cuda.synchronize(device)
++    # copy -> rise seen -> confirming copy -> report: four ticks at most
++    for _ in range(4):
++        guard_telemetry._poll_once()
++    assert guard_telemetry._seen.get((device, site), 0) == 3
++    snap = guard_telemetry.snapshot()
++    key = f"{device}:{guard_telemetry.SITE_NAMES[site]}"
++    assert snap[key][0] == 3 and snap[key][1] == 5
+diff --git a/vllm/models/qwen4_exp/nvidia/qsa.py b/vllm/models/qwen4_exp/nvidia/qsa.py
+index 4c25e22f9..6067eebb6 100644
+--- a/vllm/models/qwen4_exp/nvidia/qsa.py
++++ b/vllm/models/qwen4_exp/nvidia/qsa.py
+@@ -162,6 +162,10 @@ if _qsa_clip_raw and not (math.isfinite(_qsa_clip_interval) and _qsa_clip_interv
+         f"{_QSA_CLIP_ENV} must be a finite positive number of seconds, got {_qsa_clip_raw!r}"
+     )
+ _qsa_clip_counters: dict[str, torch.Tensor] = {}
++# v2-rc6 (qwen38next-flash#17): the reader must never block on the compute
++# stream; see guard_telemetry.NonBlockingReader.
++from vllm.v1.worker.guard_telemetry import NonBlockingReader as _NonBlockingReader  # noqa: E402
++_qsa_clip_nb = _NonBlockingReader()
+ _qsa_clip_reader_started = False
+ _qsa_clip_lock = threading.Lock()
+ 
+@@ -175,8 +179,19 @@ def _qsa_clip_reader() -> None:
+         try:
+             totals_k = totals_v = 0
+             for name, ctr in list(_qsa_clip_counters.items()):
+-                k_total = int(ctr[0].item())
+-                v_total = int(ctr[1].item())
++                if not _qsa_clip_nb.registered(name):
++                    _qsa_clip_nb.register(name, ctr)  # reader thread: never capturing
++            ready = _qsa_clip_nb.poll()
++            for name, ctr in list(_qsa_clip_counters.items()):
++                row = ready.get(name)
++                if row is None:
++                    # copy still in flight: report on the next pass
++                    prev_k, prev_v = last.get(name, (0, 0))
++                    totals_k += prev_k
++                    totals_v += prev_v
++                    continue
++                k_total = int(row[0])
++                v_total = int(row[1])
+                 totals_k += k_total
+                 totals_v += v_total
+                 prev_k, prev_v = last.get(name, (0, 0))
+@@ -215,7 +230,7 @@ def _qsa_clip_count(
+         # First forward is eager (profiling/warmup precede capture), so the
+         # allocation never happens inside cudagraph capture.
+         ctr = torch.zeros(2, dtype=torch.int64, device=key.device)
+-        _qsa_clip_counters[layer.layer_name] = ctr
++        _qsa_clip_counters[layer.layer_name] = ctr  # registered with the reader by the reader thread (never during capture)
+         with _qsa_clip_lock:
+             if not _qsa_clip_reader_started:
+                 _qsa_clip_reader_started = True
+diff --git a/vllm/v1/worker/guard_telemetry.py b/vllm/v1/worker/guard_telemetry.py
+index aa0edd91a..27efd0154 100644
+--- a/vllm/v1/worker/guard_telemetry.py
++++ b/vllm/v1/worker/guard_telemetry.py
+@@ -157,6 +157,129 @@ _pending: str | None = None
+ # measuring nothing.
+ _seen: dict[tuple[torch.device, int], int] = {}
+ 
++
++class NonBlockingReader:
++    """Reads device counter tensors from a side thread without ever waiting on
++    the compute stream (v2-rc6, qwen38next-flash#17).
++
++    The rc3 reader called ``buf.tolist()`` on its cadence: a synchronous,
++    pageable device-to-host copy on the compute stream. The driver services
++    that copy holding the CUDA context lock until the stream's queued work has
++    completed. Under the PLE pull transport the stream can hold a GPU-side
++    wait whose producer needs the same lock (the connector thread's
++    ``event.synchronize()`` and the main thread's next kernel launch), so a
++    reader tick landing inside that window deadlocked the whole worker until
++    the executor timeout killed the engine (two hangs, 2026-09-16/17, both at
++    the end of long prefills; py-spy stacks in the #17 record).
++
++    Here every registered tensor gets a pinned host mirror and the copy runs
++    on a dedicated side stream with ``non_blocking=True``; completion is
++    observed with ``event.query()``. Nothing in this class blocks on the GPU.
++    The side stream has no dependency on the compute stream, so a pending
++    wait there cannot stall the copy, and a non-blocking pinned copy returns
++    from the driver immediately. The rows a tick reports are therefore the
++    values as of the previous tick's copy, and the three slots of one site
++    may come from slightly different moments while kernels are still
++    counting: the count is monotone and the maxima are lifetime maxima, so
++    this changes nothing the reader claims.
++    """
++
++    def __init__(self) -> None:
++        self._streams: dict[torch.device, "torch.cuda.Stream"] = {}
++        # key -> [device_tensor, pinned_host_tensor | None, event | None, inflight]
++        self._jobs: dict[object, list] = {}
++        self._lock = threading.Lock()
++
++    def register(self, key: object, tensor: torch.Tensor) -> None:
++        with self._lock:
++            if key in self._jobs:
++                return
++            if tensor.device.type != "cuda":
++                self._jobs[key] = [tensor, None, None, False]
++                return
++            dev = tensor.device
++            # Luna r1 P1: a stream/event/pinned allocation inside a cudagraph
++            # capture is not capture-safe. prealloc() registers before capture
++            # and the reader thread registers lazily (it is never capturing);
++            # any other caller reaching this during a capture is a bug.
++            if torch.cuda.is_current_stream_capturing():
++                raise RuntimeError(
++                    "guard_telemetry: NonBlockingReader.register() called during "
++                    "cudagraph capture; prealloc() must run before capture"
++                )
++            if dev not in self._streams:
++                with torch.cuda.device(dev):
++                    self._streams[dev] = torch.cuda.Stream(device=dev)
++            host = torch.empty(tensor.shape, dtype=tensor.dtype, device="cpu", pin_memory=True)
++            with torch.cuda.device(dev):
++                event = torch.cuda.Event()
++            self._jobs[key] = [tensor, host, event, False]
++
++    def registered(self, key: object) -> bool:
++        return key in self._jobs
++
++    def poll_one(self, key: object) -> list | None:
++        """Return the rows of a completed copy for ``key`` and start the next
++        one; return None when the previous copy is still in flight. Never
++        blocks."""
++        job = self._jobs[key]
++        tensor, host, event, inflight = job
++        if host is None:  # CPU tensor: nothing can block
++            return tensor.tolist()
++        rows = None
++        if inflight:
++            if not event.query():
++                return None
++            rows = host.tolist()
++        stream = self._streams[tensor.device]
++        with torch.cuda.device(tensor.device), torch.cuda.stream(stream):
++            host.copy_(tensor, non_blocking=True)
++            event.record(stream)
++        job[3] = True
++        return rows
++
++    def poll(self) -> dict[object, list]:
++        out = {}
++        with self._lock:
++            keys = list(self._jobs)
++        for key in keys:
++            rows = self.poll_one(key)
++            if rows is not None:
++                out[key] = rows
++        return out
++
++    def read_now(self, key: object) -> list:
++        """Blocking read for orderly shutdown / tests ONLY: copies through the
++        pinned mirror on the side stream and waits for THAT copy (never a
++        pageable copy, never a wait on the compute stream). Callers sync the
++        device first when they need the latest kernel writes."""
++        job = self._jobs[key]
++        tensor, host, event, _ = job
++        if host is None:
++            return tensor.tolist()
++        stream = self._streams[tensor.device]
++        with torch.cuda.device(tensor.device), torch.cuda.stream(stream):
++            host.copy_(tensor, non_blocking=True)
++            event.record(stream)
++        event.synchronize()
++        job[3] = False
++        return host.tolist()
++
++    def reset(self) -> None:
++        """Test helper: drop in-flight copies so a zeroed counter is not
++        reported from a stale mirror."""
++        for job in self._jobs.values():
++            if job[1] is not None:
++                if job[3]:
++                    job[2].synchronize()
++                job[1].zero_()
++            job[3] = False
++
++
++_nb_reader = NonBlockingReader()
++# device -> the copy in which a count increase was first seen (reported on the next tick)
++_confirm_pending: dict[torch.device, list] = {}
++
+ # Sites that arm the pending raise even under VLLM_E2_GUARD_MODE=warn. warn is
+ # the right default for a guard that turns a crash into a locally wrong answer,
+ # because the run continues and produces more evidence. It is the wrong default
+@@ -223,6 +346,10 @@ def counter(site: int, device: torch.device) -> torch.Tensor:
+                     (NUM_SITES, SLOTS_PER_SITE), dtype=torch.int64, device=device
+                 )
+                 _buffers[device] = buf
++                # v2-rc6 (#17): the reader mirrors this buffer through a pinned
++                # host copy on a side stream (registered by prealloc() before
++                # capture, or lazily by the reader thread -- never here, where
++                # a capture may be in progress).
+     return buf[site]
+ 
+ 
+@@ -237,6 +364,9 @@ def prealloc(device: torch.device) -> None:
+     """
+     for site in range(NUM_SITES):
+         counter(site, device)
++    device = _normalize(device)
++    if not _nb_reader.registered(device):
++        _nb_reader.register(device, _buffers[device])
+ 
+ 
+ def start_reader() -> None:
+@@ -311,7 +441,30 @@ def _poll_once() -> None:
+         if device in _read_disabled:
+             continue
+         try:
+-            rows = buf.tolist()
++            # v2-rc6 (#17): a non-blocking side-stream copy; None means the
++            # previous copy is still in flight (report on a later tick).
++            if not _nb_reader.registered(device):
++                _nb_reader.register(device, buf)  # reader thread: never capturing
++            rows = _nb_reader.poll_one(device)
++            if rows is None:
++                continue
++            # Luna r1 P1: the side-stream copy is not a coherent snapshot of a
++            # site's three slots -- the kernels write the count first, then
++            # the maxima. A copy taken between them pairs a new count with
++            # stale maxima. So a count increase seen in copy k is REPORTED
++            # from copy k+1 (one tick later, >= 50 ms after the increment,
++            # by which time the maxima of that hit are written). The fatal
++            # decision is count-based either way; only its report waits a tick.
++            pend = _confirm_pending.get(device)
++            rising = [site for site, (n, _r, _v) in enumerate(rows) if n > _seen.get((device, site), 0)]
++            if pend is None:
++                if rising:
++                    _confirm_pending[device] = rows
++                continue
++            _confirm_pending.pop(device, None)
++            # report with the CONFIRMING copy's values (never lower than the
++            # pending copy's counts: the counters are monotone)
++            rows = [[max(a[0], b[0]), b[1], b[2]] for a, b in zip(pend, rows)]
+         except Exception:  # noqa: BLE001 -- a reader must never kill the run
+             # Never silent: a reader that cannot read is an instrument that
+             # is not there, and this whole series depends on it. Log once,
+@@ -406,7 +559,9 @@ def drain(*, raise_on_fatal: bool = False) -> dict[str, list[int]]:
+         try:
+             if device.type == "cuda":
+                 torch.cuda.synchronize(device)
+-            rows = buf.tolist()
++            if not _nb_reader.registered(device):
++                _nb_reader.register(device, buf)
++            rows = _nb_reader.read_now(device)  # pinned mirror, side stream only
+         except Exception:  # noqa: BLE001
+             logger.exception("rc3-instr FINAL DRAIN could not read %s", device)
+             fatal.append(f"reader lost {device}")
+@@ -456,5 +611,7 @@ def reset_for_test() -> None:
+     global _pending
+     for buf in _buffers.values():
+         buf.zero_()
++    _nb_reader.reset()
++    _confirm_pending.clear()
+     _seen.clear()
+     _pending = None
+-- 
+2.47.3
+

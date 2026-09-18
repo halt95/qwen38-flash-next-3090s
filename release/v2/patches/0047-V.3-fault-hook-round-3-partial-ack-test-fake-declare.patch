@@ -1,0 +1,29 @@
+From f35bd13d3809c0032cf9e892b9ebc52f85390e9d Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Mon, 14 Sep 2026 05:41:59 +0000
+Subject: [PATCH 47/76] V.3 fault hook round 3: partial-ack test fake declares
+ its armed cut (bootstrap guard reads _FAULT.cut)
+
+---
+ tests/v1/ple_offload/test_fault_round3.py | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/tests/v1/ple_offload/test_fault_round3.py b/tests/v1/ple_offload/test_fault_round3.py
+index 6554d5a2e..6bcfa7ebc 100644
+--- a/tests/v1/ple_offload/test_fault_round3.py
++++ b/tests/v1/ple_offload/test_fault_round3.py
+@@ -255,7 +255,10 @@ def test_cut6_requires_same_incomplete_completion(monkeypatch):
+ def test_partial_ack_requires_complete_required_prefix(monkeypatch):
+     import vllm_ple_offload_bootstrap as bootstrap
+ 
+-    fault = SimpleNamespace(fires=Mock(return_value=True))
++    fault = SimpleNamespace(
++        cut="launch_partial_ready_header",
++        fires=Mock(return_value=True),
++    )
+     monkeypatch.setattr(bootstrap, "_FAULT", fault)
+     assert not bootstrap._write_and_ack_partial(
+         1,
+-- 
+2.47.3
+

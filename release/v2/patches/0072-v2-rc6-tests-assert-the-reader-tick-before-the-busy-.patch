@@ -1,0 +1,54 @@
+From 9d2e089eae68002fd0b7e792c65771d5ce6a047f Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Thu, 17 Sep 2026 03:56:53 +0000
+Subject: [PATCH 72/76] v2-rc6 tests: assert the reader tick before the busy
+ control (a blocking reader zeroes the control); round-11 reader-loss test
+ injects the failure at the NonBlockingReader
+
+GPU proof 2026-09-17 03:55 UTC: rc6 suite 139 passed (tests/v1/worker/gpu incl. the new file, mamba utils, fused sigmoid gating, deferred block free); the same busy-stream tests on the unfixed rc5 tree fail with "reader tick took 2.039s while the compute stream was busy" and "did not return within 1 s".
+---
+ tests/v1/worker/gpu/test_guard_reader_nonblocking.py | 6 ++++--
+ tests/v1/worker/gpu/test_guard_telemetry_round11.py  | 9 +++++----
+ 2 files changed, 9 insertions(+), 6 deletions(-)
+
+diff --git a/tests/v1/worker/gpu/test_guard_reader_nonblocking.py b/tests/v1/worker/gpu/test_guard_reader_nonblocking.py
+index 8c5759b0a..6b9e4602a 100644
+--- a/tests/v1/worker/gpu/test_guard_reader_nonblocking.py
++++ b/tests/v1/worker/gpu/test_guard_reader_nonblocking.py
+@@ -83,8 +83,10 @@ def test_reader_tick_returns_while_the_compute_stream_is_busy():
+     t1 = time.monotonic()
+     torch.cuda.synchronize(device)
+     busy = time.monotonic() - t1
+-    assert busy > 0.5, f"control failed: the parked kernel finished in {busy:.3f}s, the test cannot discriminate"
+-    assert tick < 0.25, f"reader tick took {tick:.3f}s while the compute stream was busy for {busy:.3f}s: it waited on the stream"
++    # The tick assertion comes first: a blocking reader spends the whole sleep inside the tick and would then make
++    # the busy control read ~0 (rc5 negative control, 2026-09-17).
++    assert tick < 0.25, f"reader tick took {tick:.3f}s while the compute stream was busy: it waited on the stream (deadlock class #17)"
++    assert tick + busy > 0.5, f"control failed: the parked kernel finished in {tick + busy:.3f}s, the test cannot discriminate"
+ 
+ 
+ @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+diff --git a/tests/v1/worker/gpu/test_guard_telemetry_round11.py b/tests/v1/worker/gpu/test_guard_telemetry_round11.py
+index 9476b04e1..3de041f85 100644
+--- a/tests/v1/worker/gpu/test_guard_telemetry_round11.py
++++ b/tests/v1/worker/gpu/test_guard_telemetry_round11.py
+@@ -50,11 +50,12 @@ def test_reader_loss_arms_the_stop(monkeypatch):
+     gt.prealloc(device)
+     gt.reset_for_test()
+ 
+-    class Broken:
+-        def tolist(self):
+-            raise RuntimeError("simulated D2H failure")
++    # v2-rc6: the cadence reader no longer reads the device buffer itself; it
++    # polls the NonBlockingReader. Inject the read failure there.
++    def broken_poll(key):
++        raise RuntimeError("simulated D2H failure")
+ 
+-    monkeypatch.setitem(gt._buffers, device, Broken())
++    monkeypatch.setattr(gt._nb_reader, "poll_one", broken_poll)
+     gt._poll_once()
+     assert device in gt._read_disabled
+     with pytest.raises(RuntimeError, match="fatal-site contract"):
+-- 
+2.47.3
+

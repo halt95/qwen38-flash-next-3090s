@@ -1,0 +1,441 @@
+From 4e2e7d47838a68a1001787b9192aeba5bce2aa66 Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Fri, 11 Sep 2026 00:03:05 +0000
+Subject: [PATCH 10/76] e2: vllm PR #46994 (MTP under PP) minus its ROCm MLA
+ file and tests
+
+---
+ .../layers/attention/sparse_mla_attention.py  | 49 +++++++++++++++----
+ vllm/model_executor/models/deepseek_mtp.py    | 18 ++++++-
+ vllm/model_executor/models/qwen3_5_mtp.py     | 12 +++--
+ vllm/models/deepseek_v32/amd/mtp.py           | 18 ++++++-
+ vllm/models/deepseek_v32/nvidia/model.py      |  5 +-
+ vllm/models/deepseek_v32/nvidia/mtp.py        | 18 ++++++-
+ .../mla/flashinfer_mla_sparse_sm120.py        | 13 ++---
+ .../attention/backends/mla/xpu_mla_sparse.py  | 12 ++---
+ vllm/v1/worker/gpu/model_runner.py            |  8 ++-
+ 9 files changed, 118 insertions(+), 35 deletions(-)
+
+diff --git a/vllm/model_executor/layers/attention/sparse_mla_attention.py b/vllm/model_executor/layers/attention/sparse_mla_attention.py
+index ab6946132..a1989ff03 100644
+--- a/vllm/model_executor/layers/attention/sparse_mla_attention.py
++++ b/vllm/model_executor/layers/attention/sparse_mla_attention.py
+@@ -29,7 +29,10 @@ from vllm.platforms import current_platform
+ from vllm.triton_utils import tl, triton
+ from vllm.utils.flashinfer import has_flashinfer
+ from vllm.utils.torch_utils import is_quantized_kv_cache, np_to_pinned_tensor
+-from vllm.v1.attention.backend import AttentionMetadata, AttentionMetadataBuilder
++from vllm.v1.attention.backend import (
++    AttentionMetadata,
++    AttentionMetadataBuilder,
++)
+ from vllm.v1.attention.backends.fa_utils import get_flash_attn_version
+ from vllm.v1.attention.backends.utils import split_decodes_and_prefills
+ from vllm.v1.attention.ops.dcp import MLADCPManager
+@@ -493,7 +496,40 @@ def _build_topk_mask(
+     return out[:batch_size, :max_q_len]
+ 
+ 
+-class SparseMLACommonImpl(MLACommonBaseImpl[T], Generic[T]):
++class SharedTopkIndicesBuffer:
++    """Resolves the shared top-k index buffer for sparse MLA implementations.
++
++    The indexer owns the buffer, but `LLMBaseProposer.load_model` repoints the
++    draft's indexers at the target's buffer after the impls are constructed, so
++    it must be resolved per read rather than snapshotted. Backbone skip-topk
++    layers have no indexer and pass the buffer explicitly.
++    """
++
++    _indexer: object | None = None
++    _topk_indices_buffer: torch.Tensor | None = None
++
++    def init_topk_indices_buffer(
++        self,
++        indexer: object | None,
++        topk_indices_buffer: torch.Tensor | None,
++    ) -> None:
++        self._indexer = indexer
++        self._topk_indices_buffer = topk_indices_buffer
++
++    @property
++    def topk_indices_buffer(self) -> torch.Tensor | None:
++        if self._indexer is not None:
++            return self._indexer.topk_indices_buffer  # type: ignore[attr-defined]
++        return self._topk_indices_buffer
++
++    @topk_indices_buffer.setter
++    def topk_indices_buffer(self, buffer: torch.Tensor | None) -> None:
++        # An explicit assignment supersedes the indexer.
++        self._indexer = None
++        self._topk_indices_buffer = buffer
++
++
++class SparseMLACommonImpl(MLACommonBaseImpl[T], SharedTopkIndicesBuffer, Generic[T]):
+     """Sparse MLA base with dense and masked-MHA prefill paths."""
+ 
+     is_sparse = True
+@@ -535,14 +571,7 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], Generic[T]):
+             kv_b_proj,
+         )
+ 
+-        # The indexer carries the shared buffer for normal layers and tests;
+-        # the explicitly-passed buffer covers backbone skip layers, whose
+-        # indexer is not constructed (see deepseek_v2.py).
+-        self.topk_indices_buffer: torch.Tensor | None = (
+-            indexer.topk_indices_buffer  # type: ignore[attr-defined]
+-            if indexer is not None
+-            else topk_indices_buffer
+-        )
++        self.init_topk_indices_buffer(indexer, topk_indices_buffer)
+         self._use_flashinfer_concat_mla_k = (
+             has_flashinfer()
+             and which("ninja") is not None
+diff --git a/vllm/model_executor/models/deepseek_mtp.py b/vllm/model_executor/models/deepseek_mtp.py
+index 8ac43e0bb..09f4a847d 100644
+--- a/vllm/model_executor/models/deepseek_mtp.py
++++ b/vllm/model_executor/models/deepseek_mtp.py
+@@ -39,9 +39,11 @@ from .deepseek_v2 import (
+     DeepseekV2MoE,
+     _try_load_fp8_indexer_wk,
+ )
++from .interfaces import SupportsPP
+ from .utils import (
+     get_pp_missing_layer_names,
+     get_spec_layer_idx_from_weight_name,
++    make_empty_intermediate_tensors_factory,
+     maybe_prefix,
+ )
+ 
+@@ -230,7 +232,7 @@ class DeepSeekMultiTokenPredictor(nn.Module):
+ 
+ 
+ @support_torch_compile
+-class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts):
++class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts, SupportsPP):
+     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+         super().__init__()
+         self.config = vllm_config.model_config.hf_config
+@@ -240,6 +242,9 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts):
+         )
+         # Set MoE hyperparameters
+         self.set_moe_parameters()
++        self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
++            ["hidden_states", "residual"], self.config.hidden_size
++        )
+ 
+     def set_moe_parameters(self):
+         self.num_moe_layers = self.config.num_nextn_predict_layers
+@@ -266,7 +271,7 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts):
+     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+         return self.model.embed_input_ids(input_ids)
+ 
+-    def forward(
++    def forward(  # type: ignore[override]
+         self,
+         input_ids: torch.Tensor | None,
+         positions: torch.Tensor,
+@@ -328,6 +333,15 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts):
+                 continue
+             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
+             if spec_layer is None:
++                # A tied top-level embed_tokens has no spec layer to rewrite
++                # from; the draft needs its own copy under PP.
++                param = params_dict.get(name) if "embed_tokens" in name else None
++                if param is not None:
++                    weight_loader = getattr(
++                        param, "weight_loader", default_weight_loader
++                    )
++                    weight_loader(param, loaded_weight)
++                    loaded_params.add(name)
+                 continue
+             is_fusion_moe_shared_experts_layer = (
+                 self.is_fused_shared_expert_enabled and ("mlp.shared_experts" in name)
+diff --git a/vllm/model_executor/models/qwen3_5_mtp.py b/vllm/model_executor/models/qwen3_5_mtp.py
+index 4c064bead..7fb699b18 100644
+--- a/vllm/model_executor/models/qwen3_5_mtp.py
++++ b/vllm/model_executor/models/qwen3_5_mtp.py
+@@ -38,6 +38,7 @@ from vllm.transformers_utils.configs.qwen3_5_moe import Qwen3_5MoeTextConfig
+ from .interfaces import (
+     MultiModalEmbeddings,
+     SupportsMultiModal,
++    SupportsPP,
+     _require_is_multimodal,
+ )
+ from .utils import (
+@@ -152,7 +153,9 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
+         inputs_embeds: torch.Tensor | None = None,
+         spec_step_idx: int = 0,
+     ) -> torch.Tensor:
+-        if get_pp_group().is_first_rank:
++        # Branch on the inputs, not the rank: the drafter is built entirely on
++        # the last PP stage, where `is_first_rank` is False.
++        if intermediate_tensors is None:
+             if inputs_embeds is None:
+                 inputs_embeds = self.embed_input_ids(input_ids)
+             assert hidden_states.shape[-1] == inputs_embeds.shape[-1]
+@@ -162,7 +165,6 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
+             hidden_states = self.fc(hidden_states)
+             residual = None
+         else:
+-            assert intermediate_tensors is not None
+             hidden_states = intermediate_tensors["hidden_states"]
+             residual = intermediate_tensors["residual"]
+ 
+@@ -212,7 +214,7 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
+         "hidden_states": 0,
+     }
+ )
+-class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal):
++class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal, SupportsPP):
+     packed_modules_mapping = {
+         "qkv_proj": [
+             "q_proj",
+@@ -254,6 +256,10 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal):
+ 
+         self.logits_processor = LogitsProcessor(config.vocab_size)
+ 
++        self.make_empty_intermediate_tensors = (
++            self.model.make_empty_intermediate_tensors
++        )
++
+     def embed_input_ids(
+         self,
+         input_ids: torch.Tensor,
+diff --git a/vllm/models/deepseek_v32/amd/mtp.py b/vllm/models/deepseek_v32/amd/mtp.py
+index 9ea86ee26..46c35dec9 100644
+--- a/vllm/models/deepseek_v32/amd/mtp.py
++++ b/vllm/models/deepseek_v32/amd/mtp.py
+@@ -32,8 +32,10 @@ from vllm.model_executor.models.deepseek_v2 import (
+     _try_load_fp8_indexer_wk,
+     get_spec_layer_idx_from_weight_name,
+ )
++from vllm.model_executor.models.interfaces import SupportsPP
+ from vllm.model_executor.models.utils import (
+     get_pp_missing_layer_names,
++    make_empty_intermediate_tensors_factory,
+     maybe_prefix,
+ )
+ from vllm.models.deepseek_v32.common.kernels import fused_eh_norm
+@@ -160,7 +162,7 @@ class DeepseekV32MultiTokenPredictor(nn.Module):
+         return self.logits_processor(mtp_layer.shared_head.head, hidden_states)
+ 
+ 
+-class DeepseekV32MTP(nn.Module, DeepseekV2MixtureOfExperts):
++class DeepseekV32MTP(nn.Module, DeepseekV2MixtureOfExperts, SupportsPP):
+     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+         super().__init__()
+         self.config = vllm_config.model_config.hf_config
+@@ -169,6 +171,9 @@ class DeepseekV32MTP(nn.Module, DeepseekV2MixtureOfExperts):
+             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
+         )
+         self.set_moe_parameters()
++        self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
++            ["hidden_states", "residual"], self.config.hidden_size
++        )
+         self.is_fused_shared_expert_enabled = is_model_fused_shared_expert_compatible(
+             self.model.layers.values(),
+             DeepseekV2MoE,
+@@ -192,7 +197,7 @@ class DeepseekV32MTP(nn.Module, DeepseekV2MixtureOfExperts):
+     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+         return self.model.embed_input_ids(input_ids)
+ 
+-    def forward(
++    def forward(  # type: ignore[override]
+         self,
+         input_ids: torch.Tensor | None,
+         positions: torch.Tensor,
+@@ -268,6 +273,15 @@ class DeepseekV32MTP(nn.Module, DeepseekV2MixtureOfExperts):
+                 continue
+             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
+             if spec_layer is None:
++                # A tied top-level embed_tokens has no spec layer to rewrite
++                # from; the draft needs its own copy under PP.
++                param = params_dict.get(name) if "embed_tokens" in name else None
++                if param is not None:
++                    weight_loader = getattr(
++                        param, "weight_loader", default_weight_loader
++                    )
++                    weight_loader(param, loaded_weight)
++                    loaded_params.add(name)
+                 continue
+             is_fusion_moe_shared_experts_layer = (
+                 self.is_fused_shared_expert_enabled and ("mlp.shared_experts" in name)
+diff --git a/vllm/models/deepseek_v32/nvidia/model.py b/vllm/models/deepseek_v32/nvidia/model.py
+index 76aa6ca8e..92b74e536 100644
+--- a/vllm/models/deepseek_v32/nvidia/model.py
++++ b/vllm/models/deepseek_v32/nvidia/model.py
+@@ -182,7 +182,8 @@ class DeepseekV32Model(torch.nn.Module):
+         # DSA is always sparse (has index_topk); allocate the shared top-k
+         # buffer the indexer writes and the sparse MLA backend reads.
+         self.is_v32 = True
+-        topk_indices_buffer = torch.empty(
++        # On the model, not a local: the MTP proposer shares it with the draft.
++        self.topk_indices_buffer = torch.empty(
+             vllm_config.scheduler_config.max_num_batched_tokens,
+             config.index_topk,
+             dtype=torch.int32,
+@@ -207,7 +208,7 @@ class DeepseekV32Model(torch.nn.Module):
+             lambda prefix: DeepseekV32DecoderLayer(
+                 vllm_config=vllm_config,
+                 prefix=prefix,
+-                topk_indices_buffer=topk_indices_buffer,
++                topk_indices_buffer=self.topk_indices_buffer,
+             ),
+             prefix=f"{prefix}.layers",
+         )
+diff --git a/vllm/models/deepseek_v32/nvidia/mtp.py b/vllm/models/deepseek_v32/nvidia/mtp.py
+index 2ea01dbdc..a5348ed22 100644
+--- a/vllm/models/deepseek_v32/nvidia/mtp.py
++++ b/vllm/models/deepseek_v32/nvidia/mtp.py
+@@ -33,8 +33,10 @@ from vllm.model_executor.models.deepseek_v2 import (
+     _try_load_fp8_indexer_wk,
+     get_spec_layer_idx_from_weight_name,
+ )
++from vllm.model_executor.models.interfaces import SupportsPP
+ from vllm.model_executor.models.utils import (
+     get_pp_missing_layer_names,
++    make_empty_intermediate_tensors_factory,
+     maybe_prefix,
+ )
+ from vllm.models.common.ops.fused_allreduce_rms_norm import fused_allreduce_rms_norm
+@@ -260,7 +262,7 @@ class DeepseekV32MultiTokenPredictor(nn.Module):
+         )
+ 
+ 
+-class DeepseekV32MTP(nn.Module, DeepseekV2MixtureOfExperts):
++class DeepseekV32MTP(nn.Module, DeepseekV2MixtureOfExperts, SupportsPP):
+     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+         super().__init__()
+         self.config = vllm_config.model_config.hf_config
+@@ -271,6 +273,9 @@ class DeepseekV32MTP(nn.Module, DeepseekV2MixtureOfExperts):
+         if self.config.model_type == "glm_moe_dsa":
+             enable_glm52_low_latency_gemm(self, vllm_config.model_config.dtype)
+         self.set_moe_parameters()
++        self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
++            ["hidden_states", "residual"], self.config.hidden_size
++        )
+ 
+     def set_moe_parameters(self):
+         self.num_moe_layers = self.config.num_nextn_predict_layers
+@@ -289,7 +294,7 @@ class DeepseekV32MTP(nn.Module, DeepseekV2MixtureOfExperts):
+     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+         return self.model.embed_input_ids(input_ids)
+ 
+-    def forward(
++    def forward(  # type: ignore[override]
+         self,
+         input_ids: torch.Tensor | None,
+         positions: torch.Tensor,
+@@ -368,6 +373,15 @@ class DeepseekV32MTP(nn.Module, DeepseekV2MixtureOfExperts):
+                 continue
+             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
+             if spec_layer is None:
++                # A tied top-level embed_tokens has no spec layer to rewrite
++                # from; the draft needs its own copy under PP.
++                param = params_dict.get(name) if "embed_tokens" in name else None
++                if param is not None:
++                    weight_loader = getattr(
++                        param, "weight_loader", default_weight_loader
++                    )
++                    weight_loader(param, loaded_weight)
++                    loaded_params.add(name)
+                 continue
+             name = self._rewrite_spec_layer_name(spec_layer, name)
+ 
+diff --git a/vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm120.py b/vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm120.py
+index 4de2c2f53..b7459203e 100644
+--- a/vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm120.py
++++ b/vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm120.py
+@@ -6,6 +6,9 @@ from typing import TYPE_CHECKING, cast
+ 
+ import torch
+ 
++from vllm.model_executor.layers.attention.sparse_mla_attention import (
++    SharedTopkIndicesBuffer,
++)
+ from vllm.v1.attention.backend import (
+     AttentionLayer,
+     AttentionType,
+@@ -29,7 +32,9 @@ def _kv_scale_format_for_model(model_type: str | None) -> str:
+     return "pow2_fp32"
+ 
+ 
+-class FlashInferMLASparseSM120Impl(MLAAttentionImpl[FlashInferMLASparseMetadata]):
++class FlashInferMLASparseSM120Impl(
++    MLAAttentionImpl[FlashInferMLASparseMetadata], SharedTopkIndicesBuffer
++):
+     """SM120 FlashInfer sparse-MLA implementation."""
+ 
+     is_sparse = True
+@@ -86,11 +91,7 @@ class FlashInferMLASparseSM120Impl(MLAAttentionImpl[FlashInferMLASparseMetadata]
+ 
+         # Skip-topk layers are built with indexer=None and get the shared
+         # buffer via mla_args instead (cf. FLASHMLA_SPARSE).
+-        self.topk_indices_buffer: torch.Tensor | None = (
+-            indexer.topk_indices_buffer
+-            if indexer is not None
+-            else mla_args.get("topk_indices_buffer")
+-        )
++        self.init_topk_indices_buffer(indexer, mla_args.get("topk_indices_buffer"))
+         from vllm.utils.flashinfer import has_flashinfer_sparse_mla_sm120
+ 
+         if not has_flashinfer_sparse_mla_sm120():
+diff --git a/vllm/v1/attention/backends/mla/xpu_mla_sparse.py b/vllm/v1/attention/backends/mla/xpu_mla_sparse.py
+index 8aaa4749d..158fbfc41 100644
+--- a/vllm/v1/attention/backends/mla/xpu_mla_sparse.py
++++ b/vllm/v1/attention/backends/mla/xpu_mla_sparse.py
+@@ -13,6 +13,9 @@ from vllm.logger import init_logger
+ from vllm.model_executor.layers.attention.mla_attention import (
+     get_mla_dims,
+ )
++from vllm.model_executor.layers.attention.sparse_mla_attention import (
++    SharedTopkIndicesBuffer,
++)
+ from vllm.utils.torch_utils import is_quantized_kv_cache, np_to_pinned_tensor
+ from vllm.v1.attention.backend import (
+     AttentionBackend,
+@@ -183,7 +186,7 @@ class XPUMLASparseMetadataBuilder(AttentionMetadataBuilder[XPUMLASparseMetadata]
+         return metadata
+ 
+ 
+-class XPUMLASparseImpl(MLAAttentionImpl[XPUMLASparseMetadata]):
++class XPUMLASparseImpl(MLAAttentionImpl[XPUMLASparseMetadata], SharedTopkIndicesBuffer):
+     is_sparse = True
+ 
+     def __init__(
+@@ -210,12 +213,7 @@ class XPUMLASparseImpl(MLAAttentionImpl[XPUMLASparseMetadata]):
+         self.kv_cache_dtype = kv_cache_dtype
+         self.kv_lora_rank: int = mla_args["kv_lora_rank"]
+         self.softmax_scale = scale
+-        # The indexer carries the shared buffer for normal layers and tests;
+-        # the explicitly-passed buffer covers backbone skip layers, whose
+-        # indexer is not constructed (see deepseek_v2.py).
+-        self.topk_indices_buffer: torch.Tensor | None = (
+-            indexer.topk_indices_buffer if indexer is not None else topk_indices_buffer
+-        )
++        self.init_topk_indices_buffer(indexer, topk_indices_buffer)
+ 
+     def _forward_bf16_kv(
+         self,
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 9dadb7911..728b2f475 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -2024,7 +2024,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         )
+ 
+         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None
+-        if self.speculator is not None and self.speculator.supports_mm_inputs:
++        # The encoder runner exists only on the first PP rank, so later ranks
++        # have no cached embeddings to gather.
++        if (
++            self.speculator is not None
++            and self.speculator.supports_mm_inputs
++            and self.model_state.supports_mm_inputs
++        ):
+             # Get cached multimodal embeddings for draft forward.
+             # NOTE: This is done here because postprocess updates
+             # num_computed_prefill_tokens.
+-- 
+2.47.3
+

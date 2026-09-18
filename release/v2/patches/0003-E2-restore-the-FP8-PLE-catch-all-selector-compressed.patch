@@ -1,0 +1,56 @@
+From 0ecce5f5b84e9e8bae51274dc977b9490d1641fa Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Thu, 10 Sep 2026 18:56:00 +0000
+Subject: [PATCH 03/76] E2: restore the FP8 PLE catch-all selector
+ (compressed-tensors checkpoint + ple_embedding_dtype /
+ VLLM_PLE_FP8_GLOBAL_SCALE): without it the offload worker materializes a BF16
+ table and OOMs the 96 GB LXC
+
+---
+ vllm/models/qwen4_exp/nvidia/ple_layer.py | 23 +++++++++++++++++++++++
+ 1 file changed, 23 insertions(+)
+
+diff --git a/vllm/models/qwen4_exp/nvidia/ple_layer.py b/vllm/models/qwen4_exp/nvidia/ple_layer.py
+index 94f94083a..6a484afd7 100644
+--- a/vllm/models/qwen4_exp/nvidia/ple_layer.py
++++ b/vllm/models/qwen4_exp/nvidia/ple_layer.py
+@@ -4,6 +4,8 @@
+ 
+ from collections.abc import Iterable, Sequence
+ 
++import os
++
+ import torch
+ import torch.nn.functional as F
+ from torch import nn
+@@ -288,6 +290,27 @@ def _get_ple_embedding_quant_method(
+             )
+             return Qwen4ExpPLEFp8EmbeddingMethod()
+ 
++    # Checkpoints pairing quantized experts with a global-scale FP8 PLE table
++    # (the RadixArk Flash-Next table grafted onto a CompressedTensors checkpoint)
++    # list the PLE under exclude_modules, so the FP8-ness is visible only in the
++    # tensors' dtype / the config's ple_embedding_dtype, not in the quant config
++    # type dispatched above. Without this branch the offload worker treats the
++    # table as BF16 and materializes ~96 GiB in host RAM (OOM-killed on the
++    # 96 GB LXC, 2026-09-10 E2 boot 1). Honour either the config key (the -e1
++    # checkpoint copy) or the explicit VLLM_PLE_FP8_GLOBAL_SCALE=1 opt-in the
++    # 0.28 prod tree uses. Placement after the typed dispatch = the E1 overlay's
++    # proven position ("gpu-1 patch").
++    if _ple_dtype_is_fp8(ple_embedding_dtype) or os.environ.get(
++        "VLLM_PLE_FP8_GLOBAL_SCALE"
++    ) == "1":
++        logger.info_once(
++            "PLE embedding %s: config declares an FP8 table with quant_config %s; "
++            "using the runtime FP8 method (global weight_scale)",
++            prefix,
++            type(quant_config).__name__,
++        )
++        return Qwen4ExpPLEFp8EmbeddingMethod()
++
+     return None
+ 
+ 
+-- 
+2.47.3
+

@@ -1,0 +1,375 @@
+From d9cbf538ec14f44e68d151b2b8dbcc27329d3c5b Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Wed, 16 Sep 2026 04:08:34 +0000
+Subject: [PATCH 67/76] rc3-instr 11/11: release defaults warn/0.05, validated
+ interval, reader failure arms the stop, synchronous final drain at shutdown
+ (Astra final review findings 1-3)
+
+---
+ .../gpu/test_guard_telemetry_round11.py       |  93 ++++++++
+ vllm/v1/worker/gpu_worker.py                  |   9 +
+ vllm/v1/worker/guard_telemetry.py             | 199 +++++++++++++-----
+ 3 files changed, 252 insertions(+), 49 deletions(-)
+ create mode 100644 tests/v1/worker/gpu/test_guard_telemetry_round11.py
+
+diff --git a/tests/v1/worker/gpu/test_guard_telemetry_round11.py b/tests/v1/worker/gpu/test_guard_telemetry_round11.py
+new file mode 100644
+index 000000000..9476b04e1
+--- /dev/null
++++ b/tests/v1/worker/gpu/test_guard_telemetry_round11.py
+@@ -0,0 +1,93 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Round 11 (Astra final review, findings 1-3) of the rc3-instr guard series.
++
++1. Release defaults are warn / 0.05 with both variables absent, and a
++   non-finite or non-positive interval is rejected at import.
++2. A reader that loses a device arms the stop (the fatal-site contract is
++   otherwise silently void).
++3. drain() reports a hit the cadence reader never saw and raises for an
++   always-fatal site when asked; it is what a stage end / orderly shutdown
++   calls so a last-step hit cannot be lost.
++"""
++
++import importlib
++import os
++import sys
++
++import pytest
++import torch
++
++pytestmark = pytest.mark.skipif(
++    not torch.cuda.is_available(), reason="CUDA required"
++)
++
++
++def _fresh(monkeypatch, **env):
++    for k in ("VLLM_E2_GUARD_MODE", "VLLM_E2_GUARD_INTERVAL"):
++        monkeypatch.delenv(k, raising=False)
++    for k, v in env.items():
++        monkeypatch.setenv(k, v)
++    sys.modules.pop("vllm.v1.worker.guard_telemetry", None)
++    return importlib.import_module("vllm.v1.worker.guard_telemetry")
++
++
++def test_release_defaults_with_env_absent(monkeypatch):
++    gt = _fresh(monkeypatch)
++    assert gt._MODE == "warn"
++    assert gt._INTERVAL == pytest.approx(0.05)
++
++
++@pytest.mark.parametrize("bad", ["nan", "inf", "-inf", "0", "-1", "abc"])
++def test_bad_interval_rejected_at_import(monkeypatch, bad):
++    with pytest.raises(ValueError):
++        _fresh(monkeypatch, VLLM_E2_GUARD_INTERVAL=bad)
++
++
++def test_reader_loss_arms_the_stop(monkeypatch):
++    gt = _fresh(monkeypatch)
++    device = torch.device("cuda:0")
++    gt.prealloc(device)
++    gt.reset_for_test()
++
++    class Broken:
++        def tolist(self):
++            raise RuntimeError("simulated D2H failure")
++
++    monkeypatch.setitem(gt._buffers, device, Broken())
++    gt._poll_once()
++    assert device in gt._read_disabled
++    with pytest.raises(RuntimeError, match="fatal-site contract"):
++        gt.check_pending()
++
++
++def test_drain_reports_last_step_hit_and_raises_for_fatal_site(monkeypatch):
++    gt = _fresh(monkeypatch)  # warn mode: a plain site must NOT raise
++    device = torch.device("cuda:0")
++    gt.prealloc(device)
++    gt.reset_for_test()
++    buf = gt._buffers[device]
++    # a hit at a non-fatal site, written as the kernels would (count, row, val)
++    plain = next(s for s in gt.SITE_NAMES if s not in gt._ALWAYS_FATAL_SITES)
++    buf[plain, 0] = 3
++    snap = gt.drain(raise_on_fatal=True)
++    assert any(v[0] == 3 for v in snap.values())
++    gt.check_pending()  # nothing armed under warn for a plain site
++    # a hit at the always-fatal RoPE site: drain must raise when asked
++    buf[gt.SITE_QSA_ROPE_POS, 0] = 1
++    with pytest.raises(RuntimeError, match="FINAL DRAIN"):
++        gt.drain(raise_on_fatal=True)
++    # and the non-raising form still arms the stop for the engine thread
++    gt.reset_for_test()
++    buf[gt.SITE_QSA_ROPE_POS, 0] = 1
++    gt.drain()
++    with pytest.raises(RuntimeError):
++        gt.check_pending()
++
++
++def test_drain_is_silent_under_off(monkeypatch):
++    gt = _fresh(monkeypatch, VLLM_E2_GUARD_MODE="off")
++    device = torch.device("cuda:0")
++    gt.prealloc(device)
++    gt._buffers[device][gt.SITE_QSA_ROPE_POS, 0] = 1
++    assert gt.drain(raise_on_fatal=True) == {}
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index 123d7f79a..7fdaf4fb3 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -1623,6 +1623,15 @@ class Worker(WorkerBase):
+         self._ple_offload_stopping = True
+         gc.unfreeze()
+ 
++        # rc3-instr round 11: synchronous final read of the guard counters, so
++        # a hit on the LAST step (never polled by check_pending, possibly
++        # ahead of the reader's next tick) is reported before teardown. Logs
++        # "rc3-instr FINAL DRAIN"; never raises here -- shutdown must complete.
++        try:
++            guard_telemetry.drain()
++        except Exception:  # noqa: BLE001
++            logger.exception("rc3-instr FINAL DRAIN failed")
++
+         # has_kv_transfer_group can be None during interpreter shutdown.
+         if ensure_kv_transfer_shutdown is not None:
+             ensure_kv_transfer_shutdown()
+diff --git a/vllm/v1/worker/guard_telemetry.py b/vllm/v1/worker/guard_telemetry.py
+index 6012f6f76..e8f4a4690 100644
+--- a/vllm/v1/worker/guard_telemetry.py
++++ b/vllm/v1/worker/guard_telemetry.py
+@@ -57,6 +57,7 @@ never stops anything. The guards themselves still mask and count on both. Any
+ release note for this series has to say so.
+ """
+ 
++import math
+ import os
+ import threading
+ import time
+@@ -103,16 +104,37 @@ SITE_NAMES = {
+ }
+ 
+ 
+-_MODE = os.environ.get("VLLM_E2_GUARD_MODE", "raise").strip().lower()
++# Release defaults (round 11, Astra final review finding 1): warn, 0.05 s.
++# Rounds 1-10 shipped raise / 0.5 while every qualification boot set both
++# variables explicitly, so the defaults were never the thing being tested.
++_MODE = os.environ.get("VLLM_E2_GUARD_MODE", "warn").strip().lower()
+ if _MODE not in ("raise", "warn", "off"):
+     # fail closed: a set-but-broken gate must not silently disarm the instrument
+     raise ValueError(
+         f"VLLM_E2_GUARD_MODE must be raise|warn|off, got {_MODE!r}"
+     )
+-try:
+-    _INTERVAL = float(os.environ.get("VLLM_E2_GUARD_INTERVAL", "0.5"))
+-except ValueError as exc:
+-    raise ValueError("VLLM_E2_GUARD_INTERVAL must be seconds") from exc
++
++
++def _parse_interval(text: str) -> float:
++    """Seconds between reader polls: a finite number > 0, or ValueError.
++
++    float() accepts "nan", "inf" and negatives; the first two reach
++    time.sleep() and kill the reader daemon, a negative one raises there
++    (round 11, Astra finding 2). Reject them at import, where a broken
++    setting is a loud boot failure instead of a silently absent instrument.
++    """
++    try:
++        value = float(text)
++    except ValueError as exc:
++        raise ValueError("VLLM_E2_GUARD_INTERVAL must be seconds") from exc
++    if not math.isfinite(value) or value <= 0:
++        raise ValueError(
++            f"VLLM_E2_GUARD_INTERVAL must be a finite number > 0, got {text!r}"
++        )
++    return value
++
++
++_INTERVAL = _parse_interval(os.environ.get("VLLM_E2_GUARD_INTERVAL", "0.05"))
+ 
+ _buffers: dict[torch.device, torch.Tensor] = {}
+ # Devices the reader has given up on. They stay in _buffers: see _reader.
+@@ -238,49 +260,80 @@ def start_reader() -> None:
+ def _reader() -> None:
+     """Off-engine-thread cadence reader. The only place a counter is read."""
+     while True:
+-        time.sleep(_INTERVAL)
+-        for device, buf in list(_buffers.items()):
+-            if device in _read_disabled:
+-                continue
+-            try:
+-                rows = buf.tolist()
+-            except Exception:  # noqa: BLE001 -- a reader must never kill the run
+-                # Never silent: a reader that cannot read is an instrument that
+-                # is not there, and this whole series depends on it. Log once,
+-                # then stop polling that device.
+-                #
+-                # STOP POLLING IT, NOT STOP HOLDING IT (review R3-3). Round 3
+-                # popped the buffer here, which drops the only durable Python
+-                # reference: counter() hands out transient buf[site] views that
+-                # are released after each launch, and under FULL replay nothing
+-                # holds one at all. The storage would return to the caching
+-                # allocator, be reused, and the CAPTURED atomics would keep
+-                # writing to the baked address -- the memory-corrupting half of
+-                # blocker B1, re-entering through the error handler.
+-                logger.exception(
+-                    "rc3-instr guard reader failed to read the counter on %s; "
+-                    "no further guard telemetry will be reported for it. The "
+-                    "buffer is kept alive: captured graphs still write to it.",
+-                    device,
+-                )
+-                _read_disabled.add(device)
+-                continue
+-            for site, (n_masked, biased_row, biased_val) in enumerate(rows):
+-                if n_masked <= _seen.get((device, site), 0):
+-                    continue
+-                _seen[(device, site)] = n_masked
+-                row = biased_row - GUARD_BIAS if biased_row else None
+-                val = biased_val - GUARD_BIAS if biased_val else None
+-                msg = (
+-                    f"rc3-instr guard masked {n_masked} out-of-range access(es) "
+-                    f"in {SITE_NAMES.get(site, site)} on {device} "
+-                    f"(example row {row}, index {val}). The access was "
+-                    f"suppressed, so this is a MASKED FAULT and not a correct "
+-                    f"result -- the metadata is wrong upstream."
+-                )
+-                logger.warning("%s", msg)
+-                if _MODE == "raise" or site in _ALWAYS_FATAL_SITES:
+-                    _arm(msg)
++        try:
++            time.sleep(_INTERVAL)
++            _poll_once()
++        except Exception:  # noqa: BLE001 -- the daemon itself must survive
++            # Round 11 (Astra finding 2): a reader that dies is an instrument
++            # that is not there, and _ALWAYS_FATAL_SITES depends on it. Arm
++            # the stop so the engine thread learns that the fatal-site
++            # contract is no longer held, then keep polling.
++            logger.exception("rc3-instr guard reader loop failed")
++            _arm(
++                "rc3-instr guard reader loop failed; the fatal-site contract "
++                "(_ALWAYS_FATAL_SITES) can no longer be enforced."
++            )
++            time.sleep(max(_INTERVAL, 0.05))
++
++
++def _report_rows(device: torch.device, rows: list[list[int]]) -> None:
++    """Report every (device, site) whose masked count advanced. Shared by the
++    cadence reader and the final drain."""
++    for site, (n_masked, biased_row, biased_val) in enumerate(rows):
++        if n_masked <= _seen.get((device, site), 0):
++            continue
++        _seen[(device, site)] = n_masked
++        row = biased_row - GUARD_BIAS if biased_row else None
++        val = biased_val - GUARD_BIAS if biased_val else None
++        msg = (
++            f"rc3-instr guard masked {n_masked} out-of-range access(es) "
++            f"in {SITE_NAMES.get(site, site)} on {device} "
++            f"(cumulative maxima: row-field {row}, index-field {val}; these "
++            f"are independent lifetime maxima, not one observed pair). The "
++            f"access was suppressed, so this is a MASKED FAULT and not a "
++            f"correct result -- the metadata is wrong upstream."
++        )
++        logger.warning("%s", msg)
++        if _MODE == "raise" or site in _ALWAYS_FATAL_SITES:
++            _arm(msg)
++
++
++def _poll_once() -> None:
++    for device, buf in list(_buffers.items()):
++        if device in _read_disabled:
++            continue
++        try:
++            rows = buf.tolist()
++        except Exception:  # noqa: BLE001 -- a reader must never kill the run
++            # Never silent: a reader that cannot read is an instrument that
++            # is not there, and this whole series depends on it. Log once,
++            # then stop polling that device.
++            #
++            # STOP POLLING IT, NOT STOP HOLDING IT (review R3-3). Round 3
++            # popped the buffer here, which drops the only durable Python
++            # reference: counter() hands out transient buf[site] views that
++            # are released after each launch, and under FULL replay nothing
++            # holds one at all. The storage would return to the caching
++            # allocator, be reused, and the CAPTURED atomics would keep
++            # writing to the baked address -- the memory-corrupting half of
++            # blocker B1, re-entering through the error handler.
++            logger.exception(
++                "rc3-instr guard reader failed to read the counter on %s; "
++                "no further guard telemetry will be reported for it. The "
++                "buffer is kept alive: captured graphs still write to it.",
++                device,
++            )
++            _read_disabled.add(device)
++            # Round 11 (Astra finding 2): losing the reader on a device
++            # silently voids the fatal-site contract for it. Arm the stop
++            # regardless of MODE (off never reaches here: no reader).
++            _arm(
++                f"rc3-instr guard reader lost the counter on {device}; the "
++                f"fatal-site contract (_ALWAYS_FATAL_SITES) is no longer "
++                f"enforced there."
++            )
++            continue
++        _report_rows(device, rows)
+ 
+ 
+ def _arm(msg: str) -> None:
+@@ -319,10 +372,58 @@ def check_pending() -> None:
+     msg = _pending
+     _pending = None
+     raise RuntimeError(
+-        f"{msg} Set VLLM_E2_GUARD_MODE=warn to continue past this."
++        f"{msg} (Sites in _ALWAYS_FATAL_SITES and reader failures stop the "
++        f"rank under every mode except off; MODE=warn only softens the other "
++        f"sites.)"
+     )
+ 
+ 
++def drain(*, raise_on_fatal: bool = False) -> dict[str, list[int]]:
++    """Synchronous final read of every counter, off the cadence (round 11,
++    Astra finding 3).
++
++    The cadence reader can miss a hit on the LAST step of a run: the forward
++    completes, its result is consumed, no further execute_model polls
++    check_pending, and the process exits before the reader's next tick. Call
++    this at stage end / orderly shutdown, outside capture. It synchronizes the
++    device, reports anything the reader has not, and returns the unbiased
++    snapshot. With raise_on_fatal it raises for a hit at a site in
++    _ALWAYS_FATAL_SITES or, under MODE=raise, at any site. MODE=off drains
++    nothing (no reporting under off, by contract).
++    """
++    if _MODE == "off":
++        return {}
++    fatal: list[str] = []
++    for device, buf in list(_buffers.items()):
++        try:
++            if device.type == "cuda":
++                torch.cuda.synchronize(device)
++            rows = buf.tolist()
++        except Exception:  # noqa: BLE001
++            logger.exception("rc3-instr FINAL DRAIN could not read %s", device)
++            fatal.append(f"reader lost {device}")
++            continue
++        _report_rows(device, rows)
++        for site, (n_masked, _r, _v) in enumerate(rows):
++            if n_masked and (_MODE == "raise" or site in _ALWAYS_FATAL_SITES):
++                fatal.append(
++                    f"{SITE_NAMES.get(site, site)} on {device}: {n_masked}"
++                )
++    snap = snapshot()
++    if fatal:
++        logger.error(
++            "rc3-instr FINAL DRAIN: fatal-site hits %s (snapshot %s)",
++            fatal, snap,
++        )
++        if raise_on_fatal:
++            raise RuntimeError(f"rc3-instr FINAL DRAIN: fatal-site hits {fatal}")
++    else:
++        logger.info(
++            "rc3-instr FINAL DRAIN: no fatal-site hits (snapshot %s)", snap
++        )
++    return snap
++
++
+ def snapshot() -> dict[str, list[int]]:
+     """Test/diagnostic helper: current counters, unbiased. Syncs -- not for the
+     step path."""
+-- 
+2.47.3
+

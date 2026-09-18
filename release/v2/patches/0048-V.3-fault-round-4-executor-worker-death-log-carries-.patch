@@ -1,0 +1,30 @@
+From 13fb5671155a8392029f8826afbf51405c7dbf18 Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Mon, 14 Sep 2026 09:21:51 +0000
+Subject: [PATCH 48/76] V.3 fault round 4: executor worker-death log carries
+ executor_shutdown_monotonic for the evaluator token envelope (Sol draft,
+ Fable applied)
+
+---
+ vllm/v1/executor/multiproc_executor.py | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/vllm/v1/executor/multiproc_executor.py b/vllm/v1/executor/multiproc_executor.py
+index c3ed6fb69..1a14b6499 100644
+--- a/vllm/v1/executor/multiproc_executor.py
++++ b/vllm/v1/executor/multiproc_executor.py
+@@ -313,9 +313,10 @@ class MultiprocExecutor(Executor):
+             proc = next(h.proc for h in workers if h.proc.sentinel == died[0])
+             logger.error(
+                 "Worker proc %s died unexpectedly (exit code: %s), "
+-                "shutting down executor.",
++                "shutting down executor. executor_shutdown_monotonic=%.9f",
+                 proc.name,
+                 proc.exitcode,
++                time.monotonic(),
+             )
+             _self.shutdown()
+             callback = _self.failure_callback
+-- 
+2.47.3
+

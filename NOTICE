@@ -1,0 +1,171 @@
+NOTICE - Flash-Next v2 (vLLM fork)
+
+This distribution contains a modified version of vLLM (https://github.com/vllm-project/vllm),
+Copyright (c) the vLLM project contributors, licensed under the Apache License, Version 2.0 (see LICENSE).
+Upstream base commit: e962733e08d10f7ca65dac4df99e116460b8b174. Release: tag v2 = d8ea70ae0e032dc9e45bcda736f9d49a9d5bc9a8.
+Delta bundle: v2-from-upstream-e962733e08.bundle (sha256 63f4ed4b73dc57d7b49aa250309d80b330f769a4eb12b63269ae8c858a82ebd7);
+patch series (reading aid): release/v2/patches/0001..0074.
+
+Per Apache-2.0 section 4(b): relative to the upstream base commit, 50 files were added and 94 modified
+(144 total; `git diff --name-status e962733e08..v2`, generated 2026-09-17).
+
+Added (50):
+  benchmarks/kernels/benchmark_hy_v4_ihc.py
+  csrc/cpu/cpu_attn_amx_fp8.hpp
+  probe/faultcut_gate.py
+  tests/models/qwen4_exp/test_host_uva_embedding.py
+  tests/v1/core/prefix_cache/test_mamba_eagle_resume_checkpoint.py
+  tests/v1/executor/test_multiproc_executor_parent_death.py
+  tests/v1/executor/test_multiproc_executor_start_method.py
+  tests/v1/ple_offload/test_correspondence.py
+  tests/v1/ple_offload/test_fatal_rpc.py
+  tests/v1/ple_offload/test_fault_round2.py
+  tests/v1/ple_offload/test_fault_round3.py
+  tests/v1/ple_offload/test_fault_round3_bootstrap_disarmed.py
+  tests/v1/ple_offload/test_fault_round3_wire.py
+  tests/v1/ple_offload/test_ipc_socket_unlink.py
+  tests/v1/ple_offload/test_pending_rpc.py
+  tests/v1/ple_offload/test_progress_deadline.py
+  tests/v1/ple_offload/test_round4_transport.py
+  tests/v1/ple_offload/test_round5_transport.py
+  tests/v1/ple_offload/test_shm_unlink.py
+  tests/v1/ple_offload/test_shutdown_order.py
+  tests/v1/ple_offload/test_spawn_bootstrap_cuda.py
+  tests/v1/ple_offload/test_test_fault.py
+  tests/v1/worker/gpu/__init__.py
+  tests/v1/worker/gpu/test_block_table_guards.py
+  tests/v1/worker/gpu/test_guard_reader_nonblocking.py
+  tests/v1/worker/gpu/test_guard_telemetry_replay.py
+  tests/v1/worker/gpu/test_guard_telemetry_round11.py
+  tests/v1/worker/gpu/test_pp_deferred_mamba_block_table.py
+  tests/v1/worker/gpu/test_pp_deferred_mamba_gpu.py
+  tests/v1/worker/gpu/test_qsa_ring_skip_telemetry.py
+  tests/v1/worker/gpu/test_qsa_rope_position_guard.py
+  tests/v1/worker/test_e2_memstats.py
+  tests/v1/worker/test_ple_offload_worker.py
+  vllm/model_executor/layers/fused_moe/configs/E=256,N=512,device_name=NVIDIA_A100_80GB_PCIe.json
+  vllm/model_executor/layers/ple_offload_layer.py
+  vllm/models/hy_v4/nvidia/triton_ihc.py
+  vllm/v1/core/sched/e2_alloc_log.py
+  vllm/v1/ple_offload/__init__.py
+  vllm/v1/ple_offload/connector.py
+  vllm/v1/ple_offload/fatal.py
+  vllm/v1/ple_offload/progress.py
+  vllm/v1/ple_offload/protocol.py
+  vllm/v1/ple_offload/rowdump.py
+  vllm/v1/ple_offload/test_fault.py
+  vllm/v1/ple_offload/worker.py
+  vllm/v1/worker/e2_memstats.py
+  vllm/v1/worker/guard_telemetry.py
+  vllm_ple_offload_bootstrap/__init__.py
+  vllm_ple_offload_bootstrap/__main__.py
+  vllm_ple_test_fault/__init__.py
+
+Modified (94):
+  .buildkite/scripts/hardware_ci/run-cpu-test.sh
+  CMakeLists.txt
+  benchmarks/kernels/cpu/benchmark_cpu_attn.py
+  cmake/cpu_extension.cmake
+  csrc/cpu/cpu_attn.cpp
+  csrc/cpu/cpu_attn_impl.hpp
+  csrc/cpu/cpu_types_x86.hpp
+  csrc/cpu/generate_cpu_attn_dispatch.py
+  csrc/libtorch_stable/topk.cu
+  docker/Dockerfile.cpu
+  docs/features/automatic_prefix_caching.md
+  docs/models/supported_models.md
+  tests/compile/passes/test_functionalization.py
+  tests/entrypoints/launchers/test_cli_args.py
+  tests/kernels/attention/test_cpu_attn.py
+  tests/kernels/test_fused_sigmoid_gating_delta_rule.py
+  tests/models/kimi_k3/test_kda_metadata.py
+  tests/models/qwen4_exp/test_ple.py
+  tests/models/registry.py
+  tests/multimodal/test_registry.py
+  tests/renderers/test_hf.py
+  tests/renderers/test_warmup.py
+  tests/v1/attention/test_backend_per_kind.py
+  tests/v1/core/prefix_cache/test_partial_prefix_cache_hits.py
+  tests/v1/core/test_deferred_block_free.py
+  tests/v1/core/test_kv_cache_utils.py
+  tests/v1/core/test_mamba_align_chunk_split.py
+  tests/v1/core/test_prefix_caching.py
+  tests/v1/core/test_single_type_kv_cache_manager.py
+  tests/v1/e2e/general/test_mamba_prefix_cache.py
+  tests/v1/engine/test_engine_core.py
+  tests/v1/executor/test_executor.py
+  tests/v1/worker/test_mamba_utils.py
+  tools/pre_commit/check_forbidden_imports.py
+  vllm/compilation/passes/utility/fix_functionalization.py
+  vllm/config/cache.py
+  vllm/config/parallel.py
+  vllm/engine/arg_utils.py
+  vllm/entrypoints/chat_utils.py
+  vllm/envs.py
+  vllm/model_executor/layers/attention/sparse_mla_attention.py
+  vllm/model_executor/layers/quantization/base_config.py
+  vllm/model_executor/layers/vocab_parallel_embedding.py
+  vllm/model_executor/model_loader/utils.py
+  vllm/model_executor/model_loader/weight_utils.py
+  vllm/model_executor/models/config.py
+  vllm/model_executor/models/deepseek_mtp.py
+  vllm/model_executor/models/qwen2_5_omni_thinker.py
+  vllm/model_executor/models/qwen3_5_mtp.py
+  vllm/models/deepseek_v32/amd/mtp.py
+  vllm/models/deepseek_v32/nvidia/model.py
+  vllm/models/deepseek_v32/nvidia/mtp.py
+  vllm/models/deepseek_v4/common/ops/cache_utils.py
+  vllm/models/glm5next/nvidia/model.py
+  vllm/models/glm5next/nvidia/mtp.py
+  vllm/models/hy_v4/nvidia/hc.py
+  vllm/models/kimi_k3/nvidia/kda.py
+  vllm/models/kimi_k3/nvidia/kda_metadata.py
+  vllm/models/qwen4_exp/nvidia/model.py
+  vllm/models/qwen4_exp/nvidia/model_state.py
+  vllm/models/qwen4_exp/nvidia/mtp.py
+  vllm/models/qwen4_exp/nvidia/ops/ple.py
+  vllm/models/qwen4_exp/nvidia/ops/qsa.py
+  vllm/models/qwen4_exp/nvidia/ops/qsa_indexer.py
+  vllm/models/qwen4_exp/nvidia/ops/qsa_pre_indexer.py
+  vllm/models/qwen4_exp/nvidia/ple_layer.py
+  vllm/models/qwen4_exp/nvidia/qsa.py
+  vllm/multimodal/registry.py
+  vllm/renderers/base.py
+  vllm/third_party/flash_linear_attention/ops/fused_recurrent.py
+  vllm/third_party/flash_linear_attention/ops/fused_sigmoid_gating.py
+  vllm/third_party/flash_linear_attention/ops/kda.py
+  vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm120.py
+  vllm/v1/attention/backends/mla/xpu_mla_sparse.py
+  vllm/v1/attention/backends/utils.py
+  vllm/v1/core/block_pool.py
+  vllm/v1/core/kv_cache_coordinator.py
+  vllm/v1/core/kv_cache_manager.py
+  vllm/v1/core/kv_cache_utils.py
+  vllm/v1/core/sched/scheduler.py
+  vllm/v1/core/single_type_kv_cache_manager.py
+  vllm/v1/engine/core.py
+  vllm/v1/executor/multiproc_executor.py
+  vllm/v1/executor/uniproc_executor.py
+  vllm/v1/kv_cache_interface.py
+  vllm/v1/worker/gpu/block_table.py
+  vllm/v1/worker/gpu/cudagraph_utils.py
+  vllm/v1/worker/gpu/model_runner.py
+  vllm/v1/worker/gpu/model_states/interface.py
+  vllm/v1/worker/gpu/model_states/mamba_hybrid.py
+  vllm/v1/worker/gpu/pp_utils.py
+  vllm/v1/worker/gpu_worker.py
+  vllm/v1/worker/mamba_utils.py
+  vllm/v1/worker/utils.py
+
+Some of these changes are upstream vLLM commits applied ahead of the base (prefix-cache chain #53614 #55747
+#53945 #54713 #55450 by ZeldaHuang, yewentao256, akshaver, tobymao, lucamotz; PRs #53899 peakcrosser7,
+#54793 and #54795 saichowdary007; #46994, #54709, #55745 hunks; #57050 port). They keep their authors and licence.
+
+Model weights are not part of this distribution. Qwen3.8-Flash-Next and its quantised derivatives
+(Intel AutoRound experts, RadixArk FP8 PLE table, our in-place packing) carry the Qwen Community License 1.0
+(LICENSE.qwen-community-1.0). Our scripts, patches, calibration tooling and harness are Apache-2.0.
+
+Credits: peakcrosser7 (release/qwen38next_offload: Flash-Next model support and PLE offload), Intel (AutoRound),
+RadixArk (FP8 PLE table), aikitoria (P2P driver for consumer Ampere), DominikBucko (MTP INT4 packing recipe),
+alesha-pro and noonghunna/club-3090 (independent
+work on the same hardware class).

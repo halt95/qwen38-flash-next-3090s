@@ -1,0 +1,46 @@
+From 6a95802cbc98eeb3377842f96c46bf1a83720c9c Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Thu, 17 Sep 2026 09:29:02 +0000
+Subject: [PATCH 74/76] v2-rc7: round-11 GPU tests opt into warn mode
+ explicitly (rc7 default is off; the drain and reader-loss contracts are
+ warn-mode contracts)
+
+---
+ tests/v1/worker/gpu/test_guard_telemetry_round11.py | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/tests/v1/worker/gpu/test_guard_telemetry_round11.py b/tests/v1/worker/gpu/test_guard_telemetry_round11.py
+index 0c692625f..cad039ed5 100644
+--- a/tests/v1/worker/gpu/test_guard_telemetry_round11.py
++++ b/tests/v1/worker/gpu/test_guard_telemetry_round11.py
+@@ -2,7 +2,8 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """Round 11 (Astra final review, findings 1-3) of the rc3-instr guard series.
+ 
+-1. Release defaults are warn / 0.05 with both variables absent, and a
++1. Release defaults are off / 0.05 with both variables absent (rc7, ruling N1;
++   rc3-rc6 shipped warn), and a
+    non-finite or non-positive interval is rejected at import.
+ 2. A reader that loses a device arms the stop (the fatal-site contract is
+    otherwise silently void).
+@@ -45,7 +46,7 @@ def test_bad_interval_rejected_at_import(monkeypatch, bad):
+ 
+ 
+ def test_reader_loss_arms_the_stop(monkeypatch):
+-    gt = _fresh(monkeypatch)
++    gt = _fresh(monkeypatch, VLLM_E2_GUARD_MODE="warn")  # the reader exists only when opted in (rc7 default off)
+     device = torch.device("cuda:0")
+     gt.prealloc(device)
+     gt.reset_for_test()
+@@ -63,7 +64,7 @@ def test_reader_loss_arms_the_stop(monkeypatch):
+ 
+ 
+ def test_drain_reports_last_step_hit_and_raises_for_fatal_site(monkeypatch):
+-    gt = _fresh(monkeypatch)  # warn mode: a plain site must NOT raise
++    gt = _fresh(monkeypatch, VLLM_E2_GUARD_MODE="warn")  # warn mode (opt-in since rc7): a plain site must NOT raise
+     device = torch.device("cuda:0")
+     gt.prealloc(device)
+     gt.reset_for_test()
+-- 
+2.47.3
+

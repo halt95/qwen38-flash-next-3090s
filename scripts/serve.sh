@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# Serve Qwen3.8-Flash-Next-W4A16-Merlin at 262K on 4x RTX 3090: the served entry
+# v1 (TP4 lane) -- superseded by scripts/serve-v2.sh; kept as the fallback entry (README, "v1, the TP4 lane").
+# Serve Qwen3.8-Flash-Next-W4A16-Merlin at 262K on 4x RTX 3090: the v1 served entry
 # (MTP K=3, calibrated FP8 KV, FULL graphs). The 2026-09-05 bench card was measured
 # on this entry with the previous scale sidecar; the sidecar this script defaults to
 # (scales/qsa_kv_scales_262k.json) was calibrated on this checkpoint on 2026-09-08 and
-# gated separately at this shape (README, "The scale sidecar").
+# gated separately at this shape (README, "Checkpoint").
 #
 #   VENV=./venv scripts/serve.sh /path/to/Qwen3.8-Flash-Next-W4A16-Merlin [extra vllm args]
 #

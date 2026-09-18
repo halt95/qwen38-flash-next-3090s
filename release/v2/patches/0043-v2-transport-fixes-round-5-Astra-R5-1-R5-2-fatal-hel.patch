@@ -1,0 +1,603 @@
+From 2c31e85448d04e08937b87c7ab2ffd9912c851ec Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Mon, 14 Sep 2026 04:12:04 +0000
+Subject: [PATCH 43/76] v2 transport fixes round 5 (Astra R5-1, R5-2): fatal
+ helper labels errors only by identity with trusted built-in exception types
+ and never invokes exception-controlled descriptors or formatting, exact-type
+ diagnostic fields; READY status type checked before comparison with only
+ READY/FAILURE accepted; bounded startup-response writer (oversized
+ READY/FAILURE become a small FAILURE); PLE identity validation shared before
+ every breakable-runner initialization incl. the profiling path (Sol draft,
+ Fable applied/tested)
+
+Tests: tests/v1/ple_offload 62/62; new test_round5_transport.py 13/13.
+---
+ tests/v1/ple_offload/test_round5_transport.py | 371 ++++++++++++++++++
+ vllm/v1/ple_offload/fatal.py                  |  40 +-
+ vllm/v1/ple_offload/worker.py                 |  37 +-
+ vllm/v1/worker/gpu/cudagraph_utils.py         |  41 +-
+ 4 files changed, 461 insertions(+), 28 deletions(-)
+ create mode 100644 tests/v1/ple_offload/test_round5_transport.py
+
+diff --git a/tests/v1/ple_offload/test_round5_transport.py b/tests/v1/ple_offload/test_round5_transport.py
+new file mode 100644
+index 000000000..2a7129525
+--- /dev/null
++++ b/tests/v1/ple_offload/test_round5_transport.py
+@@ -0,0 +1,371 @@
++# SPDX-License-Identifier: Apache-2.0
++
++import os
++import signal
++import subprocess
++import sys
++import time
++from pathlib import Path
++
++import pytest
++
++
++def _run_bounded_child(
++    source: str,
++    tmp_path: Path,
++    *arguments: str,
++    expected_exitcode: int = 0,
++) -> None:
++    marker = tmp_path / f"started-{time.monotonic_ns()}"
++    process = subprocess.Popen(
++        [sys.executable, "-c", source, str(marker), *arguments],
++        stderr=subprocess.DEVNULL,
++        start_new_session=os.name == "posix",
++    )
++    deadline = time.monotonic() + 120
++    while not marker.exists() and time.monotonic() < deadline:
++        time.sleep(0.05)
++    assert marker.exists(), "child did not finish cold startup within 120 seconds"
++
++    stayed_alive = False
++    try:
++        process.wait(timeout=5)
++    except subprocess.TimeoutExpired:
++        stayed_alive = True
++    finally:
++        if process.poll() is None:
++            if os.name == "posix":
++                os.killpg(process.pid, signal.SIGKILL)
++            else:
++                process.terminate()
++            process.wait(timeout=120)
++
++    assert not stayed_alive, "child stayed alive after the bounded operation"
++    assert process.returncode == expected_exitcode
++
++
++_FATAL_SOURCE = r"""
++import os
++import sys
++import threading
++from pathlib import Path
++
++from vllm.v1.ple_offload.fatal import ple_fail_closed
++
++scenario = sys.argv[2]
++
++if scenario == "blocking-name-property":
++    class Meta(type):
++        @property
++        def __name__(cls):
++            threading.Event().wait()
++
++    class Error(Exception, metaclass=Meta):
++        pass
++
++    error = Error()
++elif scenario == "blocking-str-descriptor":
++    class Descriptor:
++        def __get__(self, instance, owner):
++            threading.Event().wait()
++
++    class Error(Exception):
++        __str__ = Descriptor()
++
++    error = Error()
++elif scenario == "blocking-name-format":
++    class BlockingName(str):
++        def __format__(self, format_spec):
++            threading.Event().wait()
++
++    class Meta(type):
++        @property
++        def __name__(cls):
++            return BlockingName("Error")
++
++    class Error(Exception, metaclass=Meta):
++        pass
++
++    error = Error()
++elif scenario == "blocking-str-method":
++    class Error(Exception):
++        def __str__(self):
++            threading.Event().wait()
++
++    error = Error()
++elif scenario == "overridden-getattribute":
++    class Error(Exception):
++        def __getattribute__(self, name):
++            threading.Event().wait()
++
++    error = Error("detail")
++elif scenario == "str-subclass-argument":
++    class BlockingString(str):
++        def __format__(self, format_spec):
++            threading.Event().wait()
++
++        def __str__(self):
++            threading.Event().wait()
++
++    error = RuntimeError(BlockingString("detail"))
++elif scenario == "huge-string":
++    error = RuntimeError("x" * (32 << 20))
++else:
++    raise AssertionError(scenario)
++
++Path(sys.argv[1]).write_text("armed", encoding="utf-8")
++ple_fail_closed(
++    where="round5-fatal",
++    rank=1,
++    layer="ple",
++    sequence=3,
++    error=error,
++)
++"""
++
++
++@pytest.mark.parametrize(
++    "scenario",
++    [
++        "blocking-name-property",
++        "blocking-str-descriptor",
++        "blocking-name-format",
++    ],
++)
++def test_fatal_helper_avoids_exception_controlled_descriptors(
++    tmp_path: Path,
++    scenario: str,
++) -> None:
++    _run_bounded_child(
++        _FATAL_SOURCE,
++        tmp_path,
++        scenario,
++        expected_exitcode=1,
++    )
++
++
++@pytest.mark.parametrize(
++    "scenario",
++    [
++        "blocking-str-method",
++        "overridden-getattribute",
++        "str-subclass-argument",
++        "huge-string",
++    ],
++)
++def test_fatal_helper_hard_exit_controls(
++    tmp_path: Path,
++    scenario: str,
++) -> None:
++    _run_bounded_child(
++        _FATAL_SOURCE,
++        tmp_path,
++        scenario,
++        expected_exitcode=1,
++    )
++
++
++@pytest.mark.skipif(sys.platform == "win32", reason="process groups are POSIX-only")
++def test_wait_for_ready_rejects_non_string_status_without_comparison(
++    tmp_path: Path,
++) -> None:
++    source = r"""
++import subprocess
++import sys
++import threading
++import time
++from pathlib import Path
++
++import vllm.v1.ple_offload.worker as worker_module
++
++class Status:
++    def __eq__(self, other):
++        threading.Event().wait()
++
++    def __ne__(self, other):
++        threading.Event().wait()
++
++class Reader:
++    def close(self):
++        return None
++
++sleeper = subprocess.Popen(
++    [sys.executable, "-c", "import time; time.sleep(120)"]
++)
++handle = worker_module.PleOffloadWorkerHandle(
++    proc=sleeper,
++    death_writer=None,
++    ready_pipe_reader=Reader(),
++    launch_deadline=time.monotonic() + 120,
++)
++worker_module._recv_bounded_connection_message = (
++    lambda reader, deadline: {
++        "status": Status(),
++        "layer_names": ["ple"],
++    }
++)
++Path(sys.argv[1]).write_text("armed", encoding="utf-8")
++try:
++    worker_module.PleOffloadWorker.wait_for_ready(handle)
++except RuntimeError:
++    pass
++finally:
++    if sleeper.poll() is None:
++        sleeper.terminate()
++        sleeper.wait(timeout=120)
++
++if sleeper.returncode is None or handle.ready_pipe_reader is not None:
++    raise AssertionError("invalid response did not close the child")
++"""
++    _run_bounded_child(source, tmp_path)
++
++
++@pytest.mark.parametrize("identity", ["duplicate", "unbound"])
++def test_profile_breakable_initializer_follows_identity_validation(
++    tmp_path: Path,
++    identity: str,
++) -> None:
++    source = r"""
++import os
++import sys
++import threading
++from pathlib import Path
++from types import SimpleNamespace
++
++from vllm.v1.worker.gpu.cudagraph_utils import ModelCudaGraphManager
++
++identity = sys.argv[2]
++if identity == "duplicate":
++    identities = ("shared", "shared")
++else:
++    identities = ("<unbound>",)
++
++modules = [
++    (
++        "module_" + str(index),
++        SimpleNamespace(
++            _is_cpu_offloaded=True,
++            _host_output_ptr=1,
++            _ple_offload_name=value,
++        ),
++    )
++    for index, value in enumerate(identities)
++]
++model = SimpleNamespace(named_modules=lambda: iter(modules))
++manager = ModelCudaGraphManager.__new__(ModelCudaGraphManager)
++spy = Path(sys.argv[1] + ".initializer")
++
++def blocking_initializer(model):
++    spy.write_text("called", encoding="utf-8")
++    threading.Event().wait()
++
++manager.init_breakable_cg_runner = blocking_initializer
++Path(sys.argv[1]).write_text("armed", encoding="utf-8")
++
++prepare = getattr(manager, "_prepare_ple_capture", None)
++if prepare is None:
++    # This is the pre-fix profiling order: initialize before validation.
++    manager.init_breakable_cg_runner(model)
++else:
++    try:
++        prepare(model, initialize_breakable=True)
++    except RuntimeError as error:
++        if "distinct, bound" not in str(error):
++            raise
++    else:
++        raise AssertionError("invalid identities were accepted")
++
++if spy.exists():
++    raise AssertionError("initializer ran before identity rejection")
++"""
++    _run_bounded_child(source, tmp_path, identity)
++
++
++@pytest.mark.skipif(sys.platform == "win32", reason="process groups are POSIX-only")
++@pytest.mark.parametrize("status", ["READY", "FAILURE"])
++def test_oversized_startup_response_becomes_bounded_failure(
++    tmp_path: Path,
++    status: str,
++) -> None:
++    source = r"""
++import socket
++import sys
++from multiprocessing.connection import Connection
++from pathlib import Path
++
++import vllm.v1.ple_offload.worker as worker_module
++
++parent_socket, child_socket = socket.socketpair()
++raw_writer = Connection(child_socket.detach())
++writer_type = getattr(
++    worker_module,
++    "_BoundedStartupResponseWriter",
++    None,
++)
++writer = raw_writer if writer_type is None else writer_type(raw_writer)
++
++if sys.argv[2] == "READY":
++    message = {
++        "status": "READY",
++        "layer_names": ["x" * (2 << 20)],
++    }
++else:
++    message = {
++        "status": "FAILURE",
++        "error": "x" * (2 << 20),
++    }
++
++Path(sys.argv[1]).write_text("armed", encoding="utf-8")
++writer.send(message)
++"""
++    _run_bounded_child(source, tmp_path, status)
++
++
++def test_startup_response_payload_at_cap_is_accepted(tmp_path: Path) -> None:
++    source = r"""
++import pickle
++import sys
++import threading
++from pathlib import Path
++
++import vllm.v1.ple_offload.worker as worker_module
++
++writer_type = getattr(
++    worker_module,
++    "_BoundedStartupResponseWriter",
++    None,
++)
++Path(sys.argv[1]).write_text("armed", encoding="utf-8")
++if writer_type is None:
++    threading.Event().wait()
++
++cap = worker_module._PLE_READY_MAX_PAYLOAD_BYTES
++name = "x" * cap
++for unused in range(8):
++    message = {"status": "READY", "layer_names": [name]}
++    payload = pickle.dumps(message, protocol=pickle.HIGHEST_PROTOCOL)
++    if len(payload) == cap:
++        break
++    next_size = len(name) + cap - len(payload)
++    if next_size < 0:
++        raise AssertionError("cannot construct exact-cap payload")
++    name = "x" * next_size
++else:
++    raise AssertionError("exact-cap payload did not converge")
++
++class Writer:
++    def __init__(self):
++        self.payload = None
++
++    def send_bytes(self, payload):
++        self.payload = payload
++
++    def close(self):
++        return None
++
++raw_writer = Writer()
++writer_type(raw_writer).send(message)
++if raw_writer.payload != payload or len(raw_writer.payload) != cap:
++    raise AssertionError("exact-cap startup response was not preserved")
++"""
++    _run_bounded_child(source, tmp_path)
+diff --git a/vllm/v1/ple_offload/fatal.py b/vllm/v1/ple_offload/fatal.py
+index 75714df52..18f8b7e0e 100644
+--- a/vllm/v1/ple_offload/fatal.py
++++ b/vllm/v1/ple_offload/fatal.py
+@@ -9,6 +9,21 @@ from typing import Any, NoReturn, TypeVar
+ 
+ _F = TypeVar("_F", bound=Callable[..., Any])
+ 
++_TRUSTED_ERROR_LABELS = (
++    (RuntimeError, "RuntimeError"),
++    (TimeoutError, "TimeoutError"),
++    (ValueError, "ValueError"),
++    (OSError, "OSError"),
++    (EOFError, "EOFError"),
++    (BrokenPipeError, "BrokenPipeError"),
++    (AssertionError, "AssertionError"),
++    (KeyError, "KeyError"),
++    (IndexError, "IndexError"),
++    (TypeError, "TypeError"),
++    (MemoryError, "MemoryError"),
++    (KeyboardInterrupt, "KeyboardInterrupt"),
++)
++
+ 
+ def ple_fail_closed(
+     *,
+@@ -22,15 +37,20 @@ def ple_fail_closed(
+     try:
+         os.set_blocking(2, False)
+         error_type = type(error)
+-        error_name = type.__getattribute__(error_type, "__name__")
++        error_name = "Exception"
++        trusted_error = False
++        for trusted_type, trusted_name in _TRUSTED_ERROR_LABELS:
++            if error_type is trusted_type:
++                error_name = trusted_name
++                trusted_error = True
++                break
++
++        safe_where = where[:128] if type(where) is str else "unknown"
++        safe_layer = layer[:256] if type(layer) is str else "unknown"
++        safe_rank = rank if type(rank) is int else -1
++        safe_sequence = sequence if type(sequence) is int else -1
+         detail_suffix = ""
+-        if (
+-            type.__getattribute__(
+-                error_type,
+-                "__str__",
+-            )
+-            is BaseException.__str__
+-        ):
++        if trusted_error:
+             args = BaseException.args.__get__(error, error_type)
+             if (
+                 type(args) is tuple
+@@ -40,8 +60,8 @@ def ple_fail_closed(
+                 detail = args[0][:512].replace("\n", "\\n")
+                 detail_suffix = f":{detail}"
+         message = (
+-            f"PLE fatal: where={where} rank={rank} layer={layer} "
+-            f"sequence={sequence} error={error_name}{detail_suffix}\n"
++            f"PLE fatal: where={safe_where} rank={safe_rank} layer={safe_layer} "
++            f"sequence={safe_sequence} error={error_name}{detail_suffix}\n"
+         )
+         os.write(2, message.encode("utf-8", "backslashreplace")[:2048])
+     except BaseException:
+diff --git a/vllm/v1/ple_offload/worker.py b/vllm/v1/ple_offload/worker.py
+index 27b51af4b..6fcd86cc6 100644
+--- a/vllm/v1/ple_offload/worker.py
++++ b/vllm/v1/ple_offload/worker.py
+@@ -269,6 +269,31 @@ def _send_framed_payload(fd: int, payload: bytes, deadline: float) -> None:
+ 
+ _PLE_READY_MAX_PAYLOAD_BYTES = 1 << 20
+ 
++class _BoundedStartupResponseWriter:
++    """Preflight startup responses against the parent receiver's frame cap."""
++
++    def __init__(self, writer: Connection) -> None:
++        self._writer = writer
++
++    def send(self, message: Any) -> None:
++        payload = pickle.dumps(message, protocol=pickle.HIGHEST_PROTOCOL)
++        if len(payload) > _PLE_READY_MAX_PAYLOAD_BYTES:
++            payload = pickle.dumps(
++                {
++                    "status": "FAILURE",
++                    "error": "PLE startup response exceeded size limit",
++                },
++                protocol=pickle.HIGHEST_PROTOCOL,
++            )
++        if len(payload) > _PLE_READY_MAX_PAYLOAD_BYTES:
++            raise RuntimeError(
++                "Bounded PLE startup failure response exceeds its frame cap"
++            )
++        self._writer.send_bytes(payload)
++
++    def close(self) -> None:
++        self._writer.close()
++
+ 
+ def _read_exact_before_deadline(
+     fd: int,
+@@ -502,7 +527,13 @@ class PleOffloadWorker:
+             if type(message) is not dict:
+                 raise RuntimeError("PLE offload worker sent an invalid response")
+             status = dict.get(message, "status")
+-            if status != PleOffloadWorker.READY_STR:
++            if type(status) is not str:
++                raise RuntimeError(
++                    "PLE offload worker sent an invalid response status"
++                )
++            if status == PleOffloadWorker.READY_STR:
++                pass
++            elif status == "FAILURE":
+                 error_detail = dict.get(message, "error")
+                 if type(error_detail) is not str:
+                     error_detail = "unknown error"
+@@ -510,6 +541,8 @@ class PleOffloadWorker:
+                     "PLE offload worker failed during startup: "
+                     f"{error_detail}"
+                 )
++            else:
++                raise RuntimeError("PLE offload worker sent unsupported status")
+             layer_names = dict.get(message, "layer_names")
+             if (
+                 type(layer_names) is not list
+@@ -545,7 +578,7 @@ class PleOffloadWorker:
+     ) -> None:
+         """Load PLE weights, accept registrations, and run the request loop."""
+         decorate_logs("PleOffloadWorker")
+-        ready_writer = ready_pipe
++        ready_writer = _BoundedStartupResponseWriter(ready_pipe)
+         shutdown_event = threading.Event()
+ 
+         def handle_signal(_signum: int, _frame: object) -> None:
+diff --git a/vllm/v1/worker/gpu/cudagraph_utils.py b/vllm/v1/worker/gpu/cudagraph_utils.py
+index f53ab5ecb..88bad141d 100644
+--- a/vllm/v1/worker/gpu/cudagraph_utils.py
++++ b/vllm/v1/worker/gpu/cudagraph_utils.py
+@@ -610,6 +610,26 @@ class ModelCudaGraphManager(CudaGraphManager):
+         self.use_aux_hidden_state_outputs = False
+         self.intermediate_tensors: IntermediateTensors | None = None
+ 
++    def _prepare_ple_capture(
++        self, model: nn.Module, *, initialize_breakable: bool
++    ) -> None:
++        expected_ple_copy_layers = tuple(
++            str(getattr(module, "_ple_offload_name", name))
++            for name, module in model.named_modules()
++            if getattr(module, "_is_cpu_offloaded", False)
++            and getattr(module, "_host_output_ptr", None) is not None
++        )
++        if (
++            "<unbound>" in expected_ple_copy_layers
++            or len(set(expected_ple_copy_layers)) != len(expected_ple_copy_layers)
++        ):
++            raise RuntimeError(
++                "PLE FULL capture requires distinct, bound connector layer identities"
++            )
++        self._expected_ple_copy_layers = expected_ple_copy_layers
++        if initialize_breakable:
++            self.init_breakable_cg_runner(model)
++
+     def capture(
+         self,
+         model: nn.Module,
+@@ -627,22 +647,9 @@ class ModelCudaGraphManager(CudaGraphManager):
+     ) -> None:
+         """Capture CUDA graphs for model forward pass."""
+         self.use_aux_hidden_state_outputs = use_aux_hidden_state_outputs
+-        expected_ple_copy_layers = tuple(
+-            str(getattr(module, "_ple_offload_name", name))
+-            for name, module in model.named_modules()
+-            if getattr(module, "_is_cpu_offloaded", False)
+-            and getattr(module, "_host_output_ptr", None) is not None
++        self._prepare_ple_capture(
++            model, initialize_breakable=self.use_breakable_cg
+         )
+-        if (
+-            "<unbound>" in expected_ple_copy_layers
+-            or len(set(expected_ple_copy_layers)) != len(expected_ple_copy_layers)
+-        ):
+-            raise RuntimeError(
+-                "PLE FULL capture requires distinct, bound connector layer identities"
+-            )
+-        self._expected_ple_copy_layers = expected_ple_copy_layers
+-        if self.use_breakable_cg:
+-            self.init_breakable_cg_runner(model)
+ 
+         if self.cudagraph_mode.has_piecewise_cudagraphs() and not (
+             self.use_breakable_cg or has_compiled_submodule(model)
+@@ -916,7 +923,9 @@ def profile_cudagraph_memory(runner: "GPUModelRunner") -> int:
+             if manager.use_breakable_cg:
+                 # Create the breakable runner before the wrapper pool swap so
+                 # its pool is covered as well.
+-                manager.init_breakable_cg_runner(runner.model)
++                manager._prepare_ple_capture(
++                    runner.model, initialize_breakable=True
++                )
+             all_wrappers = list(CUDAGraphWrapper._all_instances) + list(
+                 BreakableCUDAGraphWrapper._all_instances
+             )
+-- 
+2.47.3
+

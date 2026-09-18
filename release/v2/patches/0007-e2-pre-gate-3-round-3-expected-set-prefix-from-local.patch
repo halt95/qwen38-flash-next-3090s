@@ -1,0 +1,57 @@
+From 0f19eb977753e8feb4fcf5528e5fd245a4d2b96b Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Thu, 10 Sep 2026 20:33:42 +0000
+Subject: [PATCH 07/76] e2: pre-gate-3 round 3 - expected-set prefix from local
+ QSA layer names (nested load_weights hook), module path only for a QSA-less
+ stage
+
+---
+ vllm/models/qwen4_exp/nvidia/model.py | 32 ++++++++++++++++++---------
+ 1 file changed, 22 insertions(+), 10 deletions(-)
+
+diff --git a/vllm/models/qwen4_exp/nvidia/model.py b/vllm/models/qwen4_exp/nvidia/model.py
+index 42e8917b5..d8b350bbc 100644
+--- a/vllm/models/qwen4_exp/nvidia/model.py
++++ b/vllm/models/qwen4_exp/nvidia/model.py
+@@ -207,16 +207,28 @@ def _maybe_load_qsa_static_kv_scales(model: nn.Module) -> None:
+             f"Qwen4Exp QSA: {_QSA_KV_SCALES_ENV} is set but the model has no "
+             "QSA (indexer) attention layers"
+         )
+-    # Whole-model QSA layer set (all pipeline stages): the QSA layer name is
+-    # "<module path of inner.layers>.<idx>.self_attn.attn"; the module path
+-    # is taken from the loaded model so no local QSA layer is needed to derive
+-    # it, and the loader rejects any local layer outside the set.
+-    layers_path = next(
+-        (name for name, module in model.named_modules() if module is inner.layers),
+-        None,
+-    )
+-    if layers_path is None:
+-        raise ValueError("Qwen4Exp QSA: cannot locate the decoder layer stack")
++    # Whole-model QSA layer set (all pipeline stages) = "<stack>.<idx>.self_attn.attn"
++    # for every configured QSA index. The stack prefix is read from a LOCAL QSA
++    # layer's registered layer_name whenever one exists: this hook also runs
++    # inside the nested Qwen4ExpForCausalLM.load_weights, where a module path
++    # relative to that submodule ("model.layers") would not match the names
++    # registered under the outer prefix ("language_model.model.layers") - the
++    # gate-3 boot 1 failure, 2026-09-10 20:24. Only a stage with no QSA layer
++    # falls back to the module path (then no local name can disagree).
++    if local_qsa:
++        stack, sep, tail = local_qsa[0].layer_name.rpartition(".layers.")
++        if not sep or not tail.split(".")[0].isdigit():
++            raise ValueError(
++                f"Qwen4Exp QSA: unexpected layer name {local_qsa[0].layer_name!r}"
++            )
++        layers_path = f"{stack}.layers"
++    else:
++        layers_path = next(
++            (name for name, module in model.named_modules() if module is inner.layers),
++            None,
++        )
++        if layers_path is None:
++            raise ValueError("Qwen4Exp QSA: cannot locate the decoder layer stack")
+     expected = {
+         f"{layers_path}.{idx}.self_attn.attn" for idx in inner._qsa_layer_ids
+     }
+-- 
+2.47.3
+

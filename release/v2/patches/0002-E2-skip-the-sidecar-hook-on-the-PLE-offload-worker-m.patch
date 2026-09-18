@@ -1,0 +1,37 @@
+From 37167e8ad01b35ccf875b377a7d843c7a95e53fa Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Thu, 10 Sep 2026 18:42:52 +0000
+Subject: [PATCH 02/76] E2: skip the sidecar hook on the PLE offload worker
+ meta model (Astra audit D)
+
+---
+ vllm/models/qwen4_exp/nvidia/model.py | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/vllm/models/qwen4_exp/nvidia/model.py b/vllm/models/qwen4_exp/nvidia/model.py
+index dff174f3f..fcbdcd536 100644
+--- a/vllm/models/qwen4_exp/nvidia/model.py
++++ b/vllm/models/qwen4_exp/nvidia/model.py
+@@ -180,6 +180,19 @@ def _maybe_load_qsa_static_kv_scales(model: nn.Module) -> None:
+     path = os.environ.get(_QSA_KV_SCALES_ENV, "").strip()
+     if not path:
+         return
++    # The PLE offload worker builds the whole target on the meta device and loads
++    # only PLE weights through load_weights; a fill_ on its meta scale buffers
++    # would log success without calibrating any GPU worker (Astra 09-10, D).
++    for module in model.modules():
++        k_scale = getattr(module, "_k_scale", None)
++        if isinstance(k_scale, torch.Tensor):
++            if k_scale.device.type == "meta":
++                logger.info(
++                    "Qwen4Exp QSA: model is on meta (PLE offload worker); "
++                    "static K/V scales are applied by the GPU workers only"
++                )
++                return
++            break
+     # strict: every QSA layer of the target model must be in the sidecar. An empty or
+     # partial file silently leaving layers at scale 1.0 is exactly the failure this
+     # call site exists to prevent.
+-- 
+2.47.3
+

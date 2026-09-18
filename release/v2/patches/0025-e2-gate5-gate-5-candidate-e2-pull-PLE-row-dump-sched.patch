@@ -1,0 +1,226 @@
+From f0f98ff4e10f4e693dca6903a7dc496aab576d4b Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Fri, 11 Sep 2026 19:36:40 +0000
+Subject: [PATCH 25/76] e2-gate5: gate-5 candidate = e2-pull + PLE row dump +
+ scheduler allocation log + worker allocator telemetry
+
+All three hooks are env-gated and inert when unset: VLLM_PLE_ROW_DUMP (cherry-picked 8bc7473990), VLLM_E2_SCHED_LOG (one JSON line per scheduler update + one per freed request: blocks per KV-cache group, computed/output/cached tokens, spec tokens scheduled), VLLM_E2_MEMSTATS + VLLM_E2_MEMSTATS_DIR (per-worker daemon thread from the first execute_model: self-resetting allocator high-water segments, whole-run maxima carried). Prereg flashnext-e2-gate5-promotion-prereg-2026-09-11.
+---
+ vllm/v1/core/sched/e2_alloc_log.py | 85 ++++++++++++++++++++++++++++++
+ vllm/v1/core/sched/scheduler.py    |  3 ++
+ vllm/v1/worker/e2_memstats.py      | 68 ++++++++++++++++++++++++
+ vllm/v1/worker/gpu_worker.py       |  3 ++
+ 4 files changed, 159 insertions(+)
+ create mode 100644 vllm/v1/core/sched/e2_alloc_log.py
+ create mode 100644 vllm/v1/worker/e2_memstats.py
+
+diff --git a/vllm/v1/core/sched/e2_alloc_log.py b/vllm/v1/core/sched/e2_alloc_log.py
+new file mode 100644
+index 000000000..60d1e9fab
+--- /dev/null
++++ b/vllm/v1/core/sched/e2_alloc_log.py
+@@ -0,0 +1,85 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Debug-only scheduler allocation log for E2 gate 5 (off unless VLLM_E2_SCHED_LOG=<path>).
++
++One JSON line per scheduler update while any request exists, and one "fin" line per request as it is freed:
++  {"t": wall, "m": monotonic, "step": n, "total": pool blocks, "free": free blocks, "running": r, "waiting": w,
++   "reqs": [[id, prompt, computed, output, cached, preemptions, spec_scheduled, status, [blocks per group]]]}
++  {"t": wall, "m": monotonic, "fin": [id, prompt, computed, output, cached, preemptions, status, [blocks per group]]}
++Blocks are counted per KV-cache group, null blocks excluded. A logging failure writes an "error" line and never
++raises into the scheduler. Unset = the scheduler only pays one env check per update.
++"""
++import json
++import os
++import time
++
++_PATH = os.environ.get("VLLM_E2_SCHED_LOG", "")
++_state = {"f": None, "step": 0, "flush": 0.0, "wrapped": False, "errors": 0}
++
++
++def enabled() -> bool:
++    return bool(_PATH)
++
++
++def _blocks(sched, rid):
++    return [sum(1 for b in m.req_to_blocks.get(rid, ()) if not b.is_null)
++            for m in sched.kv_cache_manager.coordinator.single_type_managers]
++
++
++def _status(r):
++    return getattr(r.status, "name", str(r.status))
++
++
++def _write(rec, force=False):
++    f = _state["f"]
++    if f is None:
++        f = _state["f"] = open(_PATH, "a", buffering=1 << 16)
++    f.write(json.dumps(rec, separators=(",", ":")) + "\n")
++    if force or rec["t"] - _state["flush"] > 0.5:
++        f.flush()
++        _state["flush"] = rec["t"]
++
++
++def _error(e):
++    _state["errors"] += 1
++    if _state["errors"] <= 20:
++        try:
++            _write({"t": round(time.time(), 4), "m": round(time.monotonic(), 4),
++                    "error": f"{type(e).__name__}: {e}"[:300]}, force=True)
++        except Exception:  # noqa: BLE001
++            pass
++
++
++def _wrap_free(sched):
++    orig = sched._free_request
++
++    def _free_request(request, *args, **kwargs):
++        try:
++            _write({"t": round(time.time(), 4), "m": round(time.monotonic(), 4),
++                    "fin": [request.request_id, request.num_prompt_tokens, request.num_computed_tokens,
++                            request.num_output_tokens, max(0, request.num_cached_tokens), request.num_preemptions,
++                            _status(request), _blocks(sched, request.request_id)]}, force=True)
++        except Exception as e:  # noqa: BLE001 - the debug log must never break the scheduler
++            _error(e)
++        return orig(request, *args, **kwargs)
++
++    sched._free_request = _free_request
++    _state["wrapped"] = True
++
++
++def log_step(sched, scheduler_output) -> None:
++    try:
++        if not _state["wrapped"]:
++            _wrap_free(sched)
++        if not sched.requests:
++            return
++        _state["step"] += 1
++        spec = getattr(scheduler_output, "scheduled_spec_decode_tokens", None) or {}
++        pool = sched.kv_cache_manager.block_pool
++        rows = [[rid, r.num_prompt_tokens, r.num_computed_tokens, r.num_output_tokens, max(0, r.num_cached_tokens),
++                 r.num_preemptions, len(spec.get(rid, ())), _status(r), _blocks(sched, rid)]
++                for rid, r in sched.requests.items()]
++        _write({"t": round(time.time(), 4), "m": round(time.monotonic(), 4), "step": _state["step"],
++                "total": pool.num_gpu_blocks, "free": pool.get_num_free_blocks(),
++                "running": len(sched.running), "waiting": len(sched.waiting), "reqs": rows})
++    except Exception as e:  # noqa: BLE001
++        _error(e)
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index dbc697a79..9916598a1 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -62,6 +62,7 @@ from vllm.v1.metrics.stats import (
+     SchedulerStats,
+ )
+ from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
++from vllm.v1.core.sched import e2_alloc_log as _e2_alloc_log
+ from vllm.v1.request import Request, RequestStatus, StreamingUpdate
+ from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
+ from vllm.v1.spec_decode.metrics import SpecDecodingStats
+@@ -2230,6 +2231,8 @@ class Scheduler(SchedulerInterface):
+                 engine_core_outputs[0] = eco = EngineCoreOutputs()
+             eco.scheduler_stats = stats
+ 
++        if _e2_alloc_log.enabled():
++            _e2_alloc_log.log_step(self, scheduler_output)
+         return engine_core_outputs
+ 
+     @staticmethod
+diff --git a/vllm/v1/worker/e2_memstats.py b/vllm/v1/worker/e2_memstats.py
+new file mode 100644
+index 000000000..339fc9ceb
+--- /dev/null
++++ b/vllm/v1/worker/e2_memstats.py
+@@ -0,0 +1,68 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Debug-only allocator telemetry for E2 gate 5 (off unless VLLM_E2_MEMSTATS=<segment seconds> and
++VLLM_E2_MEMSTATS_DIR=<dir>).
++
++One daemon thread per GPU worker, started at the worker's first execute_model (after KV-cache sizing and CUDA-graph
++capture, so it can never disturb memory profiling). Every segment it reads this device's caching-allocator counters
++and cudaMemGetInfo, then resets the peak counters: each line holds the high-water mark of its own segment [t0, t1].
++Whole-run maxima and the minimum free memory are carried on every line, so a reset never loses them.
++No device synchronisation, no GPU allocation, no lock shared with the model path. A failed read writes an "error"
++line and the loop continues.
++Line: {"t0","t1","rank","local","dev","pid","alloc","alloc_peak","res","res_peak","retries","ooms","free","total",
++       "run_alloc_peak","run_res_peak","min_free"}
++"""
++import json
++import os
++import threading
++import time
++
++import torch
++
++_SEG = float(os.environ.get("VLLM_E2_MEMSTATS", "0") or 0)
++_DIR = os.environ.get("VLLM_E2_MEMSTATS_DIR", "")
++_started = []
++
++
++def enabled() -> bool:
++    return _SEG > 0 and bool(_DIR)
++
++
++def ensure_started(worker) -> None:
++    if _started:
++        return
++    dev = torch.cuda.current_device()
++    t = threading.Thread(target=_loop, args=(dev, getattr(worker, "rank", -1), getattr(worker, "local_rank", -1)),
++                         name="e2-memstats", daemon=True)
++    _started.append(t)
++    t.start()
++
++
++def _loop(dev, rank, local):
++    os.makedirs(_DIR, exist_ok=True)
++    f = open(os.path.join(_DIR, f"memstats-rank{rank}-pid{os.getpid()}.jsonl"), "a", buffering=1)
++    run_ap = run_rp = 0
++    min_free = None
++    torch.cuda.reset_peak_memory_stats(dev)
++    t0 = time.time()
++    while True:
++        time.sleep(_SEG)
++        try:
++            s = torch.cuda.memory_stats(dev)
++            free, total = torch.cuda.mem_get_info(dev)
++            torch.cuda.reset_peak_memory_stats(dev)
++            t1 = time.time()
++            ap, rp = int(s.get("allocated_bytes.all.peak", 0)), int(s.get("reserved_bytes.all.peak", 0))
++            run_ap, run_rp = max(run_ap, ap), max(run_rp, rp)
++            min_free = free if min_free is None else min(min_free, free)
++            rec = {"t0": round(t0, 4), "t1": round(t1, 4), "rank": rank, "local": local, "dev": dev,
++                   "pid": os.getpid(), "alloc": int(s.get("allocated_bytes.all.current", 0)), "alloc_peak": ap,
++                   "res": int(s.get("reserved_bytes.all.current", 0)), "res_peak": rp,
++                   "retries": int(s.get("num_alloc_retries", 0)), "ooms": int(s.get("num_ooms", 0)),
++                   "free": int(free), "total": int(total), "run_alloc_peak": run_ap, "run_res_peak": run_rp,
++                   "min_free": int(min_free)}
++        except Exception as e:  # noqa: BLE001 - telemetry must never raise into the worker
++            t1 = time.time()
++            rec = {"t0": round(t0, 4), "t1": round(t1, 4), "rank": rank, "pid": os.getpid(),
++                   "error": f"{type(e).__name__}: {e}"[:300]}
++        f.write(json.dumps(rec, separators=(",", ":")) + "\n")
++        t0 = t1
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index 96054e0c4..c36383a49 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -84,6 +84,7 @@ from vllm.v1.outputs import (
+     ModelRunnerOutput,
+ )
+ from vllm.v1.utils import compute_iteration_details, report_usage_stats
++from vllm.v1.worker import e2_memstats as _e2_memstats
+ from vllm.v1.worker.sentinel.gpu_worker_sentinel import WorkerSentinel
+ from vllm.v1.worker.startup_plan import (
+     maybe_apply_startup_plan,
+@@ -1283,6 +1284,8 @@ class Worker(WorkerBase):
+     def execute_model(
+         self, scheduler_output: "SchedulerOutput"
+     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
++        if _e2_memstats.enabled():
++            _e2_memstats.ensure_started(self)
+         # Wait for the previous step's sends so this forward pass cannot
+         # overwrite buffers they are still reading.
+         if self._pp_send_work:
+-- 
+2.47.3
+

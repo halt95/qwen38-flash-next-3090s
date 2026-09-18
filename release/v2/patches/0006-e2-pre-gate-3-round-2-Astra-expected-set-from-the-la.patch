@@ -1,0 +1,131 @@
+From 3803096e3246192511d7bcf8be3756aaecf87b79 Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Thu, 10 Sep 2026 20:18:14 +0000
+Subject: [PATCH 06/76] e2: pre-gate-3 round 2 (Astra) - expected set from the
+ layer-stack module path, empty PP stage still validates, no-indexer + sidecar
+ raises, collector identity cached
+
+---
+ vllm/models/qwen4_exp/nvidia/model.py | 38 ++++++++++++++++-----------
+ vllm/models/qwen4_exp/nvidia/qsa.py   | 32 ++++++++++++++--------
+ 2 files changed, 44 insertions(+), 26 deletions(-)
+
+diff --git a/vllm/models/qwen4_exp/nvidia/model.py b/vllm/models/qwen4_exp/nvidia/model.py
+index 4264a4060..42e8917b5 100644
+--- a/vllm/models/qwen4_exp/nvidia/model.py
++++ b/vllm/models/qwen4_exp/nvidia/model.py
+@@ -200,28 +200,36 @@ def _maybe_load_qsa_static_kv_scales(model: nn.Module) -> None:
+             return
+     if inner is None:
+         raise ValueError("Qwen4Exp QSA: no Qwen4ExpModel found for the sidecar")
++    if not inner._qsa_layer_ids:
++        # A requested calibration for a model without QSA layers is a
++        # configuration error, never a silent no-op (Astra 09-10, 3).
++        raise ValueError(
++            f"Qwen4Exp QSA: {_QSA_KV_SCALES_ENV} is set but the model has no "
++            "QSA (indexer) attention layers"
++        )
++    # Whole-model QSA layer set (all pipeline stages): the QSA layer name is
++    # "<module path of inner.layers>.<idx>.self_attn.attn"; the module path
++    # is taken from the loaded model so no local QSA layer is needed to derive
++    # it, and the loader rejects any local layer outside the set.
++    layers_path = next(
++        (name for name, module in model.named_modules() if module is inner.layers),
++        None,
++    )
++    if layers_path is None:
++        raise ValueError("Qwen4Exp QSA: cannot locate the decoder layer stack")
++    expected = {
++        f"{layers_path}.{idx}.self_attn.attn" for idx in inner._qsa_layer_ids
++    }
+     if not local_qsa:
+-        # A pipeline stage without a full-attention layer (possible only for a
+-        # very uneven split); the other stages apply their slices.
++        # A pipeline stage without a full-attention layer (only for a very
++        # uneven split): validate the complete sidecar here too, apply nothing.
+         logger.warning(
+             "Qwen4Exp QSA: this pipeline stage holds no QSA layer "
+-            "(layers %d-%d); sidecar %s not applied here",
++            "(pipeline layers %d-%d); sidecar %s validated, nothing to apply",
+             inner.start_layer,
+             inner.end_layer,
+             path,
+         )
+-        return
+-    # Whole-model QSA layer set (all pipeline stages) from the config: the
+-    # sidecar is validated against this, the local slice is what gets applied.
+-    prefix, sep, tail = local_qsa[0].layer_name.rpartition(".layers.")
+-    if not sep or not tail.split(".")[0].isdigit():
+-        raise ValueError(
+-            f"Qwen4Exp QSA: unexpected layer name {local_qsa[0].layer_name!r}"
+-        )
+-    suffix = tail.split(".", 1)[1]  # "self_attn.attn"
+-    expected = {
+-        f"{prefix}.layers.{idx}.{suffix}" for idx in inner._qsa_layer_ids
+-    }
+     # strict: every QSA layer of the whole model must be in the sidecar. An empty
+     # or partial file silently leaving layers at scale 1.0 is exactly the failure
+     # this call site exists to prevent.
+diff --git a/vllm/models/qwen4_exp/nvidia/qsa.py b/vllm/models/qwen4_exp/nvidia/qsa.py
+index d31b1ed6b..4c25e22f9 100644
+--- a/vllm/models/qwen4_exp/nvidia/qsa.py
++++ b/vllm/models/qwen4_exp/nvidia/qsa.py
+@@ -82,26 +82,36 @@ _qsa_collect_state: dict[str, list[torch.Tensor]] = {}
+ _qsa_collect_calls = 0
+ 
+ 
+-def _qsa_collect_dump() -> None:
+-    if not _qsa_collect_state:
+-        return
+-    pp_tag = ""
++_qsa_collect_ident: str | None = None
++
++
++def _qsa_collect_identity() -> str:
++    """Stable per-process dump name: (pp, tp) rank, resolved once and cached so
++    a teardown-time lookup failure cannot move the final flush to a PID-named
++    file (Astra 09-10, D). TP-only runs keep the historical name."""
++    global _qsa_collect_ident
++    if _qsa_collect_ident is not None:
++        return _qsa_collect_ident
+     try:
+         from vllm.distributed import get_pp_group, get_tensor_model_parallel_rank
+ 
+         rank = get_tensor_model_parallel_rank()
+         pp_group = get_pp_group()
+-        if pp_group.world_size > 1:
+-            # One file per (pp, tp) rank: stages hold disjoint layers, so a
+-            # TP-only filename would let stage 1 overwrite stage 0's dump.
+-            pp_tag = f"pp{pp_group.rank_in_group}_"
++        pp_tag = f"pp{pp_group.rank_in_group}_" if pp_group.world_size > 1 else ""
++        _qsa_collect_ident = f"{pp_tag}rank{rank}"
+     except Exception:
+-        rank = os.getpid()
++        return f"pid{os.getpid()}"  # not cached: retry once the groups exist
++    return _qsa_collect_ident
++
++
++def _qsa_collect_dump() -> None:
++    if not _qsa_collect_state:
++        return
+     out = {
+         name: {"k_absmax": float(st[0].item()), "v_absmax": float(st[1].item())}
+         for name, st in _qsa_collect_state.items()
+     }
+-    path = Path(_qsa_collect_dir) / f"qsa_absmax_{pp_tag}rank{rank}.json"
++    path = Path(_qsa_collect_dir) / f"qsa_absmax_{_qsa_collect_identity()}.json"
+     tmp = path.with_suffix(".tmp")
+     tmp.write_text(json.dumps(out, indent=1), encoding="utf-8")
+     tmp.replace(path)
+@@ -795,7 +805,7 @@ def load_qsa_static_kv_scales(
+             and isinstance(layer, Qwen4ExpQSAAttention)
+         }
+ 
+-    if not qsa_layers:
++    if not qsa_layers and expected_layer_names is None:
+         raise ValueError("No Qwen4Exp QSA attention layers were supplied")
+     non_fp8_layers = sorted(
+         name
+-- 
+2.47.3
+

@@ -1,0 +1,668 @@
+From 92de5c6b49c337ed1efcd02e125781851948cda6 Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Sun, 13 Sep 2026 23:45:32 +0000
+Subject: [PATCH 40/76] v2 transport fixes round 4 (Astra R4-1..R4-3): fatal
+ diagnostic never calls exception-defined code, READY receives a complete
+ bounded frame under the absolute deadline with validation inside cleanup,
+ distinct bound PLE layer identities before capture, graceful close sends
+ SIGTERM with parent-death supervision still connected; behavioural tests for
+ blocked send, real wait-copy geometry, normal-close cleanup (Sol draft, Fable
+ applied/tested)
+
+Tests: tests/v1/ple_offload green (see record flashnext-v2-transport-sol-r4-applied-2026-09-13 for red runs).
+---
+ tests/v1/ple_offload/test_round4_transport.py | 343 ++++++++++++++++++
+ .../ple_offload/test_spawn_bootstrap_cuda.py  |  14 +-
+ vllm/v1/ple_offload/fatal.py                  |  21 +-
+ vllm/v1/ple_offload/worker.py                 | 132 +++++--
+ vllm/v1/worker/gpu/cudagraph_utils.py         |  10 +-
+ 5 files changed, 484 insertions(+), 36 deletions(-)
+ create mode 100644 tests/v1/ple_offload/test_round4_transport.py
+
+diff --git a/tests/v1/ple_offload/test_round4_transport.py b/tests/v1/ple_offload/test_round4_transport.py
+new file mode 100644
+index 000000000..fb37122de
+--- /dev/null
++++ b/tests/v1/ple_offload/test_round4_transport.py
+@@ -0,0 +1,343 @@
++# SPDX-License-Identifier: Apache-2.0
++
++import multiprocessing
++import os
++import signal
++import struct
++import subprocess
++import sys
++import time
++from pathlib import Path
++from types import SimpleNamespace
++from typing import Any
++
++import pytest
++
++
++class _BlockingStrError(Exception):
++    def __str__(self) -> str:
++        __import__("threading").Event().wait()
++        return "unreachable"
++
++
++def _blocking_fatal_formatter_case(marker_path: str) -> None:
++    from vllm.v1.ple_offload.fatal import ple_fail_closed
++
++    Path(marker_path).write_text("armed", encoding="utf-8")
++    try:
++        raise _BlockingStrError()
++    except BaseException as error:
++        ple_fail_closed(
++            where="blocking-formatter",
++            rank=1,
++            layer="ple",
++            sequence=3,
++            error=error,
++        )
++
++
++def test_fatal_helper_does_not_call_blocking_exception_str(
++    tmp_path: Path,
++) -> None:
++    context = multiprocessing.get_context("spawn")
++    marker = tmp_path / "fatal-formatter-armed"
++    process = context.Process(
++        target=_blocking_fatal_formatter_case,
++        args=(str(marker),),
++    )
++    process.start()
++    try:
++        deadline = time.monotonic() + 120
++        while not marker.exists() and time.monotonic() < deadline:
++            time.sleep(0.05)
++        assert marker.exists()
++
++        process.join(timeout=5)
++        assert not process.is_alive()
++        assert process.exitcode not in (None, 0)
++    finally:
++        if process.is_alive():
++            process.terminate()
++            process.join(timeout=120)
++
++
++@pytest.mark.skipif(sys.platform == "win32", reason="pass_fds is POSIX-only")
++@pytest.mark.parametrize(
++    ("behavior", "ready_timeout", "expected_exception"),
++    [
++        pytest.param("partial", "1", TimeoutError, id="partial-frame"),
++        pytest.param("silent", "1", TimeoutError, id="no-response"),
++        pytest.param("ready", "120", None, id="complete-ready"),
++        pytest.param("invalid", "120", RuntimeError, id="invalid-layer-names"),
++    ],
++)
++def test_wait_for_ready_receives_complete_bounded_frame(
++    monkeypatch: pytest.MonkeyPatch,
++    behavior: str,
++    ready_timeout: str,
++    expected_exception: type[BaseException] | None,
++) -> None:
++    import vllm.v1.ple_offload.worker as worker_module
++
++    real_popen = subprocess.Popen
++    spawned: list[subprocess.Popen] = []
++    child_code = (
++        "import os,signal,struct,sys,time\n"
++        "from multiprocessing.connection import Connection\n"
++        "signal.alarm(10)\n"
++        "fd=int(sys.argv[1])\n"
++        "behavior=sys.argv[3]\n"
++        "if behavior=='partial':\n"
++        " os.write(fd,struct.pack('!i',128)+b'partial')\n"
++        "elif behavior=='ready':\n"
++        " Connection(fd).send({'status':'READY','layer_names':['ple']})\n"
++        "elif behavior=='invalid':\n"
++        " Connection(fd).send({'status':'READY','layer_names':'ple'})\n"
++        "time.sleep(120)\n"
++    )
++
++    def launch_fixture(argv: list[str], **kwargs: Any) -> subprocess.Popen:
++        process = real_popen(
++            [
++                sys.executable,
++                "-c",
++                child_code,
++                argv[-2],
++                argv[-1],
++                behavior,
++            ],
++            **kwargs,
++        )
++        spawned.append(process)
++        return process
++
++    monkeypatch.setenv("VLLM_PLE_OFFLOAD_READY_TIMEOUT", ready_timeout)
++    monkeypatch.setattr(worker_module.subprocess, "Popen", launch_fixture)
++
++    handle = worker_module.PleOffloadWorker.make_process(None, 0, "unused")
++    try:
++        started = time.monotonic()
++        if expected_exception is None:
++            worker_module.PleOffloadWorker.wait_for_ready(handle)
++            assert handle.ready_pipe_reader is None
++        else:
++            with pytest.raises(expected_exception):
++                worker_module.PleOffloadWorker.wait_for_ready(handle)
++            if expected_exception is TimeoutError:
++                assert time.monotonic() - started < 5
++            assert spawned[0].poll() is not None
++    finally:
++        handle.close(graceful=False)
++
++
++@pytest.mark.skipif(sys.platform == "win32", reason="pass_fds is POSIX-only")
++def test_make_process_large_payload_send_has_absolute_deadline(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    import vllm.v1.ple_offload.worker as worker_module
++
++    real_popen = subprocess.Popen
++    spawned: list[subprocess.Popen] = []
++
++    def launch_nonreader(argv: list[str], **kwargs: Any) -> subprocess.Popen:
++        process = real_popen(
++            [
++                sys.executable,
++                "-c",
++                "import signal,time; signal.alarm(120); time.sleep(120)",
++                argv[-2],
++                argv[-1],
++            ],
++            **kwargs,
++        )
++        spawned.append(process)
++        return process
++
++    monkeypatch.setenv("VLLM_PLE_OFFLOAD_READY_TIMEOUT", "5")
++    monkeypatch.setattr(worker_module.subprocess, "Popen", launch_nonreader)
++
++    started = time.monotonic()
++    with pytest.raises(TimeoutError, match="transmission"):
++        worker_module.PleOffloadWorker.make_process(
++            b"x" * (64 << 20),
++            0,
++            "unused",
++        )
++
++    assert time.monotonic() - started < 20
++    assert spawned
++    assert spawned[0].poll() is not None
++
++
++@pytest.mark.parametrize(
++    "identities",
++    [
++        pytest.param(("shared", "shared"), id="duplicate"),
++        pytest.param(("<unbound>",), id="unbound"),
++    ],
++)
++def test_expected_ple_layers_are_bound_and_unique_before_publication(
++    monkeypatch: pytest.MonkeyPatch,
++    identities: tuple[str, ...],
++) -> None:
++    from vllm.config import CUDAGraphMode
++    from vllm.v1.worker.gpu.cudagraph_utils import (
++        CudaGraphManager,
++        ModelCudaGraphManager,
++    )
++
++    manager = ModelCudaGraphManager.__new__(ModelCudaGraphManager)
++    manager.graphs = {}
++    manager.use_breakable_cg = False
++    manager.cudagraph_mode = CUDAGraphMode.FULL
++
++    modules = [
++        (
++            f"module_{index}",
++            SimpleNamespace(
++                _is_cpu_offloaded=True,
++                _host_output_ptr=1,
++                _ple_offload_name=identity,
++            ),
++        )
++        for index, identity in enumerate(identities)
++    ]
++    model = SimpleNamespace(named_modules=lambda: iter(modules))
++
++    def publish_graph(self: Any, *_args: Any, **_kwargs: Any) -> None:
++        self.graphs["published"] = object()
++
++    monkeypatch.setattr(CudaGraphManager, "capture", publish_graph)
++
++    with pytest.raises(RuntimeError, match="distinct, bound"):
++        ModelCudaGraphManager.capture(
++            manager,
++            model=model,
++            model_state=object(),
++            input_buffers=object(),
++            intermediate_tensors=None,
++            block_tables=object(),
++            attn_groups=[],
++            kv_cache_config=object(),
++        )
++    assert manager.graphs == {}
++
++
++def test_real_wait_copy_geometry_rejected_before_graph_publication(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    import torch
++
++    import vllm.model_executor.layers.ple_offload_layer as ple_layer_module
++    from vllm.config import CUDAGraphMode
++    from vllm.v1.worker.gpu.cudagraph_utils import (
++        BatchExecutionDescriptor,
++        CudaGraphManager,
++    )
++
++    manager = CudaGraphManager.__new__(CudaGraphManager)
++    manager.graphs = {}
++    manager._ple_full_copy_geometry = {}
++    manager._expected_ple_copy_layers = ("ple",)
++    manager._allow_ple_full_graph = True
++    desc = BatchExecutionDescriptor(
++        cg_mode=CUDAGraphMode.FULL,
++        num_tokens=8,
++        num_reqs=1,
++    )
++
++    success = SimpleNamespace(value=0)
++    monkeypatch.setattr(
++        ple_layer_module.torch.cuda,
++        "current_stream",
++        lambda: SimpleNamespace(cuda_stream=1),
++    )
++    monkeypatch.setattr(
++        ple_layer_module.cuda_driver,
++        "CUstream",
++        lambda value: value,
++    )
++    monkeypatch.setattr(
++        ple_layer_module.cuda_driver,
++        "CUdeviceptr",
++        lambda value: value,
++    )
++    monkeypatch.setattr(
++        ple_layer_module.cuda_driver,
++        "cuStreamWaitValue32",
++        lambda *_args: (success,),
++    )
++    monkeypatch.setattr(
++        ple_layer_module.cuda_driver,
++        "cuMemcpyHtoDAsync",
++        lambda *_args: (success,),
++    )
++
++    gpu_output_buffer = torch.empty(12, 4, dtype=torch.float32)
++    hidden_states = torch.empty(12, 1, dtype=torch.float32)
++
++    def capture_then_publish() -> None:
++        with manager.capture_ple_copy_geometry(desc):
++            ple_layer_module._ple_offload_wait_copy_impl(
++                gpu_output_buffer,
++                hidden_states,
++                1,
++                2,
++                16,
++                12,
++                "ple",
++            )
++        manager.graphs[desc] = object()
++
++    with pytest.raises(RuntimeError, match="actual PLE copy geometry"):
++        capture_then_publish()
++    assert desc not in manager._ple_full_copy_geometry
++    assert desc not in manager.graphs
++
++
++class _CleanupConfig:
++    def __init__(self, started_path: str, cleaned_path: str) -> None:
++        self.started_path = started_path
++        self.cleaned_path = cleaned_path
++
++    def __reduce__(self):
++        source = (
++            "import signal,threading\n"
++            "from pathlib import Path\n"
++            "from vllm.v1.ple_offload.worker import PleOffloadWorker\n"
++            f"_started=Path({self.started_path!r})\n"
++            f"_cleaned=Path({self.cleaned_path!r})\n"
++            "def _cleanup_proc_main(vllm_config,num_workers,ipc_addr,ready_pipe):\n"
++            " _stop=threading.Event()\n"
++            " signal.signal(signal.SIGTERM,lambda *_args:_stop.set())\n"
++            " _started.write_text('started',encoding='utf-8')\n"
++            " try:\n"
++            "  _stop.wait()\n"
++            " finally:\n"
++            "  _cleaned.write_text('cleaned',encoding='utf-8')\n"
++            "PleOffloadWorker.proc_main=staticmethod(_cleanup_proc_main)\n"
++        )
++        return exec, (source, {})
++
++
++@pytest.mark.skipif(sys.platform == "win32", reason="pass_fds is POSIX-only")
++def test_normal_close_runs_child_cleanup(tmp_path: Path) -> None:
++    from vllm.v1.ple_offload.worker import PleOffloadWorker
++
++    started = tmp_path / "cleanup-started"
++    cleaned = tmp_path / "cleanup-finished"
++    handle = PleOffloadWorker.make_process(
++        _CleanupConfig(str(started), str(cleaned)),
++        0,
++        "unused",
++    )
++    try:
++        deadline = time.monotonic() + 120
++        while not started.exists() and time.monotonic() < deadline:
++            time.sleep(0.05)
++        assert started.exists()
++    finally:
++        handle.close()
++
++    assert handle.proc.returncode == 0
++    assert cleaned.read_text(encoding="utf-8") == "cleaned"
+diff --git a/tests/v1/ple_offload/test_spawn_bootstrap_cuda.py b/tests/v1/ple_offload/test_spawn_bootstrap_cuda.py
+index 4ce15650a..ea8d1a390 100644
+--- a/tests/v1/ple_offload/test_spawn_bootstrap_cuda.py
++++ b/tests/v1/ple_offload/test_spawn_bootstrap_cuda.py
+@@ -18,12 +18,6 @@ from pathlib import Path
+ 
+ import pytest
+ 
+-from vllm.v1.ple_offload.worker import (
+-    PleOffloadWorker,
+-    _send_framed_payload,
+-)
+-
+-
+ def _native_cuda_probe(output_path: str) -> None:
+     """Run during config unpickling, before the bootstrap imports vLLM."""
+     library = ctypes.util.find_library("cudart")
+@@ -67,6 +61,8 @@ def test_spawn_bootstrap_sets_visibility_before_native_cuda(
+     tmp_path: Path,
+     monkeypatch: pytest.MonkeyPatch,
+ ) -> None:
++    from vllm.v1.ple_offload.worker import PleOffloadWorker
++
+     if ctypes.util.find_library("cudart") is None:
+         pytest.skip("CUDA runtime is not installed")
+ 
+@@ -120,6 +116,8 @@ def test_fresh_interpreter_has_child_environment_before_vllm_import(
+     tmp_path: Path,
+     monkeypatch: pytest.MonkeyPatch,
+ ) -> None:
++    from vllm.v1.ple_offload.worker import PleOffloadWorker
++
+     # This test module has unconditional top-level imports. The dedicated
+     # bootstrap interpreter must not import it as __mp_main__.
+     original = os.environ.get("CUDA_VISIBLE_DEVICES")
+@@ -196,6 +194,8 @@ class _BlockingConfigProbe:
+ 
+ 
+ def _launch_blocked_config(output_path: str, child_pids) -> None:
++    from vllm.v1.ple_offload.worker import PleOffloadWorker
++
+     handle = PleOffloadWorker.make_process(
+         _BlockingConfigProbe(output_path), 0, "unused"
+     )
+@@ -289,6 +289,8 @@ class _ExecFdProbe:
+ def test_actual_bootstrap_restores_cloexec_before_helper_exec(
+     tmp_path: Path,
+ ) -> None:
++    from vllm.v1.ple_offload.worker import _send_framed_payload
++
+     control_parent, control_child = socket.socketpair()
+     death_parent, death_child = socket.socketpair()
+     inherited = [
+diff --git a/vllm/v1/ple_offload/fatal.py b/vllm/v1/ple_offload/fatal.py
+index 187c8efc7..75714df52 100644
+--- a/vllm/v1/ple_offload/fatal.py
++++ b/vllm/v1/ple_offload/fatal.py
+@@ -21,10 +21,27 @@ def ple_fail_closed(
+     """Emit one best-effort nonblocking diagnostic and terminate immediately."""
+     try:
+         os.set_blocking(2, False)
+-        detail = str(error).replace("\n", "\\n")[:512]
++        error_type = type(error)
++        error_name = type.__getattribute__(error_type, "__name__")
++        detail_suffix = ""
++        if (
++            type.__getattribute__(
++                error_type,
++                "__str__",
++            )
++            is BaseException.__str__
++        ):
++            args = BaseException.args.__get__(error, error_type)
++            if (
++                type(args) is tuple
++                and len(args) == 1
++                and type(args[0]) is str
++            ):
++                detail = args[0][:512].replace("\n", "\\n")
++                detail_suffix = f":{detail}"
+         message = (
+             f"PLE fatal: where={where} rank={rank} layer={layer} "
+-            f"sequence={sequence} error={type(error).__name__}:{detail}\n"
++            f"sequence={sequence} error={error_name}{detail_suffix}\n"
+         )
+         os.write(2, message.encode("utf-8", "backslashreplace")[:2048])
+     except BaseException:
+diff --git a/vllm/v1/ple_offload/worker.py b/vllm/v1/ple_offload/worker.py
+index 49a1c927c..27b51af4b 100644
+--- a/vllm/v1/ple_offload/worker.py
++++ b/vllm/v1/ple_offload/worker.py
+@@ -267,6 +267,72 @@ def _send_framed_payload(fd: int, payload: bytes, deadline: float) -> None:
+             os.set_blocking(fd, True)
+ 
+ 
++_PLE_READY_MAX_PAYLOAD_BYTES = 1 << 20
++
++
++def _read_exact_before_deadline(
++    fd: int,
++    size: int,
++    deadline: float,
++) -> bytes:
++    """Read exactly ``size`` bytes without crossing an absolute deadline."""
++    chunks = bytearray()
++    while len(chunks) < size:
++        remaining = deadline - time.monotonic()
++        if remaining <= 0:
++            raise TimeoutError(
++                "PLE offload worker did not become ready before its "
++                "absolute launch deadline"
++            )
++        readable, _, _ = select.select([fd], [], [], remaining)
++        if not readable:
++            raise TimeoutError(
++                "PLE offload worker did not become ready before its "
++                "absolute launch deadline"
++            )
++        try:
++            chunk = os.read(fd, size - len(chunks))
++        except BlockingIOError:
++            continue
++        if not chunk:
++            raise EOFError("PLE startup response was truncated")
++        chunks.extend(chunk)
++    return bytes(chunks)
++
++
++def _recv_bounded_connection_message(
++    reader: Connection,
++    deadline: float,
++) -> Any:
++    """Receive one bounded multiprocessing Connection frame by ``deadline``."""
++    fd = reader.fileno()
++    os.set_blocking(fd, False)
++    try:
++        header = _read_exact_before_deadline(fd, 4, deadline)
++        size = struct.unpack("!i", header)[0]
++        if size == -1:
++            size = struct.unpack(
++                "!Q", _read_exact_before_deadline(fd, 8, deadline)
++            )[0]
++        elif size < 0:
++            raise RuntimeError("PLE startup response has an invalid frame size")
++        if size > _PLE_READY_MAX_PAYLOAD_BYTES:
++            raise RuntimeError(
++                f"PLE startup response exceeds "
++                f"{_PLE_READY_MAX_PAYLOAD_BYTES} bytes"
++            )
++        frame = _read_exact_before_deadline(fd, size, deadline)
++    finally:
++        with contextlib.suppress(OSError):
++            os.set_blocking(fd, True)
++    try:
++        return pickle.loads(frame)
++    except BaseException as error:
++        raise RuntimeError(
++            "PLE startup response is not a valid serialized message"
++        ) from error
++
++
+ @dataclass
+ class PleOffloadWorkerHandle:
+     """Resources owned by the GPU worker that spawned the offload process."""
+@@ -281,24 +347,24 @@ class PleOffloadWorkerHandle:
+         if self.ready_pipe_reader is not None:
+             self.ready_pipe_reader.close()
+             self.ready_pipe_reader = None
+-        if self.death_writer is not None:
+-            self.death_writer.close()
+-            self.death_writer = None
+-        # Normal teardown first allows parent-death supervision to stop the child.
+-        # An expired launch skips directly to bounded TERM -> KILL.
+         if graceful and self.proc.poll() is None:
++            # Keep parent-death supervision connected while SIGTERM lets
++            # proc_main run its shutdown event and finally cleanup.
++            self.proc.terminate()
+             try:
+                 self.proc.wait(timeout=5)
+             except subprocess.TimeoutExpired:
+                 pass
+-        # Fall back to SIGTERM if graceful shutdown times out.
+-        if self.proc.poll() is None:
++        if self.death_writer is not None:
++            self.death_writer.close()
++            self.death_writer = None
++        if not graceful and self.proc.poll() is None:
++            # Expired launch: retain the immediate EOF -> TERM path.
+             self.proc.terminate()
+             try:
+                 self.proc.wait(timeout=5)
+             except subprocess.TimeoutExpired:
+                 pass
+-        # Use SIGKILL as the final fallback for a stuck child.
+         if self.proc.poll() is None:
+             self.proc.kill()
+             try:
+@@ -430,13 +496,35 @@ class PleOffloadWorker:
+         if reader is None:
+             return
+         try:
+-            remaining = handle.launch_deadline - time.monotonic()
+-            if remaining <= 0 or not reader.poll(remaining):
+-                raise TimeoutError(
+-                    "PLE offload worker did not become ready before its "
+-                    "absolute launch deadline"
++            message = _recv_bounded_connection_message(
++                reader, handle.launch_deadline
++            )
++            if type(message) is not dict:
++                raise RuntimeError("PLE offload worker sent an invalid response")
++            status = dict.get(message, "status")
++            if status != PleOffloadWorker.READY_STR:
++                error_detail = dict.get(message, "error")
++                if type(error_detail) is not str:
++                    error_detail = "unknown error"
++                raise RuntimeError(
++                    "PLE offload worker failed during startup: "
++                    f"{error_detail}"
++                )
++            layer_names = dict.get(message, "layer_names")
++            if (
++                type(layer_names) is not list
++                or any(
++                    type(name) is not str for name in layer_names
++                )
++            ):
++                raise RuntimeError(
++                    "PLE offload worker sent invalid READY layer_names"
+                 )
+-            message = reader.recv()
++            logger.info(
++                "Worker ready - %d PleOffloadLayer(s): %s",
++                len(layer_names),
++                layer_names,
++            )
+         except EOFError as error:
+             handle.close(graceful=False)
+             raise RuntimeError("PLE offload worker exited during startup") from error
+@@ -447,18 +535,6 @@ class PleOffloadWorker:
+             if handle.ready_pipe_reader is not None:
+                 handle.ready_pipe_reader.close()
+                 handle.ready_pipe_reader = None
+-        if message.get("status") != PleOffloadWorker.READY_STR:
+-            handle.close(graceful=False)
+-            raise RuntimeError(
+-                "PLE offload worker failed during startup: "
+-                f"{message.get('error', 'unknown error')}"
+-            )
+-        layer_names = message["layer_names"]
+-        logger.info(
+-            "Worker ready - %d PleOffloadLayer(s): %s",
+-            len(layer_names),
+-            layer_names,
+-        )
+ 
+     @staticmethod
+     def proc_main(
+@@ -542,7 +618,9 @@ class PleOffloadWorker:
+             logger.exception("Unexpected failure in PLE offload worker.")
+             if ready_writer is not None:
+                 with contextlib.suppress(Exception):
+-                    ready_writer.send({"status": "FAILURE", "error": repr(error)})
++                    ready_writer.send(
++                        {"status": "FAILURE", "error": repr(error)[:4096]}
++                    )
+             raise
+         finally:
+             if pull_socket is not None:
+diff --git a/vllm/v1/worker/gpu/cudagraph_utils.py b/vllm/v1/worker/gpu/cudagraph_utils.py
+index 597dab309..f53ab5ecb 100644
+--- a/vllm/v1/worker/gpu/cudagraph_utils.py
++++ b/vllm/v1/worker/gpu/cudagraph_utils.py
+@@ -627,12 +627,20 @@ class ModelCudaGraphManager(CudaGraphManager):
+     ) -> None:
+         """Capture CUDA graphs for model forward pass."""
+         self.use_aux_hidden_state_outputs = use_aux_hidden_state_outputs
+-        self._expected_ple_copy_layers = tuple(
++        expected_ple_copy_layers = tuple(
+             str(getattr(module, "_ple_offload_name", name))
+             for name, module in model.named_modules()
+             if getattr(module, "_is_cpu_offloaded", False)
+             and getattr(module, "_host_output_ptr", None) is not None
+         )
++        if (
++            "<unbound>" in expected_ple_copy_layers
++            or len(set(expected_ple_copy_layers)) != len(expected_ple_copy_layers)
++        ):
++            raise RuntimeError(
++                "PLE FULL capture requires distinct, bound connector layer identities"
++            )
++        self._expected_ple_copy_layers = expected_ple_copy_layers
+         if self.use_breakable_cg:
+             self.init_breakable_cg_runner(model)
+ 
+-- 
+2.47.3
+

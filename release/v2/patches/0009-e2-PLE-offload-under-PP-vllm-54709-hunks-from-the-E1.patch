@@ -1,0 +1,55 @@
+From 31fe013bbac18f03dc932e212cca5eebdb6da3e4 Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Thu, 10 Sep 2026 21:33:12 +0000
+Subject: [PATCH 09/76] e2: PLE offload under PP (vllm#54709 hunks from the E1
+ overlay): per-rank PLE ownership, PP dropped from the unsupported list
+
+---
+ vllm/v1/worker/gpu_worker.py | 24 +++++++++++++++++++++---
+ 1 file changed, 21 insertions(+), 3 deletions(-)
+
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index 3fc72a2aa..318c7af30 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -243,7 +243,24 @@ class Worker(WorkerBase):
+         if not envs.VLLM_PLE_CPU_OFFLOAD:
+             return False
+         text_config = self.model_config.hf_text_config
+-        return bool(getattr(text_config, "ple_layer_ids", None))
++        ple_layer_ids = getattr(text_config, "ple_layer_ids", None)
++        if not ple_layer_ids:
++            return False
++        # PP (vllm#54709, carried from the E1 overlay): only the pipeline rank
++        # that owns a PLE layer takes part in the offload (rank 0 with the
++        # default partition). Other ranks build PPMissingLayer there and must
++        # skip the connector entirely.
++        pp_size = self.parallel_config.pipeline_parallel_size
++        if pp_size > 1:
++            from vllm.distributed.utils import get_pp_indices
++
++            tp_size = self.parallel_config.tensor_parallel_size
++            pp_rank = (self.rank // tp_size) % pp_size
++            start, end = get_pp_indices(
++                int(text_config.num_hidden_layers), pp_rank, pp_size
++            )
++            return any(start <= int(i) - 1 < end for i in ple_layer_ids)
++        return True
+ 
+     def _validate_ple_offload_config(self) -> None:
+         """Reject unsupported PLE offload execution modes."""
+@@ -266,8 +283,9 @@ class Worker(WorkerBase):
+                 f"({parallel_config.data_parallel_size_local}/"
+                 f"{parallel_config.data_parallel_size} local ranks)"
+             )
+-        if parallel_config.pipeline_parallel_size != 1:
+-            unsupported.append(f"PP={parallel_config.pipeline_parallel_size}")
++        # PP allowed (vllm#54709): PLE layers must live on pipeline rank 0
++        # (enforced placement-based in models/config.py); num_workers stays
++        # dp_size * tp_size = the ranks of the owning stage.
+         if parallel_config.prefill_context_parallel_size != 1:
+             unsupported.append(f"PCP={parallel_config.prefill_context_parallel_size}")
+         if parallel_config.decode_context_parallel_size != 1:
+-- 
+2.47.3
+

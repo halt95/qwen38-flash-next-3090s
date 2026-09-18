@@ -1,0 +1,115 @@
+From 0a5d6d43ef312f01ca03d97516fb14eda9ae12c8 Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Tue, 15 Sep 2026 23:41:42 +0000
+Subject: [PATCH 66/76] rc3-instr 10/10: keep the traceback on the PLE
+ fail-closed path
+
+The 2026-09-15 23:27 rc3 qualification boot died in warmup with
+
+  PLE fatal: where=execute_model rank=0
+  layer=language_model.model.layers.1.ple.ple_embedding sequence=1
+  error=Exception pid=3811367
+
+on both PP0 ranks, and there was no traceback anywhere, in any rank's log. The
+cause could not be named at all; the only available next step was a re-run.
+
+ple_fail_closed builds one line and os._exit(1)s, which runs no handlers and
+flushes nothing, so whatever is not written there is gone. The line names the
+exception TYPE only when the type is in _TRUSTED_ERROR_LABELS, and the match is
+`error_type is trusted_type` -- exact identity, not isinstance. Everything else
+is flattened to the literal string "Exception", and that set includes the two
+that matter most here: torch.AcceleratorError, which is a RuntimeError SUBCLASS
+and so misses the identity test, and Triton CompilationError. In other words
+the label is least informative exactly where a CUDA fault or a JIT compile
+failure is the likely cause.
+
+This writes the full traceback, unconditionally, in its own try so it cannot
+cost the existing line, bounded to 8 KiB, before the exit.
+
+A fail-closed path is where evidence matters most rather than least: it fires
+once, it kills the process, and it is the only witness. Printing the type of a
+wrapped exception without the frames that raised it is not a diagnostic.
+
+Verified end to end on CPU with a non-trusted exception type: the process still
+exits 1, still emits the original line with error=Exception, and now follows it
+with the frames.
+
+Draft for Astra review. Not merged into any RC.
+---
+ vllm/v1/ple_offload/fatal.py | 53 ++++++++++++++++++++++++++++++++++++
+ 1 file changed, 53 insertions(+)
+
+diff --git a/vllm/v1/ple_offload/fatal.py b/vllm/v1/ple_offload/fatal.py
+index 76aaa13b2..bb14b793d 100644
+--- a/vllm/v1/ple_offload/fatal.py
++++ b/vllm/v1/ple_offload/fatal.py
+@@ -5,6 +5,7 @@
+ import functools
+ import os
+ import time
++import traceback
+ from collections.abc import Callable
+ from typing import Any, NoReturn, TypeVar
+ 
+@@ -69,6 +70,58 @@ def ple_fail_closed(
+         os.write(2, message.encode("utf-8", "backslashreplace")[:2048])
+     except BaseException:
+         pass
++    # THE TRACEBACK, unconditionally, in its own try so it cannot cost us the
++    # line above.
++    #
++    # This path os._exit(1)s, which runs no handlers and flushes nothing, so
++    # whatever is not written here is gone. The line above names the TYPE only
++    # when the type is one of _TRUSTED_ERROR_LABELS and flattens everything
++    # else to the literal string "Exception" -- and the flattened set includes
++    # the two that matter most here: torch.AcceleratorError (a RuntimeError
++    # SUBCLASS, so the `is` comparison misses it) and Triton CompilationError.
++    # The 2026-09-15 23:27 rc3 boot died exactly that way: both PP0 ranks
++    # reported "error=Exception" and there was no traceback anywhere in the
++    # log, in any rank, so the cause could not be named at all and the next
++    # step was a re-run rather than a fix.
++    #
++    # A fail-closed path is where evidence matters most, not least: it fires
++    # once, it kills the process, and it is the only witness. Printing the type
++    # of a wrapped exception without the frames that raised it is not a
++    # diagnostic.
++    try:
++        # Three-arg form: it does not depend on being inside an active except
++        # block, and this function is called from one frame further out than
++        # the raise.
++        tb = "".join(
++            traceback.format_exception(type(error), error, error.__traceback__)
++        )
++        raw = tb.encode("utf-8", "backslashreplace")
++        # Truncate from the END, not the start. format_exception puts the
++        # frames first and the exception TYPE AND MESSAGE last, so a head-side
++        # cut throws away the one line that names what went wrong and keeps the
++        # import-time frames nobody needs. A long chained traceback is exactly
++        # the case where that matters.
++        clipped = len(raw) > 8192
++        raw = raw[-8192:]
++        os.write(
++            2,
++            b"PLE fatal traceback (tail) follows:\n" if clipped
++            else b"PLE fatal traceback follows:\n",
++        )
++        os.write(2, raw)
++        if not raw.endswith(b"\n"):
++            os.write(2, b"\n")
++    except BaseException:
++        # Never silent HERE of all places: without this the reader cannot tell
++        # "the wrapper predates the traceback fix" from "the traceback itself
++        # could not be produced", and those call for different next steps.
++        # Still guarded, because os._exit below must run whatever happens: an
++        # escape from this handler would leave the worker alive in the state
++        # the fail-closed path exists to end.
++        try:
++            os.write(2, b"PLE fatal: traceback unavailable\n")
++        except BaseException:
++            pass
+     os._exit(1)
+ 
+ 
+-- 
+2.47.3
+

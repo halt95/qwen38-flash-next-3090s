@@ -1,0 +1,29 @@
+From d86c2dcc9429e81e656c76ef2ab28da9ad9d6ad3 Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Fri, 11 Sep 2026 05:12:45 +0000
+Subject: [PATCH 13/76] e2: PLE offload worker drops VLLM_PP_LAYER_PARTITION in
+ its PP=1 process (gate 4b boot A)
+
+---
+ vllm/v1/ple_offload/worker.py | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/vllm/v1/ple_offload/worker.py b/vllm/v1/ple_offload/worker.py
+index 94d0e30cc..902853e0c 100644
+--- a/vllm/v1/ple_offload/worker.py
++++ b/vllm/v1/ple_offload/worker.py
+@@ -293,6 +293,11 @@ class PleOffloadWorker:
+ 
+             # Initialize Gloo before installing the real VllmConfig. This keeps
+             # the CPU process in an isolated rank-zero, world-size-one group.
++            # The offload worker is a PP=1 world; a VLLM_PP_LAYER_PARTITION set
++            # for the GPU workers (e.g. "25,23") would make make_layers raise
++            # "len(partitions) does not match pp_size=1" while the meta model
++            # is built here. Drop it in this process only.
++            os.environ.pop("VLLM_PP_LAYER_PARTITION", None)
+             _init_offload_distributed()
+ 
+             # Model components read the active VllmConfig while the meta model
+-- 
+2.47.3
+

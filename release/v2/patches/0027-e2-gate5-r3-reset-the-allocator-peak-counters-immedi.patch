@@ -1,0 +1,43 @@
+From 8da7d431302ae112c160cbae4ba14ea3578e8293 Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Fri, 11 Sep 2026 22:17:51 +0000
+Subject: [PATCH 27/76] e2-gate5 r3: reset the allocator peak counters
+ immediately after the boundary read (R8-1)
+
+The peak reset ran after the close record was written, so the read-to-reset gap contained file I/O. It now follows the counter read directly; the docstring claim is narrowed to what the code guarantees.
+---
+ vllm/v1/worker/e2_memstats.py | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/vllm/v1/worker/e2_memstats.py b/vllm/v1/worker/e2_memstats.py
+index c39233d37..69ef951ce 100644
+--- a/vllm/v1/worker/e2_memstats.py
++++ b/vllm/v1/worker/e2_memstats.py
+@@ -8,8 +8,9 @@ warm-up calls execute_model before capture, so execute_model is not a post-captu
+ Peak counters are reset ONLY at acknowledged window boundaries, which the gate driver opens and closes while the
+ server is quiet (no request running): <dir>/window.ctl holds "<seq> <name>". On a new seq this thread reads the
+ counters one last time for the old window (its "close" record: the allocator high-water marks since the window
+-opened), resets the peak counters, and writes an "ack" record. Inside a window nothing is reset, so no allocation
+-peak can be lost between a read and a reset; every "sample" line carries the high-water mark since its window opened
++opened), resets the peak counters, and writes an "ack" record. Inside a window nothing is reset; at a boundary the
++reset immediately follows that read, with no file I/O between them, and the driver crosses a boundary only while the
++server is quiet, so no allocation peak of a measured row can be lost. Every "sample" line carries the high-water mark since its window opened
+ (monotone within a window), which localises when it was reached. Whole-run maxima are carried across windows.
+ Retry and OOM counters are cumulative and never reset. min_free_sampled is the minimum of sampled cudaMemGetInfo
+ values, not a continuous minimum.
+@@ -86,11 +87,11 @@ def _loop(dev, rank, local, armed_by):
+             if c is not None and c[0] != seq:
+                 s2 = torch.cuda.memory_stats(dev)
+                 ap2, rp2 = int(s2.get("allocated_bytes.all.peak", 0)), int(s2.get("reserved_bytes.all.peak", 0))
++                torch.cuda.reset_peak_memory_stats(dev)  # immediately after the read: no file I/O inside the gap
+                 run_ap, run_rp = max(run_ap, ap2), max(run_rp, rp2)
+                 w({"kind": "close", "t": round(time.time(), 4), "m": round(time.monotonic(), 4), "window": name,
+                    "seq": seq, "alloc_peak_w": ap2, "res_peak_w": rp2, "retries": int(s2.get("num_alloc_retries", 0)),
+                    "ooms": int(s2.get("num_ooms", 0)), "run_alloc_peak": run_ap, "run_res_peak": run_rp})
+-                torch.cuda.reset_peak_memory_stats(dev)
+                 seq, name = c
+                 t1, m1 = time.time(), time.monotonic()
+                 w({"kind": "ack", "t": round(t1, 4), "m": round(m1, 4), "window": name, "seq": seq})
+-- 
+2.47.3
+

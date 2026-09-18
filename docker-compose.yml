@@ -1,0 +1,36 @@
+# Flash-Next v2.0.1 on 4x RTX 3090 with one command:
+#   MODEL_DIR=/path/to/Qwen3.8-Flash-Next-W4A16-Merlin docker compose up -d
+# then talk to http://localhost:8000/v1 (OpenAI-compatible; model name "flash-next").
+# First start compiles the cudagraphs (~10 min) into the flash-next-cache volume; later starts are fast.
+services:
+  flash-next:
+    image: qwen38-flash-next-3090s:v2.0.1
+    build:
+      context: .
+      # args:
+      #   BUNDLE_URL: https://github.com/halt95/qwen38-flash-next-3090s/releases/download/v2.0.1/v2.0.1-from-upstream-e962733e08.bundle.gz
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    shm_size: 8g              # the PLE transport needs /dev/shm >= 1 GB
+    ulimits:
+      memlock: -1             # pinned host memory: the ~48 GiB n-gram table + ~4.2 GiB of embedding tables (1,064 MiB per rank)
+      stack: 67108864
+    ports:
+      - "8000:8000"
+    environment:
+      HOST: 0.0.0.0
+      PORT: 8000
+      # MODEL_NAME: "flash-next"          # names requests may use; default = the six production names
+      # PLE_HOME: "0"                     # card that hosts the n-gram table's home context
+      # CUDA_VISIBLE_DEVICES: "0,1,2,3"
+    volumes:
+      - "${MODEL_DIR:?set MODEL_DIR to the Qwen3.8-Flash-Next-W4A16-Merlin directory}:/models/Qwen3.8-Flash-Next-W4A16-Merlin"
+      - flash-next-cache:/cache
+    restart: unless-stopped
+volumes:
+  flash-next-cache: {}

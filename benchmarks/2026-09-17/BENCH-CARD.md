@@ -7,7 +7,7 @@
 > judge, ladder, prompts and reference files pinned by hash. Per boot: three sends per cell, streamed,
 > client-timed, T=0 with `seed`, thinking on ("decode") and off ("decode_off"). Rows are judged as
 > **median over the five v2 boots vs median over the five v1 boots** (rule: ≥ 0.97 and every boot ≥ 0.90).
-> Full judge output: `records/flashnext-v2-rc7-g6-run6-close-2026-09-17.md`. Instrument: `fnbench.py` ladder
+> The full judge output is not published. Instrument: `fnbench.py` ladder
 > + `g6_judge.py` (maintainer scripts, not published). The judge's machine verdict for the run is FAIL, driven by the one
 > thinking-off 4K cell below; every other row passes.
 
@@ -16,21 +16,25 @@ v1: vLLM 0.28.0 fn28 tree, TP4.
 
 ## Summary (the same table as the model card and the README; medians over the five boots of each arm)
 
-| | **v2** | v1 TP4 build (same gate, same box) |
+| | **v2** | v1 TP4 build (same gate, same box; † see the note under the table) |
 |---|---|---|
 | shape | TP2 × PP2 + expert parallel, MTP K=3 | TP4 + EP, MTP K=3 |
 | KV pool, FP8 tokens, whole box | **806,792** (3.08 × a full-context request; three 262K sessions resident, measured) | 342,912 (1.31 ×) |
 | context per request | 262,144 | 262,144 |
 | concurrent sequences admitted | **8** (3 × 262K, 1 × 262K + 3 × 131K, 5 × 131K, 8 × 65K, 8 × 32K all resident) | 2 |
-| decode, single stream, thinking on, 4K / 32K / 131K / 261K prompt | **162 / 166 / 169 / 176** tok/s (medians of 5 boots) | 163 / 165 / 172 / — (261K preregistered for the v2 arm only; v1 serves it, see its 2026-09-08 card) |
-| decode, thinking off, same depths | 118 / 123 / 123 / 125 | 124 / 122 / 120 / — |
-| median event interval, thinking on, same depths | 18.72 / 18.73 / 19.10 / 19.33 ms | 18.61 / 18.73 / 19.17 / — ms |
-| MTP tokens per step, thinking on, same depths | 3.02 / 3.07 / 3.13 / 3.28 | 3.00 / 3.04 / 3.17 / — |
+| decode, single stream, thinking on, 4K / 32K / 131K / 261K prompt | **162 / 166 / 169 / 176** tok/s (medians of 5 boots) | 163 / 165 / 172 / 170† |
+| decode, thinking off, same depths | 118 / 123 / 123 / 125 | 124 / 122 / 120 / 125† |
+| median event interval, thinking on, same depths | 18.72 / 18.73 / 19.10 / 19.33 ms | 18.61 / 18.73 / 19.17 / 19.37† ms |
+| MTP tokens per step, thinking on, same depths | 3.02 / 3.07 / 3.13 / 3.28 | 3.00 / 3.04 / 3.17 / 3.24† |
 | prefill, 10K / 100K / 261K prompt | **4,944 / 5,282 / 5,122** tok/s | 4,498 / 4,194 / — |
 | time to first token, cold, 4K / 32K / 131K / 261K | 0.91 / 6.19 / 24.77 / 50.68 s | 0.97 / 7.16 / 31.94 / — s |
 | quality vs the BF16 teacher (24 held-out prompts, 5 boots; lower is closer) | 0.0365–0.0378 | 0.0378–0.0385 |
 | tool-call structure (150 cases) / exact recall (160 cases) | 130/150 / 160/160 | reference quant 125/150 / 160/160 (parity band, ≥ ref − 2) |
 | vision | on, 2 images per request | on |
+
+† v1 at 261K was measured on 2026-09-18, after the gate, in one boot with three sends (170.1 / 124.6 tok/s; median event
+interval 19.37 / 19.40 ms; 3.24 / 2.39 tokens per step, thinking on / off). Every other v1 cell is a median of five boots;
+the 261K depth was preregistered for the v2 arm only, so v1 prefill and time to first token at that depth are not measured.
 
 The per-boot values behind every cell follow.
 
@@ -41,7 +45,7 @@ The per-boot values behind every cell follow.
 | 4K | 162.6 | 162.2 162.5 160.6 162.6 161.8 | 162.2 | **0.997** | 0.988 | 18.61 / 18.72 | 3.00 / 3.02 |
 | 32K | 164.9 | 166.6 166.8 165.8 165.6 166.3 | 166.3 | **1.009** | 1.004 | 18.73 / 18.73 | 3.04 / 3.07 |
 | 131K | 171.5 | 173.9 169.4 165.7 166.5 172.9 | 169.4 | **0.988** | 0.966 | 19.17 / 19.10 | 3.17 / 3.13 |
-| 261K (v2 arm only, per the preregistration; not run on v1 in this gate) | not run | 175.0 178.6 171.1 176.2 182.4 | 176.2 | no v1 cell | no v1 cell | not run / 19.33 | not run / 3.28 |
+| 261K (v2 arm only, per the preregistration; not run on v1 in this gate) | not run in the gate († 170.1, one boot, 2026-09-18) | 175.0 178.6 171.1 176.2 182.4 | 176.2 | no v1 cell | no v1 cell | († 19.37) / 19.33 | († 3.24) / 3.28 |
 
 ## Decode, thinking off (`decode_off`, same prompts)
 
@@ -50,10 +54,10 @@ The per-boot values behind every cell follow.
 | 4K | 124.1 | 122.7 118.2 119.3 115.4 114.4 | 118.2 | **0.952 (FAIL vs the 0.97 rule)** | 0.922 | 18.64 / 18.66 | 2.31 / 2.21 |
 | 32K | 122.0 | 123.0 124.8 122.0 120.6 123.5 | 123.0 | 1.008 | 0.988 | 18.77 / 18.81 | 2.28 / 2.31 |
 | 131K | 120.4 | 123.3 123.0 123.1 124.8 127.3 | 123.3 | 1.024 | 1.022 | 19.17 / 18.97 | 2.29 / 2.35 |
-| 261K (v2 arm only, per the preregistration) | not run | 125.9 122.7 125.2 126.3 125.0 | 125.2 | no v1 cell | no v1 cell | not run / 19.15 | not run / 2.37 |
+| 261K (v2 arm only, per the preregistration) | not run in the gate († 124.6, one boot, 2026-09-18) | 125.9 122.7 125.2 126.3 125.0 | 125.2 | no v1 cell | no v1 cell | († 19.40) / 19.15 | († 2.39) / 2.37 |
 
 The 261K depth was preregistered for the v2 arm only (4.1 posted-decode rule against 173 tok/s; 4.3 prefill rule), so the v1
-columns at that depth are empty by design, not because v1 cannot serve it: the v1 lane holds one 262,144-token request
+columns at that depth were empty by design, not because v1 cannot serve it (the † cells were measured after the gate, 2026-09-18, one boot): the v1 lane holds one 262,144-token request
 (pool 342,912) and its own 2026-09-08 card measured 163 tok/s at a 260K prompt under a different protocol (image-bearing
 prompts, served defaults), which is not comparable to this ladder. The 261K event interval and tokens per step (added 09-17 evening from the same boots' streams: thinking on 19.14–19.38 ms and 3.24–3.40 per boot; thinking off 19.13–19.21 ms and 2.33–2.41) follow the 4K–131K trend.
 

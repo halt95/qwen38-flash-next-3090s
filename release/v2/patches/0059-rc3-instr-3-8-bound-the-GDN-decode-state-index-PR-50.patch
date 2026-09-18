@@ -1,0 +1,207 @@
+From f78bbc29a50d637e7e4d7e6d856e9e4c289faeb4 Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Tue, 15 Sep 2026 21:04:26 +0000
+Subject: [PATCH 59/76] rc3-instr 3/8: bound the GDN decode state index (PR
+ #50021)
+
+Ports the fused_sigmoid_gating.py hunk from upstream vLLM PR #50021.
+
+In the spec-decoding path i_t is num_accepted_tokens - 1, loaded from device
+memory and never bounded against the stride_indices_seq columns of
+ssm_state_indices. A zero accepted count gives i_t == -1, which reads before
+this request's row and, for i_n == 0, before the tensor. A stale or too-large
+count reads past the row. The existing state_idx <= 0 check rejects only
+non-positive values, so an out-of-range read that happens to return a positive
+int flowed straight into h0 + state_idx * stride_init_state_token and faulted
+the SM. This is the same shape as the S2 illegal address, in a different
+kernel.
+
+The load is now masked to the row, with other=0 falling into the existing
+invalid-state path. That path no longer returns without writing: o is
+q.new_empty, so the early return left this request's rows holding whatever the
+allocator handed back. It now stores zeros over its T rows first.
+
+Launch-site audit for this signature (review B2 asked for a second look):
+the only Triton launch is fused_sigmoid_gating.py:242, and the JIT warmup at
+model_executor/warmup/qwen_triton_warmup.py:235 goes through the Python entry
+point fused_sigmoid_gating_delta_rule_update rather than the raw kernel, so the
+new kwarg reaches it with no edit. csrc/cpu/sgl-kernels/fla.cpp has a
+same-named CPU C++ implementation; it is a separate code path and is not
+touched. There is no AMD mirror of this file.
+
+Test: tests/kernels/test_fused_sigmoid_gating_delta_rule.py gains
+test_spec_invalid_accepted_count_zeroes_output from PR #50021, covering
+num_accepted 0 (i_t == -1) and 5 (past the row). The upstream test's
+fused_recurrent_gated_delta_rule arm is DROPPED: that kernel carries the
+identical unbounded i_t at fused_recurrent.py:106-116 and this series does not
+touch it, so asserting on it would claim a fix we did not make. Recorded as a
+known gap in GUARDS.md.
+
+This test file does not run on CPU at all -- 18 of its pre-existing cases fail
+at v2-rc2 under CUDA_VISIBLE_DEVICES="" -- so it is a GPU-smoke test only. The
+new case is CUDA-gated and skips.
+
+ROUND 3: _GUARD_BIAS is bound as tl.constexpr. Round 2 declared it as a plain
+module-level int, which a @triton.jit body cannot read, and the GPU smoke
+failed every guarded-kernel test with "NameError: Cannot access global variable
+_GUARD_BIAS". Checked the other module-level names in this file: none are
+referenced from a jit body.
+
+Draft for Astra review. Not merged into any RC.
+---
+ .../test_fused_sigmoid_gating_delta_rule.py   | 66 +++++++++++++++++++
+ .../ops/fused_sigmoid_gating.py               | 42 ++++++++++--
+ 2 files changed, 103 insertions(+), 5 deletions(-)
+
+diff --git a/tests/kernels/test_fused_sigmoid_gating_delta_rule.py b/tests/kernels/test_fused_sigmoid_gating_delta_rule.py
+index fc923cb94..1b154ac7e 100644
+--- a/tests/kernels/test_fused_sigmoid_gating_delta_rule.py
++++ b/tests/kernels/test_fused_sigmoid_gating_delta_rule.py
+@@ -197,3 +197,69 @@ def test_fused_sigmoid_gating_delta_rule_update_spec(
+     torch.testing.assert_close(
+         last_recurrent_state, last_recurrent_state_ref, atol=1e-2, rtol=1e-2
+     )
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
++@pytest.mark.parametrize("num_accepted", [0, 5])
++def test_spec_invalid_accepted_count_zeroes_output(num_accepted: int) -> None:
++    """Invalid active-request state selection must not expose empty output.
++
++    Ported from upstream vLLM PR #50021 (rc3-instr guard 3/8), with the
++    fused_recurrent_gated_delta_rule arm of the upstream test DROPPED: that
++    kernel has the identical unbounded ``i_t`` (fused_recurrent.py:106-116) and
++    this series does not touch it, so including the arm would assert a fix we
++    did not make. See GUARDS.md "round 2", known gaps.
++
++    num_accepted 0 gives i_t == -1, a read before this request's row;
++    num_accepted 5 exceeds the one-column ssm_state_indices, a read past it.
++    ``fill_uninitialized_memory`` makes the old behaviour visible: the kernel
++    returned early without writing ``o``, which is ``q.new_empty``.
++    """
++    torch.set_default_device(DEVICE)
++    set_random_seed(0)
++
++    num_tokens, num_k_heads, num_v_heads = 4, 2, 4
++    head_k_dim = head_v_dim = 16
++    query = torch.rand(1, num_tokens, num_k_heads, head_k_dim)
++    key = torch.rand_like(query)
++    value = torch.rand(1, num_tokens, num_v_heads, head_v_dim)
++    a = torch.rand(num_tokens, num_v_heads)
++    b = torch.rand_like(a)
++    A_log = torch.rand(num_v_heads)
++    dt_bias = torch.rand_like(A_log)
++    initial_state = torch.rand(num_tokens + 1, num_v_heads, head_v_dim, head_k_dim)
++    state_indices = torch.arange(1, num_tokens + 1, dtype=torch.int32).view(
++        1, num_tokens
++    )
++    cu_seqlens = torch.tensor([0, num_tokens], dtype=torch.int32)
++    accepted = torch.tensor([num_accepted], dtype=torch.int32)
++
++    previous_deterministic = torch.are_deterministic_algorithms_enabled()
++    previous_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
++    previous_fill = torch.utils.deterministic.fill_uninitialized_memory
++    torch.use_deterministic_algorithms(True)
++    torch.utils.deterministic.fill_uninitialized_memory = True
++    try:
++        sigmoid_state = initial_state.clone()
++        sigmoid_out, sigmoid_state = fused_sigmoid_gating_delta_rule_update(
++            A_log=A_log,
++            a=a,
++            b=b,
++            dt_bias=dt_bias,
++            q=query,
++            k=key,
++            v=value,
++            initial_state=sigmoid_state,
++            inplace_final_state=True,
++            ssm_state_indices=state_indices,
++            cu_seqlens=cu_seqlens,
++            num_accepted_tokens=accepted,
++        )
++    finally:
++        torch.utils.deterministic.fill_uninitialized_memory = previous_fill
++        torch.use_deterministic_algorithms(
++            previous_deterministic, warn_only=previous_warn_only
++        )
++
++    torch.testing.assert_close(sigmoid_out, torch.zeros_like(sigmoid_out))
++    torch.testing.assert_close(sigmoid_state, initial_state)
+diff --git a/vllm/third_party/flash_linear_attention/ops/fused_sigmoid_gating.py b/vllm/third_party/flash_linear_attention/ops/fused_sigmoid_gating.py
+index 7e0c7e05c..53b89a306 100644
+--- a/vllm/third_party/flash_linear_attention/ops/fused_sigmoid_gating.py
++++ b/vllm/third_party/flash_linear_attention/ops/fused_sigmoid_gating.py
+@@ -10,6 +10,14 @@
+ import torch
+ 
+ from vllm.triton_utils import tl, triton
++from vllm.v1.worker import guard_telemetry
++
++# Bias so a negative row/index survives atomic_max on a zeroed counter
++# (review B4). MUST be a tl.constexpr: a plain module-level int is not readable
++# from a @triton.jit body -- round 2 shipped one and every guarded kernel died
++# with "NameError: Cannot access global variable _GUARD_BIAS" on the smoke.
++_GUARD_BIAS = tl.constexpr(guard_telemetry.GUARD_BIAS)
++
+ 
+ 
+ @triton.heuristics(
+@@ -37,6 +45,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
+     cu_seqlens,
+     ssm_state_indices,
+     num_accepted_tokens,
++    guard_ctr,  # rc3-instr persistent int64[3]
+     scale,
+     N: tl.int64,  # num of sequences
+     T: tl.int64,  # num of tokens
+@@ -106,12 +115,32 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
+                 i_t = tl.load(num_accepted_tokens + i_n).to(tl.int64) - 1
+             else:
+                 i_t = 0
+-            # Load state index and check for invalid entries
+-            state_idx = tl.load(ssm_state_indices + i_n * stride_indices_seq + i_t).to(
+-                tl.int64
+-            )
+-            # Skip if state index is invalid (NULL_BLOCK_ID=0)
++            # PR #50021: i_t is num_accepted_tokens - 1 and is otherwise
++            # unbounded against a stride_indices_seq-column tensor. A zero
++            # accepted count gives i_t == -1, a read before this request's row
++            # (and before the tensor for i_n == 0); a stale or too-large count
++            # reads past the row. The state_idx <= 0 guard below rejects only
++            # non-positive values, so an out-of-range read returning a garbage
++            # positive int flowed into h0 + state_idx * stride_init_state_token
++            # and faulted the SM.
++            idx_in_row = (i_t >= 0) & (i_t < stride_indices_seq)
++            if (i_t < 0) or (i_t >= stride_indices_seq):
++                tl.atomic_add(guard_ctr, 1)
++                tl.atomic_max(guard_ctr + 1, (i_n).to(tl.int64) + _GUARD_BIAS)
++                tl.atomic_max(guard_ctr + 2, (i_t).to(tl.int64) + _GUARD_BIAS)
++            state_idx = tl.load(
++                ssm_state_indices + i_n * stride_indices_seq + i_t,
++                mask=idx_in_row,
++                other=0,
++            ).to(tl.int64)
++            # Skip invalid state indices without exposing uninitialized output.
++            # o is q.new_empty in the entry below, so the previous early return
++            # left this request's rows holding whatever the allocator returned.
+             if state_idx <= 0:
++                zero = tl.zeros([BV], dtype=tl.float32).to(p_o.dtype.element_ty)
++                for _ in range(0, T):
++                    tl.store(p_o, zero, mask=mask_v)
++                    p_o += HV * V
+                 return
+             p_h0 = h0 + state_idx * stride_init_state_token
+         else:
+@@ -255,6 +284,9 @@ def fused_sigmoid_gating_delta_rule_update(
+         cu_seqlens=cu_seqlens,
+         ssm_state_indices=ssm_state_indices,
+         num_accepted_tokens=num_accepted_tokens,
++        guard_ctr=guard_telemetry.counter(
++            guard_telemetry.SITE_GDN_DECODE_STATE, q.device
++        ),
+         scale=scale,
+         N=N,
+         T=T,
+-- 
+2.47.3
+

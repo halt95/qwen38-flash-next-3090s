@@ -1,0 +1,826 @@
+From b6f6015d7ef5a7c8aa57d0a0d457332c07cd431f Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Tue, 15 Sep 2026 09:20:29 +0000
+Subject: [PATCH 54/76] v2-ppfix2: index the persistent per-req-slot block
+ table from the align post-process
+
+The PP-deferred Mamba align post-process reads a block table that belongs to a
+different step's batch.
+
+Mechanism. There is exactly one gathered destination buffer per KV group,
+allocated once and rewritten in place every step
+(block_table.py:74-76, :149-176); the Mamba context captures its data_ptr once
+(mamba_utils.py:1078-1092) and the kernel takes its row with
+`bt_row_idx = batch_idx` (mamba_utils.py:481). But `update_pp_decode_requests`
+is the FIRST statement of `execute_model` (model_runner.py:1644), while that
+step's `gather_block_tables` runs ~280 lines later (model_runner.py:1442 ->
+block_table.py:149). So when `get_prev_sampled_outputs`
+(pp_utils.py:121-180) -> `postprocess_sampled` (model_runner.py:1579) ->
+`MambaHybridModelState.postprocess_state` (mamba_hybrid.py:386) ->
+`run_fused_postprocess_align` (mamba_utils.py:1264) launches the kernel, the
+buffer still holds the gather of step T-1, while `idx_mapping` came off a
+`PendingRecv` captured at step T-2 (pp_utils.py:57-58, 258-271). Every
+per-request value (num_accepted, mamba_state_idx, new_num_computed) is read at
+the correct `req_idx = idx_mapping[batch_idx]`; only the block-table row is
+taken at `batch_idx`. Under two-way PP micro-batch alternation T-1 and T-2 are
+different micro-batches by construction, so the row is a different request's.
+
+Window. The kernel returns before touching the table unless `needs_copy`
+(mamba_utils.py:462-465), i.e. `new_num_computed mod mamba_block_size <
+num_accepted` - one 3,200-token block crossing inside the accepted window - and
+again on `src == dst && bias == 0` (:478-479). Measured on the Arm D 317 boot:
+14,610 deferred steps, 10,489 (71.8%) with a row-identity mismatch, but only
+~12 boundary crossings across the whole 19-request run. So the hazard is real
+and rare: a third-party request's recurrent state is overwritten at the
+perpetrator's logical columns a handful of times per boot, which is compatible
+with coherent outputs and a passing quality battery.
+
+Fix. Capture the persistent per-req-slot tables
+(`BlockTables.block_tables[i].gpu`, block_table.py:53-59 - already the gather
+kernel's source, pointers at block_table.py:94-96) in a second int64 pointer
+tensor on `MambaSpecDecodeGPUContext`, add `BT_ROW_IS_REQ: tl.constexpr` so
+mamba_utils.py:481 becomes `bt_row_idx = req_idx`, and have
+`run_fused_postprocess_align` pass that set. `input_block_tables` is
+`torch.zeros_like` of the persistent tables, so stride(0) is identical and
+`block_table_stride_req` is unchanged (asserted at populate time). `req_idx` is
+always in [0, max_num_reqs) and always addresses a row that belongs to the
+request, in this step or any later one; recycled slots are already masked to -1
+upstream (pp_utils.py:139-140) and skipped (mamba_utils.py:441-442), and that
+guard is expressed in req-slot terms, which is now the same space as the row.
+The change is correct on the same-step (last-rank / no-PP) path too, so it is
+unconditional.
+
+NOT changed: `precopy_mamba_align_fused_kernel` (mamba_utils.py:613-615) keeps
+the gathered tables and `batch_idx`. It runs from `preprocess_state`
+(mamba_hybrid.py:224-230) five lines after the gather that feeds it
+(model_runner.py:1718 -> :1723), so batch row i IS this request there;
+`bt_row_idx = req_idx` would break it. Likewise `compute_aligned_state_indices`
+(mamba_utils.py:1095-1113) reads the same-step table and is untouched. Do not
+port zebgop patch 0010's second hunk.
+
+No `0 <= block_id < num_blocks` guard: the context holds neither the per-group
+physical block count nor the per-request `num_blocks`, so adding one is new
+plumbing, not a free line. Proposed separately.
+
+Plumbing: `ModelState.set_block_tables` (no-op by default) so the runner can
+hand the model state its `BlockTables` (model_runner.py, after construction);
+`MambaHybridModelState._ensure_align_ctx` passes the per-group persistent
+tensors alongside the gathered ones. When the hook is absent the context logs
+once and falls back to the old behaviour rather than crashing.
+
+Test: tests/v1/worker/gpu/test_pp_deferred_mamba_block_table.py - CPU model of
+the row selection. A port of `_gather_block_tables_kernel` (with its own
+instrument check) fills the shared buffer at T-2 with [r0, r1, r2] and again at
+T-1 with [r2]; the production plumbing then runs and the launch is captured
+instead of dispatched; the kernel's index arithmetic is replayed against the
+recorded arguments, bound to the real kernel signature. r0's deferred copy must
+resolve to block ids 10/11 (r0's persistent row). On v2-rc1 it resolves to
+30/31 - r2's row, which the T-1 gather left at batch row 0. A second test
+asserts the pre-copy launcher still uses the gathered set and batch rows.
+
+Test runs (CPU, the reference host):
+  tests/v1/worker/gpu ................................ 4 passed
+  tests/v1/ple_offload ............................... 138 passed, 1 skipped
+  tests/v1/worker + gpu -k "pp or mamba" ............. 131 passed, 4 failed
+All four failures are pre-existing. Re-run serially,
+test_profile_cudagraph_memory_frees_throwaway_pool passes (its batch failure
+was EADDRINUSE on the hard-coded port 12345), and the other three fail
+identically on the v2-rc1 tree: test_hybrid_attention_mamba_tensor_shapes and
+test_mamba_cache_raises_when_max_num_seqs_exceeds_blocks on EADDRINUSE :12345,
+test_v2_sample_tokens_runs_eplb_on_non_last_pp_rank on `SimpleNamespace has no
+attribute 'ple_serving'`. Targeted re-run of
+tests/v1/worker/gpu + test_mamba_utils + test_mamba_hybrid_model_state +
+test_gpu_block_table + test_pp_utils: 65 passed.
+
+Not verified without a GPU: that the Triton kernel compiles with the new
+constexpr, and the on-GPU effect. Both need the planned V.5-shape boot.
+---
+ tests/v1/worker/gpu/__init__.py               |   2 +
+ .../gpu/test_pp_deferred_mamba_block_table.py | 439 ++++++++++++++++++
+ vllm/v1/worker/gpu/model_runner.py            |   4 +
+ vllm/v1/worker/gpu/model_states/interface.py  |   8 +
+ .../worker/gpu/model_states/mamba_hybrid.py   |  19 +
+ vllm/v1/worker/mamba_utils.py                 |  92 +++-
+ 6 files changed, 559 insertions(+), 5 deletions(-)
+ create mode 100644 tests/v1/worker/gpu/__init__.py
+ create mode 100644 tests/v1/worker/gpu/test_pp_deferred_mamba_block_table.py
+
+diff --git a/tests/v1/worker/gpu/__init__.py b/tests/v1/worker/gpu/__init__.py
+new file mode 100644
+index 000000000..208f01a7c
+--- /dev/null
++++ b/tests/v1/worker/gpu/__init__.py
+@@ -0,0 +1,2 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+diff --git a/tests/v1/worker/gpu/test_pp_deferred_mamba_block_table.py b/tests/v1/worker/gpu/test_pp_deferred_mamba_block_table.py
+new file mode 100644
+index 000000000..6f9162514
+--- /dev/null
++++ b/tests/v1/worker/gpu/test_pp_deferred_mamba_block_table.py
+@@ -0,0 +1,439 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Which block-table row the align post-process kernel reads.
++
++Under pipeline parallelism the Mamba align post-process is *deferred*: it is
++enqueued by ``update_pp_decode_requests`` at the top of ``execute_model``
++(``model_runner.py:1644``), before this step's ``gather_block_tables``
++(``model_runner.py:1442`` -> ``block_table.py:149``), and the ``idx_mapping`` it
++carries was captured ``pp_size`` steps earlier on a ``PendingRecv``
++(``pp_utils.py:57-58, 258-271``). There is exactly one gathered destination
++buffer, reused in place for the engine's lifetime (``block_table.py:74-76``), so
++at that moment it holds the batch of step T-1 while the mapping describes the
++batch of step T-2. With two-way PP micro-batch alternation those are different
++micro-batches by construction, so ``bt_row_idx = batch_idx``
++(``mamba_utils.py:481``) resolved a *different request's* row.
++
++These tests model the row selection on CPU: they drive the production plumbing
++(``MambaHybridModelState._ensure_align_ctx`` ->
++``MambaSpecDecodeGPUContext.initialize_from_forward_context`` ->
++``run_fused_postprocess_align``), capture the launch instead of running Triton,
++and then replay the kernel's index arithmetic against the two candidate tables.
++
++No GPU is required.
++"""
++
++import inspect
++from types import SimpleNamespace
++from unittest.mock import MagicMock
++
++import pytest
++import torch
++
++from vllm.model_executor.layers.mamba.mamba_utils import (
++    MambaStateCopyFuncsByType,
++    get_conv_copy_spec,
++    get_temporal_copy_spec,
++)
++from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
++from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec, MambaSpec
++from vllm.v1.worker import mamba_utils as mamba_utils_mod
++from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
++from vllm.v1.worker.mamba_utils import MambaSpecDecodeGPUContext
++
++MAX_NUM_REQS = 8
++MAX_NUM_BLOCKS = 6
++MAMBA_BLOCK_SIZE = 16
++NUM_PHYS_BLOCKS = 64
++CONV_WIDTH = 4
++CONV_INNER = 8
++TEMPORAL_DIM = 16
++DTYPE = torch.float16
++
++_COPY_FUNCS: MambaStateCopyFuncsByType = {
++    MambaAttentionBackendEnum.GDN_ATTN: (get_conv_copy_spec, get_temporal_copy_spec),
++}
++
++# Captured before any monkeypatching so the replay binds against the real
++# kernel signature; a launch that stops matching it fails loudly here.
++_POSTPROCESS_SIG = inspect.signature(
++    mamba_utils_mod.postprocess_mamba_fused_kernel.fn
++)
++_PRECOPY_SIG = inspect.signature(
++    mamba_utils_mod.precopy_mamba_align_fused_kernel.fn
++)
++
++
++class _MockCpuGpuBuffer:
++    """CpuGpuBuffer stand-in that needs no pinned memory."""
++
++    def __init__(self, size: int, dtype: torch.dtype, device: torch.device):
++        self.cpu = torch.zeros(size, dtype=dtype, device="cpu")
++        self.gpu = torch.zeros(size, dtype=dtype, device=device)
++        self.np = self.cpu.numpy()
++
++    def copy_to_gpu(self, n: int | None = None) -> torch.Tensor:
++        if n is None:
++            self.gpu.copy_(self.cpu)
++            return self.gpu
++        self.gpu[:n].copy_(self.cpu[:n])
++        return self.gpu[:n]
++
++
++class _RecordingKernel:
++    """Stands in for a triton.jit kernel and records the launch."""
++
++    def __init__(self) -> None:
++        self.launches: list[tuple[tuple[int, ...], tuple, dict]] = []
++
++    def __getitem__(self, grid):
++        def launch(*args, **kwargs):
++            self.launches.append((grid, args, kwargs))
++
++        return launch
++
++
++def _ptr_to_int(value: int) -> int:
++    """Undo ``_reinterpret_u64_as_i64`` (mamba_utils.py:186-189)."""
++    return value + (1 << 64) if value < 0 else value
++
++
++def _gather_rows(
++    persistent: torch.Tensor,
++    num_blocks: list[int],
++    idx_mapping: list[int],
++    num_reqs_padded: int,
++    dst: torch.Tensor,
++) -> None:
++    """CPU port of ``_gather_block_tables_kernel`` (block_table.py:236-273).
++
++    Row ``batch_idx`` of ``dst`` receives ``num_blocks[req_idx]`` entries of
++    persistent row ``req_idx``; rows in ``[num_reqs, num_reqs_padded)`` are
++    zeroed whole; rows at or beyond ``num_reqs_padded`` are left holding the
++    previous gather's content.
++    """
++    num_reqs = len(idx_mapping)
++    for batch_idx in range(num_reqs_padded):
++        if batch_idx >= num_reqs:
++            dst[batch_idx].zero_()
++            continue
++        req_idx = idx_mapping[batch_idx]
++        nb = num_blocks[req_idx]
++        dst[batch_idx, :nb] = persistent[req_idx, :nb]
++
++
++def _make_kv_cache_config() -> KVCacheConfig:
++    spec = MambaSpec(
++        block_size=MAMBA_BLOCK_SIZE,
++        shapes=((CONV_WIDTH, CONV_INNER), (TEMPORAL_DIM,)),
++        dtypes=(DTYPE, DTYPE),
++        mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
++        mamba_cache_mode="align",
++        num_speculative_blocks=3,
++    )
++    return KVCacheConfig(
++        num_blocks=NUM_PHYS_BLOCKS,
++        kv_cache_tensors=[],
++        kv_cache_groups=[KVCacheGroupSpec(["layer_0"], spec)],
++    )
++
++
++def _make_forward_context() -> dict:
++    attention = MagicMock()
++    attention.kv_cache = [
++        torch.zeros(NUM_PHYS_BLOCKS, CONV_WIDTH, CONV_INNER, dtype=DTYPE),
++        torch.zeros(NUM_PHYS_BLOCKS, TEMPORAL_DIM, dtype=DTYPE),
++    ]
++    return {"layer_0": attention}
++
++
++def _register_block_tables(state: MambaHybridModelState, block_tables) -> bool:
++    """Hand the runner's persistent ``BlockTables`` to the model state.
++
++    Deliberately tolerant: on a tree without the fix the hook does not exist, and
++    the point of these tests is to report *which row the kernel reads*, not to
++    die on a missing attribute.
++    """
++    setter = getattr(state, "set_block_tables", None)
++    if setter is None:
++        return False
++    setter(block_tables)
++    return True
++
++
++def _build_scenario(device: torch.device = torch.device("cpu")):
++    """T-2 gathers [r0, r1, r2]; T-1 gathers [r2]; the deferred post-process
++    then runs with T-2's mapping against whatever the buffer now holds."""
++    kv_cache_config = _make_kv_cache_config()
++    forward_context = _make_forward_context()
++
++    # Persistent per-req-slot table (block_table.py:53-59). Row r owns block
++    # ids 10*(r+1) + col, so a row is identifiable from any single entry.
++    persistent = torch.zeros(
++        MAX_NUM_REQS, MAX_NUM_BLOCKS, dtype=torch.int32, device=device
++    )
++    for r in range(MAX_NUM_REQS):
++        for c in range(MAX_NUM_BLOCKS):
++            persistent[r, c] = 10 * (r + 1) + c
++    num_blocks = [3] * MAX_NUM_REQS
++
++    # The single gathered destination buffer (block_table.py:74-76).
++    gathered = torch.zeros_like(persistent)
++    _gather_rows(persistent, num_blocks, [0, 1, 2], 4, gathered)  # step T-2
++    _gather_rows(persistent, num_blocks, [2], 2, gathered)  # step T-1
++
++    ctx = MambaSpecDecodeGPUContext.create(
++        max_num_reqs=MAX_NUM_REQS,
++        kv_cache_config=kv_cache_config,
++        copy_funcs=_COPY_FUNCS,
++        device=device,
++        make_buffer=lambda n, dtype: _MockCpuGpuBuffer(n, dtype, device),
++    )
++
++    state = object.__new__(MambaHybridModelState)
++    state.device = device
++    state.max_num_reqs = MAX_NUM_REQS
++    state._align_mode = True
++    state._mamba_ctx = ctx
++    state._mamba_group_ids = []
++    state._mamba_spec = None
++    state._mamba_state_copy_funcs = _COPY_FUNCS
++    state.vllm_config = SimpleNamespace(
++        compilation_config=SimpleNamespace(static_forward_context=forward_context)
++    )
++    registered = _register_block_tables(
++        state,
++        SimpleNamespace(block_tables=[SimpleNamespace(gpu=persistent)]),
++    )
++
++    # What the runner hands prepare_attn/preprocess_state: the T-1 gather view.
++    gathered_view = gathered[:2]
++    state._ensure_align_ctx(kv_cache_config, [0], (gathered_view,))
++
++    tables_by_ptr = {
++        persistent.data_ptr(): ("persistent", persistent),
++        gathered.data_ptr(): ("gathered", gathered),
++    }
++    return SimpleNamespace(
++        ctx=ctx,
++        state=state,
++        persistent=persistent,
++        gathered=gathered,
++        tables_by_ptr=tables_by_ptr,
++        registered=registered,
++    )
++
++
++def _replay_row(scenario, launch, batch_idx: int) -> tuple[str, int, dict]:
++    """Replay the kernel's row selection (mamba_utils.py:437-490) for one row.
++
++    Returns ``(table_name, bt_row_idx, predicate)``.
++    """
++    grid, args, kwargs = launch
++    bound = _POSTPROCESS_SIG.bind(*args, **kwargs)
++    bound.apply_defaults()
++    a = bound.arguments
++
++    num_reqs = a["num_reqs"]
++    assert grid[0] == num_reqs, (grid, num_reqs)
++    assert batch_idx < num_reqs
++
++    has_idx_mapping = bool(a["HAS_IDX_MAPPING"])
++    # Absent on a tree without the fix; the kernel then always uses batch_idx.
++    bt_row_is_req = bool(a.get("BT_ROW_IS_REQ", False))
++
++    if has_idx_mapping:
++        req_idx = int(a["idx_mapping_ptr"][batch_idx])
++        if req_idx < 0:
++            return ("skipped", -1, {})
++    else:
++        req_idx = batch_idx
++
++    num_accepted = int(a["num_accepted_tokens_ptr"][req_idx])
++    src_block_idx = int(a["mamba_state_idx_ptr"][req_idx])
++    assert bool(a["PRECOMPUTED_NEW_COMPUTED"]), "V2 align path only"
++    new_num_computed = int(a["num_computed_tokens_ptr"][req_idx])
++    block_size = int(a["block_size"])
++
++    num_tokens_running_state = new_num_computed - num_accepted + 1
++    aligned_new_computed = (new_num_computed // block_size) * block_size
++    needs_copy = aligned_new_computed >= num_tokens_running_state
++    accept_token_bias = aligned_new_computed - num_tokens_running_state
++    dest_block_idx = aligned_new_computed // block_size - 1
++    predicate = {
++        "needs_copy": needs_copy,
++        "num_accepted": num_accepted,
++        "new_num_computed_mod_block": new_num_computed % block_size,
++        "src_col": src_block_idx,
++        "dst_col": dest_block_idx,
++        "token_bias": accept_token_bias,
++        "src_eq_dst": src_block_idx == dest_block_idx,
++    }
++
++    if bt_row_is_req:
++        bt_row_idx = req_idx
++    else:
++        bt_row_idx = batch_idx if has_idx_mapping else req_idx
++
++    group_idx = int(a["state_group_indices_ptr"][0])
++    ptr = _ptr_to_int(int(a["block_table_ptrs_ptr"][group_idx]))
++    name, _table = scenario.tables_by_ptr[ptr]
++    return (name, bt_row_idx, predicate)
++
++
++def _block_ids(scenario, launch, batch_idx: int) -> dict:
++    name, bt_row_idx, predicate = _replay_row(scenario, launch, batch_idx)
++    table = next(
++        tbl for label, tbl in scenario.tables_by_ptr.values() if label == name
++    )
++    return {
++        "table": name,
++        "row": bt_row_idx,
++        "src_block_id": int(table[bt_row_idx, predicate["src_col"]]),
++        "dst_block_id": int(table[bt_row_idx, predicate["dst_col"]]),
++        "temporal_src_block_id": int(
++            table[bt_row_idx, predicate["src_col"] + predicate["token_bias"]]
++        ),
++        **predicate,
++    }
++
++
++def _run_deferred(scenario, monkeypatch: pytest.MonkeyPatch) -> _RecordingKernel:
++    recorder = _RecordingKernel()
++    monkeypatch.setattr(
++        mamba_utils_mod, "postprocess_mamba_fused_kernel", recorder
++    )
++    device = scenario.persistent.device
++
++    def t(values):
++        return torch.tensor(values, dtype=torch.int32, device=device)
++
++    # Per-req-slot decision arrays. Only r0 crosses a block boundary inside its
++    # accepted window: 32 % 16 = 0 < num_accepted 2.
++    num_accepted = torch.ones(MAX_NUM_REQS, dtype=torch.int32, device=device)
++    num_accepted[0] = 2
++    num_accepted[1] = 2
++    state_idx = torch.zeros(MAX_NUM_REQS, dtype=torch.int32, device=device)
++    new_num_computed = torch.zeros(MAX_NUM_REQS, dtype=torch.int32, device=device)
++    new_num_computed[0] = 32  # crossing -> needs_copy
++    new_num_computed[1] = 40  # 40 % 16 = 8 >= 2 -> no copy
++    new_num_computed[2] = 50  # 50 % 16 = 2 >= 1 -> no copy
++
++    scenario.ctx.run_fused_postprocess_align(
++        num_reqs=3,
++        num_accepted_tokens_gpu=num_accepted,
++        state_idx_gpu=state_idx,
++        new_num_computed_tokens_gpu=new_num_computed,
++        idx_mapping=t([0, 1, 2]),  # captured at T-2
++    )
++    return recorder
++
++
++def test_gather_port_matches_production_semantics() -> None:
++    """Instrument check: the CPU gather port must reproduce block_table.py."""
++    persistent = torch.arange(
++        MAX_NUM_REQS * MAX_NUM_BLOCKS, dtype=torch.int32
++    ).reshape(MAX_NUM_REQS, MAX_NUM_BLOCKS)
++    dst = torch.full_like(persistent, -7)
++    num_blocks = [2] * MAX_NUM_REQS
++
++    _gather_rows(persistent, num_blocks, [3, 1], 3, dst)
++
++    # Gathered rows carry only the first num_blocks entries...
++    assert dst[0, :2].tolist() == persistent[3, :2].tolist()
++    assert dst[1, :2].tolist() == persistent[1, :2].tolist()
++    # ...the tail of a gathered row is untouched (block_table.py:269-273),
++    assert dst[0, 2:].tolist() == [-7] * (MAX_NUM_BLOCKS - 2)
++    # ...padded rows in [num_reqs, num_reqs_padded) are zeroed whole,
++    assert dst[2].tolist() == [0] * MAX_NUM_BLOCKS
++    # ...and rows at or beyond num_reqs_padded keep the previous content.
++    assert dst[3].tolist() == [-7] * MAX_NUM_BLOCKS
++
++
++def test_deferred_postprocess_resolves_the_requests_own_row(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """r0's deferred copy must land on r0's blocks, not on r2's.
++
++    T-2 gathered [r0, r1, r2]; T-1 re-gathered [r2] into the same buffer, so
++    gathered row 0 now holds r2. The deferred launch still carries T-2's
++    mapping, so ``batch_idx = 0`` means r0.
++    """
++    scenario = _build_scenario()
++    recorder = _run_deferred(scenario, monkeypatch)
++    assert len(recorder.launches) == 1
++    launch = recorder.launches[0]
++
++    row0 = _block_ids(scenario, launch, 0)
++    why = (
++        f"resolved={row0} "
++        f"runner_hook_registered={scenario.registered} "
++        f"(a missing runner hook leaves the kernel on the batch-order gather)"
++    )
++
++    # The copy predicate really fires for this row, so the kernel does
++    # dereference the block table here (mamba_utils.py:462-479).
++    assert row0["needs_copy"] is True, why
++    assert row0["src_eq_dst"] is False, why
++    assert (row0["src_col"], row0["dst_col"], row0["token_bias"]) == (0, 1, 1), why
++
++    # The gathered buffer holds r2 at batch row 0 after the T-1 gather, so a
++    # kernel that still indexes it by batch_idx corrupts r2 on r0's behalf.
++    assert scenario.gathered[0, 0].item() == 30
++
++    # r0's persistent row is 10, 11, 12, ...
++    assert row0["table"] == "persistent", why
++    assert row0["row"] == 0, why
++    assert row0["src_block_id"] == 10, why
++    assert row0["dst_block_id"] == 11, why
++    assert row0["temporal_src_block_id"] == 11, why
++    assert scenario.registered, why
++
++
++def test_deferred_postprocess_skips_rows_without_a_boundary_crossing(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """The other two rows do not reach the block table at all."""
++    scenario = _build_scenario()
++    recorder = _run_deferred(scenario, monkeypatch)
++    launch = recorder.launches[0]
++
++    for batch_idx in (1, 2):
++        _name, _row, predicate = _replay_row(scenario, launch, batch_idx)
++        assert predicate["needs_copy"] is False, (batch_idx, predicate)
++
++
++def test_precopy_still_uses_the_same_step_gather(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """The pre-copy site must keep batch-order rows.
++
++    ``precopy_mamba_align_fused_kernel`` (mamba_utils.py:613-615) runs from
++    ``preprocess_state``, five lines after the gather that feeds it
++    (``model_runner.py:1718`` -> ``:1723``), so batch row i *is* this request.
++    Switching it to req rows would break it.
++    """
++    scenario = _build_scenario()
++    recorder = _RecordingKernel()
++    monkeypatch.setattr(
++        mamba_utils_mod, "precopy_mamba_align_fused_kernel", recorder
++    )
++    device = scenario.persistent.device
++    z = torch.zeros(MAX_NUM_REQS, dtype=torch.int32, device=device)
++
++    scenario.ctx.run_fused_precopy(
++        num_reqs=3,
++        state_idx_gpu=z.clone(),
++        src_col_gpu=z.clone(),
++        token_bias_gpu=z.clone(),
++        idx_mapping=torch.tensor([0, 1, 2], dtype=torch.int32, device=device),
++    )
++
++    assert len(recorder.launches) == 1
++    _grid, args, kwargs = recorder.launches[0]
++    bound = _PRECOPY_SIG.bind(*args, **kwargs)
++    bound.apply_defaults()
++    ptr = _ptr_to_int(int(bound.arguments["block_table_ptrs_ptr"][0]))
++    assert scenario.tables_by_ptr[ptr][0] == "gathered"
++    assert bound.arguments["HAS_IDX_MAPPING"] is True
++    assert "BT_ROW_IS_REQ" not in bound.arguments
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index c3f639de7..db937f75c 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -662,6 +662,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             cp_rank=self.dcp_rank,
+             cp_interleave=self.cp_interleave,
+         )
++        # Mamba "align" indexes a block table from the PP-deferred post-process,
++        # which runs pp_size steps after the gather that produced its
++        # idx_mapping; give the model state the persistent per-req-slot tables.
++        self.model_state.set_block_tables(self.block_tables)
+         self.pcp_manager = pcp.maybe_build_pcp_manager(
+             self.vllm_config,
+             self.device,
+diff --git a/vllm/v1/worker/gpu/model_states/interface.py b/vllm/v1/worker/gpu/model_states/interface.py
+index a5c8d6f4c..8ce512122 100644
+--- a/vllm/v1/worker/gpu/model_states/interface.py
++++ b/vllm/v1/worker/gpu/model_states/interface.py
+@@ -126,6 +126,14 @@ class ModelState(ABC):
+     def apply_staged_writes(self) -> None:
+         return None
+ 
++    def set_block_tables(self, block_tables: Any) -> None:
++        """Register the runner's `BlockTables` once it exists.
++
++        Model states that index a block table outside the step that gathered it
++        (mamba "align" + the PP-deferred post-process) need the persistent
++        per-req-slot tables, not the batch-order gather. No-op by default."""
++        return None
++
+     def get_additional_cg_support(self) -> tuple[AttentionCGSupport, str | None]:
+         """Cudagraph support of attention groups this ModelState builds outside
+         ``init_attn_backend`` (e.g. encoder-only layers).
+diff --git a/vllm/v1/worker/gpu/model_states/mamba_hybrid.py b/vllm/v1/worker/gpu/model_states/mamba_hybrid.py
+index 0ac3f2f63..0a8b5d70e 100644
+--- a/vllm/v1/worker/gpu/model_states/mamba_hybrid.py
++++ b/vllm/v1/worker/gpu/model_states/mamba_hybrid.py
+@@ -94,6 +94,9 @@ class MambaHybridModelState(DefaultModelState):
+         # kernel reusing the postprocess copy machinery, so the per-step src
+         # columns and the running state_idx are kept GPU-resident.
+         self._align_mode = self.cache_config.mamba_cache_mode == "align"
++        # Set by the runner via `set_block_tables`; the align post-process needs
++        # the persistent per-req-slot tables, not the per-step gather.
++        self._runner_block_tables: Any = None
+         self.recoverssm = (
+             RecoverSSMState() if self.cache_config.use_kda_recoverssm else None
+         )
+@@ -112,6 +115,9 @@ class MambaHybridModelState(DefaultModelState):
+             self._mamba_spec: MambaSpec | None = None
+             self._mamba_state_copy_funcs: MambaStateCopyFuncsByType | None = None
+ 
++    def set_block_tables(self, block_tables: Any) -> None:
++        self._runner_block_tables = block_tables
++
+     def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
+         super().add_request(req_index, new_req_data)
+         # Must reset the speculative acceptance count in this idx which could be stale.
+@@ -172,11 +178,24 @@ class MambaHybridModelState(DefaultModelState):
+             # block_tables are batch-order slices of the persistent
+             # input_block_tables (stable data_ptr), so the metadata is captured
+             # once here and reused across steps.
++            #
++            # Also hand over the per-req-slot tables the gather reads from
++            # (block_table.py:53-59). The align post-process can run pp_size
++            # steps after the gather that produced its idx_mapping, at which
++            # point the batch-order buffer belongs to another micro-batch; it
++            # indexes these by req slot instead.
++            persistent_block_tables = None
++            if self._runner_block_tables is not None:
++                persistent_block_tables = [
++                    self._runner_block_tables.block_tables[gid].gpu
++                    for gid in mamba_group_ids
++                ]
+             ctx.initialize_from_forward_context(
+                 kv_cache_config,
+                 forward_context,
+                 copy_funcs,
+                 [block_tables[gid] for gid in mamba_group_ids],
++                persistent_block_tables=persistent_block_tables,
+             )
+         return ctx
+ 
+diff --git a/vllm/v1/worker/mamba_utils.py b/vllm/v1/worker/mamba_utils.py
+index 724c71405..f89ae0b8e 100644
+--- a/vllm/v1/worker/mamba_utils.py
++++ b/vllm/v1/worker/mamba_utils.py
+@@ -410,6 +410,14 @@ def postprocess_mamba_fused_kernel(
+     # PRECOMPUTED_NEW_COMPUTED: when True, num_computed_tokens_ptr already holds
+     # the post-step new_num_computed value (V2 supplies the advanced count).
+     PRECOMPUTED_NEW_COMPUTED: tl.constexpr = False,
++    # BT_ROW_IS_REQ: when True, block_table_ptrs_ptr points at the *persistent*
++    # per-req-slot block tables (BlockTables.block_tables[i].gpu,
++    # block_table.py:53-59), whose rows are request state slots, so the row
++    # index is req_idx rather than batch_idx. When False it points at the
++    # batch-order gather (BlockTables.input_block_tables, block_table.py:74-76)
++    # and batch_idx is the row. Required by the PP-deferred post-process, which
++    # runs pp_size steps after the gather that produced its idx_mapping.
++    BT_ROW_IS_REQ: tl.constexpr = False,
+     # TEMPORAL_TILES: when > 1, the temporal copy body is partitioned across
+     # TEMPORAL_TILES CTAs along the u64 inner range. Callers must launch a
+     # 3D grid (num_reqs, total_states, TEMPORAL_TILES). Default 1 preserves
+@@ -478,7 +486,15 @@ def postprocess_mamba_fused_kernel(
+     if src_block_idx == dest_block_idx and accept_token_bias == 0:
+         return
+ 
+-    bt_row_idx = batch_idx if HAS_IDX_MAPPING else req_idx
++    if BT_ROW_IS_REQ:
++        # Persistent per-req-slot table: the row is the request's own slot, so
++        # it stays correct however many steps separate the gather from this
++        # launch (the PP-deferred post-process is enqueued at the top of
++        # execute_model, before this step's gather, with an idx_mapping
++        # captured pp_size steps earlier).
++        bt_row_idx = req_idx
++    else:
++        bt_row_idx = batch_idx if HAS_IDX_MAPPING else req_idx
+     _copy_mamba_state_block(
+         state_idx,
+         bt_row_idx,
+@@ -813,6 +829,18 @@ class MambaSpecDecodeGPUContext:
+     block_table_ptrs: torch.Tensor
+     block_table_stride_req: int = 0
+ 
++    # Per-group *persistent* per-req-slot block-table addresses: int64[num_groups].
++    # `block_table_ptrs` above addresses the batch-order gather
++    # (BlockTables.input_block_tables, block_table.py:74-76), which is rewritten
++    # in place every step and is only valid for the step that gathered it. These
++    # address BlockTables.block_tables[i].gpu (block_table.py:53-59), the
++    # persistent [max_num_reqs, max_num_blocks] tables the gather reads from
++    # (their data_ptrs are already held device-side at block_table.py:94-96).
++    # Rows there are request state slots, so they can be indexed by req_idx from
++    # any later step. Used only by the align post-process (BT_ROW_IS_REQ).
++    persistent_block_table_ptrs: torch.Tensor | None = None
++    has_persistent_block_tables: bool = False
++
+     # persistent output for the once-per-step, all-group aligned-index launch.
+     # shape: [num_groups, max_num_reqs, 1 + num_speculative_blocks].
+     aligned_state_indices: torch.Tensor | None = None
+@@ -903,6 +931,9 @@ class MambaSpecDecodeGPUContext:
+             block_table_ptrs=torch.zeros(
+                 len(mamba_group_ids), dtype=torch.int64, device=device
+             ),
++            persistent_block_table_ptrs=torch.zeros(
++                len(mamba_group_ids), dtype=torch.int64, device=device
++            ),
+             aligned_state_indices=torch.empty(
+                 (
+                     len(mamba_group_ids),
+@@ -927,6 +958,7 @@ class MambaSpecDecodeGPUContext:
+         forward_context: dict[str, Any],
+         mamba_state_copy_funcs: MambaStateCopyFuncsByType,
+         block_tables: list[torch.Tensor],
++        persistent_block_tables: list[torch.Tensor] | None = None,
+     ) -> None:
+         """
+         Extract and cache memory layout metadata from Mamba state tensors.
+@@ -958,9 +990,14 @@ class MambaSpecDecodeGPUContext:
+                 have a `kv_cache` attribute containing the list of state tensors.
+             mamba_state_copy_funcs: Mapping from MambaAttentionBackendEnum to
+                 copy functions.
+-            block_tables: per-mamba-group persistent block-table tensors, in
+-                the same order as `mamba_group_ids`. Their `data_ptr()` /
+-                `stride(0)` are captured once for the kernel to index into.
++            block_tables: per-mamba-group *gathered*, batch-order block-table
++                tensors, in the same order as `mamba_group_ids`. Their
++                `data_ptr()` / `stride(0)` are captured once for the kernel to
++                index into by batch row.
++            persistent_block_tables: per-mamba-group *persistent* per-req-slot
++                block-table tensors (`BlockTables.block_tables[i].gpu`), same
++                order. Captured separately so the align post-process can index
++                by req slot; see `persistent_block_table_ptrs`.
+         """
+         if self.is_initialized:
+             return
+@@ -971,6 +1008,7 @@ class MambaSpecDecodeGPUContext:
+                 forward_context,
+                 mamba_state_copy_funcs,
+                 block_tables,
++                persistent_block_tables,
+             )
+ 
+     def _populate_metadata(
+@@ -979,6 +1017,7 @@ class MambaSpecDecodeGPUContext:
+         forward_context: dict[str, Any],
+         mamba_state_copy_funcs: MambaStateCopyFuncsByType,
+         block_tables: list[torch.Tensor],
++        persistent_block_tables: list[torch.Tensor] | None = None,
+     ) -> None:
+         idx = 0
+         for group_local_idx, mamba_group_id in enumerate(self.mamba_group_ids):
+@@ -1090,6 +1129,33 @@ class MambaSpecDecodeGPUContext:
+         for i, bt in enumerate(block_tables):
+             self.block_table_ptrs[i] = _reinterpret_u64_as_i64(bt.data_ptr())
+ 
++        # Same capture for the persistent per-req-slot tables. `input_block_tables`
++        # is `torch.zeros_like` of these (block_table.py:74-76), so stride(0) is
++        # identical and `block_table_stride_req` covers both; assert it rather
++        # than assume.
++        if persistent_block_tables is not None:
++            assert len(persistent_block_tables) == self.num_groups, (
++                f"expected {self.num_groups} persistent block tables, "
++                f"got {len(persistent_block_tables)}"
++            )
++            persistent_strides = {bt.stride(0) for bt in persistent_block_tables}
++            assert persistent_strides == strides, (
++                "persistent block tables must share stride(0) with the gathered "
++                f"tables, got {persistent_strides} vs {strides}"
++            )
++            assert self.persistent_block_table_ptrs is not None
++            for i, bt in enumerate(persistent_block_tables):
++                self.persistent_block_table_ptrs[i] = _reinterpret_u64_as_i64(
++                    bt.data_ptr()
++                )
++            self.has_persistent_block_tables = True
++        else:
++            logger.warning_once(
++                "Mamba align context initialized without the persistent "
++                "per-req-slot block tables; the align post-process will index "
++                "the batch-order gather, which is stale on the PP-deferred path."
++            )
++
+         self.is_initialized = True
+ 
+     def compute_aligned_state_indices(
+@@ -1259,6 +1325,21 @@ class MambaSpecDecodeGPUContext:
+         num_accepted_tokens_snapshot = self.num_accepted_tokens_out
+         num_accepted_tokens_snapshot.copy_(num_accepted_tokens_gpu)
+ 
++        # Under PP this launch is the *deferred* post-process: it is enqueued by
++        # `update_pp_decode_requests` at the top of `execute_model`
++        # (model_runner.py:1644), i.e. before this step's
++        # `gather_block_tables` (model_runner.py:1442 / block_table.py:149), and
++        # `idx_mapping` was captured pp_size steps earlier
++        # (pp_utils.py:57-58, 258-271). So the batch-order gather buffer holds a
++        # *different* micro-batch's rows and `batch_idx` resolves to the wrong
++        # request. Index the persistent per-req-slot tables by `req_idx`
++        # instead, which is correct in every step and also on the same-step
++        # (last-rank / no-PP) path.
++        use_req_rows = self.has_persistent_block_tables
++        block_table_ptrs = (
++            self.persistent_block_table_ptrs if use_req_rows else self.block_table_ptrs
++        )
++
+         total_states = self.num_states
+         grid = (num_reqs, total_states, _TEMPORAL_TILES)
+         postprocess_mamba_fused_kernel[grid](
+@@ -1267,7 +1348,7 @@ class MambaSpecDecodeGPUContext:
+             None,  # num_scheduled: unused under PRECOMPUTED_NEW_COMPUTED
+             new_num_computed_tokens_gpu,
+             None,  # num_draft: unused under PRECOMPUTED_NEW_COMPUTED
+-            self.block_table_ptrs,
++            block_table_ptrs,
+             self.block_table_stride_req,
+             self.state_base_addrs,
+             self.state_block_strides,
+@@ -1285,6 +1366,7 @@ class MambaSpecDecodeGPUContext:
+             CONV_STATE_DIM_FIRST=is_conv_state_dim_first(),
+             HAS_IDX_MAPPING=True,
+             PRECOMPUTED_NEW_COMPUTED=True,
++            BT_ROW_IS_REQ=use_req_rows,
+             TEMPORAL_TILES=_TEMPORAL_TILES,
+         )
+ 
+-- 
+2.47.3
+

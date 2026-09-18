@@ -1,0 +1,117 @@
+From 9a8871a481c9f8a5bfedd7185657da1ed41538d5 Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Mon, 14 Sep 2026 05:36:08 +0000
+Subject: [PATCH 46/76] V.3 fault hook round 3 fix: partial-READY writers run
+ only when armed for that cut (round 3 wrote a fake partial READY frame plus
+ header bytes on every disarmed PLE launch; found by the GPU idle smoke);
+ disarmed control-stream framing test
+
+---
+ .../test_fault_round3_bootstrap_disarmed.py   | 80 +++++++++++++++++++
+ vllm_ple_offload_bootstrap/__init__.py        |  3 +
+ 2 files changed, 83 insertions(+)
+ create mode 100644 tests/v1/ple_offload/test_fault_round3_bootstrap_disarmed.py
+
+diff --git a/tests/v1/ple_offload/test_fault_round3_bootstrap_disarmed.py b/tests/v1/ple_offload/test_fault_round3_bootstrap_disarmed.py
+new file mode 100644
+index 000000000..40c88c76f
+--- /dev/null
++++ b/tests/v1/ple_offload/test_fault_round3_bootstrap_disarmed.py
+@@ -0,0 +1,80 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Round-3 apply check: a disarmed PLE child writes nothing but the real READY."""
++
++import os
++import subprocess
++import sys
++from multiprocessing.connection import Connection
++from types import SimpleNamespace
++from unittest.mock import Mock
++
++import pytest
++
++
++def test_partial_ready_writers_are_inert_unless_armed_for_that_cut(monkeypatch):
++    import vllm_ple_offload_bootstrap as bootstrap
++
++    sender = Mock(return_value=(8, 16))
++    monkeypatch.setattr(bootstrap, "_FAULT", None)
++    for cut in ("launch_partial_ready", "launch_partial_ready_header"):
++        assert bootstrap._write_and_ack_partial(99, cut, sender) is False
++    sender.assert_not_called()
++
++    other = SimpleNamespace(cut="exc_before_prepare", fires=Mock(return_value=True))
++    monkeypatch.setattr(bootstrap, "_FAULT", other)
++    assert bootstrap._write_and_ack_partial(99, "launch_partial_ready", sender) is False
++    sender.assert_not_called()
++    other.fires.assert_not_called()
++
++
++# The launch payload's config field is the protocol-0 encoding of None (b"N.").
++_CHILD = r"""
++import os, sys, types
++write_fd = int(sys.argv[1])
++os.environ.pop("VLLM_PLE_TEST_FAULT", None)
++import vllm_ple_offload_bootstrap as bootstrap
++assert bootstrap._FAULT is None
++bootstrap._recv_launch_payload = lambda fd: {
++    "vllm_config_payload": b"N.",
++    "num_workers": 1,
++    "ipc_addr": "ipc:///unused",
++}
++
++def proc_main(*, vllm_config, num_workers, ipc_addr, ready_pipe):
++    assert vllm_config is None
++    ready_pipe.send({"status": "READY", "layer_names": ["ple"]})
++    os._exit(0)
++
++fake = types.ModuleType("vllm.v1.ple_offload.worker")
++fake.PleOffloadWorker = types.SimpleNamespace(proc_main=proc_main)
++sys.modules["vllm.v1.ple_offload.worker"] = fake
++death_read, death_write = os.pipe()
++sys.argv = ["bootstrap", str(write_fd), str(death_read)]
++bootstrap.main()
++"""
++
++
++@pytest.mark.skipif(sys.platform == "win32", reason="inherited fds are POSIX-only")
++def test_disarmed_bootstrap_control_stream_is_exactly_one_ready_frame():
++    read_fd, write_fd = os.pipe()
++    env = dict(os.environ)
++    env.pop("VLLM_PLE_TEST_FAULT", None)
++    proc = subprocess.Popen(
++        [sys.executable, "-c", _CHILD, str(write_fd)],
++        pass_fds=(write_fd,),
++        env=env,
++    )
++    os.close(write_fd)
++    reader = Connection(read_fd)
++    try:
++        assert proc.wait(timeout=120) == 0
++        assert reader.poll(5), "no READY frame on the control stream"
++        assert reader.recv() == {"status": "READY", "layer_names": ["ple"]}
++        # Nothing may follow (or precede, which would have broken the frame).
++        with pytest.raises(EOFError):
++            reader.recv_bytes()
++    finally:
++        reader.close()
++        if proc.poll() is None:
++            proc.kill()
++            proc.wait(timeout=120)
+diff --git a/vllm_ple_offload_bootstrap/__init__.py b/vllm_ple_offload_bootstrap/__init__.py
+index 8da83ff9b..60ddda472 100644
+--- a/vllm_ple_offload_bootstrap/__init__.py
++++ b/vllm_ple_offload_bootstrap/__init__.py
+@@ -88,6 +88,9 @@ def _write_and_ack_partial(
+     sender: Any,
+ ) -> bool:
+     """A short or failed prefix write cannot acknowledge or enter the park."""
++    if _FAULT is None or _FAULT.cut != cut:
++        # Disarmed or armed for another cut: the control stream is untouched.
++        return False
+     written, frame_size = sender(fd)
+     if written <= 0 or written >= frame_size:
+         return False
+-- 
+2.47.3
+

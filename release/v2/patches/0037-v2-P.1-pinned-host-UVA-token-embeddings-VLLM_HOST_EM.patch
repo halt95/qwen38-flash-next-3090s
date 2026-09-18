@@ -1,0 +1,712 @@
+From c32446222ef9b6210ec19911f7158b0541ca7bd0 Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Sun, 13 Sep 2026 19:00:45 +0000
+Subject: [PATCH 37/76] v2 P.1: pinned-host UVA token embeddings
+ (VLLM_HOST_EMBED_TABLE=1) for the stage-0 target and stage-1 MTP drafter; TP
+ shard, masking and all-reduce retained; PLE worker meta construction kept;
+ tied embeddings refused (Sol UVA draft after Astra REDESIGN, Fable
+ applied/tested: 13/13 incl. GPU capture tests)
+
+---
+ .../qwen4_exp/test_host_uva_embedding.py      | 404 ++++++++++++++++++
+ .../layers/vocab_parallel_embedding.py        | 163 +++++++
+ vllm/models/qwen4_exp/nvidia/model.py         |  23 +-
+ vllm/models/qwen4_exp/nvidia/mtp.py           |  17 +-
+ 4 files changed, 603 insertions(+), 4 deletions(-)
+ create mode 100644 tests/models/qwen4_exp/test_host_uva_embedding.py
+
+diff --git a/tests/models/qwen4_exp/test_host_uva_embedding.py b/tests/models/qwen4_exp/test_host_uva_embedding.py
+new file mode 100644
+index 000000000..76a147547
+--- /dev/null
++++ b/tests/models/qwen4_exp/test_host_uva_embedding.py
+@@ -0,0 +1,404 @@
++# SPDX-License-Identifier: Apache-2.0
++
++from contextlib import nullcontext
++from types import SimpleNamespace
++
++import pytest
++import torch
++from torch import nn
++
++import vllm.model_executor.layers.vocab_parallel_embedding as vpe
++import vllm.models.qwen4_exp.nvidia.model as model_mod
++import vllm.models.qwen4_exp.nvidia.mtp as mtp_mod
++from vllm.model_executor.layers.vocab_parallel_embedding import (
++    HOST_EMBED_TABLE_ENV,
++    PinnedHostVocabParallelEmbedding,
++    VocabParallelEmbedding,
++    host_embed_table_enabled,
++)
++
++
++VOCAB = 67
++HIDDEN = 16
++
++
++def _set_tp(monkeypatch, rank: int, world_size: int) -> None:
++    monkeypatch.setattr(vpe, "get_tensor_model_parallel_rank", lambda: rank)
++    monkeypatch.setattr(
++        vpe,
++        "get_tensor_model_parallel_world_size",
++        lambda: world_size,
++    )
++    monkeypatch.setattr(
++        vpe,
++        "tensor_model_parallel_all_reduce",
++        lambda value: value,
++    )
++
++
++def _weight(vocab: int = VOCAB, hidden: int = HIDDEN) -> torch.Tensor:
++    values = torch.arange(vocab * hidden, dtype=torch.int32)
++    weight = values.reshape(vocab, hidden).to(torch.bfloat16)
++    if vocab > 64 and hidden >= 2:
++        bits = weight.view(torch.uint16)
++        bits[64, 0] = 0x8000  # -0.0
++        bits[64, 1] = 0x7FC1  # quiet NaN with a nonzero payload
++    return weight
++
++
++def _assert_same_bytes(actual: torch.Tensor, expected: torch.Tensor) -> None:
++    assert actual.shape == expected.shape
++    assert actual.dtype == expected.dtype
++    assert torch.equal(
++        actual.contiguous().view(torch.uint8),
++        expected.contiguous().view(torch.uint8),
++    )
++
++
++@pytest.mark.parametrize(
++    ("value", "expected"),
++    [
++        (None, False),
++        ("", False),
++        ("0", False),
++        ("1", True),
++        (" 1 ", False),
++        ("true", False),
++    ],
++)
++def test_host_embedding_flag_is_exact(monkeypatch, value, expected):
++    if value is None:
++        monkeypatch.delenv(HOST_EMBED_TABLE_ENV, raising=False)
++    else:
++        monkeypatch.setenv(HOST_EMBED_TABLE_ENV, value)
++    assert host_embed_table_enabled() is expected
++
++
++def test_u1_tp2_masking_and_reduction_are_bytewise_identical(monkeypatch):
++    weight = _weight()
++    ids = torch.tensor(
++        [0, 1, 63, 64, 65, 66, -1, VOCAB, 127],
++        dtype=torch.int64,
++    )
++    stock_parts = []
++    host_parts = []
++
++    for rank in range(2):
++        _set_tp(monkeypatch, rank, 2)
++        with torch.device("cpu"):
++            stock = VocabParallelEmbedding(
++                VOCAB,
++                HIDDEN,
++                params_dtype=torch.bfloat16,
++            )
++            host = PinnedHostVocabParallelEmbedding(
++                VOCAB,
++                HIDDEN,
++                params_dtype=torch.bfloat16,
++                create_accelerator_view=False,
++            )
++
++        # The CPU reference deliberately exercises the stock masked fallback,
++        # not the CUDA-only fused kernel.
++        stock.use_fused_embedding = False
++        stock.weight_loader(stock.weight, weight)
++        host.weight_loader(host.weight, weight)
++
++        stock_local = stock(ids)
++        host_local = host(ids)
++        _assert_same_bytes(host_local, stock_local)
++        stock_parts.append(stock_local)
++        host_parts.append(host_local)
++
++    # Use the same floating-point SUM ordering for both implementations. This
++    # intentionally covers the signed-zero and NaN caveat of the real TP path.
++    stock_reduced = stock_parts[0] + stock_parts[1]
++    host_reduced = host_parts[0] + host_parts[1]
++    _assert_same_bytes(host_reduced, stock_reduced)
++
++    invalid = host_reduced[-3:].contiguous().view(torch.uint8)
++    assert torch.count_nonzero(invalid) == 0
++
++
++class _LanguageModel(nn.Module):
++    def __init__(self, embedding: nn.Module) -> None:
++        super().__init__()
++        self.embed_tokens = embedding
++
++    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
++        return self.embed_tokens(input_ids)
++
++
++def test_u1_real_multimodal_text_mask_and_merge(monkeypatch):
++    _set_tp(monkeypatch, 0, 1)
++    weight = _weight()
++    with torch.device("cpu"):
++        embedding = PinnedHostVocabParallelEmbedding(
++            VOCAB,
++            HIDDEN,
++            params_dtype=torch.bfloat16,
++            create_accelerator_view=False,
++        )
++    embedding.weight_loader(embedding.weight, weight)
++
++    model = model_mod.Qwen4ExpForConditionalGeneration.__new__(
++        model_mod.Qwen4ExpForConditionalGeneration
++    )
++    nn.Module.__init__(model)
++    model.language_model = _LanguageModel(embedding)
++    model.language_model_only = False
++    model.use_deepstack = False
++    model._has_oov_mm_tokens = True
++
++    ids = torch.tensor([1, VOCAB + 5, -1, 64], dtype=torch.int64)
++    is_multimodal = torch.tensor([False, True, False, False])
++    image_row = torch.full((1, HIDDEN), 123, dtype=torch.bfloat16)
++
++    actual = model.embed_input_ids(
++        ids,
++        multimodal_embeddings=[image_row],
++        is_multimodal=is_multimodal,
++    )
++
++    expected = torch.zeros(4, HIDDEN, dtype=torch.bfloat16)
++    expected[0].copy_(weight[1])
++    expected[1].copy_(image_row[0])
++    expected[3].copy_(weight[64])
++    _assert_same_bytes(actual, expected)
++
++
++class _PPGroup:
++    is_first_rank = True
++    is_last_rank = False
++
++
++class _StubModule(nn.Module):
++    def __init__(self, *args, **kwargs) -> None:
++        super().__init__()
++
++
++def _tiny_config(*, tie_word_embeddings: bool = False):
++    text_config = SimpleNamespace(
++        vocab_size=VOCAB,
++        hidden_size=HIDDEN,
++        hc_count=1,
++        layer_types=[],
++        num_hidden_layers=0,
++        mtp_num_hidden_layers=0,
++        rms_norm_eps=1e-6,
++        hc_lowrank=1,
++        tie_word_embeddings=tie_word_embeddings,
++    )
++    model_config = SimpleNamespace(
++        hf_text_config=text_config,
++        dtype=torch.bfloat16,
++    )
++    parallel_config = SimpleNamespace(
++        eplb_config=SimpleNamespace(num_redundant_experts=0),
++        use_sequence_parallel_moe=False,
++    )
++    scheduler_config = SimpleNamespace(max_num_batched_tokens=8)
++    # The @support_torch_compile wrapper reads vllm_config.compilation_config after
++    # __init__; mode NONE makes it return without compiling.
++    from vllm.config import CompilationMode
++
++    compilation_config = SimpleNamespace(mode=CompilationMode.NONE)
++    return SimpleNamespace(
++        model_config=model_config,
++        parallel_config=parallel_config,
++        scheduler_config=scheduler_config,
++        compilation_config=compilation_config,
++        speculative_config=None,
++        quant_config=None,
++    )
++
++
++def _patch_tiny_model_construction(monkeypatch) -> None:
++    _set_tp(monkeypatch, 0, 1)
++    monkeypatch.setattr(model_mod, "get_pp_group", lambda: _PPGroup())
++    monkeypatch.setattr(
++        model_mod,
++        "make_layers",
++        lambda *args, **kwargs: (0, 0, nn.ModuleList()),
++    )
++    monkeypatch.setattr(
++        model_mod,
++        "is_model_fused_shared_expert_compatible",
++        lambda *args, **kwargs: False,
++    )
++    monkeypatch.setattr(
++        model_mod,
++        "make_empty_intermediate_tensors_factory",
++        lambda *args, **kwargs: lambda *a, **k: None,
++    )
++
++    monkeypatch.setattr(
++        mtp_mod,
++        "_make_draft_vllm_config",
++        lambda *args, **kwargs: SimpleNamespace(quant_config=None),
++    )
++    monkeypatch.setattr(
++        mtp_mod,
++        "set_current_vllm_config",
++        lambda *args, **kwargs: nullcontext(),
++    )
++    monkeypatch.setattr(mtp_mod, "ColumnParallelLinear", _StubModule)
++    monkeypatch.setattr(mtp_mod, "GemmaRMSNorm", _StubModule)
++    monkeypatch.setattr(mtp_mod, "GatedResidual", _StubModule)
++    monkeypatch.setattr(
++        mtp_mod,
++        "is_model_fused_shared_expert_compatible",
++        lambda *args, **kwargs: False,
++    )
++    monkeypatch.setattr(
++        mtp_mod,
++        "make_empty_intermediate_tensors_factory",
++        lambda *args, **kwargs: lambda *a, **k: None,
++    )
++
++
++def test_u2_ple_meta_construction_materializes_neither_table(monkeypatch):
++    monkeypatch.setenv(HOST_EMBED_TABLE_ENV, "1")
++    _patch_tiny_model_construction(monkeypatch)
++    config = _tiny_config()
++
++    with torch.device("meta"):
++        target = model_mod.Qwen4ExpModel(vllm_config=config)
++        predictor = mtp_mod.Qwen4ExpMultiTokenPredictor(vllm_config=config)
++
++    assert isinstance(target.embed_tokens, VocabParallelEmbedding)
++    assert not isinstance(
++        target.embed_tokens,
++        PinnedHostVocabParallelEmbedding,
++    )
++    assert target.embed_tokens.weight.device.type == "meta"
++
++    assert isinstance(predictor.embed_tokens, VocabParallelEmbedding)
++    assert not isinstance(
++        predictor.embed_tokens,
++        PinnedHostVocabParallelEmbedding,
++    )
++    assert predictor.embed_tokens.weight.device.type == "meta"
++
++
++def test_tied_embeddings_are_rejected_for_both_owners(monkeypatch):
++    monkeypatch.setenv(HOST_EMBED_TABLE_ENV, "1")
++    _patch_tiny_model_construction(monkeypatch)
++    config = _tiny_config(tie_word_embeddings=True)
++
++    with pytest.raises(ValueError, match="tie_word_embeddings=True"):
++        model_mod.Qwen4ExpModel(vllm_config=config)
++    with pytest.raises(ValueError, match="tie_word_embeddings=True"):
++        mtp_mod.Qwen4ExpMultiTokenPredictor(vllm_config=config)
++
++
++def _cuda_host_layer(monkeypatch, vocab=VOCAB, hidden=HIDDEN):
++    _set_tp(monkeypatch, 0, 1)
++    layer = PinnedHostVocabParallelEmbedding(
++        vocab,
++        hidden,
++        params_dtype=torch.bfloat16,
++    )
++    weight = _weight(vocab, hidden)
++    layer.weight_loader(layer.weight, weight)
++    return layer, weight
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA UVA")
++def test_u3_uva_lookup_is_graph_capturable_and_replayable(monkeypatch):
++    layer, weight = _cuda_host_layer(monkeypatch)
++    assert layer.weight.device.type == "cpu"
++    assert layer.weight.is_pinned()
++    assert layer.accelerator_weight_view is not None
++    assert layer.accelerator_weight_view.device.type == "cuda"
++
++    ids = torch.tensor([0, 1, 64, 66], device="cuda")
++    layer(ids)
++    torch.cuda.synchronize()
++
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph):
++        captured_output = layer(ids)
++
++    for replay_ids in (
++        torch.tensor([2, 3, 4, 5]),
++        torch.tensor([64, 65, 66, 0]),
++    ):
++        ids.copy_(replay_ids.to(device="cuda"))
++        graph.replay()
++        torch.cuda.synchronize()
++        _assert_same_bytes(
++            captured_output.cpu(),
++            weight[replay_ids],
++        )
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA UVA")
++def test_u3_three_lookup_steps_inside_one_graph(monkeypatch):
++    layer, weight = _cuda_host_layer(monkeypatch)
++    loop_ids = torch.tensor([1, 8, 32, 60], device="cuda")
++
++    for _ in range(3):
++        layer(loop_ids)
++    torch.cuda.synchronize()
++
++    graph = torch.cuda.CUDAGraph()
++    captured_steps = []
++    with torch.cuda.graph(graph):
++        for _ in range(3):
++            captured_steps.append(layer(loop_ids))
++            loop_ids.add_(1)
++
++    for seed in (
++        torch.tensor([1, 8, 32, 60]),
++        torch.tensor([4, 12, 40, 63]),
++    ):
++        loop_ids.copy_(seed.to(device="cuda"))
++        graph.replay()
++        torch.cuda.synchronize()
++        for step, output in enumerate(captured_steps):
++            _assert_same_bytes(output.cpu(), weight[seed + step])
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA UVA")
++def test_u4_real_shard_loader_has_no_cuda_table_transient(monkeypatch):
++    vocab = 4096
++    hidden = 256
++    _set_tp(monkeypatch, 1, 2)
++
++    layer = PinnedHostVocabParallelEmbedding(
++        vocab,
++        hidden,
++        params_dtype=torch.bfloat16,
++    )
++    view = layer.accelerator_weight_view
++    assert view is not None
++    view_ptr = view.data_ptr()
++
++    loaded_weight = _weight(vocab, hidden)
++    local_table_bytes = layer.weight.numel() * layer.weight.element_size()
++
++    torch.cuda.synchronize()
++    baseline = torch.cuda.memory_allocated()
++    torch.cuda.reset_peak_memory_stats()
++
++    assert (
++        layer.weight_loader.__func__
++        is VocabParallelEmbedding.weight_loader
++    )
++    layer.weight_loader(layer.weight, loaded_weight)
++
++    torch.cuda.synchronize()
++    peak_growth = torch.cuda.max_memory_allocated() - baseline
++
++    assert layer.weight.device.type == "cpu"
++    assert layer.weight.is_pinned()
++    assert view.device.type == "cuda"
++    assert view.shape == layer.weight.shape
++    assert view.dtype == layer.weight.dtype
++    assert view.data_ptr() == view_ptr
++    assert set(dict(layer.named_parameters())) == {"weight"}
++    assert peak_growth < local_table_bytes
++
++    expected = loaded_weight.narrow(0, vocab // 2, vocab // 2)
++    _assert_same_bytes(layer.weight, expected)
+diff --git a/vllm/model_executor/layers/vocab_parallel_embedding.py b/vllm/model_executor/layers/vocab_parallel_embedding.py
+index ba901550e..16bd181f9 100644
+--- a/vllm/model_executor/layers/vocab_parallel_embedding.py
++++ b/vllm/model_executor/layers/vocab_parallel_embedding.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
++import os
+ from collections.abc import Sequence
+ from dataclasses import dataclass
+ 
+@@ -30,8 +31,26 @@ from vllm.model_executor.layers.utils import dispatch_unquantized_gemm
+ from vllm.model_executor.parameter import BasevLLMParameter
+ from vllm.model_executor.utils import set_weight_attrs
+ from vllm.platforms import current_platform
++from vllm.utils.torch_utils import (
++    PIN_MEMORY,
++    get_accelerator_view_from_cpu_tensor,
++)
+ 
+ DEFAULT_VOCAB_PADDING_SIZE = 64
++HOST_EMBED_TABLE_ENV = "VLLM_HOST_EMBED_TABLE"
++
++
++def host_embed_table_enabled() -> bool:
++    """Return whether the exact host-embedding opt-in is set."""
++    return os.environ.get(HOST_EMBED_TABLE_ENV, "") == "1"
++
++
++def should_use_host_embed_table() -> bool:
++    """Keep the PLE offload worker's model construction on the meta device."""
++    return (
++        host_embed_table_enabled()
++        and torch.empty(0).device.type != "meta"
++    )
+ 
+ 
+ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
+@@ -90,6 +109,44 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
+         return layer
+ 
+ 
++class _PinnedHostUnquantizedEmbeddingMethod(UnquantizedEmbeddingMethod):
++    """Allocate an unquantized embedding shard without a CUDA transient."""
++
++    def __init__(self, *, device: torch.device, pin_memory: bool) -> None:
++        self.device = device
++        self.pin_memory = pin_memory
++
++    def create_weights(
++        self,
++        layer: torch.nn.Module,
++        input_size_per_partition: int,
++        output_partition_sizes: list[int],
++        input_size: int,
++        output_size: int,
++        params_dtype: torch.dtype,
++        **extra_weight_attrs,
++    ) -> None:
++        del input_size, output_size
++        weight = Parameter(
++            torch.empty(
++                sum(output_partition_sizes),
++                input_size_per_partition,
++                dtype=params_dtype,
++                device=self.device,
++                pin_memory=self.pin_memory,
++            ),
++            requires_grad=False,
++        )
++        set_weight_attrs(weight, {"input_dim": 1, "output_dim": 0})
++        layer.register_parameter("weight", weight)
++        set_weight_attrs(weight, extra_weight_attrs)
++
++    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
++        # The serving layer must retain the same pinned allocation whose mapped
++        # address was captured. CPU-only reference tests need no GEMM dispatch.
++        del layer
++
++
+ def pad_vocab_size(vocab_size: int, pad_to: int = DEFAULT_VOCAB_PADDING_SIZE) -> int:
+     """Pad the vocab size to the given value."""
+     return ((vocab_size + pad_to - 1) // pad_to) * pad_to
+@@ -552,6 +609,112 @@ class VocabParallelEmbedding(PluggableLayer):
+         return s
+ 
+ 
++class PinnedHostVocabParallelEmbedding(VocabParallelEmbedding):
++    """TP-sharded embedding read on CUDA through mapped pinned host memory."""
++
++    def __init__(
++        self,
++        num_embeddings: int,
++        embedding_dim: int,
++        params_dtype: torch.dtype | None = None,
++        org_num_embeddings: int | None = None,
++        padding_size: int = DEFAULT_VOCAB_PADDING_SIZE,
++        prefix: str = "",
++        *,
++        disable_tp: bool = False,
++        create_accelerator_view: bool = True,
++    ) -> None:
++        construction_device = torch.empty(0).device
++        is_meta = construction_device.type == "meta"
++        if (
++            create_accelerator_view
++            and not is_meta
++            and current_platform.is_cuda()
++            and not PIN_MEMORY
++        ):
++            raise RuntimeError(
++                "VLLM_HOST_EMBED_TABLE requires available pinned host memory"
++            )
++
++        storage_device = construction_device if is_meta else torch.device("cpu")
++        pin_memory = (
++            not is_meta
++            and current_platform.is_cuda()
++            and PIN_MEMORY
++        )
++        quant_method = _PinnedHostUnquantizedEmbeddingMethod(
++            device=storage_device,
++            pin_memory=pin_memory,
++        )
++        super().__init__(
++            num_embeddings,
++            embedding_dim,
++            params_dtype=params_dtype,
++            org_num_embeddings=org_num_embeddings,
++            padding_size=padding_size,
++            prefix=prefix,
++            disable_tp=disable_tp,
++            quant_method=quant_method,
++        )
++
++        # The custom fused kernel is specified for ordinary device-resident
++        # shards, not device-mapped host allocations. Use the regular masked
++        # embedding path whose CUDA tensor argument is the mapped view.
++        self.use_fused_embedding = False
++        self._uva_weight: torch.Tensor | None = None
++        if (
++            create_accelerator_view
++            and self.weight.device.type == "cpu"
++            and current_platform.is_cuda()
++        ):
++            if not self.weight.is_pinned():
++                raise RuntimeError(
++                    "VLLM_HOST_EMBED_TABLE weight was not allocated pinned"
++                )
++            self._uva_weight = get_accelerator_view_from_cpu_tensor(self.weight)
++
++    @property
++    def accelerator_weight_view(self) -> torch.Tensor | None:
++        return self._uva_weight
++
++    def _apply(self, fn, recurse: bool = True):
++        # Parent-model device/dtype transforms must not replace the pinned
++        # allocation or invalidate the stable address held by CUDA graphs.
++        del fn, recurse
++        return self
++
++    def _lookup_weight(self, input_: torch.Tensor) -> torch.Tensor:
++        if input_.device.type == "cpu":
++            return self.weight
++        if self._uva_weight is None:
++            raise RuntimeError(
++                "Host embedding received accelerator IDs without a UVA view"
++            )
++        if self._uva_weight.device != input_.device:
++            raise RuntimeError(
++                "Host embedding UVA view and input IDs are on different devices"
++            )
++        return self._uva_weight
++
++    def forward(self, input_: torch.Tensor) -> torch.Tensor:
++        masked_input, input_mask = get_masked_input_and_mask(
++            input_,
++            self.shard_indices.org_vocab_start_index,
++            self.shard_indices.org_vocab_end_index,
++            self.shard_indices.num_org_vocab_padding,
++            self.shard_indices.added_vocab_start_index,
++            self.shard_indices.added_vocab_end_index,
++        )
++        output_parallel = F.embedding(
++            masked_input.long(),
++            self._lookup_weight(input_),
++        )
++        output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
++        if self.tp_size == 1:
++            return output_parallel
++        return tensor_model_parallel_all_reduce(output_parallel)
++
++
+ # --8<-- [start:parallel_lm_head]
+ @PluggableLayer.register("parallel_lm_head")
+ class ParallelLMHead(VocabParallelEmbedding):
+diff --git a/vllm/models/qwen4_exp/nvidia/model.py b/vllm/models/qwen4_exp/nvidia/model.py
+index 11a3cb652..bf6a9915b 100644
+--- a/vllm/models/qwen4_exp/nvidia/model.py
++++ b/vllm/models/qwen4_exp/nvidia/model.py
+@@ -29,8 +29,10 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
+ )
+ from vllm.model_executor.layers.quantization import QuantizationConfig
+ from vllm.model_executor.layers.vocab_parallel_embedding import (
++    PinnedHostVocabParallelEmbedding,
+     ParallelLMHead,
+     VocabParallelEmbedding,
++    should_use_host_embed_table,
+ )
+ from vllm.model_executor.models.interfaces import (
+     HasInnerState,
+@@ -513,14 +515,29 @@ class Qwen4ExpModel(nn.Module):
+             if layer_type == "full_attention"
+             and getattr(config, "indexer_n_heads", None) is not None
+         )
++        self.uses_host_embed_table = (
++            get_pp_group().is_first_rank
++            and should_use_host_embed_table()
++        )
++        if self.uses_host_embed_table and getattr(
++            config, "tie_word_embeddings", False
++        ):
++            raise ValueError(
++                "VLLM_HOST_EMBED_TABLE=1 is incompatible with "
++                "tie_word_embeddings=True"
++            )
+         # PP ownership (Astra review 2026-09-11): the input embedding runs on
+         # the first stage only (see forward); later stages carried an unused
+         # 248320 x 2560 bf16 table (0.59 GiB per GPU at TP2) beside the MTP
+-        # drafter's own copy. PP=1 (and the PLE offload worker) is unchanged.
++        # drafter's own copy. PP=1 ownership is unchanged, and the PLE offload
++        # worker retains meta construction.
+         if get_pp_group().is_first_rank:
+-            self.embed_tokens = VocabParallelEmbedding(
+-                self.vocab_size, config.hidden_size
++            embedding_cls = (
++                PinnedHostVocabParallelEmbedding
++                if self.uses_host_embed_table
++                else VocabParallelEmbedding
+             )
++            self.embed_tokens = embedding_cls(self.vocab_size, config.hidden_size)
+         else:
+             self.embed_tokens = PPMissingLayer()
+ 
+diff --git a/vllm/models/qwen4_exp/nvidia/mtp.py b/vllm/models/qwen4_exp/nvidia/mtp.py
+index 7d8c81d3d..97445953b 100644
+--- a/vllm/models/qwen4_exp/nvidia/mtp.py
++++ b/vllm/models/qwen4_exp/nvidia/mtp.py
+@@ -29,8 +29,10 @@ from vllm.model_executor.layers.layernorm import GemmaRMSNorm
+ from vllm.model_executor.layers.linear import ColumnParallelLinear
+ from vllm.model_executor.layers.logits_processor import LogitsProcessor
+ from vllm.model_executor.layers.vocab_parallel_embedding import (
++    PinnedHostVocabParallelEmbedding,
+     ParallelLMHead,
+     VocabParallelEmbedding,
++    should_use_host_embed_table,
+ )
+ from vllm.model_executor.model_loader.utils import configure_quant_config
+ from vllm.model_executor.models.interfaces import SupportsPP
+@@ -174,7 +176,20 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
+         self.hidden_size = config.hidden_size
+         self.hc_count = config.hc_count
+ 
+-        self.embed_tokens = VocabParallelEmbedding(self.vocab_size, self.hidden_size)
++        self.uses_host_embed_table = should_use_host_embed_table()
++        if self.uses_host_embed_table and getattr(
++            config, "tie_word_embeddings", False
++        ):
++            raise ValueError(
++                "VLLM_HOST_EMBED_TABLE=1 is incompatible with "
++                "tie_word_embeddings=True"
++            )
++        embedding_cls = (
++            PinnedHostVocabParallelEmbedding
++            if self.uses_host_embed_table
++            else VocabParallelEmbedding
++        )
++        self.embed_tokens = embedding_cls(self.vocab_size, self.hidden_size)
+         draft_vllm_config = _make_draft_vllm_config(
+             vllm_config,
+             self.mtp_start_layer_idx,
+-- 
+2.47.3
+

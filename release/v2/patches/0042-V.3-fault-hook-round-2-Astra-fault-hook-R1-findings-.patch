@@ -1,0 +1,1184 @@
+From 57cfc1ce6c87836926a8f2c4c5f4f06822f5b0d2 Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Mon, 14 Sep 2026 00:33:10 +0000
+Subject: [PATCH 42/76] V.3 fault hook round 2 (Astra fault-hook R1 findings
+ 1-6): stdlib singleton vllm_ple_test_fault with dedicated O_NONBLOCK marker
+ log (failed write suppresses the fault), explicit per-site eligibility and
+ counting units, impossible selectors rejected, dropped D2H events retained,
+ exc_async_output hooked on the PP0 relay path with sample_tokens under the
+ PLE fatal boundary, acknowledged gates (publish-ack park, GIL-releasing FIFO
+ for reconstruction/import, send-entry log), partial READY header cut (Sol
+ draft, Fable applied/tested)
+
+Fable fixups: disarmed async-output site checks _FAULT before reading progress state; stale round-1 test fixtures updated to the round-2 contract; site-count test now checks every fires() call is behind the None check; launch-deadline test reads only its own result line (send-entry log shares stdout).
+
+Tests: tests/v1/ple_offload green (see log). Harness faultcut.sh/faultcut_eval.py kept outside the repo.
+---
+ tests/v1/ple_offload/test_fault_round2.py     | 244 +++++++++++++++++
+ .../ple_offload/test_spawn_bootstrap_cuda.py  |   6 +-
+ tests/v1/ple_offload/test_test_fault.py       |  81 +++---
+ vllm/v1/ple_offload/connector.py              |  27 +-
+ vllm/v1/ple_offload/fatal.py                  |  18 +-
+ vllm/v1/ple_offload/test_fault.py             |  18 +-
+ vllm/v1/ple_offload/worker.py                 |  46 +++-
+ vllm/v1/worker/gpu/model_runner.py            |  31 ++-
+ vllm_ple_offload_bootstrap/__init__.py        |  88 ++++---
+ vllm_ple_test_fault/__init__.py               | 249 ++++++++++++++++++
+ 10 files changed, 703 insertions(+), 105 deletions(-)
+ create mode 100644 tests/v1/ple_offload/test_fault_round2.py
+ create mode 100644 vllm_ple_test_fault/__init__.py
+
+diff --git a/tests/v1/ple_offload/test_fault_round2.py b/tests/v1/ple_offload/test_fault_round2.py
+new file mode 100644
+index 000000000..049c5bfe1
+--- /dev/null
++++ b/tests/v1/ple_offload/test_fault_round2.py
+@@ -0,0 +1,244 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++import os
++import queue
++import subprocess
++import sys
++import threading
++from collections import deque
++from pathlib import Path
++from types import SimpleNamespace
++from unittest.mock import Mock
++
++import pytest
++
++import vllm_ple_test_fault as test_fault
++
++
++def _spec(monkeypatch, tmp_path, value):
++    monkeypatch.setenv("VLLM_PLE_TEST_FAULT_LOG", str(tmp_path / "fault.log"))
++    spec = test_fault._parse_fault_spec(value)
++    assert spec is not None
++    return spec
++
++
++@pytest.mark.parametrize(
++    "value",
++    [
++        "cut=park_before_publish,ordinal=1,tp=0",
++        "cut=launch_silent_ready,ordinal=1,pp=0",
++        "cut=drop_request,ordinal=1,tp=1,pp=0",
++        "cut=exc_after_prepare,ordinal=1,tp=0,pp=1",
++    ],
++)
++def test_impossible_role_selectors_are_rejected(monkeypatch, tmp_path, value):
++    monkeypatch.setenv("VLLM_PLE_TEST_FAULT_LOG", str(tmp_path / "fault.log"))
++    with pytest.raises(ValueError):
++        test_fault._parse_fault_spec(value)
++
++
++def test_armed_import_requires_dedicated_log(tmp_path):
++    env = dict(os.environ)
++    env["VLLM_PLE_TEST_FAULT"] = (
++        "cut=exc_before_prepare,ordinal=1,rank=any"
++    )
++    env.pop("VLLM_PLE_TEST_FAULT_LOG", None)
++    proc = subprocess.run(
++        [sys.executable, "-c", "import vllm_ple_test_fault"],
++        env=env,
++        text=True,
++        capture_output=True,
++        timeout=120,
++    )
++    assert proc.returncode != 0
++    assert "VLLM_PLE_TEST_FAULT_LOG is required" in proc.stderr
++
++
++def test_failed_marker_write_suppresses_action(monkeypatch, tmp_path):
++    spec = _spec(
++        monkeypatch,
++        tmp_path,
++        "cut=exc_after_prepare,ordinal=1,tp=0,pp=0",
++    )
++    monkeypatch.setattr(test_fault.os, "write", Mock(side_effect=BlockingIOError))
++    assert not spec.fires(
++        "exc_after_prepare",
++        role="gpu",
++        unit="runner-forward",
++        eligible=True,
++        tp_rank=0,
++        pp_rank=0,
++        transaction_id="sequence:1",
++    )
++    assert spec._state.diagnostic_failed
++    assert not spec._state.fired
++
++
++@pytest.mark.parametrize("order", ["bootstrap-first", "package-first"])
++@pytest.mark.parametrize("armed", [False, True])
++def test_fresh_interpreter_import_identity(tmp_path, order, armed):
++    env = dict(os.environ)
++    env.pop("VLLM_PLE_TEST_FAULT", None)
++    env.pop("VLLM_PLE_TEST_FAULT_LOG", None)
++    if armed:
++        env["VLLM_PLE_TEST_FAULT"] = (
++            "cut=launch_silent_ready,ordinal=1,rank=any"
++        )
++        env["VLLM_PLE_TEST_FAULT_LOG"] = str(tmp_path / f"{order}.log")
++    script = f"""
++import sys
++if {order!r} == "bootstrap-first":
++    import vllm_ple_offload_bootstrap as bootstrap
++    absent_before_package = "vllm_ple_test_fault" not in sys.modules
++    import vllm_ple_test_fault as package
++else:
++    import vllm_ple_test_fault as package
++    import vllm_ple_offload_bootstrap as bootstrap
++    absent_before_package = False
++assert bootstrap._FAULT is package._FAULT
++assert getattr(sys.modules["vllm_ple_test_fault"], "_FAULT") is package._FAULT
++if {armed!r}:
++    assert package._FAULT is not None
++else:
++    assert package._FAULT is None
++    if {order!r} == "bootstrap-first":
++        assert absent_before_package
++"""
++    subprocess.run(
++        [sys.executable, "-c", script],
++        env=env,
++        check=True,
++        timeout=120,
++    )
++
++
++class _IncompleteEvent:
++    def query(self):
++        return False
++
++
++class _FatalObserved(BaseException):
++    pass
++
++
++@pytest.mark.parametrize(
++    ("record_completion", "complete_submission", "expected"),
++    [
++        (False, False, "host-submission"),
++        (True, False, "gpu-completion"),
++        (True, True, "gpu-completion"),
++    ],
++)
++def test_real_progress_monitor_observed_state(
++    monkeypatch,
++    record_completion,
++    complete_submission,
++    expected,
++):
++    import vllm.v1.ple_offload.progress as progress_module
++
++    observed = []
++    reached = threading.Event()
++
++    def fatal(**kwargs):
++        observed.append(kwargs)
++        reached.set()
++        raise _FatalObserved
++
++    monkeypatch.setattr(progress_module, "ple_fail_closed", fatal)
++    monitor = progress_module.PleProgressMonitor(
++        rank=0,
++        layer_names=("ple",),
++        serving_deadline_s=0.02,
++        startup_deadline_s=0.02,
++    )
++    monitor.begin(startup=False, num_tokens=1)
++    if record_completion:
++        monitor.track_completion(_IncompleteEvent())
++    if complete_submission:
++        monitor.complete()
++    assert reached.wait(2)
++    assert expected in observed[0]["where"]
++    monitor.close()
++
++
++def test_drop_retains_event_and_next_pool_one_launch_fails_closed(
++    monkeypatch,
++    tmp_path,
++):
++    import vllm.v1.ple_offload.connector as connector_module
++
++    spec = _spec(
++        monkeypatch,
++        tmp_path,
++        "cut=drop_request,ordinal=1,tp=0,pp=0",
++    )
++    monkeypatch.setattr(connector_module, "_FAULT", spec)
++
++    connector = object.__new__(connector_module.PleOffloadConnector)
++    connector.tp_rank = 0
++    connector.pp_rank = 0
++    connector.dp_rank = 0
++    connector._progress = SimpleNamespace(sequence=7)
++    connector._dropped_events = []
++    connector._d2h_event_pool = queue.Queue(maxsize=1)
++    event = Mock()
++    connector._d2h_event_pool.put_nowait(event)
++    connector._request_queue = Mock()
++    connector._enqueue_cuda_inputs = Mock()
++
++    connector._launch(num_reqs=1, num_tokens=2)
++    assert connector._dropped_events == [event]
++    connector._request_queue.put_nowait.assert_not_called()
++
++    with pytest.raises(
++        RuntimeError,
++        match="more requests than configured concurrent batches",
++    ):
++        connector._launch(num_reqs=1, num_tokens=2)
++
++
++def test_async_output_cut_uses_real_sample_boundary(monkeypatch, tmp_path):
++    import vllm.v1.worker.gpu.model_runner as model_runner_module
++
++    spec = _spec(
++        monkeypatch,
++        tmp_path,
++        "cut=exc_async_output,ordinal=1,tp=0,pp=0",
++    )
++    monkeypatch.setattr(model_runner_module, "_FAULT", spec)
++
++    class FatalReached(Exception):
++        pass
++
++    connector = SimpleNamespace(
++        tp_rank=0,
++        pp_rank=0,
++        has_pending_completions=True,
++        _progress=SimpleNamespace(sequence=11),
++        _fail_closed=Mock(side_effect=FatalReached),
++    )
++    runner = object.__new__(model_runner_module.GPUModelRunner)
++    runner._ple_offload_connector = connector
++    runner.is_last_pp_rank = False
++    runner.pp_handler = Mock()
++    runner.execute_model_state = SimpleNamespace(
++        input_batch=object(),
++        attn_metadata=None,
++        slot_mappings_by_layer=None,
++        hidden_states=None,
++        aux_hidden_states=None,
++        dp_sync=None,
++        finished_req_ids=[],
++        ec_connector_output=None,
++        routed_experts=None,
++        cudagraph_stats=None,
++    )
++
++    with pytest.raises(FatalReached):
++        runner.sample_tokens(None)
++    assert connector._fail_closed.call_args.args[0] == "sample_tokens"
++    error = connector._fail_closed.call_args.args[1]
++    assert isinstance(error, RuntimeError)
++    assert "exc_async_output" in str(error)
+diff --git a/tests/v1/ple_offload/test_spawn_bootstrap_cuda.py b/tests/v1/ple_offload/test_spawn_bootstrap_cuda.py
+index ea8d1a390..d154c6649 100644
+--- a/tests/v1/ple_offload/test_spawn_bootstrap_cuda.py
++++ b/tests/v1/ple_offload/test_spawn_bootstrap_cuda.py
+@@ -174,7 +174,11 @@ def test_launch_payload_send_has_absolute_deadline() -> None:
+             process.terminate()
+             process.wait(timeout=5)
+     assert process.returncode == 0, stderr
+-    marker, elapsed = stdout.strip().split()
++    # Round 2 logs the send entry through vLLM's logger on stdout; read only
++    # the probe's own result line.
++    result = [line for line in stdout.splitlines() if line.startswith('TIMED_OUT ')]
++    assert len(result) == 1, stdout
++    marker, elapsed = result[0].split()
+     assert marker == "TIMED_OUT"
+     assert float(elapsed) < 5
+ 
+diff --git a/tests/v1/ple_offload/test_test_fault.py b/tests/v1/ple_offload/test_test_fault.py
+index 715d227a2..417fa521b 100644
+--- a/tests/v1/ple_offload/test_test_fault.py
++++ b/tests/v1/ple_offload/test_test_fault.py
+@@ -2,7 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
+ import contextlib
+-import importlib
++import os
+ import queue
+ import sys
+ from dataclasses import FrozenInstanceError
+@@ -14,11 +14,12 @@ import pytest
+ 
+ 
+ @pytest.fixture
+-def fault_module(monkeypatch):
++def fault_module(monkeypatch, tmp_path):
+     monkeypatch.delenv("VLLM_PLE_TEST_FAULT", raising=False)
+-    import vllm.v1.ple_offload.test_fault as test_fault
++    monkeypatch.setenv("VLLM_PLE_TEST_FAULT_LOG", str(tmp_path / "fault.log"))
++    import vllm_ple_test_fault as test_fault
+ 
+-    return importlib.reload(test_fault)
++    return test_fault
+ 
+ 
+ def test_disarmed_import_is_none(fault_module):
+@@ -31,7 +32,7 @@ def test_disarmed_import_is_none(fault_module):
+         "cut=exc_before_prepare,ordinal=60,rank=any",
+         "cut=exc_after_prepare,ordinal=2,tp=1",
+         "cut=exc_in_release,ordinal=3,pp=0",
+-        "cut=park_before_publish,ordinal=4,tp=1,pp=0,phase=any",
++        "cut=park_before_publish,ordinal=4,rank=any,phase=any",
+     ],
+ )
+ def test_valid_specs(fault_module, value):
+@@ -68,31 +69,34 @@ def test_one_shot_rank_phase_and_ordinal(fault_module, monkeypatch):
+     )
+     assert spec is not None
+ 
+-    writes = []
+-    monkeypatch.setattr(fault_module.os, "set_blocking", Mock())
+-    monkeypatch.setattr(
+-        fault_module.os,
+-        "write",
+-        lambda fd, data: writes.append((fd, data)) or len(data),
+-    )
+     monkeypatch.setattr(fault_module.os, "getpid", lambda: 123)
++    monkeypatch.setattr(fault_module.time, "monotonic", lambda: 12.5)
+     monkeypatch.setattr(fault_module.time, "time", lambda: 456.25)
+ 
+-    assert not spec.fires("other", tp_rank=1, pp_rank=0)
+-    assert not spec.fires("exc_after_prepare", tp_rank=0, pp_rank=0)
+-    assert not spec.fires(
+-        "exc_after_prepare", tp_rank=1, pp_rank=0, serving=False
+-    )
+-    assert not spec.fires("exc_after_prepare", tp_rank=1, pp_rank=0)
+-    assert spec.fires("exc_after_prepare", tp_rank=1, pp_rank=0)
+-    assert not spec.fires("exc_after_prepare", tp_rank=1, pp_rank=0)
+-    assert writes == [
+-        (
+-            2,
+-            b"PLE TEST FAULT FIRING cut=exc_after_prepare ordinal=2 "
+-            b"rank=tp1/pp0 pid=123 t=456.25\n",
++    def fires(cut, tp_rank=1, eligible=True):
++        return spec.fires(
++            cut,
++            role="gpu",
++            unit="runner-forward",
++            eligible=eligible,
++            tp_rank=tp_rank,
++            pp_rank=0,
++            transaction_id="sequence:9",
+         )
+-    ]
++
++    assert not fires("other")
++    assert not fires("exc_after_prepare", tp_rank=0)
++    assert not fires("exc_after_prepare", eligible=False)
++    assert not fires("exc_after_prepare")
++    assert fires("exc_after_prepare")
++    assert not fires("exc_after_prepare")
++    line = Path(os.environ["VLLM_PLE_TEST_FAULT_LOG"]).read_text()
++    assert line == (
++        "PLE TEST FAULT FIRING cut=exc_after_prepare ordinal=2 count=2 "
++        "unit=runner-forward role=gpu tp=1 pp=0 pid=123 "
++        "monotonic=12.500000000 wall=456.250000000 "
++        "transaction=sequence:9\n"
++    )
+     with pytest.raises(FrozenInstanceError):
+         spec.ordinal = 3
+ 
+@@ -111,6 +115,7 @@ def test_disarmed_connector_sites_continue(fault_module, monkeypatch):
+     event = Mock()
+     connector._d2h_event_pool.put_nowait(event)
+     connector._request_queue = Mock()
++    connector._progress = SimpleNamespace(sequence=0)
+     connector._enqueue_cuda_inputs = Mock()
+ 
+     connector._launch(num_reqs=1, num_tokens=2)
+@@ -120,6 +125,8 @@ def test_disarmed_connector_sites_continue(fault_module, monkeypatch):
+     staged = connector_module._PendingPleOffloadRequest(
+         connector_module.PleOffloadRequest(dp_rank=0, num_tokens=2, num_reqs=1),
+         event,
++        True,
++        "sequence:0",
+     )
+     socket = Mock()
+     monkeypatch.setattr(
+@@ -172,6 +179,7 @@ def test_disarmed_worker_park_site_continues(fault_module, monkeypatch):
+     runner._layers = {}
+     runner._clamp_input_ids = False
+     runner._step = 0
++    runner._request_index = 0
+     request = SimpleNamespace(dp_rank=0)
+ 
+     runner._handle_requests_impl([request])
+@@ -184,12 +192,19 @@ def test_all_injection_sites_use_the_disarmed_short_circuit():
+     expected = {
+         "vllm/v1/ple_offload/connector.py": 3,
+         "vllm/v1/ple_offload/worker.py": 1,
+-        "vllm/v1/worker/gpu/model_runner.py": 3,
+-        "vllm_ple_offload_bootstrap/__init__.py": 3,
++        "vllm/v1/worker/gpu/model_runner.py": 4,
++        "vllm_ple_offload_bootstrap/__init__.py": 1,
+     }
+-    needle = "if _FAULT is not None and _FAULT.fires("
+     for relative, count in expected.items():
+-        assert (root / relative).read_text(encoding="utf-8").count(needle) == count
++        lines = (root / relative).read_text(encoding="utf-8").splitlines()
++        sites = [i for i, line in enumerate(lines) if "_FAULT.fires(" in line]
++        assert len(sites) == count, relative
++        for i in sites:
++            window = "\n".join(lines[max(0, i - 3): i + 1])
++            # The None check must precede fires() in the same condition, so a
++            # disarmed process never calls into the fault module.
++            assert "_FAULT is not None" in window, (relative, i + 1)
++            assert window.index("_FAULT is not None") < window.index("_FAULT.fires("), (relative, i + 1)
+ 
+ 
+ class _FatalReached(Exception):
+@@ -231,15 +246,19 @@ def test_exc_in_release_reaches_real_connector_fatal_wrapper(
+     sys.platform == "win32",
+     reason="production PLE launcher requires POSIX pass_fds",
+ )
++@pytest.mark.parametrize("cut", ["launch_partial_ready", "launch_partial_ready_header"])
+ def test_partial_ready_times_out_and_terminates_production_child(
+     monkeypatch,
++    tmp_path,
++    cut,
+ ):
+     import vllm.v1.ple_offload.worker as worker_module
+ 
+     monkeypatch.setenv(
+         "VLLM_PLE_TEST_FAULT",
+-        "cut=launch_partial_ready,ordinal=1,rank=any",
++        f"cut={cut},ordinal=1,rank=any",
+     )
++    monkeypatch.setenv("VLLM_PLE_TEST_FAULT_LOG", str(tmp_path / "fault.log"))
+     monkeypatch.setattr(
+         worker_module.envs,
+         "VLLM_PLE_OFFLOAD_READY_TIMEOUT",
+diff --git a/vllm/v1/ple_offload/connector.py b/vllm/v1/ple_offload/connector.py
+index 33afcb989..5fdf9559e 100644
+--- a/vllm/v1/ple_offload/connector.py
++++ b/vllm/v1/ple_offload/connector.py
+@@ -29,8 +29,8 @@ from vllm.v1.ple_offload.protocol import (
+     PleOffloadRegistration,
+     PleOffloadRequest,
+ )
+-from vllm.v1.ple_offload.test_fault import _FAULT
+ from vllm.v1.utils import record_function_or_nullcontext
++from vllm_ple_test_fault import _FAULT
+ 
+ logger = init_logger(__name__)
+ 
+@@ -46,6 +46,8 @@ class _PendingPleOffloadRequest:
+ 
+     request: PleOffloadRequest
+     d2h_done_event: torch.cuda.Event
++    eligible: bool
++    transaction_id: str
+ 
+ 
+ def _cuda_check(result: Any, operation: str) -> Any:
+@@ -136,6 +138,7 @@ class PleOffloadConnector:
+         self._request_queue: queue.Queue[_PendingPleOffloadRequest | None] = (
+             queue.Queue(maxsize=vllm_config.max_concurrent_batches)
+         )
++        self._dropped_events: list[torch.cuda.Event] = []
+         self._request_thread: threading.Thread | None = None
+         self._request_thread_ready = threading.Event()
+         self._zmq_ctx: zmq.Context | None = None
+@@ -383,8 +386,12 @@ class PleOffloadConnector:
+         assert event_pool is not None, "PLE D2H event pool is not initialized"
+         if _FAULT is not None and _FAULT.fires(
+             "block_input_completion",
++            role="gpu",
++            unit="connector-request",
++            eligible=pending.eligible,
+             tp_rank=self.tp_rank,
+             pp_rank=self.pp_rank,
++            transaction_id=pending.transaction_id,
+         ):
+             threading.Event().wait()
+ 
+@@ -477,16 +484,27 @@ class PleOffloadConnector:
+                 "PLE has more requests than configured concurrent batches"
+             ) from exc
+         self._enqueue_cuda_inputs(request, d2h_done_event)
++        transaction_id = f"sequence:{self._progress.sequence}"
+         if _FAULT is not None and _FAULT.fires(
+             "drop_request",
++            role="gpu",
++            unit="connector-request",
++            eligible=True,
+             tp_rank=self.tp_rank,
+             pp_rank=self.pp_rank,
++            transaction_id=transaction_id,
+         ):
+             # Deliberately retain the event: the fault is loss after D2H, not
+             # premature event-pool reuse while that D2H may still be in flight.
++            self._dropped_events.append(d2h_done_event)
+             return
+         self._request_queue.put_nowait(
+-            _PendingPleOffloadRequest(request, d2h_done_event)
++            _PendingPleOffloadRequest(
++                request,
++                d2h_done_event,
++                eligible=True,
++                transaction_id=transaction_id,
++            )
+         )
+ 
+     def _fail_closed(self, where: str, error: BaseException) -> None:
+@@ -594,9 +612,12 @@ class PleOffloadConnector:
+         """Mark GPU output buffers reusable after the model consumes them."""
+         if _FAULT is not None and _FAULT.fires(
+             "exc_in_release",
++            role="gpu",
++            unit="connector-release",
++            eligible=not self._after_dummy,
+             tp_rank=self.tp_rank,
+             pp_rank=self.pp_rank,
+-            serving=not self._after_dummy,
++            transaction_id=f"sequence:{self._progress.sequence}",
+         ):
+             raise RuntimeError("PLE test fault: exc_in_release")
+         n = getattr(self, "_rowdump_n", None)
+diff --git a/vllm/v1/ple_offload/fatal.py b/vllm/v1/ple_offload/fatal.py
+index 75714df52..5bd82589e 100644
+--- a/vllm/v1/ple_offload/fatal.py
++++ b/vllm/v1/ple_offload/fatal.py
+@@ -4,6 +4,7 @@
+ 
+ import functools
+ import os
++import time
+ from collections.abc import Callable
+ from typing import Any, NoReturn, TypeVar
+ 
+@@ -20,7 +21,6 @@ def ple_fail_closed(
+ ) -> NoReturn:
+     """Emit one best-effort nonblocking diagnostic and terminate immediately."""
+     try:
+-        os.set_blocking(2, False)
+         error_type = type(error)
+         error_name = type.__getattribute__(error_type, "__name__")
+         detail_suffix = ""
+@@ -41,9 +41,19 @@ def ple_fail_closed(
+                 detail_suffix = f":{detail}"
+         message = (
+             f"PLE fatal: where={where} rank={rank} layer={layer} "
+-            f"sequence={sequence} error={error_name}{detail_suffix}\n"
++            f"sequence={sequence} error={error_name}{detail_suffix} "
++            f"monotonic={time.monotonic():.9f} wall={time.time():.9f}\n"
+         )
+-        os.write(2, message.encode("utf-8", "backslashreplace")[:2048])
++        # Opening procfs creates an independent file description, so O_NONBLOCK
++        # does not change fd 2 or descriptors inherited from it.
++        diagnostic_fd = os.open(
++            "/proc/self/fd/2",
++            os.O_WRONLY | os.O_NONBLOCK,
++        )
++        try:
++            os.write(diagnostic_fd, message.encode("utf-8", "backslashreplace")[:2048])
++        finally:
++            os.close(diagnostic_fd)
+     except BaseException:
+         pass
+     os._exit(1)
+@@ -68,6 +78,6 @@ def fail_ple_execute_model(func: _F) -> _F:
+                 )
+             if connector is None:
+                 raise
+-            connector._fail_closed("execute_model", error)
++            connector._fail_closed(func.__name__, error)
+ 
+     return wrapped  # type: ignore[return-value]
+diff --git a/vllm/v1/ple_offload/test_fault.py b/vllm/v1/ple_offload/test_fault.py
+index 3b53a4b6c..9041b8928 100644
+--- a/vllm/v1/ple_offload/test_fault.py
++++ b/vllm/v1/ple_offload/test_fault.py
+@@ -156,13 +156,11 @@ def _parse_fault_spec(value: str | None) -> FaultSpec | None:
+     if phase not in {"serving", "any"}:
+         raise ValueError(f"{_ENV_NAME}: phase must be 'serving' or 'any'")
+ 
+-    return FaultSpec(
+-        cut=cut,
+-        ordinal=ordinal,
+-        tp_rank=tp_rank,
+-        pp_rank=pp_rank,
+-        phase=phase,
+-    )
+-
+-
+-_FAULT = _parse_fault_spec(os.environ.get(_ENV_NAME))
++# Compatibility import for out-of-tree users of the round-1 module path.
++# Runtime sites and the bootstrap share the normally imported top-level
++# singleton; this module no longer parses the environment or owns state.
++from vllm_ple_test_fault import (  # noqa: E402,F401
++    FaultSpec as FaultSpec,
++    _FAULT as _FAULT,
++    _parse_fault_spec as _parse_fault_spec,
++)
+diff --git a/vllm/v1/ple_offload/worker.py b/vllm/v1/ple_offload/worker.py
+index 4d914aa66..913862f4c 100644
+--- a/vllm/v1/ple_offload/worker.py
++++ b/vllm/v1/ple_offload/worker.py
+@@ -70,8 +70,8 @@ from vllm.v1.ple_offload.protocol import (
+     PleOffloadRegistration,
+     PleOffloadRequest,
+ )
+-from vllm.v1.ple_offload.test_fault import _FAULT
+ from vllm.v1.utils import record_function_or_nullcontext
++from vllm_ple_test_fault import _FAULT
+ 
+ logger = init_logger(__name__)
+ 
+@@ -247,6 +247,12 @@ def _send_framed_payload(fd: int, payload: bytes, deadline: float) -> None:
+     """Send one launch payload without blocking beyond an absolute deadline."""
+     frame = memoryview(struct.pack("!Q", len(payload)) + payload)
+     offset = 0
++    logger.info(
++        "PLE launch payload send entered pid=%d bytes=%d monotonic=%.9f",
++        os.getpid(),
++        len(frame),
++        time.monotonic(),
++    )
+     os.set_blocking(fd, False)
+     try:
+         while offset < len(frame):
+@@ -473,12 +479,20 @@ class PleOffloadWorker:
+             launch_deadline=launch_deadline,
+         )
+         try:
++            launch_state = {
++                "vllm_config_payload": config_payload,
++                "num_workers": num_workers,
++                "ipc_addr": ipc_addr,
++            }
++            if (
++                _FAULT is not None
++                and _FAULT.cut == "launch_park_before_payload_read"
++            ):
++                # Larger than ordinary AF_UNIX socket buffers: an acknowledged
++                # non-reading child leaves the parent inside framed transmission.
++                launch_state["_test_padding"] = b"\0" * (8 << 20)
+             launch_payload = pickle.dumps(
+-                {
+-                    "vllm_config_payload": config_payload,
+-                    "num_workers": num_workers,
+-                    "ipc_addr": ipc_addr,
+-                },
++                launch_state,
+                 protocol=pickle.HIGHEST_PROTOCOL,
+             )
+             _send_framed_payload(
+@@ -650,6 +664,7 @@ class PleOffloadRunner:
+         self._scratch_bufs: dict[int, dict[str, torch.Tensor]] = {}
+         self._shutdown_event: threading.Event | None = None
+         self._step = 0  # number of handled request batches (diagnostics)
++        self._request_index = 0
+         # Shared-memory inputs are registered once per DP rank by TP rank zero.
+         self._input_bufs: dict[int, PleOffloadInputBuffers] = {}
+         self._load_weights()
+@@ -1039,13 +1054,18 @@ class PleOffloadRunner:
+             requests_by_dp[request.dp_rank] = request
+         self._step += 1
+         for request in requests_by_dp.values():
+-            if _FAULT is not None and _FAULT.fires(
+-                "park_before_publish",
+-                tp_rank=0,
+-                pp_rank=0,
+-            ):
+-                # No multiprocessing lock is held here.
+-                threading.Event().wait()
++            self._request_index += 1
++            for cut in ("park_before_publish", "park_before_publish_ack"):
++                if _FAULT is not None and _FAULT.fires(
++                    cut,
++                    role="offload",
++                    unit="offload-request",
++                    eligible=True,
++                    transaction_id=f"request:{self._request_index}",
++                ):
++                    # Validation and request draining are complete. No
++                    # multiprocessing or fault-state lock is held while parked.
++                    threading.Event().wait()
+ 
+         # Speculative placeholders are not vocabulary IDs. Normalize each DP
+         # input once before all PLE layers consume the shared buffer.
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 256b72845..1722aafc0 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -1868,17 +1868,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         if connector is not None:
+             if _FAULT is not None and _FAULT.fires(
+                 "exc_before_prepare",
++                role="gpu",
++                unit="runner-forward",
++                eligible=not dummy_run and not is_profile,
+                 tp_rank=connector.tp_rank,
+                 pp_rank=connector.pp_rank,
+-                serving=not dummy_run and not is_profile,
+             ):
+                 raise RuntimeError("PLE test fault: exc_before_prepare")
+             self._prepare_ple_forward(input_batch, batch_desc, dummy_run)
+             if _FAULT is not None and _FAULT.fires(
+                 "exc_after_prepare",
++                role="gpu",
++                unit="runner-forward",
++                eligible=not dummy_run and not is_profile,
+                 tp_rank=connector.tp_rank,
+                 pp_rank=connector.pp_rank,
+-                serving=not dummy_run and not is_profile,
++                transaction_id=f"sequence:{connector._progress.sequence}",
+             ):
+                 raise RuntimeError("PLE test fault: exc_after_prepare")
+ 
+@@ -1936,9 +1941,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             connector.release_outputs()
+             if _FAULT is not None and _FAULT.fires(
+                 "exc_after_release",
++                role="gpu",
++                unit="runner-forward",
++                eligible=not dummy_run and not is_profile,
+                 tp_rank=connector.tp_rank,
+                 pp_rank=connector.pp_rank,
+-                serving=not dummy_run and not is_profile,
++                transaction_id=f"sequence:{connector._progress.sequence}",
+             ):
+                 raise RuntimeError("PLE test fault: exc_after_release")
+ 
+@@ -1985,6 +1993,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             )
+         return None
+ 
++    @fail_ple_execute_model
+     @torch.inference_mode()
+     @step_eplb_after()
+     def sample_tokens(
+@@ -2011,6 +2020,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             # IntermediateTensors instead of final hidden states. Receive the
+             # sampled tokens broadcast from the last rank and update local state.
+             assert self.pp_handler is not None
++            connector = self._ple_offload_connector
++            if (
++                connector is not None
++                and _FAULT is not None
++                and connector.has_pending_completions
++                and _FAULT.fires(
++                    "exc_async_output",
++                    role="gpu",
++                    unit="runner-output-relay",
++                    eligible=True,
++                    tp_rank=connector.tp_rank,
++                    pp_rank=connector.pp_rank,
++                    transaction_id=f"sequence:{connector._progress.sequence}",
++                )
++            ):
++                raise RuntimeError("PLE test fault: exc_async_output")
+             all_decode_next = self.pp_handler.receive(input_batch)
+             # Optimistically update num_computed_tokens for entire batch here.
+             # Will be adjusted for rejections if necessary in update_requests.
+diff --git a/vllm_ple_offload_bootstrap/__init__.py b/vllm_ple_offload_bootstrap/__init__.py
+index 115cfadba..ec5e5b551 100644
+--- a/vllm_ple_offload_bootstrap/__init__.py
++++ b/vllm_ple_offload_bootstrap/__init__.py
+@@ -2,36 +2,16 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """Minimal PLE child bootstrap; intentionally imports no torch or vLLM."""
+ 
+-import importlib.util
+ import os
+ import pickle
+ import struct
+ import sys
+ import threading
+ from multiprocessing.connection import Connection
+-from pathlib import Path
+-
+-
+-def _load_test_fault():
+-    """Load the stdlib-only hook before importing the vLLM package."""
+-    module_name = "vllm.v1.ple_offload.test_fault"
+-    loaded = sys.modules.get(module_name)
+-    if loaded is not None:
+-        return loaded
+-    module_path = (
+-        Path(__file__).resolve().parent.parent
+-        / "vllm"
+-        / "v1"
+-        / "ple_offload"
+-        / "test_fault.py"
+-    )
+-    spec = importlib.util.spec_from_file_location(module_name, module_path)
+-    if spec is None or spec.loader is None:
+-        raise RuntimeError("cannot load the PLE test-fault module")
+-    module = importlib.util.module_from_spec(spec)
+-    sys.modules[module_name] = module
+-    spec.loader.exec_module(module)
+-    return module
++
++_FAULT = None
++if os.environ.get("VLLM_PLE_TEST_FAULT") is not None:
++    from vllm_ple_test_fault import _FAULT as _FAULT
+ 
+ 
+ def _send_partial_ready_frame(fd: int) -> None:
+@@ -48,7 +28,14 @@ def _send_partial_ready_frame(fd: int) -> None:
+         fragment = fragment[written:]
+ 
+ 
+-_FAULT = _load_test_fault()._FAULT
++def _send_partial_ready_header(fd: int) -> None:
++    """Write fewer than the four bytes required for a Connection header."""
++    fragment = memoryview(struct.pack("!i", 1)[:2])
++    while fragment:
++        written = os.write(fd, fragment)
++        if written <= 0:
++            raise BrokenPipeError("PLE READY control socket closed")
++        fragment = fragment[written:]
+ 
+ 
+ def _read_exact(fd: int, size: int) -> bytes:
+@@ -69,6 +56,31 @@ def _recv_launch_payload(fd: int) -> dict:
+     return payload
+ 
+ 
++def _fires(cut: str) -> bool:
++    return _FAULT is not None and _FAULT.fires(
++        cut,
++        role="bootstrap",
++        unit="bootstrap-launch",
++        eligible=True,
++        transaction_id="launch:1",
++    )
++
++
++def _block_on_harness_gate() -> None:
++    """Block in a GIL-releasing FIFO read while the death monitor remains runnable."""
++    path = os.environ.get("VLLM_PLE_TEST_FAULT_GATE")
++    if path is None or not path:
++        raise RuntimeError(
++            "VLLM_PLE_TEST_FAULT_GATE is required for this bootstrap cut"
++        )
++    fd = os.open(path, os.O_RDONLY)
++    try:
++        if os.read(fd, 1) == b"":
++            raise EOFError("PLE bootstrap fault gate closed")
++    finally:
++        os.close(fd)
++
++
+ def main() -> None:
+     """Receive launch state before importing torch or vLLM."""
+     if len(sys.argv) != 3:
+@@ -100,36 +112,32 @@ def main() -> None:
+         name="PleOffloadBootstrapDeathMonitor",
+     ).start()
+ 
+-    if _FAULT is not None and _FAULT.fires(
+-        "launch_park_before_payload_read",
+-        tp_rank=0,
+-        pp_rank=0,
+-    ):
++    if _fires("launch_park_before_payload_read"):
+         threading.Event().wait()
+ 
+     payload = _recv_launch_payload(control_fd)
+ 
+-    if _FAULT is not None and _FAULT.fires(
+-        "launch_partial_ready",
+-        tp_rank=0,
+-        pp_rank=0,
+-    ):
++    if _fires("launch_partial_ready"):
+         _send_partial_ready_frame(control_fd)
+         threading.Event().wait()
+ 
+-    if _FAULT is not None and _FAULT.fires(
+-        "launch_silent_ready",
+-        tp_rank=0,
+-        pp_rank=0,
+-    ):
++    if _fires("launch_partial_ready_header"):
++        _send_partial_ready_header(control_fd)
++        threading.Event().wait()
++
++    if _fires("launch_silent_ready"):
+         threading.Event().wait()
+ 
+     ready_pipe = Connection(control_fd)
+ 
+     # The environment was supplied by Popen and was visible before interpreter
+     # startup. Parent-death supervision is already active before this unpickle.
++    if _fires("launch_block_reconstruction"):
++        _block_on_harness_gate()
+     vllm_config = pickle.loads(payload["vllm_config_payload"])
+ 
++    if _fires("launch_block_worker_import"):
++        _block_on_harness_gate()
+     from vllm.v1.ple_offload.worker import PleOffloadWorker
+ 
+     PleOffloadWorker.proc_main(
+diff --git a/vllm_ple_test_fault/__init__.py b/vllm_ple_test_fault/__init__.py
+new file mode 100644
+index 000000000..8baec4206
+--- /dev/null
++++ b/vllm_ple_test_fault/__init__.py
+@@ -0,0 +1,249 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Stdlib-only, test-only PLE fault injection.
++
++This package intentionally lives outside ``vllm`` so the offload bootstrap can
++import the same singleton without pre-populating part of the vLLM package tree.
++"""
++
++import os
++import re
++import threading
++import time
++from dataclasses import dataclass, field
++
++_ENV_NAME = "VLLM_PLE_TEST_FAULT"
++_LOG_ENV_NAME = "VLLM_PLE_TEST_FAULT_LOG"
++_UINT_RE = re.compile(r"(?:0|[1-9][0-9]*)\Z")
++_POSITIVE_INT_RE = re.compile(r"[1-9][0-9]*\Z")
++
++# cut -> (role, counting unit, TP0-only)
++_CUT_META = {
++    "exc_before_prepare": ("gpu", "runner-forward", False),
++    "exc_after_prepare": ("gpu", "runner-forward", False),
++    "exc_in_release": ("gpu", "connector-release", False),
++    "exc_after_release": ("gpu", "runner-forward", False),
++    "exc_async_output": ("gpu", "runner-output-relay", False),
++    "drop_request": ("gpu", "connector-request", True),
++    "block_input_completion": ("gpu", "connector-request", True),
++    "park_before_publish": ("offload", "offload-request", False),
++    "park_before_publish_ack": ("offload", "offload-request", False),
++    "launch_park_before_payload_read": (
++        "bootstrap",
++        "bootstrap-launch",
++        False,
++    ),
++    "launch_partial_ready": ("bootstrap", "bootstrap-launch", False),
++    "launch_partial_ready_header": (
++        "bootstrap",
++        "bootstrap-launch",
++        False,
++    ),
++    "launch_silent_ready": ("bootstrap", "bootstrap-launch", False),
++    "launch_block_reconstruction": (
++        "bootstrap",
++        "bootstrap-launch",
++        False,
++    ),
++    "launch_block_worker_import": (
++        "bootstrap",
++        "bootstrap-launch",
++        False,
++    ),
++}
++
++
++@dataclass
++class _FaultState:
++    count: int = 0
++    fired: bool = False
++    diagnostic_failed: bool = False
++    lock: threading.Lock = field(default_factory=threading.Lock)
++
++
++@dataclass(frozen=True)
++class FaultSpec:
++    """Immutable fault selection with process-local one-shot runtime state."""
++
++    cut: str
++    ordinal: int
++    tp_rank: int | None
++    pp_rank: int | None
++    phase: str
++    role: str
++    unit: str
++    log_fd: int = field(compare=False, repr=False)
++    _state: _FaultState = field(
++        default_factory=_FaultState,
++        compare=False,
++        repr=False,
++    )
++
++    def fires(
++        self,
++        cut: str,
++        *,
++        role: str,
++        unit: str,
++        eligible: bool,
++        tp_rank: int | None = None,
++        pp_rank: int | None = None,
++        transaction_id: str | int | None = None,
++    ) -> bool:
++        """Record one eligible unit and return true only after a complete marker."""
++        if cut != self.cut or role != self.role or unit != self.unit:
++            return False
++        if not eligible and self.phase != "any":
++            return False
++        if self.role == "gpu":
++            if tp_rank is None or pp_rank is None:
++                raise ValueError("GPU fault sites must provide TP and PP ranks")
++            if self.tp_rank is not None and tp_rank != self.tp_rank:
++                return False
++            if self.pp_rank is not None and pp_rank != self.pp_rank:
++                return False
++        elif tp_rank is not None or pp_rank is not None:
++            raise ValueError(f"{self.role} fault sites must not provide GPU ranks")
++
++        with self._state.lock:
++            if self._state.fired or self._state.diagnostic_failed:
++                return False
++            self._state.count += 1
++            count = self._state.count
++            if count != self.ordinal:
++                return False
++
++            rank_fields = ""
++            if self.role == "gpu":
++                rank_fields = f" tp={tp_rank} pp={pp_rank}"
++            transaction = ""
++            if transaction_id is not None:
++                clean_transaction = str(transaction_id).replace(
++                    "\n", "\\n"
++                ).replace(" ", "_")
++                transaction = f" transaction={clean_transaction[:160]}"
++            message = (
++                f"PLE TEST FAULT FIRING cut={self.cut} ordinal={self.ordinal} "
++                f"count={count} unit={self.unit} role={self.role}{rank_fields} "
++                f"pid={os.getpid()} monotonic={time.monotonic():.9f} "
++                f"wall={time.time():.9f}{transaction}\n"
++            ).encode("ascii", "backslashreplace")
++
++            try:
++                written = os.write(self.log_fd, message)
++            except BaseException:
++                self._state.diagnostic_failed = True
++                return False
++            if written != len(message):
++                self._state.diagnostic_failed = True
++                return False
++            self._state.fired = True
++            return True
++
++
++def _parse_uint(value: str, name: str, *, positive: bool = False) -> int:
++    pattern = _POSITIVE_INT_RE if positive else _UINT_RE
++    if pattern.fullmatch(value) is None:
++        requirement = "a positive integer" if positive else "a non-negative integer"
++        raise ValueError(f"{_ENV_NAME}: {name} must be {requirement}")
++    return int(value)
++
++
++def _open_fault_log() -> int:
++    path = os.environ.get(_LOG_ENV_NAME)
++    if path is None or not path or path != path.strip():
++        raise ValueError(
++            f"{_LOG_ENV_NAME} is required and must be a non-empty path "
++            f"when {_ENV_NAME} is armed"
++        )
++    flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NONBLOCK
++    try:
++        return os.open(path, flags, 0o600)
++    except OSError as error:
++        raise ValueError(f"{_LOG_ENV_NAME}: cannot open {path!r}") from error
++
++
++def _parse_fault_spec(value: str | None) -> FaultSpec | None:
++    """Strictly parse the environment representation."""
++    if value is None:
++        return None
++    if not value or value != value.strip():
++        raise ValueError(f"{_ENV_NAME}: spec must be non-empty with no outer whitespace")
++
++    fields: dict[str, str] = {}
++    for item in value.split(","):
++        if item.count("=") != 1:
++            raise ValueError(f"{_ENV_NAME}: every field must be key=value")
++        key, field_value = item.split("=", 1)
++        if (
++            not key
++            or not field_value
++            or key != key.strip()
++            or field_value != field_value.strip()
++        ):
++            raise ValueError(f"{_ENV_NAME}: fields must not contain whitespace")
++        if key in fields:
++            raise ValueError(f"{_ENV_NAME}: duplicate field {key!r}")
++        fields[key] = field_value
++
++    allowed = {"cut", "ordinal", "rank", "tp", "pp", "phase"}
++    unknown = set(fields).difference(allowed)
++    if unknown:
++        raise ValueError(f"{_ENV_NAME}: unknown field(s): {sorted(unknown)}")
++    missing = {"cut", "ordinal"}.difference(fields)
++    if missing:
++        raise ValueError(f"{_ENV_NAME}: missing field(s): {sorted(missing)}")
++
++    cut = fields["cut"]
++    if cut not in _CUT_META:
++        raise ValueError(f"{_ENV_NAME}: unknown cut {cut!r}")
++    ordinal = _parse_uint(fields["ordinal"], "ordinal", positive=True)
++    role, unit, tp0_only = _CUT_META[cut]
++
++    has_any_rank = "rank" in fields
++    has_specific_rank = "tp" in fields or "pp" in fields
++    if has_any_rank:
++        if fields["rank"] != "any":
++            raise ValueError(f"{_ENV_NAME}: rank must be exactly 'any'")
++        if has_specific_rank:
++            raise ValueError(f"{_ENV_NAME}: rank=any cannot be combined with tp or pp")
++        tp_rank = None
++        pp_rank = None
++    else:
++        if not has_specific_rank:
++            raise ValueError(f"{_ENV_NAME}: specify rank=any, tp, or pp")
++        tp_rank = _parse_uint(fields["tp"], "tp") if "tp" in fields else None
++        pp_rank = _parse_uint(fields["pp"], "pp") if "pp" in fields else None
++
++    if role in {"offload", "bootstrap"} and not has_any_rank:
++        raise ValueError(
++            f"{_ENV_NAME}: {role} cut {cut!r} requires rank=any; "
++            "it has no TP/PP rank"
++        )
++    if role == "gpu":
++        if pp_rank is not None and pp_rank != 0:
++            raise ValueError(
++                f"{_ENV_NAME}: cut {cut!r} exists only on PP rank zero"
++            )
++        if tp0_only and tp_rank is not None and tp_rank != 0:
++            raise ValueError(
++                f"{_ENV_NAME}: cut {cut!r} exists only on TP rank zero"
++            )
++
++    phase = fields.get("phase", "serving")
++    if phase not in {"serving", "any"}:
++        raise ValueError(f"{_ENV_NAME}: phase must be 'serving' or 'any'")
++
++    return FaultSpec(
++        cut=cut,
++        ordinal=ordinal,
++        tp_rank=tp_rank,
++        pp_rank=pp_rank,
++        phase=phase,
++        role=role,
++        unit=unit,
++        log_fd=_open_fault_log(),
++    )
++
++
++_FAULT = _parse_fault_spec(os.environ.get(_ENV_NAME))
+-- 
+2.47.3
+

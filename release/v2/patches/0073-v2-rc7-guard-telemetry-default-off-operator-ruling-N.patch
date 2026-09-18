@@ -1,0 +1,66 @@
+From 2b1685e68719c48628492aa18a1225a0278e86ee Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Thu, 17 Sep 2026 07:25:24 +0000
+Subject: [PATCH 73/76] v2-rc7: guard telemetry default off (operator ruling
+ N1, 2026-09-17)
+
+The rc3-instr guard reader thread and the QSA clip reader cost about 0.3 ms per
+decode step on TP2xPP2 (K3 round 1, D0 vs D1: ITL 19.0 -> 18.7 ms at 4K/32K).
+Default VLLM_E2_GUARD_MODE becomes off: the kernels still mask and count, no
+reader thread, nothing read -- including _ALWAYS_FATAL_SITES. Opt in with
+VLLM_E2_GUARD_MODE=warn for diagnosis. Round-11 default test updated.
+---
+ tests/v1/worker/gpu/test_guard_telemetry_round11.py | 2 +-
+ vllm/v1/worker/guard_telemetry.py                   | 9 ++++++---
+ 2 files changed, 7 insertions(+), 4 deletions(-)
+
+diff --git a/tests/v1/worker/gpu/test_guard_telemetry_round11.py b/tests/v1/worker/gpu/test_guard_telemetry_round11.py
+index 3de041f85..0c692625f 100644
+--- a/tests/v1/worker/gpu/test_guard_telemetry_round11.py
++++ b/tests/v1/worker/gpu/test_guard_telemetry_round11.py
+@@ -34,7 +34,7 @@ def _fresh(monkeypatch, **env):
+ 
+ def test_release_defaults_with_env_absent(monkeypatch):
+     gt = _fresh(monkeypatch)
+-    assert gt._MODE == "warn"
++    assert gt._MODE == "off"  # v2-rc7: default off (ruling N1)
+     assert gt._INTERVAL == pytest.approx(0.05)
+ 
+ 
+diff --git a/vllm/v1/worker/guard_telemetry.py b/vllm/v1/worker/guard_telemetry.py
+index 27efd0154..5fb4fae69 100644
+--- a/vllm/v1/worker/guard_telemetry.py
++++ b/vllm/v1/worker/guard_telemetry.py
+@@ -34,7 +34,7 @@ is still 0 means "nothing recorded", which is distinguishable from a recorded
+ module-level int is not readable from a @triton.jit body.
+ 
+ MODES -- VLLM_E2_GUARD_MODE:
+-  raise  (default) the reader logs and arms a flag; a LATER execute_model on
++  raise  the reader logs and arms a flag; a LATER execute_model on
+          the engine thread raises. Mirrors VLLM_RAISE_ON_LOGIT_NANS in intent:
+          a masked fault that silently returns a wrong answer is worse for a
+          serving product than a loud stop. Read check_pending below before
+@@ -44,7 +44,10 @@ MODES -- VLLM_E2_GUARD_MODE:
+          the raise whatever the mode says, because their masked value has
+          already been written somewhere durable. USE THIS FOR LONG STRESS
+          BOOTS.
+-  off    no reader thread. The kernels still mask and still count; nothing is
++  off    (DEFAULT since v2-rc7, operator ruling N1 2026-09-17: the reader thread
++         and the QSA clip reader cost ~0.3 ms per decode step on TP2xPP2; opt in
++         with VLLM_E2_GUARD_MODE=warn for diagnosis)
++         no reader thread. The kernels still mask and still count; nothing is
+          read -- INCLUDING the sites in _ALWAYS_FATAL_SITES. Use only when you
+          have decided you do not want the evidence.
+ 
+@@ -115,7 +118,7 @@ SITE_NAMES = {
+ # Release defaults (round 11, Astra final review finding 1): warn, 0.05 s.
+ # Rounds 1-10 shipped raise / 0.5 while every qualification boot set both
+ # variables explicitly, so the defaults were never the thing being tested.
+-_MODE = os.environ.get("VLLM_E2_GUARD_MODE", "warn").strip().lower()
++_MODE = os.environ.get("VLLM_E2_GUARD_MODE", "off").strip().lower()
+ if _MODE not in ("raise", "warn", "off"):
+     # fail closed: a set-but-broken gate must not silently disarm the instrument
+     raise ValueError(
+-- 
+2.47.3
+

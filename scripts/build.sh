@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Build the patched vLLM this repo serves with, from a pinned, hash-checked base.
+# v1 (TP4 lane) -- superseded by scripts/build-v2.sh; kept for the fallback entry (README, "v1, the TP4 lane").
+# Build the v1 patched vLLM from a pinned, hash-checked base.
 #
 #   scripts/build.sh [SRC_DIR] [VENV_DIR] [--no-csrc]
 #

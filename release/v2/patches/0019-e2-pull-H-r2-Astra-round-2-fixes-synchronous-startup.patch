@@ -1,0 +1,177 @@
+From cf58d100960f156f5213c9bc84d7825050de152e Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Fri, 11 Sep 2026 13:50:34 +0000
+Subject: [PATCH 19/76] e2-pull H r2: Astra round-2 fixes (synchronous startup
+ releases until the first real forward; mapped outputs/flags never
+ unregistered in-process; offload-death watchdog in the spawning GPU worker;
+ negative num_tokens rejected; producer checks the result shape before
+ publishing)
+
+---
+ .../layers/ple_offload_layer.py               |  2 +-
+ vllm/v1/ple_offload/connector.py              | 36 ++++++++++++++++++-
+ vllm/v1/ple_offload/worker.py                 |  9 +++++
+ vllm/v1/worker/gpu_worker.py                  | 32 +++++++++++++++++
+ 4 files changed, 77 insertions(+), 2 deletions(-)
+
+diff --git a/vllm/model_executor/layers/ple_offload_layer.py b/vllm/model_executor/layers/ple_offload_layer.py
+index 5313e10fe..ec551c083 100644
+--- a/vllm/model_executor/layers/ple_offload_layer.py
++++ b/vllm/model_executor/layers/ple_offload_layer.py
+@@ -223,7 +223,7 @@ def _ple_offload_wait_copy_impl(
+     num_tokens: int,
+ ) -> None:
+     """Wait for the host-side result, then DMA it into the GPU buffer."""
+-    if int(num_tokens) > gpu_output_buffer.shape[0] or int(row_bytes) != (
++    if not 0 <= int(num_tokens) <= gpu_output_buffer.shape[0] or int(row_bytes) != (
+         gpu_output_buffer.shape[1] * gpu_output_buffer.element_size()
+     ):
+         raise RuntimeError(
+diff --git a/vllm/v1/ple_offload/connector.py b/vllm/v1/ple_offload/connector.py
+index 5a2438d1c..6b836ed09 100644
+--- a/vllm/v1/ple_offload/connector.py
++++ b/vllm/v1/ple_offload/connector.py
+@@ -105,6 +105,14 @@ class PleOffloadConnector:
+         self._validate_input_sources()
+ 
+         self._pinned_input_buffers: list[torch.Tensor] = []
++        # Device-mapped host outputs/flags referenced by raw address from
++        # captured graphs: never unregistered while the process lives (Astra
++        # 09-11 R2 #2: unregistering under a pending graph wait unmaps it).
++        self._mapped_host_buffers: list[torch.Tensor] = []
++        # Until the first real forward, every release is synchronous, so each
++        # rank's final startup reset has EXECUTED before the executor's
++        # all-rank init barrier returns and serving can publish (R2 #1).
++        self._serving = False
+         self._request_queue: queue.Queue[_PendingPleOffloadRequest | None] = (
+             queue.Queue(maxsize=vllm_config.max_concurrent_batches)
+         )
+@@ -246,7 +254,10 @@ class PleOffloadConnector:
+             ),
+             "cuMemHostRegister(PLE host buffer)",
+         )
+-        self._pinned_input_buffers.append(buffer)
++        if device_map:
++            self._mapped_host_buffers.append(buffer)
++        else:
++            self._pinned_input_buffers.append(buffer)
+         if not buffer.is_pinned():
+             raise RuntimeError("CUDA did not page-lock a PLE host buffer")
+ 
+@@ -451,6 +462,14 @@ class PleOffloadConnector:
+         if dummy_run:
+             self.signal_dummy_outputs(num_tokens)
+             return
++        if not self._serving:
++            self._serving = True
++            logger.info(
++                "PleOffload: first real forward (dp_rank=%d, tp_rank=%d); "
++                "startup releases were synchronous",
++                self.dp_rank,
++                self.tp_rank,
++            )
+         self._launch(num_reqs, num_tokens)
+ 
+     def signal_dummy_outputs(self, num_tokens: int) -> None:
+@@ -469,6 +488,13 @@ class PleOffloadConnector:
+         stream = torch.cuda.current_stream(self.device)
+         for layer in self._layers.values():
+             layer.release_offloaded_output(stream)
++        # Startup only (profile, capture warm-ups, adaptive-verification dummy
++        # replays, capture cleanup): complete the reset before returning, so
++        # no startup reset can still be pending on this rank when another
++        # rank's first real request lets the offload publish (R2 #1). Never
++        # inside a stream capture.
++        if not self._serving and not torch.cuda.is_current_stream_capturing():
++            stream.synchronize()
+ 
+     def close(self) -> None:
+         """Stop request transport and release host registrations."""
+@@ -488,6 +514,14 @@ class PleOffloadConnector:
+         if self._pinned_input_buffers:
+             with torch.accelerator.device_index(self.device.index):
+                 self._unpin_input_buffers()
++        # Device-mapped outputs/flags stay registered until process exit:
++        # captured graphs hold their raw addresses and a graph may still be
++        # waiting on a flag; the driver releases them when the process ends.
++        if self._mapped_host_buffers:
++            logger.debug(
++                "PleOffload: %d device-mapped host buffers retained until exit",
++                len(self._mapped_host_buffers),
++            )
+         self._d2h_event_pool = None
+         if self._registration_socket is not None:
+             self._registration_socket.close(linger=0)
+diff --git a/vllm/v1/ple_offload/worker.py b/vllm/v1/ple_offload/worker.py
+index 06f6ad516..fcfb5ea61 100644
+--- a/vllm/v1/ple_offload/worker.py
++++ b/vllm/v1/ple_offload/worker.py
+@@ -758,6 +758,15 @@ class PleOffloadRunner:
+                 # released the previous result (``release_outputs`` stores
+                 # flag=0 on the model stream after the forward, which is also
+                 # after the in-graph DMA read it). Then write rows, then flag=1.
++                scratch = self._scratch_bufs[dp_rank][layer_name]
++                if result.dim() != 2 or result.shape[0] != request.num_tokens or (
++                    result.shape[1] != scratch.shape[1]
++                ):
++                    raise RuntimeError(
++                        f"PLE result {tuple(result.shape)} for {layer_name} does not "
++                        f"match the request ({request.num_tokens} rows x "
++                        f"{scratch.shape[1]}); refusing to publish (step {self._step})"
++                    )
+                 slices = tuple(slice(0, size) for size in result.shape)
+                 for target in targets:
+                     self._wait_flag_released(target, layer_name, dp_rank)
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index 318c7af30..96054e0c4 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -340,6 +340,37 @@ class Worker(WorkerBase):
+             num_workers,
+             ipc_addr,
+         )
++        self._start_ple_offload_watchdog()
++
++    def _start_ple_offload_watchdog(self) -> None:
++        """Fail this worker if the PLE offload process exits unexpectedly.
++
++        Host-mapped pull: a dead producer would leave the captured forward
++        waiting on its host flag forever; turn that into a fast, visible
++        engine failure instead of a hang. ``shutdown`` sets the stop marker
++        before closing the handle, so a normal close is not a failure.
++        """
++        import threading
++        from multiprocessing.connection import wait as mp_wait
++
++        handle = self._ple_offload_worker_handle
++        self._ple_offload_stopping = False
++
++        def watch() -> None:
++            mp_wait([handle.proc.sentinel])
++            if getattr(self, "_ple_offload_stopping", False):
++                return
++            logger.error(
++                "PLE offload process %s exited unexpectedly (exitcode %s); "
++                "failing this worker so the engine does not hang on a PLE wait",
++                handle.proc.pid,
++                handle.proc.exitcode,
++            )
++            os._exit(1)
++
++        threading.Thread(
++            target=watch, name="ple-offload-watchdog", daemon=True
++        ).start()
+ 
+     def wait_ple_offload_ready(self) -> None:
+         """Wait until weights and every TP registration are ready."""
+@@ -1591,6 +1622,7 @@ class Worker(WorkerBase):
+         self.elastic_ep_executor.shutdown()
+ 
+         if self._ple_offload_worker_handle is not None:
++            self._ple_offload_stopping = True
+             self._ple_offload_worker_handle.close()
+             self._ple_offload_worker_handle = None
+ 
+-- 
+2.47.3
+

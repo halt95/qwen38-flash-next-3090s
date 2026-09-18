@@ -1,0 +1,164 @@
+From 41f48e826a221811187b26d59ed31e653e550e5b Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Sat, 12 Sep 2026 05:29:54 +0000
+Subject: [PATCH 29/76] e2_memstats r5: boundary-only telemetry, no polling
+ inside a measured region
+
+The r2/r3 hook read memory_stats() and reset_peak_memory_stats() every VLLM_E2_MEMSTATS
+seconds. Both take the per-device caching-allocator mutex and the Python bindings do not
+release the GIL, so the preregistered claim that this thread takes no lock shared with the
+model path was false. Three one-boot arms at pin 4.1e9 showed a monotone dose-response:
+4 Hz wedged a stage-0 worker during A-think-131072, 1.1 Hz survived that row and wedged
+during A-think-260000, and with the thread disabled the run completed every row.
+Causation is not established at n=1 per arm, but polling has no place inside a measured
+region and was never necessary - PyTorch maintains the allocator high-water marks itself.
+
+Between boundaries the thread now makes NO CUDA call: its tick is a plain read of
+window.ctl. At a boundary, which the driver crosses only while the server is quiet, it
+does exactly one allocator interaction - memory_stats, reset_peak_memory_stats
+immediately after with no file I/O in the gap, then mem_get_info - and writes the close
+and ack records. No sample records exist any more, and the evaluator rejects any it sees.
+
+Declared loss of resolution: peaks are exact per ROW window, not per P3F interval.
+---
+ vllm/v1/worker/e2_memstats.py | 99 ++++++++++++++++++-----------------
+ 1 file changed, 51 insertions(+), 48 deletions(-)
+
+diff --git a/vllm/v1/worker/e2_memstats.py b/vllm/v1/worker/e2_memstats.py
+index 69ef951ce..a73cb6bb5 100644
+--- a/vllm/v1/worker/e2_memstats.py
++++ b/vllm/v1/worker/e2_memstats.py
+@@ -1,24 +1,36 @@
+ # SPDX-License-Identifier: Apache-2.0
+-"""Debug-only allocator telemetry for E2 gate 5, r2 (Astra R7-3, R7-4, R7-10). Off unless VLLM_E2_MEMSTATS=<sample
+-seconds> and VLLM_E2_MEMSTATS_DIR=<dir>.
+-
+-The worker starts it at the END of compile_or_warm_up_model, after warm-up and CUDA-graph capture (the V2 runner's
+-warm-up calls execute_model before capture, so execute_model is not a post-capture boundary).
+-
+-Peak counters are reset ONLY at acknowledged window boundaries, which the gate driver opens and closes while the
+-server is quiet (no request running): <dir>/window.ctl holds "<seq> <name>". On a new seq this thread reads the
+-counters one last time for the old window (its "close" record: the allocator high-water marks since the window
+-opened), resets the peak counters, and writes an "ack" record. Inside a window nothing is reset; at a boundary the
+-reset immediately follows that read, with no file I/O between them, and the driver crosses a boundary only while the
+-server is quiet, so no allocation peak of a measured row can be lost. Every "sample" line carries the high-water mark since its window opened
+-(monotone within a window), which localises when it was reached. Whole-run maxima are carried across windows.
+-Retry and OOM counters are cumulative and never reset. min_free_sampled is the minimum of sampled cudaMemGetInfo
+-values, not a continuous minimum.
+-
+-Records (one JSON per line): kind start | sample | close | ack | error; wall and monotonic times (samples: t0/t1,
+-m0/m1); rank, local, dev, pid; window, seq; alloc, res, alloc_peak_w, res_peak_w, retries, ooms, free, total,
+-run_alloc_peak, run_res_peak, min_free_sampled. No device synchronisation and no GPU allocation; each counter read or
+-reset takes the caching allocator's own mutex briefly, and records are written with synchronous file I/O.
++"""Debug-only allocator telemetry for E2, r4 BOUNDARY-ONLY. Off unless VLLM_E2_MEMSTATS=<ctl poll seconds> and
++VLLM_E2_MEMSTATS_DIR=<dir>.
++
++WHY THIS IS NOT A SAMPLER ANY MORE (2026-09-12). The r2/r3 version read torch.cuda.memory_stats() and
++reset_peak_memory_stats() every VLLM_E2_MEMSTATS seconds. Both take the per-device caching-allocator mutex and the
++Python bindings do not release the GIL, so the old contract's claim that this thread "takes no lock shared with the
++model path" was FALSE. Three one-boot arms at pin 4.1e9 showed a monotone dose-response: sampling at 4 Hz wedged a
++stage-0 worker during A-think-131072; at 1.1 Hz it survived that row and wedged during A-think-260000; with the
++thread disabled the run completed every row. Causation is not established at n=1 per arm (see the Sol review,
++flashnext-e2-capacity-probe-sol-review-2026-09-12), but polling has no place inside a measured region, and it was
++never necessary: PyTorch maintains the allocator high-water marks itself, so reading them once per window is exact.
++
++WHAT THIS THREAD DOES NOW. Between window boundaries it makes NO CUDA calls and touches NO allocator state: its tick
++is a plain read of <dir>/window.ctl, which holds "<seq> <name>". The gate driver crosses a boundary only while the
++server is quiet (no request running). On a new seq the thread performs exactly ONE allocator interaction:
++  1. memory_stats()            -> the closing window's exact high-water marks and cumulative retry/OOM counters
++  2. reset_peak_memory_stats() -> immediately after the read, with no file I/O in the gap
++  3. mem_get_info()            -> device free/total AT THAT QUIESCENT INSTANT
++then writes the "close" record for the old window and the "ack" record for the new one.
++
++WHAT THIS MEASURES.
++  - A row's allocator peak is EXACT for that row's window (not a sampled maximum; it cannot miss a transient).
++  - Device free/total is observed ONLY at quiescent boundaries. No minimum-free figure exists for the inside of a
++    row, and none may be reported.
++  - Retry and OOM counters are cumulative and never reset; per-row deltas come from consecutive close records.
++  - There is NO interval-level peak. The P3F qualifying interval is narrower than its row and is identified only
++    afterwards from the scheduler log, so the peak attributable to P3F is the ROW-level high-water mark, which
++    over-includes the prefill ramp. The prereg states this loss of resolution explicitly.
++
++Records (one JSON per line): kind start | close | ack | error; rank, local, dev, pid; window, seq; and for close:
++alloc_peak_w, res_peak_w, retries, ooms, free, total, run_alloc_peak, run_res_peak. Records are written with
++synchronous file I/O, never inside the read-to-reset gap. Nothing here raises into the worker.
+ """
+ import json
+ import os
+@@ -30,6 +42,7 @@ import torch
+ _SEG = float(os.environ.get("VLLM_E2_MEMSTATS", "0") or 0)
+ _DIR = os.environ.get("VLLM_E2_MEMSTATS_DIR", "")
+ _started = []
++VERSION = "e2_memstats/4-boundary"
+ 
+ 
+ def enabled() -> bool:
+@@ -39,7 +52,7 @@ def enabled() -> bool:
+ def ensure_started(worker, armed_by: str = "compile_or_warm_up_model") -> None:
+     if _started:
+         return
+-    dev = torch.cuda.current_device()
++    dev = torch.cuda.current_device()   # captured on the worker's own thread: every call below passes it explicitly
+     t = threading.Thread(target=_loop, name="e2-memstats", daemon=True,
+                          args=(dev, getattr(worker, "rank", -1), getattr(worker, "local_rank", -1), armed_by))
+     _started.append(t)
+@@ -64,39 +77,29 @@ def _loop(dev, rank, local, armed_by):
+         f.write(json.dumps({**base, **rec}, separators=(",", ":")) + "\n")
+ 
+     run_ap = run_rp = 0
+-    min_free = None
+     seq, name = _ctl() or (0, "serve")
+     torch.cuda.reset_peak_memory_stats(dev)
+-    t0, m0 = time.time(), time.monotonic()
+-    w({"kind": "start", "t": round(t0, 4), "m": round(m0, 4), "armed_by": armed_by, "window": name, "seq": seq})
++    w({"kind": "start", "t": round(time.time(), 4), "m": round(time.monotonic(), 4), "armed_by": armed_by,
++       "window": name, "seq": seq, "version": VERSION, "poll_s": _SEG})
+     while True:
+         time.sleep(_SEG)
+         try:
+-            free, total = torch.cuda.mem_get_info(dev)
++            c = _ctl()                                   # file read only: no CUDA, no allocator lock, no GIL-held call
++            if c is None or c[0] == seq:
++                continue
++            # Boundary. The driver only crosses one while the server is quiet, so this is the single point at which
++            # this thread touches the allocator at all.
+             s = torch.cuda.memory_stats(dev)
+-            t1, m1 = time.time(), time.monotonic()
+             ap, rp = int(s.get("allocated_bytes.all.peak", 0)), int(s.get("reserved_bytes.all.peak", 0))
++            torch.cuda.reset_peak_memory_stats(dev)      # immediately after the read: no file I/O inside the gap
++            free, total = torch.cuda.mem_get_info(dev)   # quiescent-boundary reading only
+             run_ap, run_rp = max(run_ap, ap), max(run_rp, rp)
+-            min_free = int(free) if min_free is None else min(min_free, int(free))
+-            w({"kind": "sample", "t0": round(t0, 4), "t1": round(t1, 4), "m0": round(m0, 4), "m1": round(m1, 4),
+-               "window": name, "seq": seq, "alloc": int(s.get("allocated_bytes.all.current", 0)),
+-               "res": int(s.get("reserved_bytes.all.current", 0)), "alloc_peak_w": ap, "res_peak_w": rp,
+-               "retries": int(s.get("num_alloc_retries", 0)), "ooms": int(s.get("num_ooms", 0)), "free": int(free),
+-               "total": int(total), "run_alloc_peak": run_ap, "run_res_peak": run_rp, "min_free_sampled": min_free})
+-            c = _ctl()
+-            if c is not None and c[0] != seq:
+-                s2 = torch.cuda.memory_stats(dev)
+-                ap2, rp2 = int(s2.get("allocated_bytes.all.peak", 0)), int(s2.get("reserved_bytes.all.peak", 0))
+-                torch.cuda.reset_peak_memory_stats(dev)  # immediately after the read: no file I/O inside the gap
+-                run_ap, run_rp = max(run_ap, ap2), max(run_rp, rp2)
+-                w({"kind": "close", "t": round(time.time(), 4), "m": round(time.monotonic(), 4), "window": name,
+-                   "seq": seq, "alloc_peak_w": ap2, "res_peak_w": rp2, "retries": int(s2.get("num_alloc_retries", 0)),
+-                   "ooms": int(s2.get("num_ooms", 0)), "run_alloc_peak": run_ap, "run_res_peak": run_rp})
+-                seq, name = c
+-                t1, m1 = time.time(), time.monotonic()
+-                w({"kind": "ack", "t": round(t1, 4), "m": round(m1, 4), "window": name, "seq": seq})
++            w({"kind": "close", "t": round(time.time(), 4), "m": round(time.monotonic(), 4), "window": name,
++               "seq": seq, "alloc_peak_w": ap, "res_peak_w": rp, "retries": int(s.get("num_alloc_retries", 0)),
++               "ooms": int(s.get("num_ooms", 0)), "free": int(free), "total": int(total),
++               "run_alloc_peak": run_ap, "run_res_peak": run_rp})
++            seq, name = c
++            w({"kind": "ack", "t": round(time.time(), 4), "m": round(time.monotonic(), 4), "window": name, "seq": seq})
+         except Exception as e:  # noqa: BLE001 - telemetry must never raise into the worker
+-            t1, m1 = time.time(), time.monotonic()
+-            w({"kind": "error", "t0": round(t0, 4), "t1": round(t1, 4), "m0": round(m0, 4), "m1": round(m1, 4),
+-               "window": name, "seq": seq, "error": f"{type(e).__name__}: {e}"[:300]})
+-        t0, m0 = t1, m1
++            w({"kind": "error", "t": round(time.time(), 4), "m": round(time.monotonic(), 4), "window": name,
++               "seq": seq, "error": f"{type(e).__name__}: {e}"[:300]})
+-- 
+2.47.3
+

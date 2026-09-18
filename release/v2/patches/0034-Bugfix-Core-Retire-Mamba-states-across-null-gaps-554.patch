@@ -1,0 +1,167 @@
+From 09a6c72265abcce08bbece63b8b78a82af780aa9 Mon Sep 17 00:00:00 2001
+From: lucamotz <luca.motz@icloud.com>
+Date: Fri, 11 Sep 2026 09:50:47 +0200
+Subject: [PATCH 34/76] [Bugfix][Core] Retire Mamba states across null gaps
+ (#55450)
+
+Signed-off-by: Luca Motz <luca.motz@icloud.com>
+Co-authored-by: mergify[bot] <37929162+mergify[bot]@users.noreply.github.com>
+Co-authored-by: Cyrus Leung <tlleungac@connect.ust.hk>
+(cherry picked from commit fadfe1c7d4df4c29b3dbc159ed790238a885b084)
+---
+ .../core/test_single_type_kv_cache_manager.py | 76 +++++++++++++++++++
+ .../v1/e2e/general/test_mamba_prefix_cache.py |  2 +-
+ vllm/v1/core/single_type_kv_cache_manager.py  | 23 ++++++
+ 3 files changed, 100 insertions(+), 1 deletion(-)
+
+diff --git a/tests/v1/core/test_single_type_kv_cache_manager.py b/tests/v1/core/test_single_type_kv_cache_manager.py
+index 391137235..14e46d7ba 100644
+--- a/tests/v1/core/test_single_type_kv_cache_manager.py
++++ b/tests/v1/core/test_single_type_kv_cache_manager.py
+@@ -103,6 +103,82 @@ def test_mamba_speculative_block_relocation_requires_exclusive_ownership():
+         manager._relocate_speculative_block([pinned_block], 0)
+ 
+ 
++def test_mamba_retirement_crosses_null_gaps():
++    spec = MambaSpec(
++        block_size=4,
++        shapes=((1, 1),),
++        dtypes=(torch.float32,),
++        mamba_cache_mode="align",
++    )
++    pool = BlockPool(num_gpu_blocks=8, enable_caching=False, hash_block_size=4)
++    manager = MambaManager(
++        spec,
++        block_pool=pool,
++        enable_caching=False,
++        kv_cache_group_id=0,
++        scheduler_block_size=4,
++    )
++    old, committed, in_flight = pool.get_new_blocks(3)
++    manager.req_to_blocks["r"] = [old, pool.null_block, committed, in_flight]
++
++    # The state at token 12 and the following in-flight state must survive.
++    for _ in range(2):
++        manager.remove_skipped_blocks("r", processed_computed_tokens=12)
++        assert manager.req_to_blocks["r"] == [
++            pool.null_block,
++            pool.null_block,
++            committed,
++            in_flight,
++        ]
++        assert old.ref_cnt == 0
++        assert committed.ref_cnt == in_flight.ref_cnt == 1
++        assert pool.get_num_free_blocks() == 5
++
++    manager.free("r")
++    manager.req_to_blocks["r"] = pool.get_new_blocks(2)
++    manager.remove_skipped_blocks("r", processed_computed_tokens=5)
++    assert manager.req_to_blocks["r"][0].is_null
++    assert manager.req_to_blocks["r"][1].ref_cnt == 1
++
++
++@pytest.mark.parametrize("block_size", [3584, 4608])
++@pytest.mark.parametrize("in_flight_chunks", [0, 1, 2])
++def test_mamba_retirement_bounds_prefill_states(block_size, in_flight_chunks):
++    spec = MambaSpec(
++        block_size=block_size,
++        shapes=((1, 1),),
++        dtypes=(torch.float32,),
++        mamba_cache_mode="align",
++        num_speculative_blocks=5,
++    )
++    pool = BlockPool(num_gpu_blocks=1000, enable_caching=True, hash_block_size=256)
++    manager = MambaManager(
++        spec,
++        block_pool=pool,
++        enable_caching=True,
++        kv_cache_group_id=0,
++        scheduler_block_size=block_size,
++    )
++    initial_free = pool.get_num_free_blocks()
++    chunk = 8192 // block_size * block_size
++    peak_held = 0
++    # Replay full prefill chunks with an async committed-token lag.
++    for target in range(chunk, 480031 + 1, chunk):
++        computed = target - chunk
++        committed = max(0, computed - in_flight_chunks * chunk)
++        manager.remove_skipped_blocks("r", committed)
++        manager.get_num_blocks_to_allocate(
++            "r", target + 5, [], computed, computed, target
++        )
++        manager.allocate_new_blocks("r", target + 5, target)
++        peak_held = max(peak_held, initial_free - pool.get_num_free_blocks())
++
++    # Five speculative blocks, current/previous states, and bounded in-flight states.
++    assert peak_held == 7 + in_flight_chunks
++    manager.free("r")
++    assert pool.get_num_free_blocks() == initial_free
++
++
+ def get_sliding_window_manager(
+     sliding_window_spec,
+     block_pool,
+diff --git a/tests/v1/e2e/general/test_mamba_prefix_cache.py b/tests/v1/e2e/general/test_mamba_prefix_cache.py
+index 27331516c..aa1f730af 100644
+--- a/tests/v1/e2e/general/test_mamba_prefix_cache.py
++++ b/tests/v1/e2e/general/test_mamba_prefix_cache.py
+@@ -837,7 +837,7 @@ def get_mamba_prefix_cache_step_configs(
+                 StepAction(
+                     560 * 10,
+                     4,
+-                    [0, 0, 0, 0, 1, 0, 0, 0, 1, 1, 1, 1, 1, 1]
++                    [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1]
+                     if a
+                     else [0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1],
+                     (9, 10),
+diff --git a/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/v1/core/single_type_kv_cache_manager.py
+index 30fb73375..10e0100a7 100644
+--- a/vllm/v1/core/single_type_kv_cache_manager.py
++++ b/vllm/v1/core/single_type_kv_cache_manager.py
+@@ -1427,6 +1427,7 @@ class MambaManager(SingleTypeKVCacheManager):
+             # Mapping from request ID to the index of the block
+             # allocated in the previous step
+             self.last_state_block_idx: dict[str, int] = {}
++            self._num_retired_blocks: dict[str, int] = {}
+             # The set of the requests that have been allocated blocks
+             self._allocated_block_reqs: set[str] = set()
+             # checkpoint position and reserved block index for the current
+@@ -1576,6 +1577,27 @@ class MambaManager(SingleTypeKVCacheManager):
+ 
+         return mask
+ 
++    def _remove_blocks_in_range(
++        self, request_id: str, first_block: int, last_block: int
++    ) -> None:
++        if self.mamba_cache_mode != "align":
++            return super()._remove_blocks_in_range(request_id, first_block, last_block)
++        blocks = self.req_to_blocks.get(request_id, [])
++        first_block = max(first_block, self._num_retired_blocks.get(request_id, 0))
++        last_block = min(last_block, len(blocks))
++        if first_block >= last_block:
++            return
++        freed: list[KVCacheBlock] = []
++        # Mamba prefill leaves null gaps between states awaiting retirement.
++        for i in range(last_block - 1, first_block - 1, -1):
++            if blocks[i].is_null:
++                continue
++            freed.append(blocks[i])
++            blocks[i] = self._null_block
++        if freed:
++            self.block_pool.free_blocks(freed)
++        self._num_retired_blocks[request_id] = last_block
++
+     def remove_skipped_blocks(
+         self,
+         request_id: str,
+@@ -1896,6 +1918,7 @@ class MambaManager(SingleTypeKVCacheManager):
+         if self.mamba_cache_mode == "align":
+             self._allocated_block_reqs.discard(request_id)
+             self.last_state_block_idx.pop(request_id, None)
++            self._num_retired_blocks.pop(request_id, None)
+             self._checkpoints.pop(request_id, None)
+             self._producer_partial_tail_reqs.pop(request_id, None)
+             # An offer is only guaranteed to hold committed bytes until the end
+-- 
+2.47.3
+

@@ -3,3 +3,9 @@ __pycache__/
 venv/
 vllm-src/
 *.whl
+vllm-v2/
+venv-v2/
+.vllm-cache-v2/
+*.bundle
+*.bundle.gz
+*.tar.gz

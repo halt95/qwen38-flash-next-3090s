@@ -1,0 +1,229 @@
+From a91afb5fc6e8cc9a5c9be0443840fccd104b307c Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Mon, 14 Sep 2026 16:57:17 +0000
+Subject: [PATCH 51/76] V.3 remaining blocks: e2_memstats close records carry
+ device allocated/reserved current and host_memory_stats() current values
+
+Debug-only telemetry (off unless VLLM_E2_MEMSTATS and VLLM_E2_MEMSTATS_DIR are set). The
+memory-hygiene probe needs per-rank device current and per-worker pinned-host allocator
+values at quiescent boundaries; the hook recorded only peaks. The device read and peak
+reset stay adjacent; the host read happens after mem_get_info, outside that gap. Record
+timestamps t/m unchanged. CPU-only schema and call-order test.
+
+(Sol draft, Fable applied/tested)
+---
+ tests/v1/worker/test_e2_memstats.py | 113 ++++++++++++++++++++++++++++
+ vllm/v1/worker/e2_memstats.py       |  51 ++++++++++---
+ 2 files changed, 154 insertions(+), 10 deletions(-)
+ create mode 100644 tests/v1/worker/test_e2_memstats.py
+
+diff --git a/tests/v1/worker/test_e2_memstats.py b/tests/v1/worker/test_e2_memstats.py
+new file mode 100644
+index 000000000..c40518746
+--- /dev/null
++++ b/tests/v1/worker/test_e2_memstats.py
+@@ -0,0 +1,113 @@
++# SPDX-License-Identifier: Apache-2.0
++"""CPU/GPU-free schema and call-order tests for vllm/v1/worker/e2_memstats.py (debug-only telemetry)."""
++from __future__ import annotations
++
++import importlib.util
++import os
++import sys
++import unittest
++from pathlib import Path
++from unittest import mock
++
++import torch
++
++MODULE_PATH = Path(__file__).resolve().parents[3] / "vllm" / "v1" / "worker" / "e2_memstats.py"
++HOST_CURRENT_KEYS = {
++    "active_bytes.current",
++    "active_requests.current",
++    "allocated_bytes.current",
++    "allocations.current",
++}
++
++
++def load_disabled_module():
++    name = "e2_memstats_under_test"
++    sys.modules.pop(name, None)
++    spec = importlib.util.spec_from_file_location(name, MODULE_PATH)
++    if spec is None or spec.loader is None:
++        raise RuntimeError(f"cannot load {MODULE_PATH}")
++    module = importlib.util.module_from_spec(spec)
++    with mock.patch.dict(os.environ, {"VLLM_E2_MEMSTATS": "", "VLLM_E2_MEMSTATS_DIR": ""}):
++        spec.loader.exec_module(module)
++    return module
++
++
++class MemstatsSchemaTest(unittest.TestCase):
++    def test_disabled_import_has_no_cuda_or_thread_side_effect(self):
++        initialized = torch.cuda.is_initialized()
++        module = load_disabled_module()
++        self.assertFalse(module.enabled())
++        self.assertEqual(module._started, [])
++        self.assertEqual(torch.cuda.is_initialized(), initialized)
++
++    def test_close_metrics_schema_and_call_order(self):
++        module = load_disabled_module()
++        initialized = torch.cuda.is_initialized()
++        calls: list[str] = []
++        device_stats = {
++            "allocated_bytes.all.current": 11,
++            "reserved_bytes.all.current": 12,
++            "allocated_bytes.all.peak": 21,
++            "reserved_bytes.all.peak": 22,
++            "num_alloc_retries": 3,
++            "num_ooms": 0,
++        }
++        host_stats = {
++            "active_bytes.current": 31,
++            "active_requests.current": 32,
++            "allocated_bytes.current": 33,
++            "allocations.current": 34,
++            "allocated_bytes.peak": 99,
++        }
++
++        def memory_stats(dev):
++            self.assertEqual(dev, 7)
++            calls.append("memory_stats")
++            return device_stats
++
++        def reset_peak_memory_stats(dev):
++            self.assertEqual(dev, 7)
++            calls.append("reset_peak_memory_stats")
++
++        def mem_get_info(dev):
++            self.assertEqual(dev, 7)
++            calls.append("mem_get_info")
++            return 41, 42
++
++        def host_memory_stats():
++            calls.append("host_memory_stats")
++            return host_stats
++
++        with (
++            mock.patch.object(module.torch.cuda, "memory_stats", side_effect=memory_stats),
++            mock.patch.object(module.torch.cuda, "reset_peak_memory_stats", side_effect=reset_peak_memory_stats),
++            mock.patch.object(module.torch.cuda, "mem_get_info", side_effect=mem_get_info),
++            mock.patch.object(module.torch.cuda, "host_memory_stats", side_effect=host_memory_stats),
++        ):
++            record = module._close_metrics(7)
++
++        # The device read and the peak reset stay adjacent; the host read comes after both.
++        self.assertEqual(calls, ["memory_stats", "reset_peak_memory_stats", "mem_get_info", "host_memory_stats"])
++        self.assertEqual(
++            set(record),
++            {
++                "allocated_bytes.all.current",
++                "reserved_bytes.all.current",
++                "alloc_peak_w",
++                "res_peak_w",
++                "retries",
++                "ooms",
++                "free",
++                "total",
++                "host",
++            },
++        )
++        self.assertEqual(set(record["host"]), HOST_CURRENT_KEYS)
++        self.assertEqual(record["host"]["allocated_bytes.current"], 33)
++        self.assertEqual(record["allocated_bytes.all.current"], 11)
++        self.assertEqual(record["reserved_bytes.all.current"], 12)
++        self.assertEqual(torch.cuda.is_initialized(), initialized)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/vllm/v1/worker/e2_memstats.py b/vllm/v1/worker/e2_memstats.py
+index a73cb6bb5..ffd574be5 100644
+--- a/vllm/v1/worker/e2_memstats.py
++++ b/vllm/v1/worker/e2_memstats.py
+@@ -13,10 +13,11 @@ never necessary: PyTorch maintains the allocator high-water marks itself, so rea
+ 
+ WHAT THIS THREAD DOES NOW. Between window boundaries it makes NO CUDA calls and touches NO allocator state: its tick
+ is a plain read of <dir>/window.ctl, which holds "<seq> <name>". The gate driver crosses a boundary only while the
+-server is quiet (no request running). On a new seq the thread performs exactly ONE allocator interaction:
++server is quiet (no request running). On a new seq the thread performs these boundary-only allocator reads:
+   1. memory_stats()            -> the closing window's exact high-water marks and cumulative retry/OOM counters
+   2. reset_peak_memory_stats() -> immediately after the read, with no file I/O in the gap
+   3. mem_get_info()            -> device free/total AT THAT QUIESCENT INSTANT
++  4. host_memory_stats()       -> pinned-host allocator current values, outside the read-to-reset gap
+ then writes the "close" record for the old window and the "ack" record for the new one.
+ 
+ WHAT THIS MEASURES.
+@@ -29,8 +30,10 @@ WHAT THIS MEASURES.
+     over-includes the prefill ramp. The prereg states this loss of resolution explicitly.
+ 
+ Records (one JSON per line): kind start | close | ack | error; rank, local, dev, pid; window, seq; and for close:
+-alloc_peak_w, res_peak_w, retries, ooms, free, total, run_alloc_peak, run_res_peak. Records are written with
+-synchronous file I/O, never inside the read-to-reset gap. Nothing here raises into the worker.
++allocated_bytes.all.current, reserved_bytes.all.current, alloc_peak_w, res_peak_w, retries, ooms, free, total,
++run_alloc_peak, run_res_peak, and a host object containing every host_memory_stats() key ending in ".current".
++Records are written with synchronous file I/O, never inside the read-to-reset gap. Nothing
++here raises into the worker.
+ """
+ import json
+ import os
+@@ -42,7 +45,37 @@ import torch
+ _SEG = float(os.environ.get("VLLM_E2_MEMSTATS", "0") or 0)
+ _DIR = os.environ.get("VLLM_E2_MEMSTATS_DIR", "")
+ _started = []
+-VERSION = "e2_memstats/4-boundary"
++VERSION = "e2_memstats/5-boundary-current-host"
++
++
++def _close_metrics(dev):
++    """Read one quiescent boundary; kept separate for CPU-only testing."""
++    s = torch.cuda.memory_stats(dev)
++    ap = int(s.get("allocated_bytes.all.peak", 0))
++    rp = int(s.get("reserved_bytes.all.peak", 0))
++    torch.cuda.reset_peak_memory_stats(dev)  # no file I/O in the gap
++    free, total = torch.cuda.mem_get_info(dev)
++    host_stats = torch.cuda.host_memory_stats()
++    host = {
++        key: int(value)
++        for key, value in host_stats.items()
++        if key.endswith(".current")
++    }
++    return {
++        "allocated_bytes.all.current": int(
++            s.get("allocated_bytes.all.current", 0)
++        ),
++        "reserved_bytes.all.current": int(
++            s.get("reserved_bytes.all.current", 0)
++        ),
++        "alloc_peak_w": ap,
++        "res_peak_w": rp,
++        "retries": int(s.get("num_alloc_retries", 0)),
++        "ooms": int(s.get("num_ooms", 0)),
++        "free": int(free),
++        "total": int(total),
++        "host": host,
++    }
+ 
+ 
+ def enabled() -> bool:
+@@ -89,14 +122,12 @@ def _loop(dev, rank, local, armed_by):
+                 continue
+             # Boundary. The driver only crosses one while the server is quiet, so this is the single point at which
+             # this thread touches the allocator at all.
+-            s = torch.cuda.memory_stats(dev)
+-            ap, rp = int(s.get("allocated_bytes.all.peak", 0)), int(s.get("reserved_bytes.all.peak", 0))
+-            torch.cuda.reset_peak_memory_stats(dev)      # immediately after the read: no file I/O inside the gap
+-            free, total = torch.cuda.mem_get_info(dev)   # quiescent-boundary reading only
++            metrics = _close_metrics(dev)
++            ap = metrics["alloc_peak_w"]
++            rp = metrics["res_peak_w"]
+             run_ap, run_rp = max(run_ap, ap), max(run_rp, rp)
+             w({"kind": "close", "t": round(time.time(), 4), "m": round(time.monotonic(), 4), "window": name,
+-               "seq": seq, "alloc_peak_w": ap, "res_peak_w": rp, "retries": int(s.get("num_alloc_retries", 0)),
+-               "ooms": int(s.get("num_ooms", 0)), "free": int(free), "total": int(total),
++               "seq": seq, **metrics,
+                "run_alloc_peak": run_ap, "run_res_peak": run_rp})
+             seq, name = c
+             w({"kind": "ack", "t": round(time.time(), 4), "m": round(time.monotonic(), 4), "window": name, "seq": seq})
+-- 
+2.47.3
+

@@ -1,0 +1,353 @@
+From 75b2b4e448c7cdeb3d7c7c089b03d04a9bc4fa39 Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Tue, 15 Sep 2026 21:07:44 +0000
+Subject: [PATCH 64/76] rc3-instr 8/8: bound the GDN recurrent state index, and
+ prove the telemetry  survives replay
+
+Two things the round-2 review asked for (ASTRA-GUARDS-R2.md R2-6 and
+qualification item 3).
+
+THE GUARD. fused_recurrent_gated_delta_rule_fwd_kernel carries the identical
+unbounded `i_t = num_accepted_tokens - 1` that commit 3/8 fixed in
+fused_sigmoid_gating -- same module, same shape, same upstream PR #50021 hunk
+(pr50021.diff:548-585). Round 2 left it alone and dropped the recurrent arm of
+the ported upstream test rather than assert a fix not made, which was honest
+but left a hole: a clean rc3 boot would have cleared the GDN decode-UPDATE
+kernel only, and the release note would have had to say so. The review's
+judgement was that the port is cheaper than the caveat, and it is: the hunk is
+a text-match apply of a shape already done twice.
+
+So: the load is masked to the row, `other=0` falls into the existing
+invalid-state path, and that path now zero-fills its output rows instead of
+returning with `o` (a `q.new_empty`) holding allocator residue. A new telemetry
+site, SITE_GDN_RECURRENT_STATE, records hits.
+
+THE REPLAY TEST. tests/v1/worker/gpu/test_guard_telemetry_replay.py. This is
+the single test that distinguishes "B1 architecturally fixed" from "B1 fixed".
+
+Round 1's telemetry was dead under CUDA-graph replay: a per-launch counter and
+an inline readback, in kernels that sit inside the captured forward. Round 2
+rebuilt it on a persistent buffer and captured atomics, and every argument
+since has been about code rather than measurement. This measures it -- capture
+a graph around a guarded kernel whose guard MUST fire (num_accepted_tokens = 0,
+so i_t == -1), replay it five times without re-entering Python, and require the
+counter to have advanced five launches' worth. A delta of zero is B1, unfixed.
+
+The test deliberately establishes its own control first: it asserts the seeded
+fault fires EAGERLY before it trusts anything the replay says, because a silent
+control would make the replay assertion meaningless either way. A second case
+pins the counter's data_ptr across calls, including through the unindexed
+torch.device("cuda") alias (review R2-7) -- if counter() ever returned a fresh
+tensor, the captured graph would write to a freed address, which is the half of
+B1 that corrupts memory rather than merely losing evidence.
+
+Both are CUDA-gated: +2 skips on CPU (47 -> 49). Neither has run.
+
+ROUND 5 (review R3-4). The B2-class launch-site sweep, re-run for this kernel,
+found a SECOND launch: flash_linear_attention/ops/kda.py:71 imports
+fused_recurrent_gated_delta_rule_fwd_kernel from fused_recurrent.py and
+launches it itself. This commit adds a required guard_ctr parameter, so that
+launch would have died with a missing argument the first time a KDA layer ran.
+Now updated, with the same telemetry site -- the defect being guarded is the
+kernel's, not the caller's. That is the third time in this series a changed
+signature had a launch site the first pass missed.
+
+The KDA siblings named in the same upstream PR (pr50021.diff:481-547,
+models/kimi_k3/{amd,nvidia}/ops/third_party/kda/fused_recurrent.py, plus the
+glm5next pair) are SEPARATE COPIES of the kernel in their own files, not
+callers of this one. They carry the same defect and are NOT fixed here; they
+are off this model's path. Stated rather than omitted.
+
+Draft for Astra review. Not merged into any RC.
+---
+ .../test_fused_sigmoid_gating_delta_rule.py   |  25 ++-
+ .../worker/gpu/test_guard_telemetry_replay.py | 150 ++++++++++++++++++
+ .../ops/fused_recurrent.py                    |  44 ++++-
+ 3 files changed, 209 insertions(+), 10 deletions(-)
+ create mode 100644 tests/v1/worker/gpu/test_guard_telemetry_replay.py
+
+diff --git a/tests/kernels/test_fused_sigmoid_gating_delta_rule.py b/tests/kernels/test_fused_sigmoid_gating_delta_rule.py
+index 1b154ac7e..61febb5e8 100644
+--- a/tests/kernels/test_fused_sigmoid_gating_delta_rule.py
++++ b/tests/kernels/test_fused_sigmoid_gating_delta_rule.py
+@@ -204,11 +204,10 @@ def test_fused_sigmoid_gating_delta_rule_update_spec(
+ def test_spec_invalid_accepted_count_zeroes_output(num_accepted: int) -> None:
+     """Invalid active-request state selection must not expose empty output.
+ 
+-    Ported from upstream vLLM PR #50021 (rc3-instr guard 3/8), with the
+-    fused_recurrent_gated_delta_rule arm of the upstream test DROPPED: that
+-    kernel has the identical unbounded ``i_t`` (fused_recurrent.py:106-116) and
+-    this series does not touch it, so including the arm would assert a fix we
+-    did not make. See GUARDS.md "round 2", known gaps.
++    Ported from upstream vLLM PR #50021, covering BOTH kernels: guard 3/8
++    (fused_sigmoid_gating) and guard 8/8 (fused_recurrent). Round 2 dropped the
++    recurrent arm because that kernel was unguarded; review R2-6 asked for the
++    guard rather than the caveat, so the arm is back.
+ 
+     num_accepted 0 gives i_t == -1, a read before this request's row;
+     num_accepted 5 exceeds the one-column ssm_state_indices, a read past it.
+@@ -240,6 +239,20 @@ def test_spec_invalid_accepted_count_zeroes_output(num_accepted: int) -> None:
+     torch.use_deterministic_algorithms(True)
+     torch.utils.deterministic.fill_uninitialized_memory = True
+     try:
++        recurrent_state = initial_state.clone()
++        recurrent_out, recurrent_state = fused_recurrent_gated_delta_rule(
++            q=query,
++            k=key,
++            v=value,
++            g=torch.rand(1, num_tokens, num_v_heads),
++            beta=torch.rand(1, num_tokens, num_v_heads),
++            initial_state=recurrent_state,
++            inplace_final_state=True,
++            ssm_state_indices=state_indices,
++            cu_seqlens=cu_seqlens,
++            num_accepted_tokens=accepted,
++        )
++
+         sigmoid_state = initial_state.clone()
+         sigmoid_out, sigmoid_state = fused_sigmoid_gating_delta_rule_update(
+             A_log=A_log,
+@@ -261,5 +274,7 @@ def test_spec_invalid_accepted_count_zeroes_output(num_accepted: int) -> None:
+             previous_deterministic, warn_only=previous_warn_only
+         )
+ 
++    torch.testing.assert_close(recurrent_out, torch.zeros_like(recurrent_out))
+     torch.testing.assert_close(sigmoid_out, torch.zeros_like(sigmoid_out))
++    torch.testing.assert_close(recurrent_state, initial_state)
+     torch.testing.assert_close(sigmoid_state, initial_state)
+diff --git a/tests/v1/worker/gpu/test_guard_telemetry_replay.py b/tests/v1/worker/gpu/test_guard_telemetry_replay.py
+new file mode 100644
+index 000000000..96b16bd31
+--- /dev/null
++++ b/tests/v1/worker/gpu/test_guard_telemetry_replay.py
+@@ -0,0 +1,150 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""The test that distinguishes "B1 architecturally fixed" from "B1 fixed".
++
++Round 1 of the rc3-instr guard series allocated a counter per launch and read
++it back inline. Under CUDA-graph REPLAY the Python host code never runs, so
++that counter was re-zeroed every step and never read: the instrument was
++silently dead in exactly the configuration the crash happens in (QSA declares
++AttentionCGSupport.UNIFORM_BATCH, so the guarded kernels sit inside the
++captured forward).
++
++Round 2 rebuilt it on a persistent buffer plus captured atomics. That is the
++right architecture, but "right architecture" is a claim about code. This is the
++measurement: capture a graph around a guarded kernel with a seeded bad value,
++replay it N times WITHOUT re-entering Python, and require the counter to have
++advanced N times.
++
++A test that only ran the kernel eagerly would pass on round 1's design too,
++which is why it must be a replay.
++"""
++
++import pytest
++import torch
++
++from vllm.third_party.flash_linear_attention.ops import (
++    fused_sigmoid_gating_delta_rule_update,
++)
++from vllm.v1.worker import guard_telemetry
++
++pytestmark = pytest.mark.skipif(
++    not torch.cuda.is_available(), reason="CUDA required"
++)
++
++REPLAYS = 5
++
++
++def _seeded_call(device):
++    """One guarded launch whose guard MUST fire.
++
++    num_accepted_tokens = 0 makes i_t == -1 in
++    fused_sigmoid_gating_delta_rule_update_kernel, a read before this request's
++    row of ssm_state_indices. That is the guard added in commit 3/8.
++    """
++    num_tokens, num_k_heads, num_v_heads = 4, 2, 4
++    head_k_dim = head_v_dim = 16
++    q = torch.rand(1, num_tokens, num_k_heads, head_k_dim, device=device)
++    k = torch.rand_like(q)
++    v = torch.rand(1, num_tokens, num_v_heads, head_v_dim, device=device)
++    a = torch.rand(num_tokens, num_v_heads, device=device)
++    b = torch.rand_like(a)
++    A_log = torch.rand(num_v_heads, device=device)
++    dt_bias = torch.rand_like(A_log)
++    state = torch.rand(
++        num_tokens + 1, num_v_heads, head_v_dim, head_k_dim, device=device
++    )
++    state_indices = torch.arange(
++        1, num_tokens + 1, dtype=torch.int32, device=device
++    ).view(1, num_tokens)
++    cu_seqlens = torch.tensor([0, num_tokens], dtype=torch.int32, device=device)
++    accepted = torch.zeros(1, dtype=torch.int32, device=device)  # -> i_t == -1
++
++    def run():
++        fused_sigmoid_gating_delta_rule_update(
++            A_log=A_log,
++            a=a,
++            b=b,
++            dt_bias=dt_bias,
++            q=q,
++            k=k,
++            v=v,
++            initial_state=state,
++            inplace_final_state=True,
++            ssm_state_indices=state_indices,
++            cu_seqlens=cu_seqlens,
++            num_accepted_tokens=accepted,
++        )
++
++    return run
++
++
++def _count(device):
++    ctr = guard_telemetry.counter(guard_telemetry.SITE_GDN_DECODE_STATE, device)
++    torch.cuda.synchronize()
++    return int(ctr[0].item())
++
++
++def test_guard_counts_under_cudagraph_replay():
++    device = torch.device("cuda", torch.cuda.current_device())
++    # Exactly what the model runner does, and for the same reason: allocate the
++    # counter before anything can capture.
++    guard_telemetry.prealloc(device)
++    guard_telemetry.reset_for_test()
++
++    run = _seeded_call(device)
++
++    # Warm up on a side stream, the standard pre-capture dance. This also
++    # compiles the kernel: a JIT compile inside a capture would abort it.
++    side = torch.cuda.Stream()
++    side.wait_stream(torch.cuda.current_stream())
++    with torch.cuda.stream(side):
++        for _ in range(3):
++            run()
++    torch.cuda.current_stream().wait_stream(side)
++    torch.cuda.synchronize()
++
++    warm = _count(device)
++    assert warm > 0, (
++        "the seeded fault did not fire the guard even eagerly -- the control is "
++        "broken, so the replay result below would mean nothing"
++    )
++    per_launch = warm // 3
++    assert per_launch > 0
++
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph):
++        run()
++    # Capturing itself must not have aborted, and must not have counted.
++    torch.cuda.synchronize()
++    before = _count(device)
++
++    for _ in range(REPLAYS):
++        graph.replay()
++    torch.cuda.synchronize()
++    after = _count(device)
++
++    delta = after - before
++    assert delta == REPLAYS * per_launch, (
++        f"counter advanced by {delta} over {REPLAYS} replays, expected "
++        f"{REPLAYS * per_launch}. A delta of 0 means the guard telemetry is "
++        f"dead under replay -- blocker B1 is NOT fixed."
++    )
++
++
++def test_counter_pointer_is_stable_across_replays():
++    """The captured atomic addresses one fixed buffer.
++
++    If counter() ever returned a fresh tensor, the captured graph would keep
++    writing to a freed address -- the other half of B1, and the one that
++    corrupts memory rather than merely losing evidence.
++    """
++    device = torch.device("cuda", torch.cuda.current_device())
++    guard_telemetry.prealloc(device)
++    first = guard_telemetry.counter(guard_telemetry.SITE_GDN_DECODE_STATE, device)
++    second = guard_telemetry.counter(guard_telemetry.SITE_GDN_DECODE_STATE, device)
++    assert first.data_ptr() == second.data_ptr()
++    # and the unindexed alias must resolve to the same buffer (review R2-7)
++    third = guard_telemetry.counter(
++        guard_telemetry.SITE_GDN_DECODE_STATE, torch.device("cuda")
++    )
++    assert third.data_ptr() == first.data_ptr()
+diff --git a/vllm/third_party/flash_linear_attention/ops/fused_recurrent.py b/vllm/third_party/flash_linear_attention/ops/fused_recurrent.py
+index eb08b938c..f5c43c673 100644
+--- a/vllm/third_party/flash_linear_attention/ops/fused_recurrent.py
++++ b/vllm/third_party/flash_linear_attention/ops/fused_recurrent.py
+@@ -11,6 +11,12 @@
+ import torch
+ 
+ from vllm.triton_utils import tl, triton
++from vllm.v1.worker import guard_telemetry
++
++# Bias so a negative row/index survives atomic_max on a zeroed counter
++# (review B4). MUST be a tl.constexpr: a plain module-level int is not
++# readable from a @triton.jit body.
++_GUARD_BIAS = tl.constexpr(guard_telemetry.GUARD_BIAS)
+ 
+ from .op import exp, log
+ 
+@@ -36,6 +42,7 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
+     cu_seqlens,
+     ssm_state_indices,
+     num_accepted_tokens,
++    guard_ctr,  # rc3-instr persistent int64[3]
+     scale,
+     N: tl.int64,  # num of sequences
+     T: tl.int64,  # num of tokens
+@@ -106,12 +113,36 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
+                 i_t = tl.load(num_accepted_tokens + i_n).to(tl.int64) - 1
+             else:
+                 i_t = 0
+-            # Load state index and check for invalid entries
+-            state_idx = tl.load(ssm_state_indices + i_n * stride_indices_seq + i_t).to(
+-                tl.int64
+-            )
+-            # Skip if state index is invalid (NULL_BLOCK_ID=0)
++            # PR #50021: i_t is num_accepted_tokens - 1 and is otherwise
++            # unbounded, while ssm_state_indices has only stride_indices_seq
++            # columns per request. A zero accepted count gives i_t == -1, a
++            # read before this request's row (and before the tensor for
++            # i_n == 0); a stale or too-large count reads past the row. The
++            # state_idx <= 0 guard below rejects only non-positive values, so
++            # an out-of-range read returning a garbage positive int flowed into
++            # h0 + state_idx * stride_init_state_token and faulted the SM.
++            #
++            # This is the SAME defect as commit 3/8, in the twin kernel. Round
++            # 2 left it unguarded and dropped the upstream test's arm for it;
++            # review R2-6 asked for it to be ported rather than caveated.
++            idx_in_row = (i_t >= 0) & (i_t < stride_indices_seq)
++            if (i_t < 0) or (i_t >= stride_indices_seq):
++                tl.atomic_add(guard_ctr, 1)
++                tl.atomic_max(guard_ctr + 1, (i_n).to(tl.int64) + _GUARD_BIAS)
++                tl.atomic_max(guard_ctr + 2, (i_t).to(tl.int64) + _GUARD_BIAS)
++            state_idx = tl.load(
++                ssm_state_indices + i_n * stride_indices_seq + i_t,
++                mask=idx_in_row,
++                other=0,
++            ).to(tl.int64)
++            # Skip invalid state indices without exposing uninitialized output.
++            # o is q.new_empty in the entry below, so the previous early return
++            # left this request's rows holding whatever the allocator returned.
+             if state_idx <= 0:
++                zero = tl.zeros([BV], dtype=tl.float32).to(p_o.dtype.element_ty)
++                for _ in range(0, T):
++                    tl.store(p_o, zero, mask=mask_v)
++                    p_o += HV * V
+                 return
+             p_h0 = h0 + state_idx * stride_init_state_token
+         else:
+@@ -227,6 +258,9 @@ def fused_recurrent_gated_delta_rule_fwd(
+         cu_seqlens=cu_seqlens,
+         ssm_state_indices=ssm_state_indices,
+         num_accepted_tokens=num_accepted_tokens,
++        guard_ctr=guard_telemetry.counter(
++            guard_telemetry.SITE_GDN_RECURRENT_STATE, q.device
++        ),
+         scale=scale,
+         N=N,
+         T=T,
+-- 
+2.47.3
+

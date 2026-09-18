@@ -1,0 +1,16 @@
+.git
+.gitattributes
+vllm-v2
+venv-v2
+.vllm-cache*
+__pycache__
+*.pyc
+benchmarks
+calib
+release/v2/patches
+release/v2/v2.0.1-combined.diff
+patches
+src-ref
+*.bak-*
+# Proxmox LXC recipes: they drive pct/systemctl on a PVE host and are meaningless inside an image
+lxc

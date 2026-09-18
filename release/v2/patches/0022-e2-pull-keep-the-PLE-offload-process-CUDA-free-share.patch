@@ -1,0 +1,125 @@
+From a1c7e5f6462db46027432ecdb2ea1432b5aaed27 Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Fri, 11 Sep 2026 15:35:04 +0000
+Subject: [PATCH 22/76] e2-pull: keep the PLE offload process CUDA-free
+ (shared-experts stream off, wider guard)
+
+The gate-4g offload context came from MoE construction: shared_experts.py calls
+aux_stream() -> torch.cuda.Stream(), whose C++ constructor creates the primary
+context without torch.cuda._lazy_init (torch.cuda.is_initialized() stays False).
+Found by a replay with a 50 ms parent-side per-PID poller + SIGUSR1 faulthandler
+dump in the child.
+
+In the offload process only (_prepare_cuda_free_process, right after
+mark_as_offload_worker):
+- VLLM_DISABLE_SHARED_EXPERTS_STREAM=1 (the offload never runs an MoE layer);
+- CUTLASS_CUDA_DEVICE_ID default (cheap defence, not observed on this path);
+- the guard now makes torch.cuda lazy init, torch.cuda.Stream construction and
+  Tensor.pin_memory raise, logging the call site.
+Verified: full-startup replay (meta model + 47.68 GiB PLE weights + CPU
+post-processing) with 511 clean polls, no context, CUDA not initialized.
+---
+ vllm/v1/ple_offload/worker.py | 58 +++++++++++++++++++++++++++++++----
+ 1 file changed, 52 insertions(+), 6 deletions(-)
+
+diff --git a/vllm/v1/ple_offload/worker.py b/vllm/v1/ple_offload/worker.py
+index 225560fa4..46ff179e8 100644
+--- a/vllm/v1/ple_offload/worker.py
++++ b/vllm/v1/ple_offload/worker.py
+@@ -82,6 +82,30 @@ def _publish_fence() -> None:
+         pass
+ 
+ 
++def _prepare_cuda_free_process() -> None:
++    """Keep the PLE offload process free of any CUDA context.
++
++    The host-mapped pull design issues no CUDA work here, yet model
++    construction reached CUDA incidentally (gate 4g and the offload-startup
++    replays of 2026-09-11):
++    1. ``VLLM_DISABLE_SHARED_EXPERTS_STREAM=1``: each MoE layer's shared-experts
++       runner calls ``aux_stream()`` -> ``torch.cuda.Stream()``, whose C++
++       constructor creates the primary context without calling
++       ``torch.cuda._lazy_init`` (``torch.cuda.is_initialized()`` stays False).
++       This is the context the replay caught (stack dumped inside
++       ``Stream.__new__``). This process never runs an MoE layer, so it never
++       needs the stream. vLLM reads the variable when the layer is built; this
++       process does not enable vLLM's env cache.
++    2. ``CUTLASS_CUDA_DEVICE_ID``: CUTLASS python (``cutlass_cppgen``) runs
++       ``initialize_cuda_context()`` -> ``cudart.cudaFree(0)`` at import unless
++       it is set. Not observed on this import path; kept as a cheap defence.
++    3. The torch guard (``_install_cuda_guard``).
++    """
++    os.environ["VLLM_DISABLE_SHARED_EXPERTS_STREAM"] = "1"
++    os.environ.setdefault("CUTLASS_CUDA_DEVICE_ID", "0")
++    _install_cuda_guard()
++
++
+ def _install_cuda_guard() -> None:
+     """Make torch-level CUDA initialization raise in the PLE offload process.
+ 
+@@ -93,6 +117,13 @@ def _install_cuda_guard() -> None:
+     probe), so raising here keeps this process context-free. Any other call
+     site fails loudly at offload startup with its stack logged, instead of
+     silently taking VRAM on a stage-0 card. The GPU workers are untouched.
++
++    torch also has C++ entry points that create the context without calling
++    ``torch.cuda._lazy_init``: stream construction (``torch.cuda.Stream``) and
++    the pinned host allocator (``Tensor.pin_memory``). Both raise here too;
++    this process needs neither (all of its buffers are plain CPU memory).
++    ``torch.cuda.is_initialized()`` only reflects the Python-level path, so
++    the per-PID GPU sampler, not that flag, is the authority on contexts.
+     """
+     import traceback
+ 
+@@ -100,19 +131,34 @@ def _install_cuda_guard() -> None:
+         logger.warning("CUDA already initialized before the PLE offload guard")
+         return
+ 
+-    def _blocked_lazy_init() -> None:
+-        stack = "".join(traceback.format_stack(limit=12)[:-1])
++    def _refuse(what: str) -> None:
++        stack = "".join(traceback.format_stack(limit=12)[:-2])
+         logger.info(
+             "PLE offload CUDA guard: blocked a CUDA initialization attempt "
+-            "(the caller must fall back to CPU or fail); call site:\n%s",
++            "(%s; the caller must fall back to CPU or fail); call site:\n%s",
++            what,
+             stack,
+         )
+         raise RuntimeError(
+-            "CUDA is disabled in the PLE offload process (host-mapped pull)"
++            f"CUDA is disabled in the PLE offload process (host-mapped pull): {what}"
+         )
+ 
++    def _blocked_lazy_init() -> None:
++        _refuse("torch.cuda lazy init")
++
++    def _blocked_stream(cls, *args, **kwargs):
++        _refuse("torch.cuda.Stream construction")
++
++    def _blocked_pin_memory(self, *args, **kwargs):
++        _refuse("Tensor.pin_memory")
++
+     torch.cuda._lazy_init = _blocked_lazy_init  # type: ignore[assignment]
+-    logger.info("PLE offload CUDA guard installed (torch CUDA init raises)")
++    torch.cuda.Stream.__new__ = staticmethod(_blocked_stream)  # type: ignore[assignment]
++    torch.Tensor.pin_memory = _blocked_pin_memory  # type: ignore[assignment]
++    logger.info(
++        "PLE offload CUDA guard installed (torch CUDA lazy init, stream "
++        "construction and pin_memory raise)"
++    )
+ 
+ 
+ @contextlib.contextmanager
+@@ -363,7 +409,7 @@ class PleOffloadWorker:
+             # CUDA_VISIBLE_DEVICES) rather than hiding all devices: an empty
+             # CUDA_VISIBLE_DEVICES makes vLLM's platform helpers raise during
+             # model construction. Never call set_device here.
+-            _install_cuda_guard()
++            _prepare_cuda_free_process()
+             home_device = os.environ.get("VLLM_PLE_OFFLOAD_HOME_DEVICE", "").strip()
+             if home_device:
+                 parent_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+-- 
+2.47.3
+

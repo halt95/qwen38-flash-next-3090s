@@ -1,0 +1,201 @@
+From 05e2f86627be0e770b03aeeb3d779003d1c2079b Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Thu, 10 Sep 2026 19:53:56 +0000
+Subject: [PATCH 05/76] e2: pre-gate-3 - sidecar validated against the
+ whole-model QSA set and applied per PP stage; collector dump named per
+ (pp,tp) rank
+
+---
+ vllm/models/qwen4_exp/nvidia/model.py | 63 +++++++++++++++++++++------
+ vllm/models/qwen4_exp/nvidia/qsa.py   | 48 +++++++++++++++++---
+ 2 files changed, 91 insertions(+), 20 deletions(-)
+
+diff --git a/vllm/models/qwen4_exp/nvidia/model.py b/vllm/models/qwen4_exp/nvidia/model.py
+index fcbdcd536..4264a4060 100644
+--- a/vllm/models/qwen4_exp/nvidia/model.py
++++ b/vllm/models/qwen4_exp/nvidia/model.py
+@@ -183,25 +183,60 @@ def _maybe_load_qsa_static_kv_scales(model: nn.Module) -> None:
+     # The PLE offload worker builds the whole target on the meta device and loads
+     # only PLE weights through load_weights; a fill_ on its meta scale buffers
+     # would log success without calibrating any GPU worker (Astra 09-10, D).
++    local_qsa: list[Qwen4ExpQSAAttention] = []
++    inner: Qwen4ExpModel | None = None
+     for module in model.modules():
+-        k_scale = getattr(module, "_k_scale", None)
+-        if isinstance(k_scale, torch.Tensor):
+-            if k_scale.device.type == "meta":
+-                logger.info(
+-                    "Qwen4Exp QSA: model is on meta (PLE offload worker); "
+-                    "static K/V scales are applied by the GPU workers only"
+-                )
+-                return
+-            break
+-    # strict: every QSA layer of the target model must be in the sidecar. An empty or
+-    # partial file silently leaving layers at scale 1.0 is exactly the failure this
+-    # call site exists to prevent.
+-    applied = load_qsa_static_kv_scales(model, path, strict=True)
++        if isinstance(module, Qwen4ExpModel) and inner is None:
++            inner = module
++        if isinstance(module, Qwen4ExpQSAAttention):
++            local_qsa.append(module)
++    for layer in local_qsa:
++        k_scale = getattr(layer, "_k_scale", None)
++        if isinstance(k_scale, torch.Tensor) and k_scale.device.type == "meta":
++            logger.info(
++                "Qwen4Exp QSA: model is on meta (PLE offload worker); "
++                "static K/V scales are applied by the GPU workers only"
++            )
++            return
++    if inner is None:
++        raise ValueError("Qwen4Exp QSA: no Qwen4ExpModel found for the sidecar")
++    if not local_qsa:
++        # A pipeline stage without a full-attention layer (possible only for a
++        # very uneven split); the other stages apply their slices.
++        logger.warning(
++            "Qwen4Exp QSA: this pipeline stage holds no QSA layer "
++            "(layers %d-%d); sidecar %s not applied here",
++            inner.start_layer,
++            inner.end_layer,
++            path,
++        )
++        return
++    # Whole-model QSA layer set (all pipeline stages) from the config: the
++    # sidecar is validated against this, the local slice is what gets applied.
++    prefix, sep, tail = local_qsa[0].layer_name.rpartition(".layers.")
++    if not sep or not tail.split(".")[0].isdigit():
++        raise ValueError(
++            f"Qwen4Exp QSA: unexpected layer name {local_qsa[0].layer_name!r}"
++        )
++    suffix = tail.split(".", 1)[1]  # "self_attn.attn"
++    expected = {
++        f"{prefix}.layers.{idx}.{suffix}" for idx in inner._qsa_layer_ids
++    }
++    # strict: every QSA layer of the whole model must be in the sidecar. An empty
++    # or partial file silently leaving layers at scale 1.0 is exactly the failure
++    # this call site exists to prevent.
++    applied = load_qsa_static_kv_scales(
++        model, path, strict=True, expected_layer_names=expected
++    )
+     shown = ", ".join(sorted(applied)[:4])
+     logger.info(
+-        "Qwen4Exp QSA: applied static K/V scales from %s to %d layer(s): %s%s",
++        "Qwen4Exp QSA: applied static K/V scales from %s to %d of %d layer(s) "
++        "(pipeline layers %d-%d): %s%s",
+         path,
+         len(applied),
++        len(expected),
++        inner.start_layer,
++        inner.end_layer,
+         shown,
+         " ..." if len(applied) > 4 else "",
+     )
+diff --git a/vllm/models/qwen4_exp/nvidia/qsa.py b/vllm/models/qwen4_exp/nvidia/qsa.py
+index 03ad8123d..d31b1ed6b 100644
+--- a/vllm/models/qwen4_exp/nvidia/qsa.py
++++ b/vllm/models/qwen4_exp/nvidia/qsa.py
+@@ -10,7 +10,7 @@ import math
+ import os
+ import threading
+ import time
+-from collections.abc import Mapping
++from collections.abc import Collection, Mapping
+ from pathlib import Path
+ from typing import ClassVar, cast
+ 
+@@ -85,17 +85,23 @@ _qsa_collect_calls = 0
+ def _qsa_collect_dump() -> None:
+     if not _qsa_collect_state:
+         return
++    pp_tag = ""
+     try:
+-        from vllm.distributed import get_tensor_model_parallel_rank
++        from vllm.distributed import get_pp_group, get_tensor_model_parallel_rank
+ 
+         rank = get_tensor_model_parallel_rank()
++        pp_group = get_pp_group()
++        if pp_group.world_size > 1:
++            # One file per (pp, tp) rank: stages hold disjoint layers, so a
++            # TP-only filename would let stage 1 overwrite stage 0's dump.
++            pp_tag = f"pp{pp_group.rank_in_group}_"
+     except Exception:
+         rank = os.getpid()
+     out = {
+         name: {"k_absmax": float(st[0].item()), "v_absmax": float(st[1].item())}
+         for name, st in _qsa_collect_state.items()
+     }
+-    path = Path(_qsa_collect_dir) / f"qsa_absmax_rank{rank}.json"
++    path = Path(_qsa_collect_dir) / f"qsa_absmax_{pp_tag}rank{rank}.json"
+     tmp = path.with_suffix(".tmp")
+     tmp.write_text(json.dumps(out, indent=1), encoding="utf-8")
+     tmp.replace(path)
+@@ -740,6 +746,7 @@ def load_qsa_static_kv_scales(
+     sidecar_path: str | Path,
+     *,
+     strict: bool = True,
++    expected_layer_names: Collection[str] | None = None,
+ ) -> list[str]:
+     """Load static scalar QSA K/V scales into already-loaded model layers.
+ 
+@@ -759,6 +766,14 @@ def load_qsa_static_kv_scales(
+     ``strict=False`` permits a deliberate subset; omitted layers keep the
+     vLLM default scale of 1.0. Unknown names and non-scalar values are always
+     errors.
++
++    Pipeline parallelism: a rank holds only its stage's layers, so the sidecar
++    legitimately names layers this rank does not own. Pass
++    ``expected_layer_names`` = the QSA layer names of the WHOLE model; names are
++    validated against that set, ``strict`` requires the sidecar to cover all
++    of it (checkable on every rank), and the scales are applied to the local
++    intersection only. Without it (TP-only callers) the local layers are the
++    universe, as before.
+     """
+ 
+     path = Path(sidecar_path)
+@@ -793,12 +808,31 @@ def load_qsa_static_kv_scales(
+             f"non-FP8 layers: {non_fp8_layers}"
+         )
+ 
+-    unknown = sorted(name for name in raw if name not in qsa_layers)
++    if expected_layer_names is None:
++        universe = set(qsa_layers)
++    else:
++        universe = set(expected_layer_names)
++        not_expected = sorted(name for name in qsa_layers if name not in universe)
++        if not_expected:
++            raise ValueError(
++                "Local QSA layers outside expected_layer_names: "
++                f"{not_expected}"
++            )
++    unknown = sorted(name for name in raw if name not in universe)
+     if unknown:
+         raise ValueError(f"Unknown QSA layer names in {path}: {unknown}")
+-    missing = sorted(name for name in qsa_layers if name not in raw)
++    missing = sorted(name for name in universe if name not in raw)
+     if strict and missing:
+         raise ValueError(f"Missing QSA layer scales in {path}: {missing}")
++    remote = sorted(name for name in raw if name not in qsa_layers)
++    if remote:
++        logger.info(
++            "Qwen4Exp QSA: %d sidecar layer(s) belong to other pipeline stages "
++            "and are skipped on this rank: %s%s",
++            len(remote),
++            ", ".join(remote[:4]),
++            " ..." if len(remote) > 4 else "",
++        )
+ 
+     validated: dict[str, tuple[float, float]] = {}
+     for layer_name, entry in raw.items():
+@@ -823,7 +857,9 @@ def load_qsa_static_kv_scales(
+                 )
+             values.append(scale)
+ 
+-        layer = qsa_layers[layer_name]
++        layer = qsa_layers.get(layer_name)
++        if layer is None:
++            continue  # another pipeline stage's layer: schema-checked only
+         for field in ("_k_scale", "_v_scale"):
+             tensor = getattr(layer, field, None)
+             if not isinstance(tensor, torch.Tensor) or tensor.numel() != 1:
+-- 
+2.47.3
+

@@ -1,0 +1,1186 @@
+From 2ce8ce4cce57c1da12b66195fad97ec9dda60cfe Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Sun, 13 Sep 2026 18:28:05 +0000
+Subject: [PATCH 35/76] v2 transport fixes (Astra F1-F6, operator D.11): fatal
+ PLE execute/prepare/release, progress deadline, request validation, child env
+ bootstrap, process-lifetime host storage, early shutdown marker;
+ tests/v1/ple_offload (Sol draft, Fable applied/tested)
+
+---
+ tests/v1/ple_offload/test_correspondence.py   |  91 +++++++++++
+ tests/v1/ple_offload/test_fatal_rpc.py        | 134 ++++++++++++++++
+ .../v1/ple_offload/test_progress_deadline.py  |  50 ++++++
+ tests/v1/ple_offload/test_shutdown_order.py   |  51 ++++++
+ .../ple_offload/test_spawn_bootstrap_cuda.py  |  84 ++++++++++
+ .../layers/ple_offload_layer.py               |  23 ++-
+ vllm/v1/ple_offload/connector.py              |  96 ++++++++++--
+ vllm/v1/ple_offload/fatal.py                  |  50 ++++++
+ vllm/v1/ple_offload/progress.py               | 143 +++++++++++++++++
+ vllm/v1/ple_offload/worker.py                 | 146 +++++++++++++-----
+ vllm/v1/worker/gpu/model_runner.py            |   3 +
+ vllm/v1/worker/gpu_worker.py                  |   2 +-
+ vllm_ple_offload_bootstrap/__init__.py        |  29 ++++
+ 13 files changed, 846 insertions(+), 56 deletions(-)
+ create mode 100644 tests/v1/ple_offload/test_correspondence.py
+ create mode 100644 tests/v1/ple_offload/test_fatal_rpc.py
+ create mode 100644 tests/v1/ple_offload/test_progress_deadline.py
+ create mode 100644 tests/v1/ple_offload/test_shutdown_order.py
+ create mode 100644 tests/v1/ple_offload/test_spawn_bootstrap_cuda.py
+ create mode 100644 vllm/v1/ple_offload/fatal.py
+ create mode 100644 vllm/v1/ple_offload/progress.py
+ create mode 100644 vllm_ple_offload_bootstrap/__init__.py
+
+diff --git a/tests/v1/ple_offload/test_correspondence.py b/tests/v1/ple_offload/test_correspondence.py
+new file mode 100644
+index 000000000..e6f1441c1
+--- /dev/null
++++ b/tests/v1/ple_offload/test_correspondence.py
+@@ -0,0 +1,91 @@
++# SPDX-License-Identifier: Apache-2.0
++
++from types import SimpleNamespace
++from typing import Any
++
++import pytest
++import torch
++
++from vllm.v1.ple_offload.connector import PleOffloadConnector
++from vllm.v1.ple_offload.protocol import PleOffloadRequest
++from vllm.v1.ple_offload.worker import (
++    PleOffloadInputBuffers,
++    PleOffloadRunner,
++)
++
++
++class _ConnectorForValidation:
++    _input_ids_buf = torch.empty(4, dtype=torch.int32)
++    _query_start_loc_buf = torch.empty(3, dtype=torch.int32)
++    _rowdump_n = None
++
++    def _signal_dummy_outputs_impl(self, num_tokens: int) -> None:
++        raise AssertionError("must fail before dummy publication")
++
++    def _launch(self, num_reqs: int, num_tokens: int) -> None:
++        raise AssertionError("must fail before request publication")
++
++
++def test_request_consumer_count_mismatch_precedes_publication() -> None:
++    connector = _ConnectorForValidation()
++    with pytest.raises(RuntimeError, match="request/consumer"):
++        PleOffloadConnector._prepare_forward_impl(
++            connector,
++            1,
++            3,
++            False,
++            consumer_num_tokens=4,
++        )
++
++
++def _runner(query_start_loc: list[int]) -> PleOffloadRunner:
++    runner = PleOffloadRunner.__new__(PleOffloadRunner)
++    flag = torch.zeros(1, dtype=torch.int32)
++    target = SimpleNamespace(
++        host_output_buffer=torch.zeros(4, 2),
++        host_flag=flag,
++    )
++    runner._worker_targets = {0: {"ple": [target]}}
++    runner._scratch_bufs = {0: {"ple": torch.empty(4, 2)}}
++    query = torch.zeros(3, dtype=torch.int32)
++    query[: len(query_start_loc)] = torch.tensor(
++        query_start_loc, dtype=torch.int32
++    )
++    runner._input_bufs = {
++        0: PleOffloadInputBuffers(
++            input_ids_buf=torch.zeros(4, dtype=torch.int32),
++            query_start_loc_buf=query,
++            ngram_context_buf=torch.zeros(2, 1, dtype=torch.int32),
++        )
++    }
++    return runner
++
++
++@pytest.mark.parametrize(
++    ("ple_request", "query_start_loc", "match"),
++    [
++        (PleOffloadRequest(dp_rank=0, num_tokens=3, num_reqs=2), [0, 2, 1],
++         "query_start_loc"),
++        (PleOffloadRequest(dp_rank=0, num_tokens=5, num_reqs=1), [0, 1],
++         "num_tokens"),
++        (PleOffloadRequest(dp_rank=0, num_tokens=1, num_reqs=3), [0, 1, 1],
++         "num_reqs"),
++        (PleOffloadRequest(dp_rank=9, num_tokens=1, num_reqs=1), [0, 1],
++         "dp_rank=9"),
++    ],
++)
++def test_invalid_request_fails_before_publication(
++    ple_request: PleOffloadRequest,
++    query_start_loc: list[int],
++    match: str,
++) -> None:
++    runner = _runner(query_start_loc)
++    flags = [
++        target.host_flag
++        for layers in runner._worker_targets.values()
++        for targets in layers.values()
++        for target in targets
++    ]
++    with pytest.raises(RuntimeError, match=match):
++        runner._validate_requests_before_publication([ple_request])
++    assert all(int(flag[0]) == 0 for flag in flags)
+diff --git a/tests/v1/ple_offload/test_fatal_rpc.py b/tests/v1/ple_offload/test_fatal_rpc.py
+new file mode 100644
+index 000000000..834406e8c
+--- /dev/null
++++ b/tests/v1/ple_offload/test_fatal_rpc.py
+@@ -0,0 +1,134 @@
++# SPDX-License-Identifier: Apache-2.0
++
++import multiprocessing
++from typing import Any
++
++import pytest
++
++from vllm.v1.ple_offload.connector import PleOffloadConnector
++from vllm.v1.ple_offload.fatal import (
++    fail_ple_execute_model,
++    ple_fail_closed,
++)
++
++
++class _Progress:
++    sequence = 7
++
++    def begin(self, **_: Any) -> int:
++        return self.sequence
++
++    def complete(self) -> None:
++        return
++
++
++class _InjectedConnector:
++    rank = 3
++    tp_rank = 1
++    _layers = {"ple": object()}
++    _progress = _Progress()
++    _input_ids_buf = None
++    _query_start_loc_buf = None
++
++    def __init__(self, where: str) -> None:
++        self.where = where
++
++    def _fail_closed(self, where: str, error: BaseException) -> None:
++        ple_fail_closed(
++            where=where,
++            rank=self.rank,
++            layer="ple",
++            sequence=self._progress.sequence,
++            error=error,
++        )
++
++    def _prepare_forward_impl(self, *args: Any, **kwargs: Any) -> None:
++        if self.where == "prepare":
++            raise RuntimeError("prepare injection")
++
++    def _release_outputs_impl(self) -> None:
++        if self.where == "release":
++            raise RuntimeError("release injection")
++
++
++class _Runner:
++    def __init__(self, where: str) -> None:
++        self._ple_offload_connector = _InjectedConnector(where)
++        self.where = where
++
++    @fail_ple_execute_model
++    def execute_model(self) -> None:
++        connector = self._ple_offload_connector
++        PleOffloadConnector.prepare_forward(
++            connector,
++            1,
++            1,
++            False,
++            consumer_num_tokens=1,
++        )
++        if self.where == "forward":
++            raise RuntimeError("forward injection")
++        PleOffloadConnector.release_outputs(connector)
++
++
++def _rpc_loop(where: str, successor_count: Any) -> None:
++    runner = _Runner(where)
++    try:
++        runner.execute_model()
++    except Exception:
++        # Mirrors WorkerProc._execute_worker_rpc: this must never regain control.
++        pass
++    with successor_count.get_lock():
++        successor_count.value += 1
++
++
++@pytest.mark.parametrize("where", ["prepare", "forward", "release"])
++def test_ple_exception_kills_workerproc_style_rpc(
++    where: str,
++) -> None:
++    context = multiprocessing.get_context("spawn")
++    successor_count = context.Value("i", 0)
++    process = context.Process(
++        target=_rpc_loop,
++        args=(where, successor_count),
++    )
++    process.start()
++    # Spawned children import vLLM cold (measured 4-8 s on bfgpu); the bound is
++    # about start-up, not the fatal path, which exits immediately.
++    process.join(timeout=120)
++    assert not process.is_alive()
++    assert process.exitcode not in (None, 0)
++    assert successor_count.value == 0
++
++
++def _rpc_loop_connector_only(where: str, successor_count: Any) -> None:
++    # No execute_model decorator: only the connector's own fatal wrappers can
++    # stop the RPC loop from regaining control. (The decorated test above
++    # passes on the decorator alone, so it cannot vouch for these wrappers.)
++    connector = _InjectedConnector(where)
++    try:
++        if where == "prepare":
++            PleOffloadConnector.prepare_forward(
++                connector, 1, 1, False, consumer_num_tokens=1
++            )
++        else:
++            PleOffloadConnector.release_outputs(connector)
++    except Exception:
++        pass
++    with successor_count.get_lock():
++        successor_count.value += 1
++
++
++@pytest.mark.parametrize("where", ["prepare", "release"])
++def test_connector_wrappers_are_fatal_without_decorator(where: str) -> None:
++    context = multiprocessing.get_context("spawn")
++    successor_count = context.Value("i", 0)
++    process = context.Process(
++        target=_rpc_loop_connector_only,
++        args=(where, successor_count),
++    )
++    process.start()
++    process.join(timeout=120)
++    assert not process.is_alive()
++    assert process.exitcode not in (None, 0)
++    assert successor_count.value == 0
+diff --git a/tests/v1/ple_offload/test_progress_deadline.py b/tests/v1/ple_offload/test_progress_deadline.py
+new file mode 100644
+index 000000000..8953abb49
+--- /dev/null
++++ b/tests/v1/ple_offload/test_progress_deadline.py
+@@ -0,0 +1,50 @@
++# SPDX-License-Identifier: Apache-2.0
++
++import multiprocessing
++import threading
++from typing import Any
++
++import pytest
++
++from vllm.v1.ple_offload.progress import PleProgressMonitor
++
++
++def _silent_producer_case(block_input: bool, started: Any) -> None:
++    monitor = PleProgressMonitor(
++        rank=2,
++        layer_names=("ple",),
++        serving_deadline_s=0.2,
++        startup_deadline_s=1.0,
++    )
++    monitor.begin(startup=False, num_tokens=32)
++    started.set()
++
++    if block_input:
++        # Models the request thread stuck in d2h_done_event.synchronize().
++        threading.Thread(
++            target=threading.Event().wait,
++            daemon=True,
++        ).start()
++
++    # Neither the fake producer nor the test terminates the process. The
++    # independent progress monitor must do so.
++    threading.Event().wait()
++
++
++@pytest.mark.parametrize("block_input", [False, True])
++def test_progress_deadline_terminates_alive_silent_worker(
++    block_input: bool,
++) -> None:
++    context = multiprocessing.get_context("spawn")
++    started = context.Event()
++    process = context.Process(
++        target=_silent_producer_case,
++        args=(block_input, started),
++    )
++    process.start()
++    # Cold vLLM import in the spawned child takes 4-8 s on bfgpu; the deadline
++    # itself (0.2 s) is only charged after `started` is set.
++    assert started.wait(timeout=120)
++    process.join(timeout=10)
++    assert not process.is_alive()
++    assert process.exitcode not in (None, 0)
+diff --git a/tests/v1/ple_offload/test_shutdown_order.py b/tests/v1/ple_offload/test_shutdown_order.py
+new file mode 100644
+index 000000000..7775e0cbb
+--- /dev/null
++++ b/tests/v1/ple_offload/test_shutdown_order.py
+@@ -0,0 +1,51 @@
++# SPDX-License-Identifier: Apache-2.0
++
++from types import SimpleNamespace
++
++from vllm.v1.worker import gpu_worker
++
++
++def test_shutdown_marks_ple_stopping_before_teardown(monkeypatch) -> None:
++    worker = gpu_worker.Worker.__new__(gpu_worker.Worker)
++    worker._ple_offload_stopping = False
++    order: list[tuple[str, bool]] = []
++
++    def record(name: str):
++        def call() -> None:
++            order.append((name, worker._ple_offload_stopping))
++        return call
++
++    monkeypatch.setattr(gpu_worker.gc, "unfreeze", record("gc"))
++    monkeypatch.setattr(
++        gpu_worker,
++        "ensure_kv_transfer_shutdown",
++        record("kv"),
++    )
++    monkeypatch.setattr(
++        gpu_worker,
++        "ensure_ec_transfer_shutdown",
++        record("ec"),
++    )
++    monkeypatch.setattr(
++        gpu_worker.current_platform,
++        "is_cuda_alike",
++        lambda: False,
++    )
++
++    worker.profiler = None
++    worker.weight_transfer_engine = None
++    worker.elastic_ep_executor = SimpleNamespace(
++        shutdown=record("elastic")
++    )
++    worker._ple_offload_worker_handle = SimpleNamespace(
++        close=record("offload")
++    )
++    worker.model_runner = SimpleNamespace(
++        shutdown=record("runner")
++    )
++
++    worker.shutdown()
++
++    assert order
++    assert all(stopping for _, stopping in order)
++    assert [name for name, _ in order][:2] == ["gc", "kv"]
+diff --git a/tests/v1/ple_offload/test_spawn_bootstrap_cuda.py b/tests/v1/ple_offload/test_spawn_bootstrap_cuda.py
+new file mode 100644
+index 000000000..cb6222015
+--- /dev/null
++++ b/tests/v1/ple_offload/test_spawn_bootstrap_cuda.py
+@@ -0,0 +1,84 @@
++# SPDX-License-Identifier: Apache-2.0
++
++import ctypes
++import ctypes.util
++import json
++import multiprocessing
++import os
++import pickle
++import sys
++from pathlib import Path
++
++import pytest
++
++from vllm_ple_offload_bootstrap import proc_main
++
++
++def _native_cuda_probe(output_path: str) -> None:
++    """Run during config unpickling, before the bootstrap imports vLLM."""
++    library = ctypes.util.find_library("cudart")
++    if library is None:
++        os._exit(77)
++    cudart = ctypes.CDLL(library)
++    result = int(cudart.cudaFree(ctypes.c_void_p()))
++    Path(output_path).write_text(
++        json.dumps(
++            {
++                "cuda_visible_devices": os.environ.get(
++                    "CUDA_VISIBLE_DEVICES"
++                ),
++                "cuda_result": result,
++                "torch_imported": "torch" in sys.modules,
++                "vllm_imported": "vllm" in sys.modules,
++            }
++        ),
++        encoding="utf-8",
++    )
++    os._exit(0)
++
++
++class _ProbePayload:
++    def __init__(self, output_path: str) -> None:
++        self.output_path = output_path
++
++    def __reduce__(self):
++        return _native_cuda_probe, (self.output_path,)
++
++
++def test_spawn_bootstrap_sets_visibility_before_native_cuda(
++    tmp_path: Path,
++) -> None:
++    if ctypes.util.find_library("cudart") is None:
++        pytest.skip("CUDA runtime is not installed")
++
++    original = os.environ.get("CUDA_VISIBLE_DEVICES")
++    child_env = dict(os.environ)
++    child_env["CUDA_VISIBLE_DEVICES"] = "0"
++    output_path = tmp_path / "probe.json"
++    payload = pickle.dumps(
++        _ProbePayload(str(output_path)),
++        protocol=pickle.HIGHEST_PROTOCOL,
++    )
++
++    context = multiprocessing.get_context("spawn")
++    process = context.Process(
++        target=proc_main,
++        kwargs={
++            "child_env": child_env,
++            "vllm_config_payload": payload,
++        },
++    )
++    process.start()
++    process.join(timeout=15)
++
++    assert not process.is_alive()
++    if process.exitcode == 77:
++        pytest.skip("spawned child could not load the CUDA runtime")
++    assert process.exitcode == 0
++
++    result = json.loads(output_path.read_text(encoding="utf-8"))
++    assert result["cuda_visible_devices"] == "0"
++    assert result["cuda_result"] == 0
++    assert result["torch_imported"] is False
++    assert result["vllm_imported"] is False
++    assert os.environ.get("CUDA_VISIBLE_DEVICES") == original
+diff --git a/vllm/model_executor/layers/ple_offload_layer.py b/vllm/model_executor/layers/ple_offload_layer.py
+index ec551c083..e6a78dd01 100644
+--- a/vllm/model_executor/layers/ple_offload_layer.py
++++ b/vllm/model_executor/layers/ple_offload_layer.py
+@@ -6,15 +6,22 @@ Synchronization between the offload process and the GPU main stream is
+ handled by :class:`CpuGpuSemaphore`, which uses CUDA's
+ ``cuStreamWaitValue32`` / ``cuStreamWriteValue32`` stream memory operations.
+ 
+-Typical decode-step timeline
+-----------------------------
+-Offload process (CPU)                  GPU main stream (forward)
+------------------------------          ------------------------------
++Decode-step timeline, host-mapped PULL design (design H)
++--------------------------------------------------------
++Offload process (CPU, no CUDA)          GPU main stream (forward)
++------------------------------          ------------------------------
+ forward_impl() on CPU                  ... other GPU ops ...
+-pinned -> GPU async H2D (copy_stream)   WaitValue32(flag==1)  <- in Graph
+-WriteValue32(flag=1, copy_stream)       return _gpu_output_buffer[:n]
+-                                       ... model consumes output ...
+-                                       WriteValue32(flag=0)  <- after forward
++wait host flag == 0                    WaitValue32(host flag == 1)   <- in graph
++rows -> shared pinned host slot         cuMemcpyHtoDAsync(slot -> GPU) <- in graph
++publish fence; host flag = 1            return _gpu_output_buffer[:n]
++                                        ... model consumes output ...
++                                        WriteValue32(host flag = 0)   <- release_outputs
++
++``release_outputs`` performs the sole reset. Safety requires serialized local
++forwards on one ordered model stream: a new transaction cannot begin until the
++prior release has been enqueued. If any prepared forward is abandoned or its
++correspondence becomes uncertain, the worker must terminate; resetting,
++retrying, or continuing could reuse stale rows or overwrite live input.
+ """
+ 
+ import functools
+diff --git a/vllm/v1/ple_offload/connector.py b/vllm/v1/ple_offload/connector.py
+index e9e587ba5..c0a3766d6 100644
+--- a/vllm/v1/ple_offload/connector.py
++++ b/vllm/v1/ple_offload/connector.py
+@@ -12,6 +12,8 @@ from typing import Any
+ import msgspec
+ import torch
+ from vllm.v1.ple_offload import rowdump as _rowdump
++from vllm.v1.ple_offload.fatal import ple_fail_closed
++from vllm.v1.ple_offload.progress import PleProgressMonitor
+ import torch.nn as nn
+ import zmq
+ from cuda.bindings import driver as cuda_driver
+@@ -31,6 +33,11 @@ from vllm.v1.utils import record_function_or_nullcontext
+ 
+ logger = init_logger(__name__)
+ 
++# CUDA registration alone does not own Python storage. Captured graphs retain
++# raw addresses, so every successfully registered host allocation remains
++# strongly referenced until process exit.
++_PROCESS_LIFETIME_REGISTERED_STORAGE: list[torch.Tensor] = []
++
+ 
+ @dataclass(frozen=True)
+ class _PendingPleOffloadRequest:
+@@ -63,6 +70,7 @@ class PleOffloadConnector:
+         ngram_context_source: torch.Tensor | None,
+     ) -> None:
+         self.device = device
++        self.rank = int(vllm_config.parallel_config.rank)
+         self.dp_rank = get_dp_group().rank_in_group
+         self.tp_rank = get_tp_group().rank_in_group
+         # Host-mapped pull design: per layer a shared host output buffer and a
+@@ -74,6 +82,10 @@ class PleOffloadConnector:
+         self._host_flags: dict[str, torch.Tensor] = {}
+         self._gpu_output_bufs: dict[str, torch.Tensor] = {}
+         self._layers = self._setup_layers(vllm_config, model)
++        self._progress = PleProgressMonitor.from_environment(
++            rank=self.rank,
++            layer_names=tuple(self._layers),
++        )
+ 
+         # TP0 registers shared buffers with CUDA for asynchronous D2H copies.
+         scheduler_config = vllm_config.scheduler_config
+@@ -260,6 +272,7 @@ class PleOffloadConnector:
+             ),
+             "cuMemHostRegister(PLE host buffer)",
+         )
++        _PROCESS_LIFETIME_REGISTERED_STORAGE.append(buffer)
+         if device_map:
+             self._mapped_host_buffers.append(buffer)
+         else:
+@@ -458,16 +471,64 @@ class PleOffloadConnector:
+             _PendingPleOffloadRequest(request, d2h_done_event)
+         )
+ 
++    def _fail_closed(self, where: str, error: BaseException) -> None:
++        ple_fail_closed(
++            where=where,
++            rank=self.rank,
++            layer=",".join(self._layers),
++            sequence=self._progress.sequence,
++            error=error,
++        )
++
+     def prepare_forward(
+         self,
+         num_reqs: int,
+         num_tokens: int,
+         dummy_run: bool,
++        *,
++        consumer_num_tokens: int | None = None,
++    ) -> None:
++        """Prepare one PLE transaction; any ordinary exception is fatal."""
++        try:
++            self._progress.begin(startup=dummy_run, num_tokens=num_tokens)
++            self._prepare_forward_impl(
++                num_reqs,
++                num_tokens,
++                dummy_run,
++                consumer_num_tokens=consumer_num_tokens,
++            )
++        except Exception as error:
++            self._fail_closed("prepare_forward", error)
++
++    def _prepare_forward_impl(
++        self,
++        num_reqs: int,
++        num_tokens: int,
++        dummy_run: bool,
++        *,
++        consumer_num_tokens: int | None = None,
+     ) -> None:
+         """Submit real inputs or satisfy the PLE wait for a dummy forward."""
++        if consumer_num_tokens is None:
++            consumer_num_tokens = num_tokens
++        if int(num_tokens) != int(consumer_num_tokens):
++            raise RuntimeError(
++                "PLE request/consumer token-count mismatch: "
++                f"request={num_tokens}, consumer={consumer_num_tokens}"
++            )
++        if not 0 <= int(num_tokens) <= self._input_ids_buf.shape[0]:
++            raise RuntimeError(
++                f"PLE token count {num_tokens} exceeds connector capacity "
++                f"{self._input_ids_buf.shape[0]}"
++            )
++        if not 0 <= int(num_reqs) < self._query_start_loc_buf.shape[0]:
++            raise RuntimeError(
++                f"PLE request count {num_reqs} exceeds connector capacity "
++                f"{self._query_start_loc_buf.shape[0] - 1}"
++            )
+         self._rowdump_n = None if dummy_run else num_tokens
+         if dummy_run:
+-            self.signal_dummy_outputs(num_tokens)
++            self._signal_dummy_outputs_impl(num_tokens)
+             return
+         if self._after_dummy:
+             # Every dummy/cleanup reset on THIS rank already completed
+@@ -486,6 +547,11 @@ class PleOffloadConnector:
+ 
+     def signal_dummy_outputs(self, num_tokens: int) -> None:
+         """Locally satisfy PLE waits for dummy and capture forwards."""
++        self._progress.begin(startup=True, num_tokens=num_tokens)
++        self._signal_dummy_outputs_impl(num_tokens)
++
++    def _signal_dummy_outputs_impl(self, num_tokens: int) -> None:
++        """Signal dummy outputs after the progress transaction is armed."""
+         # Dummy and capture forwards do not send CPU requests, but every PLE
+         # placeholder still waits for a completed output semaphore.
+         self._after_dummy = True
+@@ -495,6 +561,14 @@ class PleOffloadConnector:
+             layer._sem.signal(stream)
+ 
+     def release_outputs(self) -> None:
++        """Release one PLE transaction; any ordinary exception is fatal."""
++        try:
++            self._release_outputs_impl()
++            self._progress.complete()
++        except Exception as error:
++            self._fail_closed("release_outputs", error)
++
++    def _release_outputs_impl(self) -> None:
+         """Mark GPU output buffers reusable after the model consumes them."""
+         n = getattr(self, "_rowdump_n", None)
+         self._rowdump_n = None
+@@ -519,7 +593,7 @@ class PleOffloadConnector:
+             stream.synchronize()
+ 
+     def close(self) -> None:
+-        """Stop request transport and release host registrations."""
++        """Stop transport without releasing process-lifetime host storage."""
+         request_thread = self._request_thread
+         if request_thread is not None and request_thread.is_alive():
+             try:
+@@ -530,19 +604,18 @@ class PleOffloadConnector:
+         if request_thread is not None and request_thread.is_alive():
+             # The thread may still access the registered buffers or ZMQ context.
+             logger.error("PLE request thread did not stop; deferring resource cleanup")
++            self._progress.close()
+             return
+         self._request_thread = None
+ 
+-        if self._pinned_input_buffers:
+-            with torch.accelerator.device_index(self.device.index):
+-                self._unpin_input_buffers()
+-        # Device-mapped outputs/flags stay registered until process exit:
+-        # captured graphs hold their raw addresses and a graph may still be
+-        # waiting on a flag; the driver releases them when the process ends.
+-        if self._mapped_host_buffers:
++        # Inputs, outputs, and flags remain registered and strongly referenced.
++        # A captured graph or delayed request can still contain their addresses;
++        # the CUDA driver releases registrations when the process exits.
++        registered = len(self._pinned_input_buffers) + len(self._mapped_host_buffers)
++        if registered:
+             logger.debug(
+-                "PleOffload: %d device-mapped host buffers retained until exit",
+-                len(self._mapped_host_buffers),
++                "PleOffload: %d registered host buffers retained until exit",
++                registered,
+             )
+         self._d2h_event_pool = None
+         if self._registration_socket is not None:
+@@ -551,3 +624,4 @@ class PleOffloadConnector:
+         if self._zmq_ctx is not None:
+             self._zmq_ctx.term()
+             self._zmq_ctx = None
++        self._progress.close()
+diff --git a/vllm/v1/ple_offload/fatal.py b/vllm/v1/ple_offload/fatal.py
+new file mode 100644
+index 000000000..5f109297e
+--- /dev/null
++++ b/vllm/v1/ple_offload/fatal.py
+@@ -0,0 +1,50 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Fail-closed helpers for the PLE single-slot transport."""
++
++import functools
++import os
++from collections.abc import Callable
++from typing import Any, NoReturn, TypeVar
++
++_F = TypeVar("_F", bound=Callable[..., Any])
++
++
++def ple_fail_closed(
++    *,
++    where: str,
++    rank: int,
++    layer: str,
++    sequence: int,
++    error: BaseException,
++) -> NoReturn:
++    """Emit one best-effort nonblocking diagnostic and terminate immediately."""
++    try:
++        os.set_blocking(2, False)
++        message = (
++            f"PLE fatal: where={where} rank={rank} layer={layer} "
++            f"sequence={sequence} error={type(error).__name__}\n"
++        )
++        os.write(2, message.encode("utf-8", "backslashreplace")[:2048])
++    except BaseException:
++        pass
++    os._exit(1)
++
++
++def fail_ple_execute_model(func: _F) -> _F:
++    """Make every non-shutdown execute_model escape fatal when PLE is active."""
++
++    @functools.wraps(func)
++    def wrapped(self: Any, *args: Any, **kwargs: Any) -> Any:
++        try:
++            return func(self, *args, **kwargs)
++        except SystemExit:
++            # WorkerProc's signal handler uses SystemExit for clean shutdown.
++            raise
++        except BaseException as error:
++            connector = getattr(self, "_ple_offload_connector", None)
++            if connector is None:
++                raise
++            connector._fail_closed("execute_model", error)
++
++    return wrapped  # type: ignore[return-value]
+diff --git a/vllm/v1/ple_offload/progress.py b/vllm/v1/ple_offload/progress.py
+new file mode 100644
+index 000000000..00595e5b5
+--- /dev/null
++++ b/vllm/v1/ple_offload/progress.py
+@@ -0,0 +1,143 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Independent progress deadline for PLE transactions."""
++
++import os
++import threading
++import time
++
++from vllm.v1.ple_offload.fatal import ple_fail_closed
++
++_DEFAULT_SERVING_DEADLINE_S = 300.0
++_DEFAULT_STARTUP_DEADLINE_S = 1800.0
++
++
++def _positive_deadline(name: str, default: float) -> float:
++    value = float(os.environ.get(name, str(default)))
++    if value <= 0:
++        raise ValueError(f"{name} must be greater than zero")
++    return value
++
++
++class PleProgressMonitor:
++    """Charge only time spent inside an outstanding PLE transaction."""
++
++    def __init__(
++        self,
++        *,
++        rank: int,
++        layer_names: tuple[str, ...],
++        serving_deadline_s: float,
++        startup_deadline_s: float,
++    ) -> None:
++        if serving_deadline_s <= 0 or startup_deadline_s <= 0:
++            raise ValueError("PLE progress deadlines must be greater than zero")
++        self._rank = rank
++        self._layer = ",".join(layer_names)
++        self._serving_deadline_s = serving_deadline_s
++        self._startup_deadline_s = startup_deadline_s
++        self._condition = threading.Condition()
++        self._active: tuple[int, bool, int, float] | None = None
++        self._depth = 0
++        self._sequence = 0
++        self._stopping = False
++        self._thread = threading.Thread(
++            target=self._run,
++            name=f"ple-progress-rank{rank}",
++            daemon=True,
++        )
++        self._thread.start()
++
++    @classmethod
++    def from_environment(
++        cls, *, rank: int, layer_names: tuple[str, ...]
++    ) -> "PleProgressMonitor":
++        return cls(
++            rank=rank,
++            layer_names=layer_names,
++            serving_deadline_s=_positive_deadline(
++                "VLLM_PLE_PROGRESS_DEADLINE_S",
++                _DEFAULT_SERVING_DEADLINE_S,
++            ),
++            startup_deadline_s=_positive_deadline(
++                "VLLM_PLE_STARTUP_DEADLINE_S",
++                _DEFAULT_STARTUP_DEADLINE_S,
++            ),
++        )
++
++    @property
++    def sequence(self) -> int:
++        with self._condition:
++            return self._sequence
++
++    def begin(self, *, startup: bool, num_tokens: int) -> int:
++        now = time.monotonic()
++        budget = (
++            self._startup_deadline_s if startup else self._serving_deadline_s
++        )
++        with self._condition:
++            if self._active is not None:
++                if not startup or not self._active[1]:
++                    raise RuntimeError(
++                        "Overlapping real PLE transactions violate the "
++                        "serialized single-slot protocol"
++                    )
++                # Capture can contain nested startup dummy executions. Keep the
++                # outer transaction armed and extend only the startup deadline.
++                sequence = self._active[0]
++                self._depth += 1
++                self._active = (sequence, True, num_tokens, now + budget)
++            else:
++                self._sequence += 1
++                sequence = self._sequence
++                self._depth = 1
++                self._active = (sequence, startup, num_tokens, now + budget)
++            self._condition.notify_all()
++            return sequence
++
++    def complete(self) -> None:
++        with self._condition:
++            if self._active is None or self._depth <= 0:
++                raise RuntimeError("PLE release has no matching transaction")
++            self._depth -= 1
++            if self._depth == 0:
++                self._active = None
++            self._condition.notify_all()
++
++    def close(self) -> None:
++        with self._condition:
++            self._stopping = True
++            self._condition.notify_all()
++        self._thread.join(timeout=1)
++
++    def _run(self) -> None:
++        while True:
++            with self._condition:
++                while self._active is None and not self._stopping:
++                    self._condition.wait()
++                if self._stopping:
++                    return
++                assert self._active is not None
++                sequence, startup, num_tokens, deadline = self._active
++                remaining = deadline - time.monotonic()
++                if remaining > 0:
++                    self._condition.wait(timeout=remaining)
++                    continue
++                # Recheck identity after waking so a completed/replaced
++                # transaction is never charged.
++                if self._active != (
++                    sequence,
++                    startup,
++                    num_tokens,
++                    deadline,
++                ):
++                    continue
++
++            mode = "startup" if startup else "serving"
++            ple_fail_closed(
++                where=f"progress-deadline:{mode}:tokens={num_tokens}",
++                rank=self._rank,
++                layer=self._layer,
++                sequence=sequence,
++                error=TimeoutError("PLE transaction made no bounded progress"),
++            )
+diff --git a/vllm/v1/ple_offload/worker.py b/vllm/v1/ple_offload/worker.py
+index dadd2722f..689ad74b0 100644
+--- a/vllm/v1/ple_offload/worker.py
++++ b/vllm/v1/ple_offload/worker.py
+@@ -83,6 +83,28 @@ def _publish_fence() -> None:
+         pass
+ 
+ 
++def _offload_child_environment() -> dict[str, str]:
++    """Build the offload environment without mutating the parent."""
++    child_env = dict(os.environ)
++    child_env["VLLM_DISABLE_SHARED_EXPERTS_STREAM"] = "1"
++    child_env.setdefault("CUTLASS_CUDA_DEVICE_ID", "0")
++    child_env.pop("VLLM_PP_LAYER_PARTITION", None)
++
++    home_device = child_env.get("VLLM_PLE_OFFLOAD_HOME_DEVICE", "").strip()
++    if home_device:
++        parent_visible = child_env.get("CUDA_VISIBLE_DEVICES", "").strip()
++        try:
++            physical = (
++                parent_visible.split(",")[int(home_device)].strip()
++                if parent_visible
++                else home_device
++            )
++        except (IndexError, ValueError) as error:
++            raise ValueError("Invalid VLLM_PLE_OFFLOAD_HOME_DEVICE") from error
++        child_env["CUDA_VISIBLE_DEVICES"] = physical
++    return child_env
++
++
+ def _prepare_cuda_free_process() -> None:
+     """Keep the PLE offload process free of any CUDA context.
+ 
+@@ -304,12 +326,18 @@ class PleOffloadWorker:
+     ) -> PleOffloadWorkerHandle:
+         """Spawn one CPU offload process for all local DP and TP workers."""
+         context = get_mp_context()
++        from vllm_ple_offload_bootstrap import proc_main as bootstrap_proc_main
++
+         ready_reader, ready_writer = context.Pipe(duplex=False)
+         death_reader, death_writer = context.Pipe(duplex=False)
++        config_payload = pickle.dumps(
++            vllm_config, protocol=pickle.HIGHEST_PROTOCOL
++        )
+         proc = context.Process(
+-            target=PleOffloadWorker.proc_main,
++            target=bootstrap_proc_main,
+             kwargs={
+-                "vllm_config": vllm_config,
++                "vllm_config_payload": config_payload,
++                "child_env": _offload_child_environment(),
+                 "num_workers": num_workers,
+                 "ipc_addr": ipc_addr,
+                 "ready_pipe": (ready_reader, ready_writer),
+@@ -405,37 +433,17 @@ class PleOffloadWorker:
+             # constructors instead of becoming empty GPU-worker placeholders.
+             mark_as_offload_worker()
+ 
+-            # Host-mapped pull design: this process issues no CUDA work (the
+-            # GPU workers wait on host flags and DMA host -> GPU themselves),
+-            # so no CUDA context is expected (the push design held one per
+-            # stage-0 card: 276-322 MiB each). Should an import or constructor
+-            # still initialize CUDA incidentally, confine it to ONE device
+-            # (VLLM_PLE_OFFLOAD_HOME_DEVICE, a logical index in the parent's
+-            # CUDA_VISIBLE_DEVICES) rather than hiding all devices: an empty
+-            # CUDA_VISIBLE_DEVICES makes vLLM's platform helpers raise during
+-            # model construction. Never call set_device here.
++            # The bootstrap established child-only visibility before importing
++            # torch or vLLM. Retain the Python-level guards for known CUDA
++            # initialization paths and fail if initialization already occurred.
+             _prepare_cuda_free_process()
+             home_device = os.environ.get("VLLM_PLE_OFFLOAD_HOME_DEVICE", "").strip()
+             if home_device:
+-                parent_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+-                physical = (
+-                    parent_visible.split(",")[int(home_device)].strip()
+-                    if parent_visible
+-                    else home_device
++                logger.info(
++                    "PLE offload bootstrap visibility is CUDA_VISIBLE_DEVICES=%s "
++                    "(host-mapped pull: no CUDA context expected)",
++                    os.environ.get("CUDA_VISIBLE_DEVICES", ""),
+                 )
+-                if torch.cuda.is_initialized():
+-                    logger.warning(
+-                        "CUDA already initialized in the PLE offload process; "
+-                        "cannot confine it to physical GPU %s",
+-                        physical,
+-                    )
+-                else:
+-                    os.environ["CUDA_VISIBLE_DEVICES"] = physical
+-                    logger.info(
+-                        "PLE offload process confined to physical GPU %s "
+-                        "(host-mapped pull: no CUDA context expected)",
+-                        physical,
+-                    )
+ 
+             # Initialize Gloo before installing the real VllmConfig. This keeps
+             # the CPU process in an isolated rank-zero, world-size-one group.
+@@ -816,16 +824,80 @@ class PleOffloadRunner:
+         with record_function_or_nullcontext("ple_offload: handle_requests"):
+             self._handle_requests_impl(requests)
+ 
++    def _validate_requests_before_publication(
++        self, requests: list[PleOffloadRequest]
++    ) -> None:
++        """Validate a drained request batch before computation or publication."""
++        for request in requests:
++            dp_rank = request.dp_rank
++            if dp_rank not in self._worker_targets or dp_rank not in self._input_bufs:
++                raise RuntimeError(
++                    f"No PLE buffers or output targets for dp_rank={dp_rank}; "
++                    "refusing request"
++                )
++
++            input_bufs = self._input_bufs[dp_rank]
++            if not 0 < request.num_tokens <= input_bufs.input_ids_buf.numel():
++                raise RuntimeError(
++                    f"PLE num_tokens={request.num_tokens} is outside capacity "
++                    f"{input_bufs.input_ids_buf.numel()} for dp_rank={dp_rank}"
++                )
++            max_reqs = input_bufs.query_start_loc_buf.numel() - 1
++            if not 0 < request.num_reqs <= max_reqs:
++                raise RuntimeError(
++                    f"PLE num_reqs={request.num_reqs} is outside capacity "
++                    f"{max_reqs} for dp_rank={dp_rank}"
++                )
++            if (
++                input_bufs.query_start_loc_buf.dtype != torch.int32
++                or input_bufs.query_start_loc_buf.dim() != 1
++            ):
++                raise RuntimeError(
++                    f"PLE query_start_loc for dp_rank={dp_rank} must be 1-D int32"
++                )
++            if (
++                input_bufs.ngram_context_buf is not None
++                and request.num_reqs > input_bufs.ngram_context_buf.shape[0]
++            ):
++                raise RuntimeError(
++                    f"PLE num_reqs={request.num_reqs} exceeds ngram context "
++                    f"capacity for dp_rank={dp_rank}"
++                )
++
++            query_start_loc = input_bufs.query_start_loc_buf[
++                : request.num_reqs + 1
++            ].tolist()
++            if (
++                query_start_loc[0] != 0
++                or query_start_loc[-1] > request.num_tokens
++                or any(a > b for a, b in zip(query_start_loc, query_start_loc[1:]))
++            ):
++                raise RuntimeError(
++                    f"Invalid PLE query_start_loc for dp_rank={dp_rank}: "
++                    f"{query_start_loc}, num_tokens={request.num_tokens}"
++                )
++
++            for layer_name, targets in self._worker_targets[dp_rank].items():
++                scratch = self._scratch_bufs[dp_rank][layer_name]
++                if request.num_tokens > scratch.shape[0] or any(
++                    request.num_tokens > target.host_output_buffer.shape[0]
++                    for target in targets
++                ):
++                    raise RuntimeError(
++                        f"PLE num_tokens={request.num_tokens} exceeds output "
++                        f"capacity for {layer_name}, dp_rank={dp_rank}"
++                    )
++
+     def _handle_requests_impl(self, requests: list[PleOffloadRequest]) -> None:
+         """Process one batch of PLE requests."""
++        self._validate_requests_before_publication(requests)
+         requests_by_dp: dict[int, PleOffloadRequest] = {}
+         for request in requests:
+             if request.dp_rank not in self._worker_targets:
+-                logger.warning(
+-                    "No PLE output targets for dp_rank=%d; skipping request.",
+-                    request.dp_rank,
++                raise RuntimeError(
++                    f"No PLE output targets for dp_rank={request.dp_rank}; "
++                    "refusing request"
+                 )
+-                continue
+             if request.dp_rank in requests_by_dp:
+                 # One input slot and one output slot per DP rank: a second
+                 # request in the same batch would alias them. Fatal, never
+@@ -876,11 +948,13 @@ class PleOffloadRunner:
+                 scratch = self._scratch_bufs[dp_rank][layer_name]
+                 if result.dim() != 2 or result.shape[0] != request.num_tokens or (
+                     result.shape[1] != scratch.shape[1]
+-                ):
++                ) or result.dtype != scratch.dtype or result.device.type != "cpu":
+                     raise RuntimeError(
+-                        f"PLE result {tuple(result.shape)} for {layer_name} does not "
++                        f"PLE result {tuple(result.shape)} {result.dtype} "
++                        f"{result.device} for {layer_name} does not "
+                         f"match the request ({request.num_tokens} rows x "
+-                        f"{scratch.shape[1]}); refusing to publish (step {self._step})"
++                        f"{scratch.shape[1]} {scratch.dtype} CPU); refusing to "
++                        f"publish (step {self._step})"
+                     )
+                 slices = tuple(slice(0, size) for size in result.shape)
+                 for target in targets:
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 728b2f475..8ed112027 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -79,6 +79,7 @@ from vllm.v1.outputs import (
+     RoutedExpertsTensors,
+ )
+ from vllm.v1.ple_offload.connector import PleOffloadConnector
++from vllm.v1.ple_offload.fatal import fail_ple_execute_model
+ from vllm.v1.worker.block_table import get_block_table_width
+ from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
+ from vllm.v1.worker.gpu import pcp_manager as pcp
+@@ -1587,6 +1588,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             self.ec_connector.no_forward(scheduler_output).ec_connector_output,
+         )
+ 
++    @fail_ple_execute_model
+     @torch.inference_mode()
+     def execute_model(
+         self,
+@@ -1835,6 +1837,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 input_batch.num_reqs,
+                 input_batch.num_tokens_after_padding,
+                 dummy_run,
++                consumer_num_tokens=int(input_batch.input_ids.shape[0]),
+             )
+ 
+         # Run model.
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index a9bd7d6c3..8c6e7f70c 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -1611,6 +1611,7 @@ class Worker(WorkerBase):
+             self.model_runner.reset_lora_state()
+ 
+     def shutdown(self) -> None:
++        self._ple_offload_stopping = True
+         gc.unfreeze()
+ 
+         # has_kv_transfer_group can be None during interpreter shutdown.
+@@ -1627,7 +1628,6 @@ class Worker(WorkerBase):
+         self.elastic_ep_executor.shutdown()
+ 
+         if self._ple_offload_worker_handle is not None:
+-            self._ple_offload_stopping = True
+             self._ple_offload_worker_handle.close()
+             self._ple_offload_worker_handle = None
+ 
+diff --git a/vllm_ple_offload_bootstrap/__init__.py b/vllm_ple_offload_bootstrap/__init__.py
+new file mode 100644
+index 000000000..6c8e63bbe
+--- /dev/null
++++ b/vllm_ple_offload_bootstrap/__init__.py
+@@ -0,0 +1,29 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Minimal PLE child bootstrap; intentionally imports no torch or vLLM."""
++
++import os
++import pickle
++from typing import Any
++
++
++def proc_main(
++    *,
++    child_env: dict[str, str],
++    vllm_config_payload: bytes,
++    **worker_kwargs: Any,
++) -> None:
++    """Install child-only environment before config or implementation imports."""
++    os.environ.clear()
++    os.environ.update(child_env)
++
++    # VllmConfig unpickling and the worker import can both import implementation
++    # modules, so neither may happen before the environment is established.
++    vllm_config = pickle.loads(vllm_config_payload)
++
++    from vllm.v1.ple_offload.worker import PleOffloadWorker
++
++    PleOffloadWorker.proc_main(
++        vllm_config=vllm_config,
++        **worker_kwargs,
++    )
+-- 
+2.47.3
+

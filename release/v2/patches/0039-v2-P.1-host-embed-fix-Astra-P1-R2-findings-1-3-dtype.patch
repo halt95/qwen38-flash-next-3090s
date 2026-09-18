@@ -1,0 +1,400 @@
+From 42afeb3a14eb54cca01f6cc92ad6d201874d20de Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Sun, 13 Sep 2026 23:23:06 +0000
+Subject: [PATCH 39/76] v2 P.1 host-embed fix (Astra P1-R2 findings 1-3 + dtype
+ contract): loader opt-out from device_loading_context so the pinned shard the
+ UVA view aliases is never moved or replaced, TP1 stock lookup semantics,
+ fixed-dtype refusal on parent dtype transforms, measured-allocation
+ provisioning note (Sol draft, Fable applied/tested)
+
+QuantizeMethodBase.requires_device_loading defaults True (all other methods unchanged); _PinnedHostUnquantizedEmbeddingMethod sets False and process_weights_after_loading calls its hook without the context. Apply note: base-class attribute placed after the existing attribute docstrings (Sol draft split a docstring).
+
+Tests: tests/models/qwen4_exp/test_host_uva_embedding.py 16 passed + U5 budget report skipped (torch 2.13 host_memory_stats exposes no byte keys). Red on 49dbdb50da, all behavioural: outer post-load peak CUDA growth 1048576 == table bytes (transient), TP1 contract, dtype move did not raise, provisioning note absent.
+---
+ .../qwen4_exp/test_host_uva_embedding.py      | 178 +++++++++++++++++-
+ .../layers/quantization/base_config.py        |   7 +
+ .../layers/vocab_parallel_embedding.py        |  26 ++-
+ vllm/model_executor/model_loader/utils.py     |  15 +-
+ 4 files changed, 206 insertions(+), 20 deletions(-)
+
+diff --git a/tests/models/qwen4_exp/test_host_uva_embedding.py b/tests/models/qwen4_exp/test_host_uva_embedding.py
+index 76a147547..e55d5d53d 100644
+--- a/tests/models/qwen4_exp/test_host_uva_embedding.py
++++ b/tests/models/qwen4_exp/test_host_uva_embedding.py
+@@ -1,5 +1,6 @@
+ # SPDX-License-Identifier: Apache-2.0
+ 
++import os
+ from contextlib import nullcontext
+ from types import SimpleNamespace
+ 
+@@ -8,6 +9,7 @@ import torch
+ from torch import nn
+ 
+ import vllm.model_executor.layers.vocab_parallel_embedding as vpe
++import vllm.model_executor.model_loader.utils as loader_utils
+ import vllm.models.qwen4_exp.nvidia.model as model_mod
+ import vllm.models.qwen4_exp.nvidia.mtp as mtp_mod
+ from vllm.model_executor.layers.vocab_parallel_embedding import (
+@@ -36,6 +38,18 @@ def _set_tp(monkeypatch, rank: int, world_size: int) -> None:
+     )
+ 
+ 
++def _require_cuda_pinned_memory() -> None:
++    if not torch.cuda.is_available():
++        pytest.skip("requires CUDA UVA")
++    if not vpe.PIN_MEMORY:
++        pytest.skip("pinned memory is unavailable")
++    try:
++        probe = torch.empty(1, pin_memory=True)
++    except RuntimeError as exc:
++        pytest.skip(f"pinned allocation is unavailable: {exc}")
++    assert probe.is_pinned()
++
++
+ def _weight(vocab: int = VOCAB, hidden: int = HIDDEN) -> torch.Tensor:
+     values = torch.arange(vocab * hidden, dtype=torch.int32)
+     weight = values.reshape(vocab, hidden).to(torch.bfloat16)
+@@ -120,6 +134,50 @@ def test_u1_tp2_masking_and_reduction_are_bytewise_identical(monkeypatch):
+     assert torch.count_nonzero(invalid) == 0
+ 
+ 
++def test_u1_tp1_matches_stock_lookup_contract(monkeypatch):
++    _set_tp(monkeypatch, 0, 1)
++    weight = _weight()
++    with torch.device("cpu"):
++        stock = VocabParallelEmbedding(
++            VOCAB,
++            HIDDEN,
++            params_dtype=torch.bfloat16,
++        )
++        host = PinnedHostVocabParallelEmbedding(
++            VOCAB,
++            HIDDEN,
++            params_dtype=torch.bfloat16,
++            create_accelerator_view=False,
++        )
++
++    assert stock.quant_method.requires_device_loading is True
++    assert host.quant_method.requires_device_loading is False
++    stock.weight_loader(stock.weight, weight)
++    host.weight_loader(host.weight, weight)
++
++    # TP1 exposes padded storage just like an ordinary embedding lookup.
++    for row, value in ((VOCAB, 11), (stock.weight.shape[0] - 1, 29)):
++        stock.weight[row].fill_(value)
++        host.weight[row].fill_(value)
++
++    ids = torch.tensor([0, 64, 66, VOCAB, stock.weight.shape[0] - 1])
++    _assert_same_bytes(host(ids), stock(ids))
++
++    # Negative IDs and IDs beyond padded storage must fail in the same way.
++    for invalid_id in (-1, stock.weight.shape[0]):
++        invalid = torch.tensor([invalid_id])
++        with pytest.raises(Exception) as stock_error:
++            stock(invalid)
++        with pytest.raises(type(stock_error.value)) as host_error:
++            host(invalid)
++        assert str(host_error.value) == str(stock_error.value)
++
++
++def test_host_budget_requires_measured_allocation():
++    doc = PinnedHostVocabParallelEmbedding.__doc__ or ""
++    assert "measured pinned allocation, not tensor payload" in doc
++
++
+ class _LanguageModel(nn.Module):
+     def __init__(self, embedding: nn.Module) -> None:
+         super().__init__()
+@@ -150,7 +208,7 @@ def test_u1_real_multimodal_text_mask_and_merge(monkeypatch):
+     model.use_deepstack = False
+     model._has_oov_mm_tokens = True
+ 
+-    ids = torch.tensor([1, VOCAB + 5, -1, 64], dtype=torch.int64)
++    ids = torch.tensor([1, VOCAB + 5, 2, 64], dtype=torch.int64)
+     is_multimodal = torch.tensor([False, True, False, False])
+     image_row = torch.full((1, HIDDEN), 123, dtype=torch.bfloat16)
+ 
+@@ -163,6 +221,7 @@ def test_u1_real_multimodal_text_mask_and_merge(monkeypatch):
+     expected = torch.zeros(4, HIDDEN, dtype=torch.bfloat16)
+     expected[0].copy_(weight[1])
+     expected[1].copy_(image_row[0])
++    expected[2].copy_(weight[2])
+     expected[3].copy_(weight[64])
+     _assert_same_bytes(actual, expected)
+ 
+@@ -292,8 +351,9 @@ def test_tied_embeddings_are_rejected_for_both_owners(monkeypatch):
+         mtp_mod.Qwen4ExpMultiTokenPredictor(vllm_config=config)
+ 
+ 
+-def _cuda_host_layer(monkeypatch, vocab=VOCAB, hidden=HIDDEN):
+-    _set_tp(monkeypatch, 0, 1)
++def _cuda_host_layer(monkeypatch, vocab=VOCAB, hidden=HIDDEN, world_size=1):
++    _require_cuda_pinned_memory()
++    _set_tp(monkeypatch, 0, world_size)
+     layer = PinnedHostVocabParallelEmbedding(
+         vocab,
+         hidden,
+@@ -361,10 +421,48 @@ def test_u3_three_lookup_steps_inside_one_graph(monkeypatch):
+ 
+ 
+ @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA UVA")
+-def test_u4_real_shard_loader_has_no_cuda_table_transient(monkeypatch):
++def test_u3_parent_device_move_preserves_storage_and_dtype_move_fails(monkeypatch):
++    layer, _ = _cuda_host_layer(monkeypatch)
++    view = layer.accelerator_weight_view
++    assert view is not None
++    weight_ptr = layer.weight.data_ptr()
++    weight_storage_ptr = layer.weight.untyped_storage().data_ptr()
++    view_ptr = view.data_ptr()
++    view_storage_ptr = view.untyped_storage().data_ptr()
++
++    parent = nn.Module()
++    parent.add_module("embed_tokens", layer)
++    parent.add_module(
++        "projection",
++        nn.Linear(HIDDEN, HIDDEN, dtype=torch.bfloat16),
++    )
++
++    parent.to("cuda")
++    assert parent.projection.weight.device.type == "cuda"
++    assert layer.weight.device.type == "cpu"
++    assert layer.weight.is_pinned()
++    assert layer.weight.data_ptr() == weight_ptr
++    assert layer.weight.untyped_storage().data_ptr() == weight_storage_ptr
++    assert view.data_ptr() == view_ptr
++    assert view.untyped_storage().data_ptr() == view_storage_ptr
++
++    with pytest.raises(RuntimeError, match="fixed dtype"):
++        parent.to(torch.float32)
++    with pytest.raises(RuntimeError, match="fixed dtype"):
++        parent.half()
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA UVA")
++def test_u4_outer_post_load_preserves_pinned_uva_storage(monkeypatch):
+     vocab = 4096
+     hidden = 256
+     _set_tp(monkeypatch, 1, 2)
++    _require_cuda_pinned_memory()
++
++    # Account for construction, loading, and the outer post-load call.
++    torch.cuda.synchronize()
++    baseline = torch.cuda.memory_allocated()
++    torch.cuda.reset_peak_memory_stats()
+ 
+     layer = PinnedHostVocabParallelEmbedding(
+         vocab,
+@@ -373,32 +471,96 @@ def test_u4_real_shard_loader_has_no_cuda_table_transient(monkeypatch):
+     )
+     view = layer.accelerator_weight_view
+     assert view is not None
++    weight_ptr = layer.weight.data_ptr()
++    weight_storage_ptr = layer.weight.untyped_storage().data_ptr()
+     view_ptr = view.data_ptr()
++    view_storage_ptr = view.untyped_storage().data_ptr()
+ 
+     loaded_weight = _weight(vocab, hidden)
+     local_table_bytes = layer.weight.numel() * layer.weight.element_size()
+ 
+-    torch.cuda.synchronize()
+-    baseline = torch.cuda.memory_allocated()
+-    torch.cuda.reset_peak_memory_stats()
+-
+     assert (
+         layer.weight_loader.__func__
+         is VocabParallelEmbedding.weight_loader
+     )
+     layer.weight_loader(layer.weight, loaded_weight)
+ 
++    model = nn.Module()
++    model.add_module("embed_tokens", layer)
++    monkeypatch.setattr(
++        loader_utils,
++        "maybe_retie_word_embeddings",
++        lambda *args, **kwargs: None,
++    )
++    loader_utils.process_weights_after_loading(
++        model,
++        SimpleNamespace(quantization=None),
++        torch.device("cuda"),
++    )
++
+     torch.cuda.synchronize()
+     peak_growth = torch.cuda.max_memory_allocated() - baseline
+ 
+     assert layer.weight.device.type == "cpu"
+     assert layer.weight.is_pinned()
++    assert layer.weight.data_ptr() == weight_ptr
++    assert layer.weight.untyped_storage().data_ptr() == weight_storage_ptr
+     assert view.device.type == "cuda"
+     assert view.shape == layer.weight.shape
+     assert view.dtype == layer.weight.dtype
+     assert view.data_ptr() == view_ptr
++    assert view.untyped_storage().data_ptr() == view_storage_ptr
+     assert set(dict(layer.named_parameters())) == {"weight"}
+     assert peak_growth < local_table_bytes
+ 
+     expected = loaded_weight.narrow(0, vocab // 2, vocab // 2)
+     _assert_same_bytes(layer.weight, expected)
++
++    # Pointer stability alone is insufficient: mutate the retained CPU
++    # parameter and prove that the CUDA view reads that same storage.
++    local_row = 7
++    global_id = vocab // 2 + local_row
++    sentinel = torch.arange(hidden, dtype=torch.float32).to(torch.bfloat16)
++    layer.weight[local_row].copy_(sentinel)
++    actual = layer(torch.tensor([global_id], device="cuda"))
++    torch.cuda.synchronize()
++    _assert_same_bytes(actual[0].cpu(), sentinel)
++
++
++@pytest.mark.skipif(
++    os.environ.get("VLLM_RUN_HOST_EMBED_BUDGET") != "1",
++    reason="set VLLM_RUN_HOST_EMBED_BUDGET=1 for the 606 MiB allocation report",
++)
++def test_u5_report_production_shard_host_allocation(monkeypatch):
++    _require_cuda_pinned_memory()
++    if not hasattr(torch.cuda, "host_memory_stats"):
++        pytest.skip("torch.cuda.host_memory_stats is unavailable")
++
++    _set_tp(monkeypatch, 0, 2)
++    before = torch.cuda.host_memory_stats()
++    allocated_key = "allocated_bytes.all.current"
++    reserved_key = "reserved_bytes.all.current"
++    if allocated_key not in before or reserved_key not in before:
++        pytest.skip("host allocator byte statistics are unavailable")
++
++    try:
++        layer = PinnedHostVocabParallelEmbedding(
++            248_320,
++            2_560,
++            params_dtype=torch.bfloat16,
++        )
++    except RuntimeError as exc:
++        pytest.skip(f"production-sized pinned allocation is unavailable: {exc}")
++
++    after = torch.cuda.host_memory_stats()
++    payload_bytes = layer.weight.numel() * layer.weight.element_size()
++    allocated_delta = after[allocated_key] - before[allocated_key]
++    reserved_delta = after[reserved_key] - before[reserved_key]
++    print(
++        "HOST_EMBED_PINNED_BUDGET "
++        f"payload_bytes={payload_bytes} "
++        f"allocated_bytes={allocated_delta} "
++        f"reserved_bytes={reserved_delta}"
++    )
++    assert payload_bytes == 635_699_200
++    assert layer.weight.is_pinned()
+diff --git a/vllm/model_executor/layers/quantization/base_config.py b/vllm/model_executor/layers/quantization/base_config.py
+index f83c1ec76..7bbd4f234 100644
+--- a/vllm/model_executor/layers/quantization/base_config.py
++++ b/vllm/model_executor/layers/quantization/base_config.py
+@@ -37,6 +37,13 @@ class QuantizeMethodBase(ABC):
+     that mode; the loader driver rejects methods that do not declare support.
+     """
+ 
++    requires_device_loading: bool = True
++    """
++    Whether post-load processing requires parameters on the target device.
++    Methods that must preserve CPU parameter storage may opt out; all existing
++    methods retain the device-loading behavior by default.
++    """
++
+     @abstractmethod
+     def create_weights(
+         self, layer: torch.nn.Module, *weight_args, **extra_weight_attrs
+diff --git a/vllm/model_executor/layers/vocab_parallel_embedding.py b/vllm/model_executor/layers/vocab_parallel_embedding.py
+index 16bd181f9..d21a7a711 100644
+--- a/vllm/model_executor/layers/vocab_parallel_embedding.py
++++ b/vllm/model_executor/layers/vocab_parallel_embedding.py
+@@ -112,6 +112,8 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
+ class _PinnedHostUnquantizedEmbeddingMethod(UnquantizedEmbeddingMethod):
+     """Allocate an unquantized embedding shard without a CUDA transient."""
+ 
++    requires_device_loading = False
++
+     def __init__(self, *, device: torch.device, pin_memory: bool) -> None:
+         self.device = device
+         self.pin_memory = pin_memory
+@@ -610,7 +612,10 @@ class VocabParallelEmbedding(PluggableLayer):
+ 
+ 
+ class PinnedHostVocabParallelEmbedding(VocabParallelEmbedding):
+-    """TP-sharded embedding read on CUDA through mapped pinned host memory."""
++    """TP-sharded embedding read on CUDA through mapped pinned host memory.
++
++    Host provisioning must use measured pinned allocation, not tensor payload.
++    """
+ 
+     def __init__(
+         self,
+@@ -678,9 +683,14 @@ class PinnedHostVocabParallelEmbedding(VocabParallelEmbedding):
+         return self._uva_weight
+ 
+     def _apply(self, fn, recurse: bool = True):
+-        # Parent-model device/dtype transforms must not replace the pinned
+-        # allocation or invalidate the stable address held by CUDA graphs.
+-        del fn, recurse
++        # Probe the transformation without applying it to the pinned shard.
++        # Device-only parent moves remain no-ops, but silently retaining this
++        # layer's dtype during a parent dtype conversion would create a
++        # mixed-dtype model.
++        del recurse
++        probe = torch.empty(0, dtype=self.weight.dtype, device=self.weight.device)
++        if fn(probe).dtype != self.weight.dtype:
++            raise RuntimeError("Pinned host embedding has a fixed dtype")
+         return self
+ 
+     def _lookup_weight(self, input_: torch.Tensor) -> torch.Tensor:
+@@ -697,6 +707,12 @@ class PinnedHostVocabParallelEmbedding(VocabParallelEmbedding):
+         return self._uva_weight
+ 
+     def forward(self, input_: torch.Tensor) -> torch.Tensor:
++        if self.tp_size == 1:
++            return F.embedding(
++                input_.long(),
++                self._lookup_weight(input_),
++            )
++
+         masked_input, input_mask = get_masked_input_and_mask(
+             input_,
+             self.shard_indices.org_vocab_start_index,
+@@ -710,8 +726,6 @@ class PinnedHostVocabParallelEmbedding(VocabParallelEmbedding):
+             self._lookup_weight(input_),
+         )
+         output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
+-        if self.tp_size == 1:
+-            return output_parallel
+         return tensor_model_parallel_all_reduce(output_parallel)
+ 
+ 
+diff --git a/vllm/model_executor/model_loader/utils.py b/vllm/model_executor/model_loader/utils.py
+index 03039cf01..dc72a14b4 100644
+--- a/vllm/model_executor/model_loader/utils.py
++++ b/vllm/model_executor/model_loader/utils.py
+@@ -119,12 +119,15 @@ def process_weights_after_loading(
+                     f"layer {name or '<root>'}: {type(quant_method).__name__} "
+                     "does not support pre-processed weights"
+                 )
+-            # When quant methods need to process weights after loading
+-            # (for repacking, quantizing, etc), they expect parameters
+-            # to be on the global target device. This scope is for the
+-            # case where cpu offloading is used, where we will move the
+-            # parameters onto device for processing and back off after.
+-            with device_loading_context(module, target_device):
++            if quant_method.requires_device_loading:
++                # When quant methods need to process weights after loading
++                # (for repacking, quantizing, etc), they expect parameters
++                # to be on the global target device. This scope is for the
++                # case where cpu offloading is used, where we will move the
++                # parameters onto device for processing and back off after.
++                with device_loading_context(module, target_device):
++                    quant_method.process_weights_after_loading(module)
++            else:
+                 quant_method.process_weights_after_loading(module)
+             # process_weights_after_loading may swap in freshly-created
+             # Parameters (e.g. FP8 requantization), which are stamped with the
+-- 
+2.47.3
+

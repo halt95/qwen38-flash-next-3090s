@@ -1,0 +1,843 @@
+From e7af2181ead1517ef14307acc2c9f21716891285 Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Fri, 11 Sep 2026 13:19:17 +0000
+Subject: [PATCH 16/76] e2-pull T: PLE offload pull via worker output thread
+ (superseded by H before boot; kept for the record)
+
+---
+ vllm/v1/ple_offload/connector.py | 230 +++++++++++++++++++++++++------
+ vllm/v1/ple_offload/protocol.py  |  46 ++++++-
+ vllm/v1/ple_offload/worker.py    | 225 +++++++++++++++++++++---------
+ 3 files changed, 389 insertions(+), 112 deletions(-)
+
+diff --git a/vllm/v1/ple_offload/connector.py b/vllm/v1/ple_offload/connector.py
+index d1b25c729..133d1f9d9 100644
+--- a/vllm/v1/ple_offload/connector.py
++++ b/vllm/v1/ple_offload/connector.py
+@@ -1,6 +1,14 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-"""Exchange PLE data between a GPU worker and the CPU-offload process."""
++"""Exchange PLE data between a GPU worker and the CPU-offload process.
++
++Pull design: the offload process never touches CUDA. Each GPU worker owns a
++shared, page-locked host output buffer per PLE layer; the offload process
++writes the layer result there and sends an output notice; this worker's
++output thread copies host -> GPU on a private stream, signals the layer's
++semaphore, waits for the DMA to finish and acks so the host buffer may be
++reused. The GPU-side wait (inside the captured graph) is unchanged.
++"""
+ 
+ import os
+ import queue
+@@ -23,8 +31,12 @@ from vllm.model_executor.layers.ple_offload_layer import (
+     PleOffloadLayer,
+ )
+ from vllm.v1.ple_offload.protocol import (
++    _PLE_OFFLOAD_OUTPUT_READY_DECODER,
++    PleOffloadAck,
+     PleOffloadRegistration,
+     PleOffloadRequest,
++    ple_offload_ack_ipc_addr,
++    ple_offload_reply_ipc_addr,
+ )
+ from vllm.v1.utils import record_function_or_nullcontext
+ 
+@@ -64,6 +76,11 @@ class PleOffloadConnector:
+         self.device = device
+         self.dp_rank = get_dp_group().rank_in_group
+         self.tp_rank = get_tp_group().rank_in_group
++        self.worker_id = (
++            self.dp_rank * vllm_config.parallel_config.world_size
++            + vllm_config.parallel_config.rank
++        )
++        self._host_output_bufs: dict[str, torch.Tensor] = {}
+         self._layers = self._setup_layers(vllm_config, model)
+ 
+         # TP0 registers shared buffers with CUDA for asynchronous D2H copies.
+@@ -96,7 +113,7 @@ class PleOffloadConnector:
+         self._ngram_context_source = ngram_context_source
+         self._validate_input_sources()
+ 
+-        self._pinned_input_buffers: list[torch.Tensor] = []
++        self._pinned_host_buffers: list[torch.Tensor] = []
+         self._request_queue: queue.Queue[_PendingPleOffloadRequest | None] = (
+             queue.Queue(maxsize=vllm_config.max_concurrent_batches)
+         )
+@@ -106,22 +123,39 @@ class PleOffloadConnector:
+         self._registration_socket: zmq.Socket | None = None
+         self._d2h_event_pool: queue.Queue[torch.cuda.Event] | None = None
+ 
++        # Every TP rank pulls its own layer outputs from host memory.
++        self._reply_ipc_addr = ple_offload_reply_ipc_addr(ipc_addr, self.worker_id)
++        self._ack_ipc_addr = ple_offload_ack_ipc_addr(ipc_addr)
++        self._output_thread: threading.Thread | None = None
++        self._output_thread_ready = threading.Event()
++        self._output_thread_stop = threading.Event()
++        self._output_thread_error: BaseException | None = None
++
+         try:
+             self._zmq_ctx = zmq.Context()
+             self._registration_socket = self._zmq_ctx.socket(zmq.PUSH)
+             self._registration_socket.connect(ipc_addr)
++
++            # The reply socket must be bound before the offload process can
++            # send the first output notice, i.e. before registration.
++            self._start_output_thread()
+             self._register_with_offload_worker(vllm_config, ipc_addr)
+ 
+-            if self.tp_rank == 0:
+-                # ForkingPickler may replace CPU storage while converting its
+-                # sharing strategy, so register only the final addresses.
+-                with torch.accelerator.device_index(self.device.index):
+-                    self._pin_input_buffers()
++            # ForkingPickler (file_system strategy) replaces a CPU storage's
++            # data pointer in place while pickling, so page-lock only AFTER
++            # registration, i.e. on the final shared addresses. No notice can
++            # arrive before this returns: notices follow requests, and requests
++            # follow the offload READY, which needs every registration.
++            with torch.accelerator.device_index(self.device.index):
++                self._pin_host_buffers(list(self._host_output_bufs.values()))
++                if self.tp_rank == 0:
++                    self._pin_host_buffers(self._input_buffers())
+                     self._d2h_event_pool = queue.Queue(
+                         maxsize=vllm_config.max_concurrent_batches
+                     )
+                     for _ in range(vllm_config.max_concurrent_batches):
+                         self._d2h_event_pool.put_nowait(torch.cuda.Event())
++            if self.tp_rank == 0:
+                 self._start_request_thread(ipc_addr)
+         except Exception:
+             self.close()
+@@ -145,82 +179,82 @@ class PleOffloadConnector:
+ 
+         config = vllm_config.model_config.hf_text_config
+         max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+-        for layer in layers.values():
++        for name, layer in layers.items():
+             if vllm_config.load_config.load_format == "dummy":
+                 layer.initialize_dummy_offload_metadata(self.device)
+-            # The CPU worker writes results here through CUDA IPC. The GPU
+-            # placeholder waits on the paired cross-process semaphore.
++            out_dim = layer.get_offload_output_dim(int(config.ple_embed_dim))
++            out_dtype = layer.get_offload_output_dtype(vllm_config.model_config.dtype)
++            # This worker's output thread fills the GPU buffer from the shared
++            # host buffer below; the placeholder waits on the local semaphore.
+             output_buffer = torch.empty(
+-                max_num_tokens,
+-                layer.get_offload_output_dim(int(config.ple_embed_dim)),
+-                dtype=layer.get_offload_output_dtype(vllm_config.model_config.dtype),
+-                device=self.device,
++                max_num_tokens, out_dim, dtype=out_dtype, device=self.device
+             )
+             layer.setup_cross_process_offload(
+                 output_buffer,
+                 CpuGpuSemaphore(self.device),
+             )
++            # The offload process writes the layer result here (shared CPU
++            # memory); it is page-locked in this worker's context only.
++            self._host_output_bufs[name] = torch.empty(
++                max_num_tokens, out_dim, dtype=out_dtype, device="cpu"
++            ).share_memory_()
+         return layers
+ 
+-    def _pin_input_buffers(self) -> None:
+-        """Page-lock shared input allocations without replacing their storage."""
++    def _input_buffers(self) -> list[torch.Tensor]:
+         buffers = [self._input_ids_buf, self._query_start_loc_buf]
+         if self._ngram_context_buf is not None:
+             buffers.append(self._ngram_context_buf)
++        return buffers
++
++    def _pin_host_buffers(self, buffers: list[torch.Tensor]) -> None:
++        """Page-lock shared allocations without replacing their storage."""
+         for buffer in buffers:
+             if buffer.device.type != "cpu" or not buffer.is_shared():
+-                raise RuntimeError("PLE input buffers must be shared CPU tensors")
++                raise RuntimeError("PLE host buffers must be shared CPU tensors")
+             if not buffer.is_contiguous():
+-                raise RuntimeError("PLE input buffers must be contiguous")
++                raise RuntimeError("PLE host buffers must be contiguous")
+             _cuda_check(
+                 cuda_driver.cuMemHostRegister(
+                     buffer.data_ptr(),
+                     buffer.numel() * buffer.element_size(),
+                     cuda_driver.CU_MEMHOSTREGISTER_PORTABLE,
+                 ),
+-                "cuMemHostRegister(PLE input buffer)",
++                "cuMemHostRegister(PLE host buffer)",
+             )
+-            self._pinned_input_buffers.append(buffer)
++            self._pinned_host_buffers.append(buffer)
+             if not buffer.is_pinned():
+-                raise RuntimeError("CUDA did not page-lock a PLE input buffer")
++                raise RuntimeError("CUDA did not page-lock a PLE host buffer")
+ 
+-    def _unpin_input_buffers(self) -> None:
+-        """Release CUDA registrations after the request thread has stopped."""
+-        for buffer in reversed(self._pinned_input_buffers):
++    def _unpin_host_buffers(self) -> None:
++        """Release CUDA registrations after the worker threads have stopped."""
++        for buffer in reversed(self._pinned_host_buffers):
+             try:
+                 _cuda_check(
+                     cuda_driver.cuMemHostUnregister(buffer.data_ptr()),
+-                    "cuMemHostUnregister(PLE input buffer)",
++                    "cuMemHostUnregister(PLE host buffer)",
+                 )
+             except RuntimeError:
+-                logger.exception("Failed to unregister a PLE input buffer")
+-        self._pinned_input_buffers.clear()
++                logger.exception("Failed to unregister a PLE host buffer")
++        self._pinned_host_buffers.clear()
+ 
+     def _register_with_offload_worker(
+         self, vllm_config: VllmConfig, ipc_addr: str
+     ) -> None:
+-        """Register CUDA IPC outputs and shared CPU inputs with the worker."""
+-        # Each GPU worker owns distinct output buffers, while TP0's shared
++        """Register shared host outputs and inputs with the offload worker."""
++        # Each GPU worker owns distinct host output buffers, while TP0's shared
+         # inputs become the request source for its DP rank.
+         registration = PleOffloadRegistration(
+-            worker_id=(
+-                self.dp_rank * vllm_config.parallel_config.world_size
+-                + vllm_config.parallel_config.rank
+-            ),
++            worker_id=self.worker_id,
+             tp_rank=self.tp_rank,
+             dp_rank=self.dp_rank,
+-            gpu_output_buffers={
+-                name: layer._gpu_output_buffer for name, layer in self._layers.items()
+-            },
+-            sem_flag_tensors={
+-                name: layer._sem.flag_tensor for name, layer in self._layers.items()
+-            },
++            host_output_buffers=dict(self._host_output_bufs),
++            reply_ipc_addr=self._reply_ipc_addr,
+             input_ids_buf=self._input_ids_buf,
+             query_start_loc_buf=self._query_start_loc_buf,
+             ngram_context_buf=self._ngram_context_buf,
+         )
+ 
+-        # ForkingPickler transmits tensors through shared-memory and CUDA IPC.
++        # ForkingPickler transmits CPU tensors through shared memory.
+         import torch.multiprocessing as torch_mp
+ 
+         original_strategy = torch_mp.get_sharing_strategy()
+@@ -234,14 +268,111 @@ class PleOffloadConnector:
+ 
+         logger.info(
+             "PleOffload: registered %d PleOffloadLayer(s) "
+-            "(dp_rank=%d, tp_rank=%d, ipc_addr=%s): %s",
++            "(dp_rank=%d, tp_rank=%d, ipc_addr=%s, reply=%s): %s",
+             len(self._layers),
+             self.dp_rank,
+             self.tp_rank,
+             ipc_addr,
++            self._reply_ipc_addr,
+             sorted(self._layers),
+         )
+ 
++    # ------------------------------------------------------------------
++    # Output pull thread (every TP rank)
++    # ------------------------------------------------------------------
++
++    def _start_output_thread(self) -> None:
++        """Start the thread that copies finished layer outputs host -> GPU."""
++        self._output_thread = threading.Thread(
++            target=self._output_loop,
++            name=f"ple-offload-out-dp{self.dp_rank}-tp{self.tp_rank}",
++            daemon=True,
++        )
++        self._output_thread.start()
++        if not self._output_thread_ready.wait(timeout=10):
++            raise RuntimeError("Timed out starting the PLE output thread")
++        if self._output_thread_error is not None:
++            raise RuntimeError(
++                "PLE output thread failed to start"
++            ) from self._output_thread_error
++
++    def _output_loop(self) -> None:
++        """Receive output notices; copy, signal and ack on a private stream."""
++        reply_socket: zmq.Socket | None = None
++        ack_socket: zmq.Socket | None = None
++        try:
++            if self._zmq_ctx is None:
++                raise RuntimeError("PLE ZMQ context closed before thread startup")
++            reply_socket = self._zmq_ctx.socket(zmq.PULL)
++            reply_socket.bind(self._reply_ipc_addr)
++            ack_socket = self._zmq_ctx.socket(zmq.PUSH)
++            ack_socket.connect(self._ack_ipc_addr)
++            poller = zmq.Poller()
++            poller.register(reply_socket, zmq.POLLIN)
++            with torch.accelerator.device_index(self.device.index):
++                copy_stream = torch.cuda.Stream(device=self.device)
++                done_event = torch.cuda.Event()
++                self._output_thread_ready.set()
++                while not self._output_thread_stop.is_set():
++                    if reply_socket not in dict(poller.poll(timeout=100)):
++                        continue
++                    notice = _PLE_OFFLOAD_OUTPUT_READY_DECODER.decode(
++                        reply_socket.recv()
++                    )
++                    self._pull_output(notice.layer_name, notice.num_tokens,
++                                      copy_stream, done_event)
++                    ack_socket.send(
++                        msgspec.msgpack.encode(
++                            PleOffloadAck(
++                                dp_rank=self.dp_rank,
++                                tp_rank=self.tp_rank,
++                                layer_name=notice.layer_name,
++                            )
++                        )
++                    )
++        except Exception as error:
++            self._output_thread_error = error
++            logger.exception("PLE output thread failed")
++            if self._output_thread_ready.is_set():
++                os._exit(1)
++        finally:
++            self._output_thread_ready.set()
++            if reply_socket is not None:
++                reply_socket.close(linger=0)
++            if ack_socket is not None:
++                ack_socket.close(linger=0)
++
++    def _pull_output(
++        self,
++        layer_name: str,
++        num_tokens: int,
++        copy_stream: torch.cuda.Stream,
++        done_event: torch.cuda.Event,
++    ) -> None:
++        """Copy one layer result host -> GPU and signal its semaphore."""
++        layer = self._layers[layer_name]
++        host_buffer = self._host_output_bufs[layer_name]
++        with (
++            record_function_or_nullcontext("ple_offload: pull_output"),
++            torch.cuda.stream(copy_stream),
++        ):
++            # The GPU output buffer must not be overwritten until the previous
++            # forward consumed it; the runner resets the flag after the
++            # forward, and this wait is stream-ordered before the copy.
++            layer._sem.wait_reset(copy_stream)
++            layer._gpu_output_buffer[:num_tokens].copy_(
++                host_buffer[:num_tokens], non_blocking=True
++            )
++            layer._sem.signal(copy_stream)
++            done_event.record(copy_stream)
++        # The host buffer is reusable by the offload process only after the
++        # DMA has read it; block this thread (not the model stream) until then.
++        done_event.synchronize()
++
++    # ------------------------------------------------------------------
++    # Request thread (TP rank zero)
++    # ------------------------------------------------------------------
++
+     def _start_request_thread(self, ipc_addr: str) -> None:
+         """Start the thread that publishes batches after inputs are ready."""
+         self._request_thread = threading.Thread(
+@@ -356,7 +487,7 @@ class PleOffloadConnector:
+     ) -> None:
+         """Stage or queue one batch for request publication."""
+         # Inputs are replicated across TP ranks. One request per DP rank drives
+-        # the CPU result fan-out to every registered TP output buffer.
++        # the CPU result fan-out to every registered TP host buffer.
+         if self.tp_rank != 0:
+             return
+ 
+@@ -400,7 +531,7 @@ class PleOffloadConnector:
+ 
+     def release_outputs(self) -> None:
+         """Mark GPU output buffers reusable after the model consumes them."""
+-        # Reset only after the consumer forward so the CPU worker cannot
++        # Reset only after the consumer forward so the output thread cannot
+         # overwrite an output that a GPU PLE placeholder may still read.
+         stream = torch.cuda.current_stream(self.device)
+         for layer in self._layers.values():
+@@ -421,9 +552,18 @@ class PleOffloadConnector:
+             return
+         self._request_thread = None
+ 
+-        if self._pinned_input_buffers:
++        output_thread = self._output_thread
++        if output_thread is not None and output_thread.is_alive():
++            self._output_thread_stop.set()
++            output_thread.join(timeout=5)
++        if output_thread is not None and output_thread.is_alive():
++            logger.error("PLE output thread did not stop; deferring resource cleanup")
++            return
++        self._output_thread = None
++
++        if self._pinned_host_buffers:
+             with torch.accelerator.device_index(self.device.index):
+-                self._unpin_input_buffers()
++                self._unpin_host_buffers()
+         self._d2h_event_pool = None
+         if self._registration_socket is not None:
+             self._registration_socket.close(linger=0)
+diff --git a/vllm/v1/ple_offload/protocol.py b/vllm/v1/ple_offload/protocol.py
+index e8c0ccaf7..c76fece18 100644
+--- a/vllm/v1/ple_offload/protocol.py
++++ b/vllm/v1/ple_offload/protocol.py
+@@ -1,6 +1,13 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-"""IPC message definitions for PLE CPU offload."""
++"""IPC message definitions for PLE CPU offload (pull design).
++
++The offload process owns no CUDA context. It writes each layer's result into
++a shared host buffer owned by the requesting GPU worker and sends a
++:class:`PleOffloadOutputReady` notice; the worker copies host -> GPU on its own
++stream, signals its local semaphore, and returns a :class:`PleOffloadAck`
++once the DMA has completed so the host buffer can be reused.
++"""
+ 
+ from dataclasses import dataclass
+ 
+@@ -19,9 +26,11 @@ class PleOffloadRegistration:
+     worker_id: int
+     tp_rank: int
+     dp_rank: int
+-    # CUDA tensors are serialized through PyTorch CUDA IPC.
+-    gpu_output_buffers: dict[str, torch.Tensor]
+-    sem_flag_tensors: dict[str, torch.Tensor]
++    # Shared CPU tensors (one per PLE layer) that the offload process fills.
++    # The GPU worker page-locks them in its own CUDA context for async H2D.
++    host_output_buffers: dict[str, torch.Tensor]
++    # ZMQ address (bound by this worker) on which it receives output notices.
++    reply_ipc_addr: str
+     # CPU tensors are allocated in shared memory and registered once.
+     input_ids_buf: torch.Tensor
+     query_start_loc_buf: torch.Tensor
+@@ -37,4 +46,33 @@ class PleOffloadRequest:
+     num_reqs: int
+ 
+ 
++@dataclass
++class PleOffloadOutputReady:
++    """Sent by the offload process to one GPU worker per layer per step."""
++
++    layer_name: str
++    num_tokens: int
++
++
++@dataclass
++class PleOffloadAck:
++    """Sent by a GPU worker once its H2D copy of a layer result completed."""
++
++    dp_rank: int
++    tp_rank: int
++    layer_name: str
++
++
+ _PLE_OFFLOAD_REQUEST_DECODER = msgspec.msgpack.Decoder(PleOffloadRequest)
++_PLE_OFFLOAD_OUTPUT_READY_DECODER = msgspec.msgpack.Decoder(PleOffloadOutputReady)
++_PLE_OFFLOAD_ACK_DECODER = msgspec.msgpack.Decoder(PleOffloadAck)
++
++
++def ple_offload_ack_ipc_addr(ipc_addr: str) -> str:
++    """Address of the offload process's ack socket derived from the base."""
++    return f"{ipc_addr}-ack"
++
++
++def ple_offload_reply_ipc_addr(ipc_addr: str, worker_id: int) -> str:
++    """Address of one GPU worker's output-notice socket."""
++    return f"{ipc_addr}-out{worker_id}"
+diff --git a/vllm/v1/ple_offload/worker.py b/vllm/v1/ple_offload/worker.py
+index 902853e0c..5dad0abca 100644
+--- a/vllm/v1/ple_offload/worker.py
++++ b/vllm/v1/ple_offload/worker.py
+@@ -5,9 +5,14 @@
+ This module implements a standalone process that:
+ 1. Loads only the :class:`PleOffloadLayer` weights into CPU memory.
+ 2. Accepts per-step computation requests from GPU worker processes.
+-3. Runs ``forward_impl()`` on CPU, copies results to every TP worker's GPU
+-   output buffer for the requesting DP rank, and signals the corresponding
+-   IPC semaphore.
++3. Runs ``forward_impl()`` on CPU, copies results into every TP worker's
++   shared HOST output buffer for the requesting DP rank, and sends that
++   worker an output notice. The GPU worker pulls host -> GPU on its own
++   stream, signals its local semaphore and acks once the DMA completed.
++
++This process owns NO CUDA context (pull design): ``CUDA_VISIBLE_DEVICES`` is
++emptied at startup so any accidental device use raises instead of silently
++allocating ~270 MiB of context per card.
+ 
+ The TP workers within one DP rank receive identical inputs, so the CPU result
+ is computed once per DP rank and fanned out to all of its TP ranks.
+@@ -44,7 +49,6 @@ from vllm.distributed.parallel_state import (
+ )
+ from vllm.logger import init_logger
+ from vllm.model_executor.layers.ple_offload_layer import (
+-    CpuGpuSemaphore,
+     PleOffloadLayer,
+     mark_as_offload_worker,
+ )
+@@ -59,9 +63,12 @@ from vllm.model_executor.model_loader.weight_utils import initialize_dummy_weigh
+ from vllm.utils.system_utils import decorate_logs, get_mp_context
+ from vllm.utils.torch_utils import set_default_torch_dtype
+ from vllm.v1.ple_offload.protocol import (
++    _PLE_OFFLOAD_ACK_DECODER,
+     _PLE_OFFLOAD_REQUEST_DECODER,
++    PleOffloadOutputReady,
+     PleOffloadRegistration,
+     PleOffloadRequest,
++    ple_offload_ack_ipc_addr,
+ )
+ from vllm.v1.utils import record_function_or_nullcontext
+ 
+@@ -70,12 +77,13 @@ logger = init_logger(__name__)
+ 
+ @dataclass
+ class PleOffloadOutputTarget:
+-    """GPU output destination and semaphore for one TP worker."""
++    """Host output destination and notice socket for one TP worker."""
+ 
++    dp_rank: int
+     tp_rank: int
+-    gpu_output_buffer: torch.Tensor  # IPC-mapped GPU buffer for this TP worker
+-    sem: CpuGpuSemaphore  # semaphore paired with gpu_output_buffer
+-    copy_stream: torch.cuda.Stream
++    host_output_buffer: torch.Tensor  # shared CPU tensor owned by the worker
++    notice_socket: zmq.Socket  # PUSH to the worker's reply address
++    pending: bool = False  # a notice was sent and its ack is outstanding
+ 
+ 
+ @dataclass
+@@ -250,6 +258,7 @@ class PleOffloadWorker:
+         ready_reader, ready_writer = ready_pipe
+         ready_reader.close()
+         shutdown_event = threading.Event()
++        runner: PleOffloadRunner | None = None
+ 
+         def monitor_parent() -> None:
+             try:
+@@ -271,25 +280,42 @@ class PleOffloadWorker:
+ 
+         zmq_context: zmq.Context | None = None
+         pull_socket: zmq.Socket | None = None
++        ack_socket: zmq.Socket | None = None
+         try:
+             # The flag lets PleOffloadLayer subclasses execute their complete
+             # constructors instead of becoming empty GPU-worker placeholders.
+             mark_as_offload_worker()
+ 
+-            # The worker needs a CUDA context on every card (IPC output
+-            # buffers, copy streams, semaphores), but incidental allocations
+-            # (allocator init, lazy module loads) land on torch's CURRENT
+-            # device — cuda:0 by default, measured ~46 MiB heavier than the
+-            # other cards. Rank 0's card is the VRAM-tightest (qwen38next
+-            # -flash #3), so allow moving that overhead to another device.
+-            home_device = os.environ.get(
+-                "VLLM_PLE_OFFLOAD_HOME_DEVICE", ""
+-            ).strip()
++            # Pull design: this process issues no CUDA work. The GPU workers
++            # own every device buffer, stream and semaphore and copy results
++            # host -> GPU themselves, so no CUDA context is expected here (the
++            # push design held one per stage-0 card: 276-322 MiB each). Should
++            # an import or constructor still initialize CUDA incidentally,
++            # confine it to ONE device (VLLM_PLE_OFFLOAD_HOME_DEVICE, logical
++            # index in the parent's CUDA_VISIBLE_DEVICES) instead of hiding all
++            # devices: an empty CUDA_VISIBLE_DEVICES makes vLLM's platform
++            # helpers raise during model construction. Never call set_device.
++            home_device = os.environ.get("VLLM_PLE_OFFLOAD_HOME_DEVICE", "").strip()
+             if home_device:
+-                torch.cuda.set_device(int(home_device))
+-                logger.info(
+-                    "PLE offload worker home device set to cuda:%s", home_device
++                parent_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
++                physical = (
++                    parent_visible.split(",")[int(home_device)].strip()
++                    if parent_visible
++                    else home_device
+                 )
++                if torch.cuda.is_initialized():
++                    logger.warning(
++                        "CUDA already initialized in the PLE offload process; "
++                        "cannot confine it to physical GPU %s",
++                        physical,
++                    )
++                else:
++                    os.environ["CUDA_VISIBLE_DEVICES"] = physical
++                    logger.info(
++                        "PLE offload process confined to physical GPU %s "
++                        "(pull design: no CUDA context expected)",
++                        physical,
++                    )
+ 
+             # Initialize Gloo before installing the real VllmConfig. This keeps
+             # the CPU process in an isolated rank-zero, world-size-one group.
+@@ -302,21 +328,30 @@ class PleOffloadWorker:
+ 
+             # Model components read the active VllmConfig while the meta model
+             # is constructed, so keep the context around runner initialization.
++            zmq_context = zmq.Context()
+             with set_current_vllm_config(vllm_config):
+-                runner = PleOffloadRunner(vllm_config)
++                runner = PleOffloadRunner(vllm_config, zmq_context)
+ 
+-            zmq_context = zmq.Context()
+             pull_socket = zmq_context.socket(zmq.PULL)
+             pull_socket.bind(ipc_addr)
++            ack_socket = zmq_context.socket(zmq.PULL)
++            ack_socket.bind(ple_offload_ack_ipc_addr(ipc_addr))
+             logger.info(
+-                "Bound IPC address %s; waiting for %d GPU worker registration(s).",
++                "Bound IPC address %s (acks on %s); waiting for %d GPU worker "
++                "registration(s).",
+                 ipc_addr,
++                ple_offload_ack_ipc_addr(ipc_addr),
+                 num_workers,
+             )
+ 
+             # READY means that the process can immediately serve requests. Wait
+             # for every DP/TP worker to register before notifying the parent.
+-            runner.accept_registrations(pull_socket, num_workers)
++            runner.accept_registrations(pull_socket, ack_socket, num_workers)
++            # Gate fact: the pull design must not have created a CUDA context.
++            logger.info(
++                "PLE offload pull mode: CUDA initialized in this process = %s",
++                torch.cuda.is_initialized(),
++            )
+             ready_writer.send(
+                 {
+                     "status": PleOffloadWorker.READY_STR,
+@@ -336,6 +371,10 @@ class PleOffloadWorker:
+         finally:
+             if pull_socket is not None:
+                 pull_socket.close(linger=0)
++            if ack_socket is not None:
++                ack_socket.close(linger=0)
++            if runner is not None:
++                runner.close()
+             if zmq_context is not None:
+                 zmq_context.term()
+             if ready_writer is not None:
+@@ -346,8 +385,9 @@ class PleOffloadWorker:
+ class PleOffloadRunner:
+     """Own all discovered PLE tables and serve every local DP rank."""
+ 
+-    def __init__(self, vllm_config: VllmConfig) -> None:
++    def __init__(self, vllm_config: VllmConfig, zmq_context: zmq.Context) -> None:
+         self.vllm_config = vllm_config
++        self._zmq_context = zmq_context
+         self._clamp_input_ids = (
+             getattr(vllm_config, "speculative_config", None) is not None
+         )
+@@ -355,14 +395,22 @@ class PleOffloadRunner:
+         self._layers: dict[str, PleOffloadLayer] = {}
+         # dp_rank -> layer_name -> one destination per TP rank
+         self._worker_targets: dict[int, dict[str, list[PleOffloadOutputTarget]]] = {}
+-        # Each (dp_rank, layer_name) pair owns a separate pinned scratch buffer.
+-        # Sharing one buffer is unsafe because an asynchronous H2D copy may still
+-        # be reading it when another layer or DP rank starts writing.
+-        self._pinned_bufs: dict[int, dict[str, torch.Tensor]] = {}
++        # Each (dp_rank, layer_name) pair owns a plain CPU scratch buffer that
++        # forward_impl writes; the result is then copied (memcpy) into every
++        # TP worker's shared host buffer. Nothing here is pinned or on a GPU.
++        self._scratch_bufs: dict[int, dict[str, torch.Tensor]] = {}
+         # Shared-memory inputs are registered once per DP rank by TP rank zero.
+         self._input_bufs: dict[int, PleOffloadInputBuffers] = {}
++        # (dp_rank, tp_rank) -> PUSH socket to that worker's reply address.
++        self._notice_sockets: dict[tuple[int, int], zmq.Socket] = {}
++        self._ack_socket: zmq.Socket | None = None
+         self._load_weights()
+ 
++    def close(self) -> None:
++        for socket in self._notice_sockets.values():
++            socket.close(linger=0)
++        self._notice_sockets.clear()
++
+     @property
+     def layer_names(self) -> list[str]:
+         """Return PleOffloadLayer names in model traversal order."""
+@@ -495,9 +543,11 @@ class PleOffloadRunner:
+     def accept_registrations(
+         self,
+         pull_socket: zmq.Socket,
++        ack_socket: zmq.Socket,
+         num_workers: int,
+     ) -> None:
+-        """Receive every local DP/TP worker's IPC and shared-memory buffers."""
++        """Receive every local DP/TP worker's shared-memory buffers."""
++        self._ack_socket = ack_socket
+         logger.info("Waiting for %d GPU worker registration(s) ...", num_workers)
+         registrations: list[PleOffloadRegistration] = []
+         for index in range(num_workers):
+@@ -513,7 +563,7 @@ class PleOffloadRunner:
+                 item.worker_id,
+                 item.dp_rank,
+                 item.tp_rank,
+-                sorted(item.gpu_output_buffers),
++                sorted(item.host_output_buffers),
+             )
+ 
+         dp_size = self.vllm_config.parallel_config.data_parallel_size
+@@ -543,21 +593,30 @@ class PleOffloadRunner:
+                 )
+ 
+         for registration in registrations:
+-            if set(registration.gpu_output_buffers) != set(self.layer_names):
++            if set(registration.host_output_buffers) != set(self.layer_names):
+                 raise RuntimeError(
+                     "Registered PLE layers do not match CPU layers: "
+-                    f"registered={sorted(registration.gpu_output_buffers)}, "
++                    f"registered={sorted(registration.host_output_buffers)}, "
+                     f"cpu={sorted(self.layer_names)}"
+                 )
++            key = (registration.dp_rank, registration.tp_rank)
++            if key in self._notice_sockets:
++                raise RuntimeError(f"Duplicate PLE registration for {key}")
++            notice_socket = self._zmq_context.socket(zmq.PUSH)
++            notice_socket.connect(registration.reply_ipc_addr)
++            self._notice_sockets[key] = notice_socket
+             targets_for_dp = self._worker_targets.setdefault(registration.dp_rank, {})
+-            for layer_name, gpu_buffer in registration.gpu_output_buffers.items():
++            for layer_name, host_buffer in registration.host_output_buffers.items():
++                if host_buffer.device.type != "cpu" or not host_buffer.is_shared():
++                    raise RuntimeError(
++                        f"PLE host output buffer for {layer_name} from worker "
++                        f"{key} is not a shared CPU tensor"
++                    )
+                 target = PleOffloadOutputTarget(
++                    dp_rank=registration.dp_rank,
+                     tp_rank=registration.tp_rank,
+-                    gpu_output_buffer=gpu_buffer,
+-                    sem=CpuGpuSemaphore.from_ipc_tensor(
+-                        registration.sem_flag_tensors[layer_name]
+-                    ),
+-                    copy_stream=torch.cuda.Stream(device=gpu_buffer.device),
++                    host_output_buffer=host_buffer,
++                    notice_socket=notice_socket,
+                 )
+                 targets_for_dp.setdefault(layer_name, []).append(target)
+             # All TP ranks in one DP group receive the same input, so buffers
+@@ -578,7 +637,7 @@ class PleOffloadRunner:
+         config = self.vllm_config.model_config.hf_text_config
+         max_tokens = self.vllm_config.scheduler_config.max_num_batched_tokens
+         for dp_rank, layer_targets in self._worker_targets.items():
+-            self._pinned_bufs[dp_rank] = {}
++            self._scratch_bufs[dp_rank] = {}
+             for layer_name, targets in layer_targets.items():
+                 if len(targets) != tp_size:
+                     raise RuntimeError(
+@@ -586,15 +645,27 @@ class PleOffloadRunner:
+                         f"{len(targets)} targets, expected {tp_size}"
+                     )
+                 targets.sort(key=lambda target: target.tp_rank)
+-                self._pinned_bufs[dp_rank][layer_name] = torch.empty(
+-                    max_tokens,
+-                    self._layers[layer_name].get_offload_output_dim(
+-                        int(config.ple_embed_dim)
+-                    ),
+-                    dtype=self._layers[layer_name].get_offload_output_dtype(
+-                        self.vllm_config.model_config.dtype
+-                    ),
+-                    pin_memory=True,
++                out_dim = self._layers[layer_name].get_offload_output_dim(
++                    int(config.ple_embed_dim)
++                )
++                out_dtype = self._layers[layer_name].get_offload_output_dtype(
++                    self.vllm_config.model_config.dtype
++                )
++                for target in targets:
++                    expected = (max_tokens, out_dim)
++                    if (
++                        tuple(target.host_output_buffer.shape) != expected
++                        or target.host_output_buffer.dtype != out_dtype
++                    ):
++                        raise RuntimeError(
++                            f"PLE host output buffer for {layer_name} (dp={dp_rank}, "
++                            f"tp={target.tp_rank}) has shape "
++                            f"{tuple(target.host_output_buffer.shape)} / "
++                            f"{target.host_output_buffer.dtype}, expected "
++                            f"{expected} / {out_dtype}"
++                        )
++                self._scratch_bufs[dp_rank][layer_name] = torch.empty(
++                    max_tokens, out_dim, dtype=out_dtype, device="cpu"
+                 )
+         logger.info(
+             "Registrations complete (dp_size=%d, tp_size=%d, layers=%s).",
+@@ -611,6 +682,7 @@ class PleOffloadRunner:
+     ) -> None:
+         """Decode and batch available requests by DP rank until shutdown."""
+         logger.info("Busy-loop started.")
++        self._shutdown_event = shutdown_event
+         poller = zmq.Poller()
+         poller.register(pull_socket, zmq.POLLIN)
+         while not shutdown_event.is_set():
+@@ -668,12 +740,11 @@ class PleOffloadRunner:
+             for dp_rank, request in requests_by_dp.items():
+                 targets = self._worker_targets[dp_rank][layer_name]
+ 
+-                # The CPU must not overwrite a GPU output buffer until its
+-                # previous result has been consumed. The GPU runner resets the
+-                # flag after the complete model forward.
+-                for target in targets:
+-                    target.copy_stream.synchronize()
+-                    target.sem.wait_reset(target.copy_stream)
++                # A worker's host buffer must not be overwritten until that
++                # worker acked the H2D copy of the previous result (the ack is
++                # sent after its DMA completed, which is stream-ordered after
++                # the GPU released the previous output).
++                self._wait_acks(targets)
+ 
+                 input_bufs = self._input_bufs[dp_rank]
+                 ngram_context = (
+@@ -686,15 +757,43 @@ class PleOffloadRunner:
+                     input_bufs.input_ids_buf[: request.num_tokens],
+                     input_bufs.query_start_loc_buf[: request.num_reqs + 1],
+                     ngram_context,
+-                    output_buffer=self._pinned_bufs[dp_rank][layer_name],
++                    output_buffer=self._scratch_bufs[dp_rank][layer_name],
+                 )
+ 
+-                # The result is identical on every TP rank in this DP group.
+-                # Each copy stream signals only after its DMA completes.
++                # The result is identical on every TP rank in this DP group:
++                # memcpy it into each worker's shared host buffer and notify.
+                 slices = tuple(slice(0, size) for size in result.shape)
++                num_tokens = int(result.shape[0])
++                notice = msgspec.msgpack.encode(
++                    PleOffloadOutputReady(layer_name=layer_name, num_tokens=num_tokens)
++                )
+                 for target in targets:
+-                    with torch.cuda.stream(target.copy_stream):
+-                        target.gpu_output_buffer[slices].copy_(
+-                            result[slices], non_blocking=True
+-                        )
+-                        target.sem.signal(target.copy_stream)
++                    target.host_output_buffer[slices].copy_(result[slices])
++                    target.pending = True
++                    target.notice_socket.send(notice)
++
++    def _wait_acks(self, targets: list[PleOffloadOutputTarget]) -> None:
++        """Block until every pending target in ``targets`` has acked."""
++        if not any(target.pending for target in targets):
++            return
++        assert self._ack_socket is not None, "PLE ack socket is not initialized"
++        poller = zmq.Poller()
++        poller.register(self._ack_socket, zmq.POLLIN)
++        while any(target.pending for target in targets):
++            if self._ack_socket not in dict(poller.poll(timeout=100)):
++                shutdown = getattr(self, "_shutdown_event", None)
++                if shutdown is not None and shutdown.is_set():
++                    raise RuntimeError("PLE offload shutting down while waiting for acks")
++                continue
++            ack = _PLE_OFFLOAD_ACK_DECODER.decode(self._ack_socket.recv())
++            acked = self._worker_targets.get(ack.dp_rank, {}).get(ack.layer_name)
++            if acked is None:
++                raise RuntimeError(f"PLE ack for unknown target: {ack}")
++            for target in acked:
++                if target.tp_rank == ack.tp_rank:
++                    if not target.pending:
++                        raise RuntimeError(f"Unexpected PLE ack (not pending): {ack}")
++                    target.pending = False
++                    break
++            else:
++                raise RuntimeError(f"PLE ack for unknown TP rank: {ack}")
+-- 
+2.47.3
+

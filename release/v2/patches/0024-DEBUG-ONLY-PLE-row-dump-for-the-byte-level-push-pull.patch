@@ -1,0 +1,123 @@
+From c08a9e43c1101e0685dbfd667ccd26f71aa61055 Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Fri, 11 Sep 2026 17:09:49 +0000
+Subject: [PATCH 24/76] DEBUG ONLY: PLE row dump for the byte-level push/pull
+ row check (VLLM_PLE_ROW_DUMP; unset = no change)
+
+---
+ vllm/v1/ple_offload/connector.py | 11 +++++++++
+ vllm/v1/ple_offload/rowdump.py   | 41 ++++++++++++++++++++++++++++++++
+ vllm/v1/ple_offload/worker.py    |  6 +++++
+ 3 files changed, 58 insertions(+)
+ create mode 100644 vllm/v1/ple_offload/rowdump.py
+
+diff --git a/vllm/v1/ple_offload/connector.py b/vllm/v1/ple_offload/connector.py
+index c1e78b2d9..e9e587ba5 100644
+--- a/vllm/v1/ple_offload/connector.py
++++ b/vllm/v1/ple_offload/connector.py
+@@ -11,6 +11,7 @@ from typing import Any
+ 
+ import msgspec
+ import torch
++from vllm.v1.ple_offload import rowdump as _rowdump
+ import torch.nn as nn
+ import zmq
+ from cuda.bindings import driver as cuda_driver
+@@ -464,6 +465,7 @@ class PleOffloadConnector:
+         dummy_run: bool,
+     ) -> None:
+         """Submit real inputs or satisfy the PLE wait for a dummy forward."""
++        self._rowdump_n = None if dummy_run else num_tokens
+         if dummy_run:
+             self.signal_dummy_outputs(num_tokens)
+             return
+@@ -494,6 +496,15 @@ class PleOffloadConnector:
+ 
+     def release_outputs(self) -> None:
+         """Mark GPU output buffers reusable after the model consumes them."""
++        n = getattr(self, "_rowdump_n", None)
++        self._rowdump_n = None
++        if _rowdump.enabled() and n is not None and not torch.cuda.is_current_stream_capturing():
++            torch.cuda.current_stream(self.device).synchronize()
++            seq = getattr(self, "_rowdump_seq", 0)
++            self._rowdump_seq = seq + 1
++            for layer in self._layers.values():
++                _rowdump.write(f"gpu-tp{self.tp_rank}", 0, self.tp_rank, seq,
++                               self._input_ids_source[:n], layer._gpu_output_buffer[:n])
+         # Reset only after the consumer forward so the CPU worker cannot
+         # overwrite an output that a GPU PLE placeholder may still read.
+         stream = torch.cuda.current_stream(self.device)
+diff --git a/vllm/v1/ple_offload/rowdump.py b/vllm/v1/ple_offload/rowdump.py
+new file mode 100644
+index 000000000..95fd3081b
+--- /dev/null
++++ b/vllm/v1/ple_offload/rowdump.py
+@@ -0,0 +1,41 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Debug-only PLE row dump for byte-level transport checks (off unless VLLM_PLE_ROW_DUMP=<dir>).
++
++Each process appends framed records to <dir>/<tag>-pid<pid>.bin:
++  b"PLER" | kind u8 (0 = GPU worker: rows its forward consumed; 1 = offload process: rows it published)
++  | rank u8 | reserved u16 | seq u32 | n u32 | row_bytes u32 | ids int64[n] | rows uint8[n * row_bytes]
++"""
++
++import os
++import struct
++import threading
++
++import torch
++
++_DIR = os.environ.get("VLLM_PLE_ROW_DUMP", "")
++_LOCK = threading.Lock()
++_FILES: dict = {}
++MAGIC = b"PLER"
++
++
++def enabled() -> bool:
++    return bool(_DIR)
++
++
++def write(tag: str, kind: int, rank: int, seq: int, ids: torch.Tensor, rows: torch.Tensor) -> None:
++    ids_cpu = ids.detach().to(device="cpu", dtype=torch.int64).contiguous()
++    rows_cpu = rows.detach().to(device="cpu").contiguous()
++    n = int(ids_cpu.shape[0])
++    if rows_cpu.shape[0] != n:
++        raise RuntimeError(f"PLE row dump: {rows_cpu.shape[0]} rows for {n} ids")
++    raw = rows_cpu.view(torch.uint8).numpy().tobytes() if n else b""
++    row_bytes = len(raw) // n if n else 0
++    record = (MAGIC + struct.pack("<BBHIII", kind, rank, 0, seq, n, row_bytes)
++              + ids_cpu.numpy().tobytes() + raw)
++    with _LOCK:
++        f = _FILES.get(tag)
++        if f is None:
++            os.makedirs(_DIR, exist_ok=True)
++            f = open(os.path.join(_DIR, f"{tag}-pid{os.getpid()}.bin"), "ab", buffering=0)
++            _FILES[tag] = f
++        f.write(record)
+diff --git a/vllm/v1/ple_offload/worker.py b/vllm/v1/ple_offload/worker.py
+index 9b22e0f55..dadd2722f 100644
+--- a/vllm/v1/ple_offload/worker.py
++++ b/vllm/v1/ple_offload/worker.py
+@@ -36,6 +36,7 @@ from typing import Any, cast
+ 
+ import msgspec
+ import torch
++from vllm.v1.ple_offload import rowdump as _rowdump
+ import torch.distributed as dist
+ import zmq
+ 
+@@ -861,6 +862,11 @@ class PleOffloadRunner:
+                     ngram_context,
+                     output_buffer=self._scratch_bufs[dp_rank][layer_name],
+                 )
++                if _rowdump.enabled():
++                    _seq = getattr(self, "_rowdump_seq", 0)
++                    self._rowdump_seq = _seq + 1
++                    _rowdump.write(f"offload-dp{dp_rank}", 1, dp_rank, _seq,
++                                   input_bufs.input_ids_buf[: request.num_tokens], result)
+ 
+                 # The result is identical on every TP rank in this DP group.
+                 # A worker's host buffer may be overwritten only after its GPU
+-- 
+2.47.3
+

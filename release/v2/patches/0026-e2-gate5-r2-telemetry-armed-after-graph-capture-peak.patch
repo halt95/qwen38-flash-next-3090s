@@ -1,0 +1,197 @@
+From 5a2a7fa8dfd1de49042af8847605f22eaf475711 Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Fri, 11 Sep 2026 21:19:00 +0000
+Subject: [PATCH 26/76] e2-gate5 r2: telemetry armed after graph capture; peaks
+ reset only at acknowledged quiet windows; scheduled tokens per request
+
+Astra R7-4: the V2 runner's warm-up calls execute_model before capture_model, so the telemetry now starts at the end of compile_or_warm_up_model. R7-3: peak counters are reset only when the gate driver opens/closes a window while the server is quiet (window.ctl + per-rank ack), so no peak can be lost between a read and a reset; samples carry the within-window high-water mark and monotonic times. The scheduler log adds tokens scheduled per request and per step (mixed prefill/decode and K=3 decode evidence). All env-gated, inert when unset.
+---
+ vllm/v1/core/sched/e2_alloc_log.py | 10 +++-
+ vllm/v1/worker/e2_memstats.py      | 93 ++++++++++++++++++++----------
+ vllm/v1/worker/gpu_worker.py       |  6 +-
+ 3 files changed, 74 insertions(+), 35 deletions(-)
+
+diff --git a/vllm/v1/core/sched/e2_alloc_log.py b/vllm/v1/core/sched/e2_alloc_log.py
+index 60d1e9fab..ad44882a7 100644
+--- a/vllm/v1/core/sched/e2_alloc_log.py
++++ b/vllm/v1/core/sched/e2_alloc_log.py
+@@ -3,7 +3,9 @@
+ 
+ One JSON line per scheduler update while any request exists, and one "fin" line per request as it is freed:
+   {"t": wall, "m": monotonic, "step": n, "total": pool blocks, "free": free blocks, "running": r, "waiting": w,
+-   "reqs": [[id, prompt, computed, output, cached, preemptions, spec_scheduled, status, [blocks per group]]]}
++   "tot": tokens scheduled this step,
++   "reqs": [[id, prompt, computed, output, cached, preemptions, spec_scheduled, status, [blocks per group],
++             tokens scheduled for this request this step]]}
+   {"t": wall, "m": monotonic, "fin": [id, prompt, computed, output, cached, preemptions, status, [blocks per group]]}
+ Blocks are counted per KV-cache group, null blocks excluded. A logging failure writes an "error" line and never
+ raises into the scheduler. Unset = the scheduler only pays one env check per update.
+@@ -75,11 +77,13 @@ def log_step(sched, scheduler_output) -> None:
+         _state["step"] += 1
+         spec = getattr(scheduler_output, "scheduled_spec_decode_tokens", None) or {}
+         pool = sched.kv_cache_manager.block_pool
++        nsched = getattr(scheduler_output, "num_scheduled_tokens", None) or {}
+         rows = [[rid, r.num_prompt_tokens, r.num_computed_tokens, r.num_output_tokens, max(0, r.num_cached_tokens),
+-                 r.num_preemptions, len(spec.get(rid, ())), _status(r), _blocks(sched, rid)]
++                 r.num_preemptions, len(spec.get(rid, ())), _status(r), _blocks(sched, rid), int(nsched.get(rid, 0))]
+                 for rid, r in sched.requests.items()]
+         _write({"t": round(time.time(), 4), "m": round(time.monotonic(), 4), "step": _state["step"],
+                 "total": pool.num_gpu_blocks, "free": pool.get_num_free_blocks(),
+-                "running": len(sched.running), "waiting": len(sched.waiting), "reqs": rows})
++                "running": len(sched.running), "waiting": len(sched.waiting),
++                "tot": int(getattr(scheduler_output, "total_num_scheduled_tokens", 0) or 0), "reqs": rows})
+     except Exception as e:  # noqa: BLE001
+         _error(e)
+diff --git a/vllm/v1/worker/e2_memstats.py b/vllm/v1/worker/e2_memstats.py
+index 339fc9ceb..c39233d37 100644
+--- a/vllm/v1/worker/e2_memstats.py
++++ b/vllm/v1/worker/e2_memstats.py
+@@ -1,15 +1,23 @@
+ # SPDX-License-Identifier: Apache-2.0
+-"""Debug-only allocator telemetry for E2 gate 5 (off unless VLLM_E2_MEMSTATS=<segment seconds> and
+-VLLM_E2_MEMSTATS_DIR=<dir>).
++"""Debug-only allocator telemetry for E2 gate 5, r2 (Astra R7-3, R7-4, R7-10). Off unless VLLM_E2_MEMSTATS=<sample
++seconds> and VLLM_E2_MEMSTATS_DIR=<dir>.
+ 
+-One daemon thread per GPU worker, started at the worker's first execute_model (after KV-cache sizing and CUDA-graph
+-capture, so it can never disturb memory profiling). Every segment it reads this device's caching-allocator counters
+-and cudaMemGetInfo, then resets the peak counters: each line holds the high-water mark of its own segment [t0, t1].
+-Whole-run maxima and the minimum free memory are carried on every line, so a reset never loses them.
+-No device synchronisation, no GPU allocation, no lock shared with the model path. A failed read writes an "error"
+-line and the loop continues.
+-Line: {"t0","t1","rank","local","dev","pid","alloc","alloc_peak","res","res_peak","retries","ooms","free","total",
+-       "run_alloc_peak","run_res_peak","min_free"}
++The worker starts it at the END of compile_or_warm_up_model, after warm-up and CUDA-graph capture (the V2 runner's
++warm-up calls execute_model before capture, so execute_model is not a post-capture boundary).
++
++Peak counters are reset ONLY at acknowledged window boundaries, which the gate driver opens and closes while the
++server is quiet (no request running): <dir>/window.ctl holds "<seq> <name>". On a new seq this thread reads the
++counters one last time for the old window (its "close" record: the allocator high-water marks since the window
++opened), resets the peak counters, and writes an "ack" record. Inside a window nothing is reset, so no allocation
++peak can be lost between a read and a reset; every "sample" line carries the high-water mark since its window opened
++(monotone within a window), which localises when it was reached. Whole-run maxima are carried across windows.
++Retry and OOM counters are cumulative and never reset. min_free_sampled is the minimum of sampled cudaMemGetInfo
++values, not a continuous minimum.
++
++Records (one JSON per line): kind start | sample | close | ack | error; wall and monotonic times (samples: t0/t1,
++m0/m1); rank, local, dev, pid; window, seq; alloc, res, alloc_peak_w, res_peak_w, retries, ooms, free, total,
++run_alloc_peak, run_res_peak, min_free_sampled. No device synchronisation and no GPU allocation; each counter read or
++reset takes the caching allocator's own mutex briefly, and records are written with synchronous file I/O.
+ """
+ import json
+ import os
+@@ -27,42 +35,67 @@ def enabled() -> bool:
+     return _SEG > 0 and bool(_DIR)
+ 
+ 
+-def ensure_started(worker) -> None:
++def ensure_started(worker, armed_by: str = "compile_or_warm_up_model") -> None:
+     if _started:
+         return
+     dev = torch.cuda.current_device()
+-    t = threading.Thread(target=_loop, args=(dev, getattr(worker, "rank", -1), getattr(worker, "local_rank", -1)),
+-                         name="e2-memstats", daemon=True)
++    t = threading.Thread(target=_loop, name="e2-memstats", daemon=True,
++                         args=(dev, getattr(worker, "rank", -1), getattr(worker, "local_rank", -1), armed_by))
+     _started.append(t)
+     t.start()
+ 
+ 
+-def _loop(dev, rank, local):
++def _ctl():
++    try:
++        with open(os.path.join(_DIR, "window.ctl")) as f:
++            seq, name = f.read().split(None, 1)
++        return int(seq), name.strip()
++    except (OSError, ValueError):
++        return None
++
++
++def _loop(dev, rank, local, armed_by):
+     os.makedirs(_DIR, exist_ok=True)
+     f = open(os.path.join(_DIR, f"memstats-rank{rank}-pid{os.getpid()}.jsonl"), "a", buffering=1)
++    base = {"rank": rank, "local": local, "dev": dev, "pid": os.getpid()}
++
++    def w(rec):
++        f.write(json.dumps({**base, **rec}, separators=(",", ":")) + "\n")
++
+     run_ap = run_rp = 0
+     min_free = None
++    seq, name = _ctl() or (0, "serve")
+     torch.cuda.reset_peak_memory_stats(dev)
+-    t0 = time.time()
++    t0, m0 = time.time(), time.monotonic()
++    w({"kind": "start", "t": round(t0, 4), "m": round(m0, 4), "armed_by": armed_by, "window": name, "seq": seq})
+     while True:
+         time.sleep(_SEG)
+         try:
+-            s = torch.cuda.memory_stats(dev)
+             free, total = torch.cuda.mem_get_info(dev)
+-            torch.cuda.reset_peak_memory_stats(dev)
+-            t1 = time.time()
++            s = torch.cuda.memory_stats(dev)
++            t1, m1 = time.time(), time.monotonic()
+             ap, rp = int(s.get("allocated_bytes.all.peak", 0)), int(s.get("reserved_bytes.all.peak", 0))
+             run_ap, run_rp = max(run_ap, ap), max(run_rp, rp)
+-            min_free = free if min_free is None else min(min_free, free)
+-            rec = {"t0": round(t0, 4), "t1": round(t1, 4), "rank": rank, "local": local, "dev": dev,
+-                   "pid": os.getpid(), "alloc": int(s.get("allocated_bytes.all.current", 0)), "alloc_peak": ap,
+-                   "res": int(s.get("reserved_bytes.all.current", 0)), "res_peak": rp,
+-                   "retries": int(s.get("num_alloc_retries", 0)), "ooms": int(s.get("num_ooms", 0)),
+-                   "free": int(free), "total": int(total), "run_alloc_peak": run_ap, "run_res_peak": run_rp,
+-                   "min_free": int(min_free)}
++            min_free = int(free) if min_free is None else min(min_free, int(free))
++            w({"kind": "sample", "t0": round(t0, 4), "t1": round(t1, 4), "m0": round(m0, 4), "m1": round(m1, 4),
++               "window": name, "seq": seq, "alloc": int(s.get("allocated_bytes.all.current", 0)),
++               "res": int(s.get("reserved_bytes.all.current", 0)), "alloc_peak_w": ap, "res_peak_w": rp,
++               "retries": int(s.get("num_alloc_retries", 0)), "ooms": int(s.get("num_ooms", 0)), "free": int(free),
++               "total": int(total), "run_alloc_peak": run_ap, "run_res_peak": run_rp, "min_free_sampled": min_free})
++            c = _ctl()
++            if c is not None and c[0] != seq:
++                s2 = torch.cuda.memory_stats(dev)
++                ap2, rp2 = int(s2.get("allocated_bytes.all.peak", 0)), int(s2.get("reserved_bytes.all.peak", 0))
++                run_ap, run_rp = max(run_ap, ap2), max(run_rp, rp2)
++                w({"kind": "close", "t": round(time.time(), 4), "m": round(time.monotonic(), 4), "window": name,
++                   "seq": seq, "alloc_peak_w": ap2, "res_peak_w": rp2, "retries": int(s2.get("num_alloc_retries", 0)),
++                   "ooms": int(s2.get("num_ooms", 0)), "run_alloc_peak": run_ap, "run_res_peak": run_rp})
++                torch.cuda.reset_peak_memory_stats(dev)
++                seq, name = c
++                t1, m1 = time.time(), time.monotonic()
++                w({"kind": "ack", "t": round(t1, 4), "m": round(m1, 4), "window": name, "seq": seq})
+         except Exception as e:  # noqa: BLE001 - telemetry must never raise into the worker
+-            t1 = time.time()
+-            rec = {"t0": round(t0, 4), "t1": round(t1, 4), "rank": rank, "pid": os.getpid(),
+-                   "error": f"{type(e).__name__}: {e}"[:300]}
+-        f.write(json.dumps(rec, separators=(",", ":")) + "\n")
+-        t0 = t1
++            t1, m1 = time.time(), time.monotonic()
++            w({"kind": "error", "t0": round(t0, 4), "t1": round(t1, 4), "m0": round(m0, 4), "m1": round(m1, 4),
++               "window": name, "seq": seq, "error": f"{type(e).__name__}: {e}"[:300]})
++        t0, m0 = t1, m1
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index c36383a49..a9bd7d6c3 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -1097,6 +1097,10 @@ class Worker(WorkerBase):
+         # intra-op parallelism.
+         set_torch_threads_for_runtime()
+ 
++        # E2 gate 5 telemetry: armed only after warm-up and CUDA-graph capture (env-gated).
++        if _e2_memstats.enabled():
++            _e2_memstats.ensure_started(self)
++
+         return CompilationTimes(
+             language_model=self.compilation_config.compilation_time,
+             encoder=self.compilation_config.encoder_compilation_time,
+@@ -1284,8 +1288,6 @@ class Worker(WorkerBase):
+     def execute_model(
+         self, scheduler_output: "SchedulerOutput"
+     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
+-        if _e2_memstats.enabled():
+-            _e2_memstats.ensure_started(self)
+         # Wait for the previous step's sends so this forward pass cannot
+         # overwrite buffers they are still reading.
+         if self._pp_send_work:
+-- 
+2.47.3
+

@@ -1,0 +1,33 @@
+# Flash-Next v2: the vLLM source this repo serves with, exactly as on the reference host.
+#   base: vllm-project/vllm nightly commit e962733e08 (2026-09-10) + PR #53899 head (peakcrosser7
+#         release/qwen38next_offload, PLE offload) + PRs #54793 #54795 = "e2-base" 0faddb0ddb
+#   + 76 patches, 71 ours and 5 carried upstream commits (release/v2/patches, reading aid; the history has 9 merge commits, so the
+#     linear series does not `git am` past patch 43 -- build from the bundle, read the patches)
+#   = tag v2.0.1 = tag v2 plus the port of upstream PRs #54442 and #56802, which fix structured output
+#     under concurrency on this pipeline-parallel shape (README, "What changed in v2.0.1").
+#     The bundle is the source artefact; scripts/build-v2.sh verifies commit AND tree.
+repo=https://github.com/vllm-project/vllm.git
+base_commit=e962733e08d10f7ca65dac4df99e116460b8b174
+# bundle prerequisites: the base commit and two upstream merge parents referenced by our history;
+# all public, fetched by full SHA at depth 1 (GitHub refuses abbreviated wants)
+prereqs="e962733e08d10f7ca65dac4df99e116460b8b174 c5d840ff6a50f544fca8524e8caffda9f63b7728 8a0a7ee40a5915dd7330c8f6e6c58ca565566471"
+bundle=v2.0.1-from-upstream-e962733e08.bundle
+bundle_sha256=eb2b17399794512d57156fff1e9b2c72af18c8b4dd6c55abd1dd0ed39097e9e3
+tag=v2.0.1
+commit=ad5c3c223999de577b04cdb9caeab2dcb76b61b9
+# git tree hash of the tagged source (content-only, stable); build-v2.sh checks it after checkout
+tree=5426cf19586a66946a1d8f7e68f48bdc7f52d62d
+# Compiled ops. The tree's csrc is upstream's at f2e2936f9 (no C++ change of ours in v2), so the
+# reference venv uses the upstream precompiled cu130 wheel for that commit; the 22 build products it
+# contributes are what build-artifacts.list enumerates. Either route below gives the same files.
+precompiled_wheel_version=0.28.1rc1.dev450+gf2e2936f9
+precompiled_csrc_commit=f2e2936f91a794513af74d009286c69e3fb2592b
+# same index as the v0.28.0 wheel the v1 release pinned; the reference copy was fetched 2026-09-10 and is hash-checked below
+precompiled_wheel_url=https://wheels.vllm.ai/f2e2936f91a794513af74d009286c69e3fb2592b/vllm-0.28.1rc1.dev450%2Bgf2e2936f9-cp38-abi3-manylinux_2_28_x86_64.whl   # HTTP 200 verified 2026-09-17 (the + must stay %2B-encoded)
+precompiled_wheel_sha256=03cdd53b5275a7b46814f4fc685b5e9912ec27584b77e3f826feaf1e323ac789
+# The reference host's extracted build products, as one tarball (291 MB, 22 files; not in git):
+artifacts_tar=build-artifacts-sm86-py313-cu130.tar.gz
+artifacts_sha256=845987ac2a5b0894a93adf831e8795dc12104bd9addea7f91e1aca8ae975f110
+# python / torch the reference venv pins (release/v2/requirements-pinned.txt is the full 199-line set)
+python=3.13
+torch=2.13.0+cu130
