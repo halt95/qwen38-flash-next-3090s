@@ -8,7 +8,7 @@ Type=simple
 EnvironmentFile=-/etc/default/flash-next
 Environment=TREE=/opt/vllm-v2 VENV=/opt/venv-v2
 WorkingDirectory=/opt/flash-next
-ExecStart=/bin/bash -c 'exec /opt/flash-next/scripts/serve-v2.sh "${CKPT:-/models/Qwen3.8-Flash-Next-W4A16-Merlin}"'
+ExecStart=/bin/bash -c 'exec bash /opt/flash-next/scripts/serve-v2.sh "${CKPT:-/models/Qwen3.8-Flash-Next-W4A16-Merlin}"'
 # vLLM with MTP + cudagraphs does not always exit on SIGTERM; give the shutdown-timeout 60 a chance, then kill the group
 KillMode=control-group
 TimeoutStopSec=90

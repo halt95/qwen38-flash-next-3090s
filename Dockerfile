@@ -23,9 +23,9 @@ WORKDIR /opt/flash-next
 COPY . /opt/flash-next/
 RUN if [ ! -f v2.0.1-from-upstream-e962733e08.bundle ]; then \
       curl -fsSL "$BUNDLE_URL" | gunzip > v2.0.1-from-upstream-e962733e08.bundle; fi \
-    && BUNDLE=/opt/flash-next/v2.0.1-from-upstream-e962733e08.bundle scripts/build-v2.sh /opt/vllm-v2 /opt/venv-v2 \
-    && rm -rf /opt/vllm-v2/.wheel /root/.cache \
-    && chmod +x scripts/docker-entrypoint.sh scripts/serve-v2.sh
+    && chmod +x scripts/*.sh scripts/make-e1-config.py \
+    && BUNDLE=/opt/flash-next/v2.0.1-from-upstream-e962733e08.bundle bash scripts/build-v2.sh /opt/vllm-v2 /opt/venv-v2 \
+    && rm -rf /opt/vllm-v2/.wheel /root/.cache
 ENV TREE=/opt/vllm-v2 VENV=/opt/venv-v2 HOST=0.0.0.0 PORT=8000 CACHE_ROOT=/cache
 VOLUME /cache
 EXPOSE 8000

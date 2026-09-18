@@ -25,13 +25,13 @@ Files in this tree (sha256 of the committed, LF-normalised content — `git show
 | `scripts/build-v2.sh` | `b48c90306a4db8d61eb54929f661f74c2848439d0d9c918990beb87c50cac85e` |
 | `scripts/serve-v2.sh` | `6ca1c400fd6cdacf2bba850124dcbf91d2b9da712d57395c69584704a8cd1edf` |
 | `scripts/make-e1-config.py` | `19bb3a3f99e0ba8b450605a4675693118f413f2364af3bc7f59b0f0549ee24fd` |
-| `Dockerfile` | `5d91a2b45aba152f19933e355b456c5e97a1d314ba69eac26e91e87ac58eeda2` |
+| `Dockerfile` | `d8d42314ffeb8498e4e2d509f04cc8178a92ddf4eec6e13baf085c82afece23e` |
 | `docker-compose.yml` | `235d7048b119938dec044a44a833802b80a9585226c91a3809d09d34fee2bcfc` |
 | `scripts/docker-entrypoint.sh` | `41f5502f4f20f1a1c0d9be40d7b37d3163a4c8543c85c59cb70f8c47bff58520` |
 | `.dockerignore` | `4febdf68980e9b17408de238c8516365079b79a4eabc51129a8a056853be6e93` |
 | `lxc/pve-create.sh` | `705043e2dac7083f321b7e0c4a32d8212eaa2a9aa413f620fb711faf584fb60b` |
 | `lxc/provision.sh` | `364c3c8066ffe38b3d5712f73e8b33564dfa7ac1b841d5edfe52d2c867a0f83e` |
-| `lxc/flash-next.service` | `3eaf49b51d981fd540a905c1112ad6a6ef93d9eb76b922144c9d6fb4d7292b7a` |
+| `lxc/flash-next.service` | `74050442960805b69937348991c6c5846b1a0a85385b7a4ea03870f69076d58b` |
 | `scales/qsa_kv_scales_262k.json` | `5cbe6ae87ed9d2dc97453a9a7b4967d0e0d32a0e6992ec260dc2c54b96305f67` |
 | `release/v2/requirements-pinned.txt` | `8390c8407106f4440359be1966b29cc3aeb3483490f2f059a83e58abfa057f62` |
 | `release/v2/build-artifacts.list` | `d26029273f3c50b4983b1c20219152de9b1cf3867977c17189184fc3bd85b6f5` |
