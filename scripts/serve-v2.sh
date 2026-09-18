@@ -9,8 +9,8 @@
 # The checkpoint needs one config key (`ple_embedding_dtype: float8_e4m3fn`) that the published HF
 # checkpoint does not carry: scripts/make-e1-config.py adds it (weights untouched; see README, "Checkpoint").
 #
-# Env knobs: PORT (8000), HOST (127.0.0.1), MODEL_NAME (names requests use in "model"; default = the six names the
-# production entry serves), PLE_HOME (0: the
+# Env knobs: PORT (8000), HOST (127.0.0.1), MODEL_NAME (names requests use in "model"; default = the four public names
+# below), PLE_HOME (0: the
 # card that hosts the PLE offload home; stage-0 card on the reference host), SCALES (KV scale sidecar,
 # defaults to scales/qsa_kv_scales_262k.json = the Merlin margin-1.10 file the v1 release shipped; v2 serves
 # the same bytes), CACHE_ROOT (torch compile / cudagraph cache dir; first boot compiles, ~10 min),
@@ -60,7 +60,7 @@ export HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1
 unset PYTORCH_CUDA_ALLOC_CONF VLLM_QSA_KV_COLLECT VLLM_QSA_KV_CLIP_COUNT VLLM_PLE_TEST_FAULT || true
 [ -f "$VLLM_QSA_KV_SCALES" ] || { echo "scales sidecar missing: $VLLM_QSA_KV_SCALES (without it FP8 KV runs at scale 1.0)"; exit 1; }
 
-read -r -a NAMES <<< "${MODEL_NAME:-flash-next-v2 flash-next flash-mtp flash-next-mtp flash-next-e2 flash-next-v2-sub}"
+read -r -a NAMES <<< "${MODEL_NAME:-flash-next-v2 flash-next flash-mtp flash-next-mtp}"
 exec "$VENV/bin/vllm" serve "$CKPT" \
   --served-model-name "${NAMES[@]}" \
   --host "${HOST:-127.0.0.1}" --port "${PORT:-8000}" \

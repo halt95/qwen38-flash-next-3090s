@@ -17,7 +17,7 @@
 # 3. Compiled ops: extract the artefact tarball into the tree (hash-checked), or unpack the .so files
 #    from the precompiled wheel. Then a metadata-only editable install (VLLM_TARGET_DEVICE=empty) so the
 #    `vllm` console script and importlib metadata exist without compiling anything.
-# Reference: clean-room run v10-v2-20260917-1422 (records/flashnext-v2-rc7-qualification-close-2026-09-17.md).
+# Reference: the clean-room reproduction that qualified the release (maintainer-run; the record is not published).
 set -euo pipefail
 for t in git curl tar sha256sum python3.13; do command -v "$t" >/dev/null || { echo "missing tool: $t"; exit 1; }; done
 # Debian and Ubuntu ship the venv machinery in a SEPARATE package, so `python3.13` can be present and working while

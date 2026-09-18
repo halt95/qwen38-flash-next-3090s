@@ -108,6 +108,11 @@ pct start 201 && pct push 201 lxc/provision.sh /root/provision.sh
 pct exec 201 -- env NVIDIA_RUN=/models/NVIDIA-Linux-x86_64-<host version>.run bash /root/provision.sh
 ```
 
+The one input the recipe cannot ship is the NVIDIA userspace, which must match the kernel module the Proxmox host runs:
+`nvidia-smi` on the host prints the version; download that `NVIDIA-Linux-x86_64-<version>.run` from NVIDIA's driver
+archive and put it under the `MODELS` directory (mounted at `/models` inside the container) before the provisioning step.
+It is installed with `--no-kernel-module`; peer-to-peer itself is a host property.
+
 **If you already have a vLLM checkout, do not start the server next to it.** vLLM inspects the model registry in a
 child process started with `python -m`, which puts the current directory ahead of `PYTHONPATH` on `sys.path`. A
 `vllm/` directory beside you therefore wins over the tree you built, and the failure surfaces much later as
@@ -287,7 +292,7 @@ The KV scale sidecar is **the file v1 shipped**, `scales/qsa_kv_scales_262k.json
 
 | piece | v2 |
 |---|---|
-| vLLM | fork tag **`v2.0.1`** = `ad5c3c223999de577b04cdb9caeab2dcb76b61b9`: public nightly `e962733e08` (2026-09-10) + the peakcrosser7 PLE-offload branch (#53899) + #54793 / #54795 + 76 patches over `e2-base`, 71 ours and 5 carried upstream commits (`release/v2/patches/`, reading aid; build from the bundle); `release/v2/v2.0.1-combined.diff` is the same delta as one applyable diff |
+| vLLM | fork tag **`v2.0.1`** = `ad5c3c223999de577b04cdb9caeab2dcb76b61b9`: public nightly `e962733e08` (2026-09-10) + the peakcrosser7 PLE-offload branch (#53899) + #54793 / #54795 (that base is what the scripts call `e2-base`) + 76 patches over it, 71 ours and 5 carried upstream commits (`release/v2/patches/`, reading aid; build from the bundle); `release/v2/v2.0.1-combined.diff` is the same delta as one applyable diff |
 | compiled ops | upstream's at `f2e2936f9` (no C++ change in v2): the precompiled cu130 wheel `0.28.1rc1.dev450+gf2e2936f9` or the reference host's 22 extracted build products, both hash-pinned in `upstream/PIN-v2` |
 | environment | Python 3.13, torch 2.13.0+cu130, flashinfer 0.6.18.post1, 199 pins in `release/v2/requirements-pinned.txt`; CUDA runtime from the venv wheels (no toolkit needed to serve) |
 | shape | TP2 × PP2 + EP, `VLLM_PP_LAYER_PARTITION=25,23`, MTP K=3 probabilistic, FULL_AND_PIECEWISE cudagraphs with captures to 32, `max-num-seqs 8`, prefill chunk 1,024, KV pin 4.1e9, fp8_e4m3 KV with the sidecar, prefix caching, `NCCL_PROTO=LL`, `--shutdown-timeout 60` |
@@ -304,7 +309,7 @@ The KV scale sidecar is **the file v1 shipped**, `scales/qsa_kv_scales_262k.json
 | `release/v2/v2.0.1-combined.diff` | one `git diff e2-base..v2.0.1` (112 files, text only, 777 KiB): `git apply` it on `e2-base` and you have the tagged source; checked to apply cleanly and to give the tag's tree hash. The way to reproduce the tree from the patches directory without the bundle (`build-v2.sh` itself uses the bundle) |
 | `release/v2/requirements-pinned.txt`, `build-artifacts.list`, `SHA256SUMS.v2.0.1`, `PACKAGE-MANIFEST.md` | the environment pins, the 22 build products, the hashes of the release assets, the combined diff and the reference patch series (`cd release/v2 && sha256sum -c --ignore-missing SHA256SUMS.v2.0.1` verifies 78 of 81 from a checkout; the other three are the release assets), the file manifest |
 | `scripts/build-v2.sh` | fetch the three prerequisite commits from GitHub + the bundle (release asset), check out `v2.0.1`, assert commit and tree, fresh venv from the pins, compiled ops from the wheel or the tarball, metadata-only install. One prerequisite is a PR-branch head (#53899); if it ever disappears upstream the bundle alone cannot be applied — a full bundle is the fallback |
-| `scripts/serve-v2.sh` | the served entry with every variable exported; port, host, names, PLE home, sidecar and cache dir configurable |
+| `scripts/serve-v2.sh` | the served entry with every variable exported; port, host, names (default `flash-next-v2 flash-next flash-mtp flash-next-mtp`), PLE home, sidecar and cache dir configurable |
 | `Dockerfile`, `docker-compose.yml`, `scripts/docker-entrypoint.sh` | the container: `build-v2.sh` at image build (bundle from the release URL or the build context), `serve-v2.sh` as the entrypoint, checkpoint and cache as mounts, the config key added on first start if the mount is writable |
 | `lxc/pve-create.sh`, `lxc/provision.sh`, `lxc/flash-next.service` | the Proxmox LXC form of the same thing: create the container with the device nodes and mounts, provision it (NVIDIA userspace, `build-v2.sh`, config key, systemd unit), serve on boot |
 | `scripts/make-e1-config.py` | adds the one config key to the published checkpoint, inside `text_config`, and re-parses the result to prove it landed where the engine reads it |
@@ -378,8 +383,10 @@ reference host.
 - Model: [Qwen/Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)
 - vLLM model support and PLE offload: the [`peakcrosser7` Flash-Next branch](https://github.com/peakcrosser7/vllm/commits/release/qwen38next_offload)
   behind vLLM PRs [#53896](https://github.com/vllm-project/vllm/pull/53896) and [#53899](https://github.com/vllm-project/vllm/pull/53899);
-  upstream fixes carried ahead of the base: #54793 / #54795 (saichowdary007), the prefix-cache chain
-  #53614 #55747 #53945 #54713 #55450 (ZeldaHuang, yewentao256, akshaver, tobymao, lucamotz), #46994, #54709, #55745, #57050
+  in the base (`e2-base`): PRs #54793 / #54795 (saichowdary007, open upstream); carried ahead of the base as the five
+  upstream-authored patches: the prefix-cache chain #53614 #55747 #53945 #54713 #55450 (ZeldaHuang, yewentao256, akshaver,
+  tobymao, lucamotz); ported by us: #46994, #55745, #57050 (merged upstream) and the #54442 / #56802 pair above; upstream
+  issue #54709 is the PP>1 refusal for PLE checkpoints that this tree works around
 - Quantised experts: [Intel/Qwen3.8-Flash-Next-W4A16-AutoRound](https://huggingface.co/Intel/Qwen3.8-Flash-Next-W4A16-AutoRound);
   FP8 PLE table: [RadixArk/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/RadixArk/Qwen3.8-Flash-Next-NVFP4);
   MTP INT4 packing recipe adapted from [DominikBucko/qwen38-flash-next-2x3090](https://github.com/DominikBucko/qwen38-flash-next-2x3090);

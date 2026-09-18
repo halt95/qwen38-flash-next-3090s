@@ -16,16 +16,16 @@ Files in this tree (sha256 of the committed, LF-normalised content — `git show
 
 | file | sha256 |
 |---|---|
-| `README.md` | `c237aef6a6711c9b683c9f19dff51055637130df017cd374bb12de6fb25a60d9` |
+| `README.md` | `4071a5b5fa3756feb706ae79b28ed8f5fa1f09b44d047e1cc8260ef701b737d6` |
 | `NOTICE` | `ad3a23f32a99e6d5ac404cfdd1100ed180b19a6fb87ab67f91ac0f6e7b489b21` |
 | `LICENSE` | `cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30` |
 | `LICENSE.qwen-community-1.0` | `465dcafcac7d3542a0cfc150fc550e0b7228c22ee68c8f1f81db942e7c658cb4` |
 | `upstream/PIN-v2` | `6d49bdc9947acf24409c8761c94056304b8c2678a0206fe7c80a33c9e44d572b` |
-| `scripts/build-v2.sh` | `6838c2056cd645ca8c4467e81b074fc3c67ef6c6e15067b5d4486d8b34f375c9` |
-| `scripts/serve-v2.sh` | `6a37cde91c416ee4d5ae714d45bdcfdcb9b043f9b51829c3d8b45be0f77ff1b3` |
+| `scripts/build-v2.sh` | `b48c90306a4db8d61eb54929f661f74c2848439d0d9c918990beb87c50cac85e` |
+| `scripts/serve-v2.sh` | `6ca1c400fd6cdacf2bba850124dcbf91d2b9da712d57395c69584704a8cd1edf` |
 | `scripts/make-e1-config.py` | `19bb3a3f99e0ba8b450605a4675693118f413f2364af3bc7f59b0f0549ee24fd` |
 | `Dockerfile` | `5d91a2b45aba152f19933e355b456c5e97a1d314ba69eac26e91e87ac58eeda2` |
-| `docker-compose.yml` | `5700f86292dff154aa31960b87f5dd7b7f92ff11e25a831e00e94459cc4ac315` |
+| `docker-compose.yml` | `235d7048b119938dec044a44a833802b80a9585226c91a3809d09d34fee2bcfc` |
 | `scripts/docker-entrypoint.sh` | `01cc19ad8138fb05c9cd62d745194080daaaac45d769e46e281a0cd9f9ae8cea` |
 | `.dockerignore` | `4febdf68980e9b17408de238c8516365079b79a4eabc51129a8a056853be6e93` |
 | `lxc/pve-create.sh` | `705043e2dac7083f321b7e0c4a32d8212eaa2a9aa413f620fb711faf584fb60b` |

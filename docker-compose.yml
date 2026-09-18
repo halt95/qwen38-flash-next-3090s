@@ -25,7 +25,7 @@ services:
     environment:
       HOST: 0.0.0.0
       PORT: 8000
-      # MODEL_NAME: "flash-next"          # names requests may use; default = the six production names
+      # MODEL_NAME: "flash-next"          # names requests may use; default = flash-next-v2 flash-next flash-mtp flash-next-mtp
       # PLE_HOME: "0"                     # card that hosts the n-gram table's home context
       # CUDA_VISIBLE_DEVICES: "0,1,2,3"
     volumes:
