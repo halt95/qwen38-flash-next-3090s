@@ -26,7 +26,7 @@ cannot hash itself.
 
 | file | sha256 |
 |---|---|
-| `README.md` | `7e9313e504419ed8e2ec87818c7c5a51c3ae89ccbffdb3cc7c15becd132cdea6` |
+| `README.md` | `54fabd42caca5a19f908cebedb0168932cded600c9535b5374c3ce788fe7d327` |
 | `NOTICE` | `21a08f7f6b053c9caf3385edf94706e782cc36ed9c926468ba393006ba2afc69` |
 | `LICENSE` | `cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30` |
 | `LICENSE.qwen-community-1.0` | `465dcafcac7d3542a0cfc150fc550e0b7228c22ee68c8f1f81db942e7c658cb4` |
@@ -35,7 +35,7 @@ cannot hash itself.
 | `scripts/serve-v2.2.sh` | `f599dac7a9861ad3358d56c14636a66c7e4bb3ce221d9804612ce41bf2d7009f` |
 | `scripts/topo_select.py` | `5ec2af2f8fdf179e2b7ab2ec8d29a0633e5570fa780c5c51c5bb11b159329ffc` |
 | `docs/topology-selector.md` | `dcdd87dac7c458bbdfb2f2472876cdf0654ce268c3f8f54b0c592eb4084c2dad` |
-| `docs/history.md` | `f512ca06d126e930da28c93093639136499d428ea5230edbbe2a091d5737cb59` |
+| `docs/history.md` | `e92f17a12752584ab468a82e2a5d43693304319c205c34fc2152120cecd57007` |
 | `docs/images/flashnext-v2.2-layout.png` | `f76b34f6710c9ab58bce62dbcede8c1cb63e31246060e989369405cd8a6503c3` |
 | `docs/images/flashnext-v2.2-vs-v2.png` | `92dd9032e23a5808df2b0a264aa9a934f7db93bb9f54cd30f6680f35dff7570f` |
 | `docs/images/flashnext-nvlink-pairing.png` | `f0e5c901d853ec2396db29082d6b2d6edaeeac20dd6463e351c7bfb4e9cd13fc` |

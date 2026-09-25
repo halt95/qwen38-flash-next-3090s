@@ -1,27 +1,11 @@
 # Qwen3.8-Flash-Next at 806K KV on 4× RTX 3090
 
-*v2.2.0: an 806,792-token KV pool with 262,144-token requests — three full-context sessions resident on four consumer cards — now on stock vLLM 0.30, with greedy output that repeats within one compile cache and fail-closed faults detected on every GPU rank.*
-
 Qwen3.8-Flash-Next (125B MoE, ~6B activated per token, plus a 51B n-gram embedding table and a 4B MTP
 head; Gated DeltaNet linear attention, 512 experts, vision tower) served with vLLM at its **full
-262,144-token context** on four consumer Ampere cards, as the daily model behind a
-[hermes](https://github.com/NousResearch/hermes-agent) agent.
-
-**v2.2.0** (2026-09-24) moves the same shape onto stock vLLM 0.30.0 and is a reliability release, at parity with v2:
-[greedy repeatability, any-rank fault detection and faster shutdown](#what-changed-in-v220). **v2.0.1** (2026-09-18) is
-the v2 shape plus one engine fix, [structured output under concurrency](docs/history.md#what-changed-in-v201). **v2**
-(2026-09-17) keeps everything the [v1 release](docs/history.md#v1-the-tp4-lane) established (calibrated FP8 KV for the
-sparse-attention layers, full cudagraphs, three-token speculative decoding) and changes the shape: **tensor
-parallel 2 × pipeline parallel 2** with expert parallel, the FP8 n-gram table served to the GPUs over a
-**host-mapped, fail-closed pull transport**, and, the piece that is entirely ours, **the token-embedding tables
-of both the target model and the MTP drafter moved out of VRAM into pinned host memory**, read by a device-mapped
-lookup that runs inside the captured cudagraph. The KV pool goes from 342,912 tokens (1.31 full-context requests) to
-**806,792 tokens: three 262K sessions resident at once**, thinking-on single-stream decode at parity with the TP4 lane
-(thinking-off at 4K measured 5 % below it in the v2 gate; a later re-test put it at parity, see Known behaviours),
-prefill 10–26 % faster. The v2-versus-v1 table below comes from the pre-registered two-arm gate that qualified v2
-([`benchmarks/2026-09-17/BENCH-CARD.md`](benchmarks/2026-09-17/BENCH-CARD.md)); v2.0.1 was requalified against those
-medians (maintainer-reported); capacity, memory, fault and prefix-cache figures are maintainer-reported from the
-campaign's close records, which are not published.
+262,144-token context** on four consumer Ampere cards: an **806,792-token** FP8 KV pool, three 262K sessions
+resident at once, TP2 × PP2 + expert parallel, MTP K=3. It is the daily model behind a
+[hermes](https://github.com/NousResearch/hermes-agent) agent. The current release, **v2.2.0**, runs the same shape on
+stock vLLM 0.30.0; it is a reliability release, at parity with v2, not faster.
 
 [![GPU](https://img.shields.io/badge/GPU-4x_RTX_3090-76B900?logo=nvidia&logoColor=white)](#hardware)
 [![Context](https://img.shields.io/badge/context-262K_per_request-ffb000)](#the-kv-budget)
@@ -30,49 +14,31 @@ campaign's close records, which are not published.
 [![MTP](https://img.shields.io/badge/MTP-K%3D3-6f42c1)](#stack)
 [![Checkpoint](https://img.shields.io/badge/%F0%9F%A4%97_checkpoint-Qwen3.8--Flash--Next--W4A16--Merlin-ffd21e)](https://huggingface.co/halt95/Qwen3.8-Flash-Next-W4A16-Merlin)
 
-> **Evidence boundary.** The v2.2.0 card ([`benchmarks/2026-09-24/BENCH-CARD.md`](benchmarks/2026-09-24/BENCH-CARD.md)) is a
-> maintainer measurement like the others; its qualification and fault records are not published. The v2 card is a
-> maintainer measurement on the reference host with a frozen, hash-pinned manifest; the bench card is published, the
-> underlying close records, raw streams and boot logs are not (as for v1). The v2.0.1 requalification figures are
-> maintainer-reported and their record is not published; the two upstream pull requests the fix ports are public and
-> can be read independently. What you can reproduce independently: the source tree (commit **and** tree hash, from the
-> public upstream commit plus the bundle shipped as a release asset), the environment (196 pinned packages for v2.2.0,
-> 199 for v2.0.1), the sidecar, and the serve command. Everything else is maintainer-reported. Of the behaviours
-> documented for v2, the illegal-address engine death is **fixed in v2.2.0**; the empty warm completion and the
-> prefix-cache loss remain **open** — read
-> [Known behaviours](#known-behaviours-of-the-qwen38-flash-next-architecture-in-vllm) before serving.
+Earlier releases (v2, v2.0.1, the v1 TP4 lane): [docs/history.md](docs/history.md).
 
-Earlier release notes (v2.0.1, how v2 got there, the v1 TP4 lane) are in [docs/history.md](docs/history.md).
+## v2.2.0 at a glance
 
-## At a glance
+- **Stock vLLM 0.30.** The public `v0.30.0` tag plus 58 commits. Same checkpoint, KV-scale sidecar, shape and
+  806,792-token pool; it needs the 0.30.0 runtime, its own two compiled extensions and a new compile cache.
+- **Greedy output repeats within one compile cache.** With the determinism switches on, 8 identical T=0 requests gave
+  1 distinct output in every sampled cell from 3,960 to 261,802 prompt tokens. Fresh compiles can still differ.
+- **A fail-closed fault on any GPU rank stops the engine** instead of hanging until a 300 s deadline: detected at
+  +0.000 s on rank 1, and the client gets HTTP 500 `EngineDeadError`.
+- **Faster orderly shutdown:** ~9.0 s to 2.65–3.55 s.
+- **The rare illegal-address engine death is fixed.** The empty warm completion and the prefix-cache loss remain open;
+  read [Known behaviours](#known-behaviours-of-the-qwen38-flash-next-architecture-in-vllm) before serving.
+- **First-serve toolchain:** the build installs the CUDA 13.0 nvcc wheels FlashInfer and Triton compile with, and the
+  serve script checks compiler, ninja, Python headers and nvcc-versus-driver before starting.
+- **Opt-in topology selector** (`AUTO_TOPO=1`) for hosts that do not look like the reference one, including NVLink
+  pairs ([Multi-GPU hosts and topology](#multi-gpu-hosts-and-topology-opt-in)).
 
-![Flash-Next v2.2.0 layout on four RTX 3090s: pipeline stage 0 on GPUs 0 and 1 (25 of 48 layers, vision tower, target embedding, PLE home GPU 0) hands off over PCIe P2P to stage 1 on GPUs 2 and 3 (23 of 48 layers, MTP drafter, drafter embedding, LM head); each pair all-reduces over PCIe P2P; the FP8 n-gram table (~48 GiB) and the pinned embedding tables (~4.2 GiB) sit in host RAM and are pulled over PCIe; the whole-box FP8 KV pool is 806,792 tokens](docs/images/flashnext-v2.2-layout.png)
+![Bar chart of single-stream decode, v2.2.0 against v2, at 4,096 / 32,768 / 131,072 / 261,120 prompt tokens: thinking on 160.0 vs 162.2, 165.6 vs 166.3, 168.9 vs 169.4, 175.1 vs 176.2 tokens/s; thinking off 119.7 vs 118.2, 127.9 vs 123.0, 121.3 vs 123.3, 121.8 vs 125.2 tokens/s; 0.973 to 1.040 of v2 in every cell](docs/images/flashnext-v2.2-vs-v2.png)
 
-| | **v2** | v1 TP4 build (same gate, same box; † see the note under the table) |
-|---|---|---|
-| shape | TP2 × PP2 + expert parallel, MTP K=3 | TP4 + EP, MTP K=3 |
-| KV pool, FP8 tokens, whole box | **806,792** (3.08 × a full-context request; three 262K sessions resident, measured) | 342,912 (1.31 ×) |
-| context per request | 262,144 | 262,144 |
-| concurrent sequences admitted (`--max-num-seqs`, configured; the shapes listed were measured resident) | **8** (3 × 262K, 1 × 262K + 3 × 131K, 5 × 131K, 8 × 65K, 8 × 32K) | 2 |
-| decode, single stream, thinking on, 4K / 32K / 131K / 261K prompt | **162 / 166 / 169 / 176** tok/s (medians of 5 boots) | 163 / 165 / 172 / 170† |
-| decode, thinking off, same depths | 118 / 123 / 123 / 125 | 124 / 122 / 120 / 125† |
-| median event interval, thinking on, same depths | 18.72 / 18.73 / 19.10 / 19.33 ms | 18.61 / 18.73 / 19.17 / 19.37† ms |
-| MTP tokens per step, thinking on, same depths | 3.02 / 3.07 / 3.13 / 3.28 | 3.00 / 3.04 / 3.17 / 3.24† |
-| prefill, 10K / 100K / 261K prompt | **4,944 / 5,282 / 5,122** tok/s | 4,498 / 4,194 / — |
-| time to first token, cold, 4K / 32K / 131K / 261K | 0.91 / 6.19 / 24.77 / 50.68 s | 0.97 / 7.16 / 31.94 / — s |
-| quality vs the BF16 teacher (24 held-out prompts, 5 boots; lower is closer) | 0.0365–0.0378 | 0.0378–0.0385 |
-| tool-call structure (150 cases) / exact recall (160 cases) | 130/150 / 160/160 | reference quant 125/150 / 160/160 (parity band, ≥ ref − 2) |
-| vision | on, 2 images per request | on |
+Single-stream decode, v2.2.0 against the v2 gate medians: 0.973–1.040 of v2 in every cell ([Benchmarks](#benchmarks)).
 
-† v1 at 261K was measured on 2026-09-18, after the gate, in one boot with three sends (170.1 / 124.6 tok/s; median event
-interval 19.37 / 19.40 ms; 3.24 / 2.39 tokens per step, thinking on / off). Every other v1 cell is a median of five boots;
-the 261K depth was preregistered for the v2 arm only, so v1 prefill and time to first token at that depth are not measured.
-
-Decode is the streamed event rate over the answer, client-timed at T=0 with a fixed seed (the gate's protocol; the
-served entry defaults to T=1.0 / top-p 0.95 / top-k 20 and the numbers were not re-measured under those defaults,
-nor under the served entry's request-logging-off flags). With MTP the honest pair is the **median event interval**
-(v2 18.7 / 18.7 / 19.1 ms vs v1 18.6 / 18.7 / 19.2 at 4K / 32K / 131K) and **tokens per step** (3.02 / 3.07 / 3.13
-vs 3.00 / 3.04 / 3.17), both in the card.
+Release: [v2.2.0 on GitHub](https://github.com/halt95/qwen38-flash-next-3090s/releases/tag/v2.2.0). Full notes:
+[What changed in v2.2.0](#what-changed-in-v220). To run it: [Quick start (container)](#quick-start-container) or
+[Build and serve](#build-and-serve).
 
 ## Quick start (container)
 
@@ -152,12 +118,6 @@ Read [Known behaviours](#known-behaviours-of-the-qwen38-flash-next-architecture-
 | `release/v2.2/requirements-pinned.txt`, `build-artifacts.list`, `SHA256SUMS.v2.2.0`, `PACKAGE-MANIFEST.md` | the environment pins (196; the build tools pip / setuptools-rust / setuptools-scm are pinned in `upstream/PIN-v2.2`), the 23 build-product paths, the hashes of the release assets, the combined diff and the 58 patches (`cd release/v2.2 && sha256sum -c --ignore-missing SHA256SUMS.v2.2.0`), the file manifest |
 | `scripts/build-v2.2.sh` | fetch `v0.30.0` from GitHub + the bundle (release asset), check out, assert commit and tree, fresh venv from the pins, the first-serve toolchain links (`lib64` and the unversioned library names) in the venv's CUDA 13.0 wheels, then the compiled ops: the artefact tarball (default, both own extensions hash-checked) or `BUILD_OWN=1` (stock wheel products + the two extensions compiled from the tree; needs cmake 3.26 or newer, ninja and a C/C++ compiler, and compiles with the venv's CUDA 13.0 nvcc unless `NVCC=` names another nvcc 13.0 or newer), metadata-only install. Relative paths are fine; a re-run resumes an interrupted source fetch or wheel download; every product file is hashed once verified (except `vllm/_version.py`, which the install regenerates; the build asserts the version instead), and a re-run re-checks the whole set |
 | `scripts/serve-v2.2.sh` | the v2.2.0 served entry with every variable exported; same knobs as `serve-v2.sh` plus `GUARD` (default `warn`), `COUNTERS` (default off) and `CUDA_HOME` (default: the venv's CUDA 13.0 wheels); checks compiler, ninja, Python headers and nvcc-versus-driver and re-hashes the build products (as recorded by the build) before starting, warns when host RAM or `/dev/shm` is below the qualified sizes, and clears inherited fork knobs |
-| `upstream/PIN-v2` | base commit, bundle prerequisites, tag commit and tree hash, precompiled-wheel identity and hash, artefact tarball hash |
-| `release/v2/patches/0001..0076` | the full series over `e2-base`, for reading (patch subjects carry the campaign's internal task and review labels; they are not renamed because the files are hashed); the history has merge commits, so `git am` cannot replay it (it stops at patch 43). These copies are byte-identical to the reference package and verify against `SHA256SUMS.v2.0.1`; contributors whose work upstream authored keep their own attribution. The bundle remains the source of truth |
-| `release/v2/v2.0.1-combined.diff` | one `git diff e2-base..v2.0.1` (112 files, text only, 777 KiB): `git apply` it on `e2-base` (the release asset `e2-base-src.tar.gz`, sha256 `fcd14214f64faaa4175d62f6a51ca39c7bc09d15bf75c190d4dfcc88846b927f`) and you have the tagged source; checked to apply cleanly and to give the tag's tree hash. The way to reproduce the tree from the patches directory without the bundle (`build-v2.sh` itself uses the bundle) |
-| `release/v2/requirements-pinned.txt`, `build-artifacts.list`, `SHA256SUMS.v2.0.1`, `PACKAGE-MANIFEST.md` | the environment pins, the 22 build products, the hashes of the release assets, the combined diff and the reference patch series (`cd release/v2 && sha256sum -c --ignore-missing SHA256SUMS.v2.0.1` verifies 78 of 81 from a checkout; the other three are the release assets), the file manifest |
-| `scripts/build-v2.sh` | fetch the three prerequisite commits from GitHub + the bundle (release asset), check out `v2.0.1`, assert commit and tree, fresh venv from the pins, compiled ops from the wheel or the tarball, metadata-only install. One prerequisite is a PR-branch head (#53899); if it ever disappears upstream the bundle alone cannot be applied — a full bundle is the fallback |
-| `scripts/serve-v2.sh` | the served entry with every variable exported; port, host, names (default `flash-next-v2 flash-next flash-mtp flash-next-mtp`), PLE home, sidecar and cache dir configurable |
 | `Dockerfile`, `docker-compose.yml`, `scripts/docker-entrypoint.sh` | the v2.2.0 container: `build-v2.2.sh` at image build (bundle and build-artifacts from the release URLs or the build context; gcc, g++ and ninja for the first serve, the base image's Python headers), `serve-v2.2.sh` as the entrypoint, checkpoint and cache as mounts, the config key added on first start if the mount is writable |
 | `lxc/pve-create.sh`, `lxc/provision.sh`, `lxc/flash-next.service` | the Proxmox LXC form of the same thing: create the container with the device nodes and mounts, provision it (NVIDIA userspace, gcc/ninja/Python headers, `build-v2.2.sh`, config key, systemd unit), serve on boot |
 | `scripts/make-e1-config.py` | adds the one config key to the published checkpoint, inside `text_config`, and re-parses the result to prove it landed where the engine reads it |
@@ -177,28 +137,9 @@ python3 scripts/make-e1-config.py /path/to/Qwen3.8-Flash-Next-W4A16-Merlin   # n
 TREE=./vllm-v2.2 VENV=./venv-v2.2 CACHE_ROOT=./.vllm-cache-v2.2 HOST=0.0.0.0 scripts/serve-v2.2.sh /path/to/Qwen3.8-Flash-Next-W4A16-Merlin
 ```
 
-The v2.0.1 route, unchanged:
-
-```bash
-# release assets: v2.0.1-from-upstream-e962733e08.bundle.gz (required), build-artifacts-sm86-py313-cu130.tar.gz (optional),
-# e2-base-src.tar.gz (only for the combined-diff route), build-artifacts.list (already in the tree)
-gunzip v2.0.1-from-upstream-e962733e08.bundle.gz
-BUNDLE=./v2.0.1-from-upstream-e962733e08.bundle scripts/build-v2.sh ./vllm-v2 ./venv-v2
-python3 scripts/make-e1-config.py /path/to/Qwen3.8-Flash-Next-W4A16-Merlin   # no-op if the config already carries the key
-TREE=./vllm-v2 VENV=./venv-v2 HOST=0.0.0.0 scripts/serve-v2.sh /path/to/Qwen3.8-Flash-Next-W4A16-Merlin
-```
-
-Four known deltas between the gate command and the shipped one:
-
-- the gate ran with `--enable-log-requests --enable-request-id-headers` (request logging on; the served entry has it
-  off; no throughput effect is claimed either way);
-- the served entry adds `--override-generation-config` (T=1.0 / top-p 0.95 / top-k 20) and
-  `--default-chat-template-kwargs` (thinking on, low effort), which the gate did not pass (it sent T=0 with a seed per
-  request);
-- `serve-v2.sh` also exports `HF_DATASETS_OFFLINE=1`;
-- the reference host exports `LD_LIBRARY_PATH` pointing at its CUDA 13.3 toolkit, which is inert: every CUDA library
-  the processes map comes from the venv wheels (`/proc/<pid>/maps` checked on a qualification boot), so `serve-v2.sh`
-  does not set it.
+The v2.0.1 files (`upstream/PIN-v2`, `release/v2/`, `scripts/build-v2.sh`, `scripts/serve-v2.sh`), its build route and
+the four deltas between its gate command and the shipped one are in
+[docs/history.md](docs/history.md#v201-build-and-serve).
 
 `HOST=0.0.0.0` exposes an endpoint without an API key on every interface: if the host is reachable from other machines,
 set `VLLM_API_KEY` (or pass `--api-key` after the checkpoint; extra arguments go to `vllm serve`), or keep the default
@@ -385,9 +326,17 @@ Rollback is pointing the entry back at the v2.0.x tree, environment and cache; n
 ## Benchmarks
 
 v2.2.0 against the v2 gate medians, single-stream decode (one boot of the release candidate; per-cell numbers in
-[`benchmarks/2026-09-24/BENCH-CARD.md`](benchmarks/2026-09-24/BENCH-CARD.md)):
+[`benchmarks/2026-09-24/BENCH-CARD.md`](benchmarks/2026-09-24/BENCH-CARD.md)): 0.973–1.040 of v2 in every cell, charted
+under [v2.2.0 at a glance](#v220-at-a-glance).
 
-![Bar chart of single-stream decode, v2.2.0 against v2, at 4,096 / 32,768 / 131,072 / 261,120 prompt tokens: thinking on 160.0 vs 162.2, 165.6 vs 166.3, 168.9 vs 169.4, 175.1 vs 176.2 tokens/s; thinking off 119.7 vs 118.2, 127.9 vs 123.0, 121.3 vs 123.3, 121.8 vs 125.2 tokens/s; 0.973 to 1.040 of v2 in every cell](docs/images/flashnext-v2.2-vs-v2.png)
+> **Evidence boundary.** The v2.2.0 card ([`benchmarks/2026-09-24/BENCH-CARD.md`](benchmarks/2026-09-24/BENCH-CARD.md)) is a
+> maintainer measurement like the others; its qualification and fault records are not published. The v2 card is a
+> maintainer measurement on the reference host with a frozen, hash-pinned manifest; the bench card is published, the
+> underlying close records, raw streams and boot logs are not (as for v1). The v2.0.1 requalification figures are
+> maintainer-reported and their record is not published; the two upstream pull requests the fix ports are public and
+> can be read independently. What you can reproduce independently: the source tree (commit **and** tree hash, from the
+> public upstream commit plus the bundle shipped as a release asset), the environment (196 pinned packages for v2.2.0,
+> 199 for v2.0.1), the sidecar, and the serve command. Everything else is maintainer-reported.
 
 The v2 gate ran **five boots per arm, alternating v2 and v1 on the same box**, one frozen manifest, three sends
 per cell, judged as medians with a 0.97 rule per depth and a 0.90 floor per boot. Full card with every boot's
@@ -465,7 +414,11 @@ in the gate.
   prefills (the instrumentation readers deadlocking under the CUDA context lock; fixed before v2, readers off
   in v2) and the upstream Mamba admission-estimate regression (#57050, ported before v2).
 
-## Hardware
+## How it works
+
+![Flash-Next v2.2.0 layout on four RTX 3090s: pipeline stage 0 on GPUs 0 and 1 (25 of 48 layers, vision tower, target embedding, PLE home GPU 0) hands off over PCIe P2P to stage 1 on GPUs 2 and 3 (23 of 48 layers, MTP drafter, drafter embedding, LM head); each pair all-reduces over PCIe P2P; the FP8 n-gram table (~48 GiB) and the pinned embedding tables (~4.2 GiB) sit in host RAM and are pulled over PCIe; the whole-box FP8 KV pool is 806,792 tokens](docs/images/flashnext-v2.2-layout.png)
+
+### Hardware
 
 | resource | reference host |
 |---|---|
@@ -475,11 +428,11 @@ in the gate.
 | disk, `/dev/shm` | ≥ 250 GB free (the checkpoint is 115 GiB); `/dev/shm` ≥ 1 GB (maintainer-measured peak +30.6 MB per boot; a `Bus error` at boot means it is undersized) |
 | OS / serving | Linux container on Proxmox, vLLM behind llama-swap; the scripts here run the same engine directly |
 
-## The KV budget
+### The KV budget
 
 **806,792 tokens** at `--kv-cache-memory 4100000000` per rank, measured on every qualification boot. The
 per-request limit stays 262,144; the pool is the aggregate over concurrent requests. Where the room came from
-relative to TP4 at the same weights (the layout diagram under [At a glance](#at-a-glance) shows where each piece sits):
+relative to TP4 at the same weights (the layout diagram under [How it works](#how-it-works) shows where each piece sits):
 
 - **PP2 halves what each card duplicates.** With tensor parallel alone every card holds a slice of every
   layer plus the whole non-sharded state; with two pipeline stages each pair of cards holds 25 / 23 of the 48
@@ -503,7 +456,7 @@ relative to TP4 at the same weights (the layout diagram under [At a glance](#at-
 Three 262K sessions resident with 302 of 317 blocks in use, three-way qualifying interval 8.41 s, is the
 capacity row of the gate.
 
-## Host-resident embeddings inside the cudagraph
+### Host-resident embeddings inside the cudagraph
 
 This is the v2 change that is ours end to end (patches `0037` and `0039` in `release/v2/patches/`, branch
 `v2-host-embed`; designed, reviewed and redesigned during the campaign). The model carries two bf16 token-embedding tables of
@@ -523,7 +476,22 @@ worth knowing if you build from source: the flag is a torch compile-cache factor
 must not share an AOT cache entry; patch `0068` registers it, and a pre-fix tree needs separate `VLLM_CACHE_ROOT`s per
 mode).
 
-## Checkpoint
+### Stack
+
+| piece | v2.2.0 |
+|---|---|
+| vLLM | stock tag **`v0.30.0`** (`ced6857afa`) + 58 commits = the v2.2.0 source, release commit **`9c27ca9a06`** (tree `eebcd648…`, the head of the bundle's branch `v2.2.0-public`; `release/v2.2/patches/`, a linear series that replays with `git am`; build from the bundle); `release/v2.2/v2.2.0-combined.diff` is the same delta as one applyable diff |
+| compiled ops | two built from this source for sm_86 (`_C_stable_libtorch` `6cb8bc77…`, `_moe_C_stable_libtorch` `66acb123…`: the delta changes the top-k kernels and the Marlin MoE split-K switch; device code identical to the qualified builds on this model's path; built in an Ubuntu 22.04 root, so they need glibc 2.34 or newer); every other build product is the stock 0.30.0 wheel's. The 23 products ship as one tarball; both routes are hash-pinned in `upstream/PIN-v2.2` |
+| environment | Python 3.13, torch 2.13.0 (CUDA 13.0), triton 3.7.1, flashinfer 0.6.18.post1, 196 pins in `release/v2.2/requirements-pinned.txt`; CUDA runtime from the venv wheels; the first serve compiles FlashInfer and Triton kernels with the pinned CUDA 13.0 nvcc wheels plus a system C/C++ compiler, ninja and the Python 3.13 headers; driver CUDA ≥ 13.0 |
+| shape | as v2.0.1: TP2 × PP2 + EP, `VLLM_PP_LAYER_PARTITION=25,23`, MTP K=3 probabilistic, FULL_AND_PIECEWISE cudagraphs with captures to 32, `max-num-seqs 8`, prefill chunk 1,024, KV pin 4.1e9, fp8_e4m3 KV with the sidecar, prefix caching, `NCCL_PROTO=LL`, `--shutdown-timeout 60`; plus `VLLM_USE_BREAKABLE_CUDAGRAPH=0` |
+| PLE table | host-mapped pull transport, home GPU 0, fail-closed (`VLLM_E2_PLE_PULL_TRANSPORT=1`, `VLLM_PLE_OFFLOAD_HOME_DEVICE=0`) |
+| embeddings | pinned host tables on both stages (`VLLM_HOST_EMBED_TABLE=1`) |
+| determinism | `MERLIN_FULL_K`, `MERLIN_QSA_SORT`, `MERLIN_TIE_DET`, `MERLIN_TIE_RECENT`, `MERLIN_TOPK_SORTED_EMIT` = 1 |
+| instrumentation | bounds guards on in `warn`; exact-restart and FP8 KV clip counters off by default (logging only; `COUNTERS=1` turns them on, as the reference host runs them) |
+
+The v2.0.1 stack is in [docs/history.md](docs/history.md#v201-stack).
+
+### Checkpoint
 
 The same checkpoint as v1, [halt95/Qwen3.8-Flash-Next-W4A16-Merlin](https://huggingface.co/halt95/Qwen3.8-Flash-Next-W4A16-Merlin)
 (Intel AutoRound INT4 g128 experts, the RadixArk FP8 n-gram table, MTP draft experts INT4 and GDN projections
@@ -539,7 +507,7 @@ published here; the Hugging Face checkpoint carries them, and the v2 delta is th
 The KV scale sidecar is **the file v1 shipped**, `scales/qsa_kv_scales_262k.json` (Merlin-calibrated, margin
 1.10, sha256 `5cbe6ae8…`); the reference host serves the same bytes under a different file name. One file ships.
 
-## Serving an agent
+### Serving an agent
 
 | agent need | as served |
 |---|---|
@@ -548,29 +516,6 @@ The KV scale sidecar is **the file v1 shipped**, `scales/qsa_kv_scales_262k.json
 | tool calls, thinking, images | Qwen3 coder tool parser, Qwen3 reasoning parser with thinking on at low effort, 2 images per request, one OpenAI-compatible front door |
 | a client that expects an answer every time | retry once on `finish_reason == "stop"` with 0 completion tokens ([empty warm completion](#known-behaviours-of-the-qwen38-flash-next-architecture-in-vllm)) |
 | not dying at depth | 14-cut fault campaign on the transport (fail-closed on every cut), stress sequence, memory profiles with three 262K sessions plus a burst, prefix-cache correctness under forced preemption (51/51 answers correct), all maintainer-run |
-
-## Stack
-
-| piece | v2.2.0 |
-|---|---|
-| vLLM | stock tag **`v0.30.0`** (`ced6857afa`) + 58 commits = the v2.2.0 source, release commit **`9c27ca9a06`** (tree `eebcd648…`, the head of the bundle's branch `v2.2.0-public`; `release/v2.2/patches/`, a linear series that replays with `git am`; build from the bundle); `release/v2.2/v2.2.0-combined.diff` is the same delta as one applyable diff |
-| compiled ops | two built from this source for sm_86 (`_C_stable_libtorch` `6cb8bc77…`, `_moe_C_stable_libtorch` `66acb123…`: the delta changes the top-k kernels and the Marlin MoE split-K switch; device code identical to the qualified builds on this model's path; built in an Ubuntu 22.04 root, so they need glibc 2.34 or newer); every other build product is the stock 0.30.0 wheel's. The 23 products ship as one tarball; both routes are hash-pinned in `upstream/PIN-v2.2` |
-| environment | Python 3.13, torch 2.13.0 (CUDA 13.0), triton 3.7.1, flashinfer 0.6.18.post1, 196 pins in `release/v2.2/requirements-pinned.txt`; CUDA runtime from the venv wheels; the first serve compiles FlashInfer and Triton kernels with the pinned CUDA 13.0 nvcc wheels plus a system C/C++ compiler, ninja and the Python 3.13 headers; driver CUDA ≥ 13.0 |
-| shape | as v2.0.1 below, plus `VLLM_USE_BREAKABLE_CUDAGRAPH=0` |
-| PLE table | host-mapped pull transport, home GPU 0, fail-closed (`VLLM_E2_PLE_PULL_TRANSPORT=1`, `VLLM_PLE_OFFLOAD_HOME_DEVICE=0`) |
-| embeddings | pinned host tables on both stages (`VLLM_HOST_EMBED_TABLE=1`) |
-| determinism | `MERLIN_FULL_K`, `MERLIN_QSA_SORT`, `MERLIN_TIE_DET`, `MERLIN_TIE_RECENT`, `MERLIN_TOPK_SORTED_EMIT` = 1 |
-| instrumentation | bounds guards on in `warn`; exact-restart and FP8 KV clip counters off by default (logging only; `COUNTERS=1` turns them on, as the reference host runs them) |
-
-| piece | v2.0.1 (previous) |
-|---|---|
-| vLLM | fork tag **`v2.0.1`** = `ad5c3c223999de577b04cdb9caeab2dcb76b61b9`: public nightly `e962733e08` (2026-09-10) + the peakcrosser7 PLE-offload branch (#53899) + #54793 / #54795 (that base is what the scripts call `e2-base`) + 76 patches over it, 71 ours and 5 carried upstream commits (`release/v2/patches/`, reading aid; build from the bundle); `release/v2/v2.0.1-combined.diff` is the same delta as one applyable diff |
-| compiled ops | upstream's at `f2e2936f9` (no C++ change in v2): the precompiled cu130 wheel `0.28.1rc1.dev450+gf2e2936f9` or the reference host's 22 extracted build products, both hash-pinned in `upstream/PIN-v2` |
-| environment | Python 3.13, torch 2.13.0+cu130, flashinfer 0.6.18.post1, 199 pins in `release/v2/requirements-pinned.txt`; CUDA runtime from the venv wheels; the first serve also JIT-compiles FlashInfer and Triton kernels, which needs a CUDA toolkit no newer than the driver, a C compiler, ninja and the Python headers (not stated when v2.0.1 shipped; see the v2.2.0 toolchain notes) |
-| shape | TP2 × PP2 + EP, `VLLM_PP_LAYER_PARTITION=25,23`, MTP K=3 probabilistic, FULL_AND_PIECEWISE cudagraphs with captures to 32, `max-num-seqs 8`, prefill chunk 1,024, KV pin 4.1e9, fp8_e4m3 KV with the sidecar, prefix caching, `NCCL_PROTO=LL`, `--shutdown-timeout 60` |
-| PLE table | host-mapped pull transport, home GPU 0, fail-closed (`VLLM_PLE_CPU_OFFLOAD=1`, `VLLM_PLE_OFFLOAD_HOME_DEVICE=0`) |
-| embeddings | pinned host tables on both stages (`VLLM_HOST_EMBED_TABLE=1`) |
-| instrumentation | bounds guards + KV clip counter compiled in, **off** in the served profile |
 
 ## What ships next
 
