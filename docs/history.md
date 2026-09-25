@@ -15,8 +15,7 @@ parallel 2 × pipeline parallel 2** with expert parallel, the FP8 n-gram table s
 **host-mapped, fail-closed pull transport**, and, the piece that is entirely ours, **the engine's token-embedding copies
 for both the target model and the MTP drafter moved out of VRAM into pinned host memory**, read by a device-mapped
 lookup that runs inside the captured cudagraph. The KV pool goes from 342,912 tokens (1.31 full-context requests) to
-**806,792 tokens: three ~256K-token sessions measured resident at once** (three full 262,144-token contexts fit by
-arithmetic), thinking-on single-stream decode at parity with the TP4 lane
+**806,792 tokens: three full 262,144-token sessions measured resident at once**, thinking-on single-stream decode at parity with the TP4 lane
 (thinking-off at 4K measured 5 % below it in the v2 gate; a later re-test put it at parity, see Known behaviours),
 prefill 10–26 % faster. The v2-versus-v1 table below comes from the pre-registered two-arm gate that qualified v2
 ([`benchmarks/2026-09-17/BENCH-CARD.md`](../benchmarks/2026-09-17/BENCH-CARD.md)); v2.0.1 was requalified against those
@@ -28,7 +27,7 @@ campaign's close records, which are not published.
 | | **v2** | v1 TP4 build (same gate, same box; † see the note under the table) |
 |---|---|---|
 | shape | TP2 × PP2 + expert parallel, MTP K=3 | TP4 + EP, MTP K=3 |
-| KV pool, FP8 tokens, whole box | **806,792** (3.08 × a full-context request; three ~256K-token sessions resident, measured at a peak of about 95 % of the pool) | 342,912 (1.31 ×) |
+| KV pool, FP8 tokens, whole box | **806,792** (3.08 × a full-context request; three full 262,144-token sessions resident, measured at a peak of about 95 % of the pool) | 342,912 (1.31 ×) |
 | context per request | 262,144 | 262,144 |
 | concurrent sequences admitted (`--max-num-seqs`, configured; the shapes listed were measured resident) | **8** (3 × 262K, 1 × 262K + 3 × 131K, 5 × 131K, 8 × 65K, 8 × 32K) | 2 |
 | decode, single stream, thinking on, 4K / 32K / 131K / 261K prompt | **162 / 166 / 169 / 176** tok/s (medians of 5 boots) | 163 / 165 / 172 / 170† |

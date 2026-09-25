@@ -3,7 +3,7 @@
 Qwen3.8-Flash-Next (125B MoE, ~6B activated per token, plus a 51B n-gram embedding table and a one-layer MTP
 head of about 2.6B parameters by the config's shapes; Gated DeltaNet linear attention, 512 experts, vision tower) served with vLLM
 at its **full 262,144-token context** on four consumer Ampere cards: an **806,792-token** FP8 KV pool (3.08 full
-262,144-token contexts by arithmetic; three ~256K-token sessions measured resident at once), TP2 × PP2 + expert
+262,144-token contexts; three full 262,144-token sessions measured resident at once on v2, re-tested at 3 × 256K on v2.2), TP2 × PP2 + expert
 parallel, MTP K=3. It is the daily model behind a
 [hermes](https://github.com/NousResearch/hermes-agent) agent. The current release, **v2.2.0**, runs the same shape on
 vLLM 0.30.0 (the public `v0.30.0` tag plus 58 commits); it is a reliability release, at parity with v2, not faster.
@@ -544,10 +544,10 @@ relative to TP4 at the same weights (the layout diagram under [How it works](#ho
 - The 4.1e9 pin is the highest that boots with a complete clean row set (measured on the qualification boots); 24/24
   layer partitions and higher pins fail on the tightest card (3.8e9 was the ceiling before the host-resident embeddings).
 
-The capacity row of the v2 gate held three ~256K-token sessions resident at once, peaking at 302 of 317 blocks
-(about 95 % of the pool), three-way qualifying interval 8.41 s; the v2.2 release candidate held three ~256K-token
-sessions at the same 302-of-317-block peak. Three full 262,144-token contexts (786,432 tokens) fit the 806,792-token pool
-by arithmetic.
+The capacity row of the v2 gate held three full 262,144-token sessions (261,120-token prompts plus 1,024 generated
+tokens each, as reported by the server) resident at once, peaking at 302 of 317 blocks (about 95 % of the pool),
+three-way qualifying interval 8.41 s; the v2.2 release candidate was re-tested with three 256,000-token prompts at the
+same 302-of-317-block peak, with no preemption. Three full contexts are 786,432 tokens of the 806,792-token pool.
 
 ### Host-resident embeddings inside the cudagraph
 
