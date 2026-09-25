@@ -1,0 +1,118 @@
+From 32ecafbad8805d96666352b1960eb3a0e8018e05 Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Tue, 22 Sep 2026 04:17:29 -0400
+Subject: [PATCH 24/58] qsa: fp8 KV capability overrides and auto-then-restore
+ construction (from upstream #55557)
+
+The QSA backend answers the KV-dtype and combination capability checks for its
+own kernels rather than inheriting flash-attn's. The FP8 reader is unchanged.
+---
+ vllm/models/qwen4_exp/nvidia/qsa.py | 74 ++++++++++++++++++++++++-----
+ 1 file changed, 63 insertions(+), 11 deletions(-)
+
+diff --git a/vllm/models/qwen4_exp/nvidia/qsa.py b/vllm/models/qwen4_exp/nvidia/qsa.py
+index 1b7d55f291..f4fa56be0f 100644
+--- a/vllm/models/qwen4_exp/nvidia/qsa.py
++++ b/vllm/models/qwen4_exp/nvidia/qsa.py
+@@ -33,6 +33,7 @@ from vllm.logger import init_logger
+ from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding, get_rope
+ from vllm.model_executor.models.qwen3_next import Qwen3NextAttention
+ from vllm.platforms import current_platform
++from vllm.platforms.interface import DeviceCapability
+ from vllm.transformers_utils.configs.qwen4_exp import (
+     Qwen4ExpTextConfig,
+ )
+@@ -309,6 +310,35 @@ class Qwen4ExpQSAFlashAttentionBackend(FlashAttentionBackend):
+         "fp8_e4m3",
+     ]
+ 
++    @classmethod
++    def supports_kv_cache_dtype(cls, kv_cache_dtype: CacheDType | None) -> bool:
++        # The parent additionally probes flash-attn for quantized-KV support
++        # and rejects fp8 wherever FA has no kernel for it (all of sm_86).
++        # QSA never runs flash-attn over this cache: reshape_and_cache_flash
++        # writes the e4m3 bytes and our Triton kernel dequantizes them on load,
++        # so the class list alone decides. See the impl constructor for the
++        # matching "auto"-then-restore of the same probe.
++        return kv_cache_dtype is None or kv_cache_dtype in cls.supported_kv_cache_dtypes
++
++    @classmethod
++    def supports_combination(
++        cls,
++        head_size: int,
++        dtype: torch.dtype,
++        kv_cache_dtype: CacheDType | None,
++        block_size: int | None,
++        use_mla: bool,
++        has_sink: bool,
++        use_sparse: bool,
++        use_mm_prefix: bool,
++        device_capability: DeviceCapability,
++    ) -> str | None:
++        # Same reason: the parent's "FP8 KV cache requires FA3 on SM90 or FA4
++        # on SM100" rejection is about flash-attn's own kernels, which QSA does
++        # not use. The real device gate for our fp8 path is
++        # `_validated_qsa_fp8_dtype`, which raises on any capability != 86.
++        return None
++
+     @staticmethod
+     def get_name() -> str:
+         return "QWEN4_EXP_QSA_TRITON"
+@@ -341,7 +371,20 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
+     supports_dcp: bool = False
+     supports_pcp: bool = False
+ 
+-    def __init__(self, *args, **kwargs) -> None:
++    def __init__(
++        self,
++        num_heads: int,
++        head_size: int,
++        scale: float,
++        num_kv_heads: int,
++        alibi_slopes: list[float] | None,
++        sliding_window: int | None,
++        kv_cache_dtype: str,
++        logits_soft_cap: float | None = None,
++        attn_type: AttentionType = AttentionType.DECODER,
++        kv_sharing_target_layer_name: str | None = None,
++        sinks: torch.Tensor | None = None,
++    ) -> None:
+         # QSA never dispatches to a FlashAttention kernel: attention runs through
+         # forward_qsa -> qsa_sparse_paged_attention (our Triton sparse-GQA kernel)
+         # and the cache write goes through the CUDA reshape_and_cache_flash op.
+@@ -350,16 +393,25 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
+         # "auto" to the base class, then restore the real dtype. The only other
+         # kv_cache_dtype use in that constructor is an SM90/FA4 dequant path that
+         # cannot trigger here, and supports_quant_query_input is set below anyway.
+-        requested_kv_cache_dtype = None
+-        if "kv_cache_dtype" in kwargs:
+-            requested_kv_cache_dtype = kwargs["kv_cache_dtype"]
+-            kwargs = {**kwargs, "kv_cache_dtype": "auto"}
+-        elif len(args) > 6:
+-            requested_kv_cache_dtype = args[6]
+-            args = (*args[:6], "auto", *args[7:])
+-        super().__init__(*args, **kwargs)
+-        if requested_kv_cache_dtype is not None:
+-            self.kv_cache_dtype = requested_kv_cache_dtype
++        # The parameters are spelled out rather than forwarded as *args/**kwargs
++        # so the substitution names the parameter instead of indexing position 6.
++        real_kv_cache_dtype = kv_cache_dtype
++        if _is_qsa_fp8_cache_dtype(kv_cache_dtype):
++            kv_cache_dtype = "auto"
++        super().__init__(
++            num_heads,
++            head_size,
++            scale,
++            num_kv_heads,
++            alibi_slopes,
++            sliding_window,
++            kv_cache_dtype,
++            logits_soft_cap,
++            attn_type,
++            kv_sharing_target_layer_name,
++            sinks,
++        )
++        self.kv_cache_dtype = real_kv_cache_dtype
+         if not is_flash_attn_varlen_func_available():
+             raise NotImplementedError("Qwen4Exp QSA requires FlashAttention")
+         if self.dcp_world_size != 1:

@@ -1,14 +1,14 @@
 [Unit]
-Description=Flash-Next v2.0.1 (Qwen3.8-Flash-Next-W4A16-Merlin, 806K KV pool on 4x RTX 3090)
+Description=Flash-Next v2.2.0 (Qwen3.8-Flash-Next-W4A16-Merlin, 806K KV pool on 4x RTX 3090)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
 EnvironmentFile=-/etc/default/flash-next
-Environment=TREE=/opt/vllm-v2 VENV=/opt/venv-v2
+Environment=TREE=/opt/vllm-v2.2 VENV=/opt/venv-v2.2
 WorkingDirectory=/opt/flash-next
-ExecStart=/bin/bash -c 'exec bash /opt/flash-next/scripts/serve-v2.sh "${CKPT:-/models/Qwen3.8-Flash-Next-W4A16-Merlin}"'
+ExecStart=/bin/bash -c 'exec bash /opt/flash-next/scripts/serve-v2.2.sh "$${CKPT:-/models/Qwen3.8-Flash-Next-W4A16-Merlin}"'
 # vLLM with MTP + cudagraphs does not always exit on SIGTERM; give the shutdown-timeout 60 a chance, then kill the group
 KillMode=control-group
 TimeoutStopSec=90

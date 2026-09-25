@@ -1,14 +1,17 @@
-# Flash-Next v2.0.1 on 4x RTX 3090 with one command:
+# Flash-Next v2.2.0 on 4x RTX 3090 with one command:
 #   MODEL_DIR=/path/to/Qwen3.8-Flash-Next-W4A16-Merlin docker compose up -d
 # then talk to http://localhost:8000/v1 (OpenAI-compatible; model name "flash-next").
-# First start compiles the cudagraphs (~10 min) into the flash-next-cache volume; later starts are fast.
+# First start compiles the cudagraphs (~6 min) into the flash-next-cache-v2.2 volume, and the first request FlashInfer's
+# kernels (the image points FlashInfer's and Triton's caches into the same volume); later starts are fast (~3 min).
+# Needs Docker Compose v2 and nvidia-container-toolkit registered with Docker (nvidia-ctk runtime configure --runtime=docker).
 services:
   flash-next:
-    image: qwen38-flash-next-3090s:v2.0.1
+    image: qwen38-flash-next-3090s:v2.2.0
     build:
       context: .
       # args:
-      #   BUNDLE_URL: https://github.com/halt95/qwen38-flash-next-3090s/releases/download/v2.0.1/v2.0.1-from-upstream-e962733e08.bundle.gz
+      #   BUNDLE_URL: https://github.com/halt95/qwen38-flash-next-3090s/releases/download/v2.2.0/v2.2.0-from-upstream-v0.30.0.bundle.gz
+      #   ARTIFACTS_URL: https://github.com/halt95/qwen38-flash-next-3090s/releases/download/v2.2.0/build-artifacts-sm86-py313-cu130-v2.2.0.tar.gz
     deploy:
       resources:
         reservations:
@@ -18,19 +21,21 @@ services:
               capabilities: [gpu]
     shm_size: 8g              # the PLE transport needs /dev/shm >= 1 GB
     ulimits:
-      memlock: -1             # pinned host memory: the ~48 GiB n-gram table + ~4.2 GiB of embedding tables (1,064 MiB per rank)
+      memlock: -1             # pinned host memory: ~4.2 GiB of embedding tables (1,064 MiB per rank) + transport buffers
+                              # (the ~48 GiB n-gram table is ordinary host memory of the offload process)
       stack: 67108864
     ports:
-      - "8000:8000"
+      - "8000:8000"           # every interface, no API key: set VLLM_API_KEY below, or use "127.0.0.1:8000:8000" behind a proxy
     environment:
       HOST: 0.0.0.0
       PORT: 8000
       # MODEL_NAME: "flash-next"          # names requests may use; default = flash-next-v2 flash-next flash-mtp flash-next-mtp
-      # PLE_HOME: "0"                     # card that hosts the n-gram table's home context
+      # PLE_HOME: "0"                     # GPU index the PLE offload is homed on (the offload process holds no CUDA context)
+      # VLLM_API_KEY: "<key>"             # clients then send Authorization: Bearer <key>
       # CUDA_VISIBLE_DEVICES: "0,1,2,3"
     volumes:
       - "${MODEL_DIR:?set MODEL_DIR to the Qwen3.8-Flash-Next-W4A16-Merlin directory}:/models/Qwen3.8-Flash-Next-W4A16-Merlin"
-      - flash-next-cache:/cache
+      - flash-next-cache-v2.2:/cache
     restart: unless-stopped
 volumes:
-  flash-next-cache: {}
+  flash-next-cache-v2.2: {}

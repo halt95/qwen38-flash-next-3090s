@@ -1,0 +1,273 @@
+From ced96a42dd1898d508908dae97bfcab10b1895f4 Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Wed, 23 Sep 2026 07:33:48 -0400
+Subject: [PATCH 36/58] kv: restore PP fix #54793 -- no KV tensors for another
+ stage's layers
+
+A KV cache group with no layer on a pipeline stage was still given tensors
+there, and allocate_kv_cache raised StopIteration on the second stage. The
+fix was lost in the v0.30.0 rebase. Test drives the real get_kv_cache_configs
+with the production layout.
+---
+ tests/v1/test_pp_kv_projection.py | 231 ++++++++++++++++++++++++++++++
+ vllm/v1/core/kv_cache_utils.py    |   9 +-
+ 2 files changed, 239 insertions(+), 1 deletion(-)
+ create mode 100644 tests/v1/test_pp_kv_projection.py
+
+diff --git a/tests/v1/test_pp_kv_projection.py b/tests/v1/test_pp_kv_projection.py
+new file mode 100644
+index 0000000000..21ed1b0b61
+--- /dev/null
++++ b/tests/v1/test_pp_kv_projection.py
+@@ -0,0 +1,231 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Observed on a PP=2 boot: PP1 workers died in ``allocate_kv_cache``
++(``vllm/v1/worker/utils.py:452``) with StopIteration.
++
++Root cause: ``_project_kv_cache_groups_to_worker`` keeps the GLOBAL
++``UniformTypeKVCacheSpecs`` for a group that has no layer on a PP stage, and
++v0.30.0's ``get_kv_cache_config_from_groups`` builds tensors from
++``group_spec.kv_cache_specs`` without checking ``group.layer_names``. On
++Flash-Next the layer-2 PLE short-conv state is a one-layer group of its own
++(SHORT_CONV MambaSpec, PP0 only), so PP1 received a tensor for
++``language_model.model.layers.2.ple`` that is in none of its groups. The E2
++base carried the fix (#54793); the v0.30.0 rebase dropped it.
++
++CPU-only. Specs are built from the model's shipped config (48 layers, QSA every
++4th, TP2, PP 25/23, MTP K=3, fp8 KV, block 3200). FAILING CONTROL: on
++an earlier commit (filter absent) ``test_flash_next_pp1_every_tensor_is_grouped`` and
++``test_empty_projected_uniform_group_gets_no_tensor`` fail; the no-PLE control
++shows the PLE group is the trigger.
++"""
++
++from types import SimpleNamespace
++
++import pytest
++import torch
++
++from vllm.model_executor.layers.mamba.mamba_utils import MambaStateShapeCalculator
++from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
++from vllm.v1.core import kv_cache_utils as ku
++from vllm.v1.kv_cache_interface import (
++    CircularBufferSpec,
++    FullAttentionSpec,
++    KVCacheGroupSpec,
++    KVCacheLayout,
++    MambaSpec,
++    MLAAttentionSpec,
++    UniformTypeKVCacheSpecs,
++    get_kv_quant_mode,
++)
++
++TP = 2
++BLOCK = 3200  # "Setting attention block size to 3200 tokens" (both stages)
++K = 3  # MTP num_speculative_tokens
++ATTN_PAGE = BLOCK * 1 * 256 * 2  # fp8 K+V, 1 KV head per TP rank, head_dim 256
++
++_MAIN = FullAttentionSpec(
++    block_size=BLOCK,
++    num_kv_heads=2 // TP,
++    head_size=256,
++    head_size_v=256,
++    dtype=torch.uint8,
++    kv_quant_mode=get_kv_quant_mode("fp8_e4m3"),
++)
++# QSAKeyStateCache: ring = 4 * cdiv(4 + K, 4) = 8, head 128 + MRoPE tail 12.
++_RING = CircularBufferSpec(
++    block_size=8, num_kv_heads=1, head_size=140, head_size_v=0, dtype=torch.bfloat16
++)
++# QSACompressedKeyCache: bf16 indexer, compress ratio 4.
++_COMP = MLAAttentionSpec(
++    block_size=BLOCK,
++    num_kv_heads=1,
++    head_size=128,
++    dtype=torch.bfloat16,
++    tokens_per_state=4,
++)
++_GDN = MambaSpec(
++    shapes=tuple(
++        MambaStateShapeCalculator.gated_delta_net_state_shape(
++            TP, 16, 48, 128, 128, 4, K
++        )
++    ),
++    dtypes=(torch.bfloat16, torch.float32),
++    block_size=BLOCK,
++    page_size_padded=ATTN_PAGE,
++    mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
++    num_speculative_blocks=K,
++)
++# Qwen4ExpPLELayer: hc_hidden 2560*4, conv_state_len (4-1)*3, TP-replicated.
++_PLE = MambaSpec(
++    shapes=tuple(
++        MambaStateShapeCalculator.short_conv_state_shape(
++            tp_world_size=1, intermediate_size=10240, conv_kernel=10, num_spec=K
++        )
++    ),
++    dtypes=(torch.bfloat16,),
++    block_size=BLOCK,
++    page_size_padded=ATTN_PAGE,
++    mamba_type=MambaAttentionBackendEnum.SHORT_CONV,
++    tp_replicated=True,
++    num_speculative_blocks=K,
++)
++
++
++def _qsa(prefix: str, specs: dict) -> None:
++    # Registration order in Qwen4ExpQSAAttention.__init__: indexer caches first.
++    specs[f"{prefix}.self_attn.indexer.raw_key_cache"] = _RING
++    specs[f"{prefix}.self_attn.indexer.compressed_key_cache"] = _COMP
++    specs[f"{prefix}.self_attn.attn"] = _MAIN
++
++
++def _stage(lo: int, hi: int, *, mtp: bool, ple: bool = True) -> dict:
++    specs: dict = {}
++    for i in range(lo, hi):
++        prefix = f"language_model.model.layers.{i}"
++        if i == 2 and ple:  # ple_layer_ids=[2]; built before the mixer
++            specs[f"{prefix}.ple"] = _PLE
++        if i % 4 == 3:  # full_attention_interval=4 -> QSA
++            _qsa(prefix, specs)
++        else:
++            specs[f"{prefix}.linear_attn"] = _GDN
++    if mtp:
++        _qsa("mtp.layers.48", specs)
++    return specs
++
++
++def _config():
++    cache = SimpleNamespace(
++        kv_cache_layout="BLNHC",  # reference host: "Using BLNHC KV cache layout."
++        num_gpu_blocks_override=None,
++        prefix_cache_retention_interval=0,
++        mamba_cache_mode="none",
++        get_resolved_kv_cache_layout=lambda: KVCacheLayout.BLNHC,
++    )
++    return SimpleNamespace(
++        cache_config=cache,
++        speculative_config=SimpleNamespace(
++            num_speculative_tokens=K,
++            method="mtp",
++            use_multi_module_mtp=lambda: False,
++            use_eagle=lambda: True,
++            use_eagle_block_drop=lambda: True,
++        ),
++        scheduler_config=SimpleNamespace(
++            disable_hybrid_kv_cache_manager=False, max_num_encoder_input_tokens=0
++        ),
++        attention_config=SimpleNamespace(hisparse_config=None),
++        model_config=SimpleNamespace(
++            original_max_model_len=262144,
++            max_model_len=262144,
++            hf_config=SimpleNamespace(model_type="qwen4_exp"),
++            get_total_num_hidden_layers=lambda: 48,
++        ),
++        device_config=SimpleNamespace(device_type="cuda"),
++        parallel_config=SimpleNamespace(
++            pipeline_parallel_size=2, decode_context_parallel_size=1
++        ),
++    )
++
++
++def _worker_configs(*, ple: bool = True):
++    pp0 = _stage(0, 25, mtp=False, ple=ple)  # VLLM_PP_LAYER_PARTITION=25,23
++    pp1 = _stage(25, 48, mtp=True, ple=ple)
++    specs = [pp0, pp0, pp1, pp1]  # TP2 x PP2
++    configs = ku.get_kv_cache_configs(_config(), specs, [4_100_000_000] * 4)
++    return specs, configs
++
++
++def _allocate_lookup(config) -> None:
++    """Verbatim group lookup of allocate_kv_cache (vllm/v1/worker/utils.py:452).
++
++    The module itself needs triton at import, so the lookup is replayed here.
++    """
++    for tensor in config.kv_cache_tensors:
++        layer_name = tensor.layers[0]
++        next(
++            (group_id, group)
++            for group_id, group in enumerate(config.kv_cache_groups)
++            if layer_name in group.layer_names
++        )
++
++
++def test_flash_next_pp1_has_an_empty_uniform_group():
++    """Guard that the shape really exercises the path (else the test below
++    could not fail): PP1 projects the PLE group to zero layers while keeping
++    the global UniformTypeKVCacheSpecs."""
++    _, configs = _worker_configs()
++    for rank in (2, 3):
++        empty = [g for g in configs[rank].kv_cache_groups if not g.layer_names]
++        assert len(empty) == 1
++        assert isinstance(empty[0].kv_cache_spec, UniformTypeKVCacheSpecs)
++        assert list(empty[0].kv_cache_spec.kv_cache_specs) == [
++            "language_model.model.layers.2.ple"
++        ]
++    for rank in (0, 1):
++        assert all(g.layer_names for g in configs[rank].kv_cache_groups)
++
++
++def test_flash_next_pp1_every_tensor_is_grouped():
++    specs, configs = _worker_configs()
++    for rank, config in enumerate(configs):
++        tensor_layers = [n for t in config.kv_cache_tensors for n in t.layers]
++        assert sorted(tensor_layers) == sorted(specs[rank]), f"rank {rank}"
++        _allocate_lookup(config)  # StopIteration on PP1 before the fix
++
++
++def test_no_ple_control_has_no_empty_group():
++    """Control: remove the PLE state and no group projects empty, so the
++    old code would also have passed -- the PLE group is the trigger."""
++    _, configs = _worker_configs(ple=False)
++    for config in configs:
++        assert all(g.layer_names for g in config.kv_cache_groups)
++        _allocate_lookup(config)
++
++
++def test_empty_projected_uniform_group_gets_no_tensor():
++    """Minimal form (the #54793 unit test, config stand-in for offline runs)."""
++    spec = _MAIN
++    groups = [
++        KVCacheGroupSpec(
++            [],
++            UniformTypeKVCacheSpecs(
++                block_size=spec.block_size, kv_cache_specs={"remote.layer": spec}
++            ),
++        ),
++        KVCacheGroupSpec(["local.layer"], spec),
++    ]
++    config = ku.get_kv_cache_config_from_groups(
++        _config(), groups, available_memory=spec.page_size_bytes * 2
++    )
++    assert [t.layers for t in config.kv_cache_tensors] == [["local.layer"]]
++
++
++@pytest.mark.parametrize("rank", [0, 1])
++def test_pp0_layout_unchanged_by_filter(rank):
++    """Groups that are non-empty on a worker keep every layer: the filter only
++    drops layers the worker does not own."""
++    specs, configs = _worker_configs()
++    grouped = {n for g in configs[rank].kv_cache_groups for n in g.layer_names}
++    assert grouped == set(specs[rank])
++    tensor_layers = [n for t in configs[rank].kv_cache_tensors for n in t.layers]
++    assert sorted(tensor_layers) == sorted(grouped)
+diff --git a/vllm/v1/core/kv_cache_utils.py b/vllm/v1/core/kv_cache_utils.py
+index 28478b69f5..d1f827dcc3 100644
+--- a/vllm/v1/core/kv_cache_utils.py
++++ b/vllm/v1/core/kv_cache_utils.py
+@@ -1768,7 +1768,14 @@ def get_kv_cache_config_from_groups(
+         layers_by_spec: defaultdict[KVCacheSpec, list[str]] = defaultdict(list)
+         if isinstance(group_spec, UniformTypeKVCacheSpecs):
+             for layer_name, spec in group_spec.kv_cache_specs.items():
+-                layers_by_spec[spec].append(layer_name)
++                # Fork (E2 PP fix #54793, dropped in the v0.30.0 rebase, restored
++                # the vLLM 0.30 rebase): _project_kv_cache_groups_to_worker keeps the GLOBAL
++                # UniformTypeKVCacheSpecs for a group with no layer on this PP
++                # stage, so without this filter the worker gets a tensor for
++                # another stage's layer and allocate_kv_cache's group lookup
++                # raises StopIteration (Flash-Next PP1: the layer-2 PLE state).
++                if layer_name in group.layer_names:
++                    layers_by_spec[spec].append(layer_name)
+         elif group.layer_names:
+             layers_by_spec[group_spec].extend(group.layer_names)
+ 

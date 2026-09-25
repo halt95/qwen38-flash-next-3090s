@@ -1,0 +1,350 @@
+From 9918e5f29e17e77a646ad3db50e515dc9e3c33b5 Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Tue, 22 Sep 2026 04:17:29 -0400
+Subject: [PATCH 25/58] tests: mamba spec-decode block-table row attribution
+ (from upstream #55506)
+
+Device tests with a non-identity request-slot permutation, covering the axis the
+persistent block-table fix changes.
+---
+ .../kernels/mamba/test_precopy_mamba_align.py | 296 +++++++++++++++++-
+ 1 file changed, 295 insertions(+), 1 deletion(-)
+
+diff --git a/tests/kernels/mamba/test_precopy_mamba_align.py b/tests/kernels/mamba/test_precopy_mamba_align.py
+index 22b73c936e..1229511f05 100644
+--- a/tests/kernels/mamba/test_precopy_mamba_align.py
++++ b/tests/kernels/mamba/test_precopy_mamba_align.py
+@@ -21,6 +21,7 @@ The kernel must also no-op when ``src_col < 0`` (fresh request) or
+ 
+ from __future__ import annotations
+ 
++import os
+ from collections.abc import Callable
+ from types import SimpleNamespace
+ from typing import Any
+@@ -31,7 +32,11 @@ import torch
+ from vllm.model_executor.layers.mamba import mamba_utils as layer_mamba_utils
+ from vllm.platforms import current_platform
+ from vllm.v1.worker import mamba_utils as worker_mamba_utils
+-from vllm.v1.worker.mamba_utils import _TEMPORAL_TILES, precopy_mamba_align_fused_kernel
++from vllm.v1.worker.mamba_utils import (
++    _TEMPORAL_TILES,
++    postprocess_mamba_fused_kernel,
++    precopy_mamba_align_fused_kernel,
++)
+ 
+ _parametrize: Callable[..., Callable[[Any], Any]]
+ 
+@@ -42,12 +47,24 @@ try:
+         not current_platform.is_cuda(),
+         reason="precopy_mamba_align_fused_kernel needs CUDA/Triton",
+     )
++    # GPU tier, same opt-in as tests/v1/worker/gpu/: the reference host always
++    # reports CUDA available and is often busy with long serving runs
++    # and sanitizer runs that must not share a device with a test suite, so
++    # `is_cuda()` alone is not a sufficient gate for a test that launches
++    # kernels over multi-MiB state pools.
++    _gpu_host_tier = pytest.mark.skipif(
++        os.environ.get("VLLM_E2_GPU_TESTS") != "1",
++        reason="set VLLM_E2_GPU_TESTS=1 to run GPU tests (shared GPU host)",
++    )
+     _parametrize = pytest.mark.parametrize
+ except ModuleNotFoundError:  # allow running directly as ``python <thisfile>``
+ 
+     def _cuda_required(fn):
+         return fn
+ 
++    def _gpu_host_tier(fn):
++        return fn
++
+     def _no_parametrize(_name, _values):
+         def _deco(fn):
+             return fn
+@@ -417,6 +434,279 @@ def test_preprocess_fused_align_matches_scalar_bookkeeping(monkeypatch, token_bi
+     ]
+     assert fused_copy_calls == scalar_copy_calls
+ 
++# ---------------------------------------------------------------------------
++# Block-table ROW ATTRIBUTION -- ported from upstream vllm PR #55506's two new
++# kernel tests, adapted to our row-attribution fix (persistent_block_table_ptrs +
++# BT_ROW_IS_REQ). See each docstring for what differs and why.
++# ---------------------------------------------------------------------------
++
++# Batch order -> request-state slot, deliberately NOT the identity.
++_PERM = (2, 0, 3, 1)
++
++
++def _build_disjoint_block_table(num_reqs, device):
++    """[num_reqs, MAX_COLS] where every row owns ids no other row references."""
++    num_blocks = num_reqs * MAX_COLS + 1
++    bt = torch.empty(num_reqs, MAX_COLS, dtype=torch.int32, device=device)
++    for r in range(num_reqs):
++        bt[r] = torch.arange(
++            1 + r * MAX_COLS, 1 + (r + 1) * MAX_COLS, dtype=torch.int32, device=device
++        )
++    return bt, num_blocks
++
++
++def _assert_copies_landed(convs, ssms, conv_ref, ssm_ref):
++    for layer in range(NUM_LAYERS):
++        torch.testing.assert_close(convs[layer], conv_ref[layer], rtol=0, atol=0)
++        torch.testing.assert_close(ssms[layer], ssm_ref[layer], rtol=0, atol=0)
++
++
++def _states_equal(convs, ssms, conv_ref, ssm_ref):
++    return all(
++        torch.equal(convs[layer], conv_ref[layer])
++        and torch.equal(ssms[layer], ssm_ref[layer])
++        for layer in range(NUM_LAYERS)
++    )
++
++
++def _permute_to_batch_order(values):
++    """Reindex a per-req-slot decision array into batch order via ``_PERM``."""
++    return values[list(_PERM)].contiguous()
++
++
++@_parametrize("conv_state_dim_first", [False, True])
++@_gpu_host_tier
++@_cuda_required
++def test_precopy_indexes_block_tables_by_batch_row(conv_state_dim_first):
++    """Block-table ROW ATTRIBUTION for ``precopy_mamba_align_fused_kernel``.
++
++    DIVERGES FROM UPSTREAM #55506 ON PURPOSE, and asserts the opposite row.
++    Upstream's ``test_precopy_indexes_block_tables_by_req_slot`` follows from
++    upstream's fix, which repoints the single shared ``block_table_ptrs`` array
++    at the persistent per-req-slot tables -- changing what "row" means for
++    every consumer of that array, precopy included. Our fix instead adds a
++    SECOND array (``persistent_block_table_ptrs``) plus a ``BT_ROW_IS_REQ``
++    switch used only by the deferred post-process, so precopy still reads the
++    batch-order gather, and it runs in the same step that produced that gather
++    (``prepare_attn`` -> ``preprocess_state`` -> ``run_fused_precopy``). Batch-row
++    indexing is therefore the CORRECT indexing here, not a latent bug, and a
++    future "fix" that made precopy index by ``req_idx`` would break it.
++
++    What is ported is the shape of the check: a deliberately non-identity
++    ``idx_mapping`` over rows with disjoint block ids, which
++    ``test_precopy_matches_v1_copy_specs`` above never exercises -- it always
++    launches with an identity mapping, where the two indexings are
++    indistinguishable. The invariant asserted is "the row index must match the
++    table you were handed": decisions resolve through ``idx_mapping`` to the
++    request slot, block-table rows stay batch rows. The last assertion is the
++    discriminator: if the req-slot reading produced the same bytes, the
++    permutation would not be separating the two worlds and the test could not
++    fail.
++    """
++    device = torch.device("cuda")
++    torch.manual_seed(0)
++    num_reqs = len(_PERM)
++    bt, num_blocks = _build_disjoint_block_table(num_reqs, device)
++
++    # Per-slot decisions must DIFFER, or the permutation is invisible: with an
++    # identity-shaped setup every batch row performs the same copy, so reading
++    # row ``batch_idx`` instead of row ``req_idx`` still touches the right bytes
++    # in aggregate. Here only slots 0 and 3 copy, and each row owns disjoint
++    # block ids, so a row mix-up moves state onto a different physical block.
++    #   slot 0: col 1 -> col 0, bias 0            (copy)
++    #   slot 1: src_col == dst_col                (no boundary, skip)
++    #   slot 2: src_col < 0                       (fresh, skip)
++    #   slot 3: col 2 -> col 0, bias 1            (copy, accepted-token shift)
++    src_col = torch.tensor([1, 1, -1, 2], dtype=torch.int32, device=device)
++    dst_col = torch.tensor([0, 1, 0, 0], dtype=torch.int32, device=device)
++    bias = torch.tensor([0, 0, 0, 1], dtype=torch.int32, device=device)
++
++    convs, ssms = _build_state(num_blocks, device, conv_state_dim_first)
++    # Correct world: block-table row b carries the decision of slot _PERM[b].
++    conv_ref, ssm_ref = _reference(
++        convs,
++        ssms,
++        bt.cpu(),
++        _permute_to_batch_order(src_col).cpu(),
++        _permute_to_batch_order(dst_col).cpu(),
++        _permute_to_batch_order(bias).cpu(),
++        num_reqs,
++        conv_state_dim_first,
++    )
++    # Wrong world: row == request slot (upstream's reading), from the same
++    # pre-copy bytes. ``_reference`` clones its inputs, so both are built off
++    # the state as it stands before the launch below.
++    conv_bad, ssm_bad = _reference(
++        convs,
++        ssms,
++        bt.cpu(),
++        src_col.cpu(),
++        dst_col.cpu(),
++        bias.cpu(),
++        num_reqs,
++        conv_state_dim_first,
++    )
++
++    base, blk_stride, elem, inner, width, group, drc, drs = _build_meta(
++        convs, ssms, device, conv_state_dim_first
++    )
++    bt_ptrs = torch.tensor([bt.data_ptr()], dtype=torch.int64, device=device)
++    idx_mapping = torch.tensor(_PERM, dtype=torch.int32, device=device)
++    guard_ctr = torch.zeros(3, dtype=torch.int64, device=device)
++
++    precopy_mamba_align_fused_kernel[(num_reqs, NUM_LAYERS * 2, 1)](
++        dst_col,
++        src_col,
++        bias,
++        bt_ptrs,
++        bt.stride(0),
++        bt.size(0),
++        guard_ctr,
++        base,
++        blk_stride,
++        elem,
++        inner,
++        width,
++        group,
++        drc,
++        drs,
++        idx_mapping,
++        num_reqs,
++        COPY_BLOCK_SIZE=1024,
++        CONV_STATE_DIM_FIRST=conv_state_dim_first,
++        HAS_IDX_MAPPING=True,
++        TEMPORAL_TILES=1,
++    )
++    torch.accelerator.synchronize()
++    _assert_copies_landed(convs, ssms, conv_ref, ssm_ref)
++    assert int(guard_ctr[0]) == 0, "in-range rows must not trip the bounds guard"
++    assert not _states_equal(convs, ssms, conv_bad, ssm_bad), (
++        "both row readings produced the same bytes: the permutation is not "
++        "discriminating and this test cannot fail"
++    )
++
++
++@_parametrize("conv_state_dim_first", [False, True])
++@_gpu_host_tier
++@_cuda_required
++def test_postprocess_indexes_block_tables_by_req_slot(conv_state_dim_first):
++    """Same invariant for ``postprocess_mamba_fused_kernel``, against our fix.
++
++    Ported from upstream #55506's test of the same name. This is the deferred
++    path where the stale batch mapping actually bites: the PP post-process is
++    enqueued at the top of ``execute_model``, before this step's gather, with
++    an ``idx_mapping`` captured ``pp_size`` steps earlier, so indexing the
++    tables by batch row walks *another request's* block ids -- freed or
++    reallocated ones -- which on a hybrid model whose unified cache layout
++    aliases every cache tensor inside one page silently poisons live recurrent
++    state (all-NaN logits, constant-token output) or faults outright.
++
++    Adapted to our API: the fix hands this kernel the persistent per-req-slot
++    tables through a second pointer array and selects the row with
++    ``BT_ROW_IS_REQ``, so this launches ``BT_ROW_IS_REQ=True`` over a
++    persistent-shaped table. The failing control is the same launch with
++    ``BT_ROW_IS_REQ=False`` on a clone of the same pre-copy bytes: it must
++    corrupt, and it must do so WITHOUT tripping the bounds guard, because a
++    stale mapping yields a row that is wrong but still in range -- exactly the
++    class ``guard_telemetry``'s row bound cannot catch.
++
++    Decision inputs are chosen so the copying slots move col 1 -> col 0 with
++    zero accepted-token bias: with ``num_scheduled = num_draft = 1``,
++    ``num_tokens_running_state == num_computed`` and ``new_num_computed`` is the
++    same, so ``aligned = floor(num_computed / block_size) * block_size``.
++      slot 0: computed 8 -> aligned 8, bias 0, dest 0, src 1   (copy)
++      slot 1: computed 8 -> dest 0 == src 0, bias 0            (skip)
++      slot 2: computed 5 -> aligned 0 < 5, needs_copy false    (skip)
++      slot 3: computed 7 + accepted 2 -> aligned 8, bias 1,
++              dest 0, src 2                                    (copy)
++    """
++    device = torch.device("cuda")
++    torch.manual_seed(0)
++    num_reqs = len(_PERM)
++    block_size = 8
++    bt, num_blocks = _build_disjoint_block_table(num_reqs, device)
++
++    num_accepted = torch.tensor([1, 1, 1, 2], dtype=torch.int32, device=device)
++    state_idx = torch.tensor([1, 0, 1, 2], dtype=torch.int32, device=device)
++    num_scheduled = torch.ones(num_reqs, dtype=torch.int32, device=device)
++    num_computed = torch.tensor([8, 8, 5, 7], dtype=torch.int32, device=device)
++    num_draft = torch.ones(num_reqs, dtype=torch.int32, device=device)
++
++    # What a correct kernel must do, stated directly: slots 0 and 3 copy; slot 2
++    # is marked fresh here because its skip comes from ``needs_copy``, which the
++    # reference models through the src_col < 0 branch.
++    ref_src = torch.tensor([1, 0, -1, 2], dtype=torch.int32)
++    ref_dst = torch.zeros(num_reqs, dtype=torch.int32)
++    ref_bias = torch.tensor([0, 0, 0, 1], dtype=torch.int32)
++
++    convs, ssms = _build_state(num_blocks, device, conv_state_dim_first)
++    conv_ref, ssm_ref = _reference(
++        convs,
++        ssms,
++        bt.cpu(),
++        ref_src,
++        ref_dst,
++        ref_bias,
++        num_reqs,
++        conv_state_dim_first,
++    )
++    # The failing control runs on a clone of the same pre-copy bytes.
++    ctl_convs = [c.clone() for c in convs]
++    ctl_ssms = [s.clone() for s in ssms]
++
++    def _launch(state_convs, state_ssms, bt_row_is_req):
++        base, blk_stride, elem, inner, width, group, drc, drs = _build_meta(
++            state_convs, state_ssms, device, conv_state_dim_first
++        )
++        bt_ptrs = torch.tensor([bt.data_ptr()], dtype=torch.int64, device=device)
++        idx_mapping = torch.tensor(_PERM, dtype=torch.int32, device=device)
++        guard_ctr = torch.zeros(3, dtype=torch.int64, device=device)
++        num_accepted_out = num_accepted.clone()
++        postprocess_mamba_fused_kernel[(num_reqs, NUM_LAYERS * 2, 1)](
++            num_accepted,
++            state_idx,
++            num_scheduled,
++            num_computed,
++            num_draft,
++            bt_ptrs,
++            bt.stride(0),
++            bt.size(0),
++            guard_ctr,
++            base,
++            blk_stride,
++            elem,
++            inner,
++            width,
++            group,
++            drc,
++            drs,
++            num_accepted_out,
++            idx_mapping,
++            num_reqs,
++            block_size=block_size,
++            COPY_BLOCK_SIZE=1024,
++            CONV_STATE_DIM_FIRST=conv_state_dim_first,
++            HAS_IDX_MAPPING=True,
++            PRECOMPUTED_NEW_COMPUTED=False,
++            BT_ROW_IS_REQ=bt_row_is_req,
++            TEMPORAL_TILES=1,
++        )
++        torch.accelerator.synchronize()
++        return guard_ctr
++
++    guard_ctr = _launch(convs, ssms, True)
++    _assert_copies_landed(convs, ssms, conv_ref, ssm_ref)
++    assert int(guard_ctr[0]) == 0, "in-range rows must not trip the bounds guard"
++
++    bad_guard = _launch(ctl_convs, ctl_ssms, False)
++    assert not _states_equal(ctl_convs, ctl_ssms, conv_ref, ssm_ref), (
++        "BT_ROW_IS_REQ=False produced the correct bytes: this test cannot fail"
++    )
++    assert int(bad_guard[0]) == 0, (
++        "a stale-mapping row is wrong but in range; if the bounds guard fires "
++        "here the scenario is not the one #55506 describes"
++    )
++
+ 
+ if __name__ == "__main__":
+     from itertools import product
+@@ -434,3 +724,7 @@ if __name__ == "__main__":
+             f"OK num_reqs={nr} token_bias={tb} has_idx_mapping={mapping} "
+             f"conv_dim_first={dim_first} temporal_tiles={tt}"
+         )
++    for dim_first in (False, True):
++        test_precopy_indexes_block_tables_by_batch_row(dim_first)
++        test_postprocess_indexes_block_tables_by_req_slot(dim_first)
++        print(f"OK row attribution conv_dim_first={dim_first}")

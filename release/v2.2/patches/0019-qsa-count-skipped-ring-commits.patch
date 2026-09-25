@@ -1,0 +1,261 @@
+From c296dafe45fef5cef0dd7350bcb6219d72e48cef Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Tue, 22 Sep 2026 04:13:09 -0400
+Subject: [PATCH 19/58] qsa: count skipped ring commits
+
+---
+ .../gpu/test_qsa_ring_skip_telemetry.py       | 204 ++++++++++++++++++
+ .../qwen4_exp/nvidia/ops/qsa_pre_indexer.py   |  15 ++
+ 2 files changed, 219 insertions(+)
+ create mode 100644 tests/v1/worker/gpu/test_qsa_ring_skip_telemetry.py
+
+diff --git a/tests/v1/worker/gpu/test_qsa_ring_skip_telemetry.py b/tests/v1/worker/gpu/test_qsa_ring_skip_telemetry.py
+new file mode 100644
+index 0000000000..04682881b2
+--- /dev/null
++++ b/tests/v1/worker/gpu/test_qsa_ring_skip_telemetry.py
+@@ -0,0 +1,204 @@
++# SPDX-License-Identifier: Apache-2.0
++"""v2 ring-skip telemetry: the ring-skip telemetry site of the QSA pre-indexer.
++
++The suffix-commit loop stores one ring row per retained token, every store
++masked by ``valid_slot``. A live token whose state slot is < 0 or beyond the
++ring capacity is therefore NOT written and nothing said so (one candidate cause
++for the raw-key ring crash class). This site counts those tokens into
++``SITE_QSA_RING_SKIP``; the write stays skipped. These tests prove the wiring
++(CPU) and that the count moves for exactly the skipped tokens (GPU).
++
++Helpers mirror tests/v1/worker/gpu/test_qsa_rope_position_guard.py on purpose:
++the two files must stay independently runnable.
++"""
++
++import inspect
++
++import pytest
++import torch
++
++from vllm.models.qwen4_exp.nvidia.ops import qsa_pre_indexer as qpi
++from vllm.v1.worker import guard_telemetry
++
++COMPRESS_RATIO = 4
++HEAD_DIM = 128
++N_HEADS = 4
++STATE_SIZE = 8          # ring capacity
++ROW_WIDTH = 140         # head dim + the int64 position triple in the tail
++MAX_MODEL_LEN = 4096
++NUM_BLOCKS = 8
++RING_CAPACITY = NUM_BLOCKS * STATE_SIZE
++
++
++class _Recorder:
++    """Stands in for the Triton kernel and keeps the launch arguments."""
++
++    def __init__(self):
++        self.launches = []
++
++    def __getitem__(self, grid):
++        def launch(*args, **kwargs):
++            self.launches.append((grid, args, kwargs))
++
++        return launch
++
++
++def _inputs(device, num_tokens=4):
++    q = torch.randn(num_tokens, N_HEADS * HEAD_DIM, dtype=torch.bfloat16, device=device)
++    k = torch.randn(num_tokens, HEAD_DIM, dtype=torch.bfloat16, device=device)
++    positions = (
++        torch.arange(num_tokens, dtype=torch.int64, device=device)
++        .unsqueeze(0)
++        .expand(3, -1)
++        .contiguous()
++    )
++    cos_sin = torch.randn(
++        MAX_MODEL_LEN, HEAD_DIM // 2, dtype=torch.bfloat16, device=device
++    )
++    ones = torch.ones(HEAD_DIM, dtype=torch.bfloat16, device=device)
++    q_out = torch.empty(num_tokens, N_HEADS, HEAD_DIM, dtype=torch.bfloat16, device=device)
++    state_cache = torch.zeros(
++        NUM_BLOCKS, STATE_SIZE, 1, ROW_WIDTH, dtype=torch.bfloat16, device=device
++    )
++    state_slots = torch.arange(num_tokens, dtype=torch.int32, device=device)
++    state_table = torch.zeros(1, 1, dtype=torch.int32, device=device)
++    qsl = torch.tensor([0, num_tokens], dtype=torch.int32, device=device)
++    logical = torch.arange(num_tokens, dtype=torch.int32, device=device)
++    comp_cache = torch.zeros(
++        NUM_BLOCKS, 800, 1, HEAD_DIM, dtype=torch.bfloat16, device=device
++    )
++    comp_slots = torch.zeros(num_tokens, dtype=torch.int32, device=device)
++    kwb = torch.zeros(
++        max(num_tokens // COMPRESS_RATIO, 1), 2, dtype=torch.int32, device=device
++    )
++    return dict(
++        q=q, k=k, positions=positions, cos_sin_cache=cos_sin,
++        q_norm_weight=ones, k_norm_weight=ones, eps=1e-6, q_out=q_out,
++        state_cache=state_cache, state_slots=state_slots,
++        state_block_table=state_table, query_start_loc=qsl,
++        logical_positions=logical, compressed_cache=comp_cache,
++        compressed_slots=comp_slots, k_work_metadata=kwb,
++    )
++
++
++def _launch(kw):
++    qpi.qsa_pre_indexer(
++        kw["q"], kw["k"], kw["positions"], kw["cos_sin_cache"],
++        kw["q_norm_weight"], kw["k_norm_weight"], kw["eps"], kw["q_out"],
++        kw["state_cache"], kw["state_slots"], kw["state_block_table"],
++        kw["query_start_loc"], kw["logical_positions"], kw["compressed_cache"],
++        kw["compressed_slots"], kw["k_work_metadata"],
++        compress_ratio=COMPRESS_RATIO, mrope_section=(11, 11, 10),
++        rope_pos_offset=HEAD_DIM,
++    )
++
++
++def test_site_is_declared_named_and_not_fatal():
++    """A site that exists but is unnamed reports as a bare integer; a site
++    that is fatal would abort a boot on the older behaviour it merely
++    observes. Both are the wrong instrument."""
++    site = guard_telemetry.SITE_QSA_RING_SKIP
++    assert site == 10 and guard_telemetry.NUM_SITES == 11
++    assert site in guard_telemetry.SITE_NAMES
++    assert "SKIPPED" in guard_telemetry.SITE_NAMES[site]
++    assert site not in guard_telemetry._ALWAYS_FATAL_SITES
++    # the counter store is sized by NUM_SITES: the new site must have a row
++    ctr = guard_telemetry.counter(site, torch.device("cpu"))
++    assert ctr.dtype == torch.int64 and ctr.numel() == guard_telemetry.SLOTS_PER_SITE
++
++
++def test_launcher_passes_the_ring_skip_counter(monkeypatch):
++    """The kernel parameter must be the persistent SITE_QSA_RING_SKIP buffer
++    and must differ from the two counters the kernel already takes (the
++    rope-guard series shipped a declared-but-never-written site once; the
++    inverted assertion below is the same defence)."""
++    device = torch.device("cpu")
++    sig = inspect.signature(qpi._qsa_pre_indexer_kernel.fn)
++    assert "ring_skip_ctr" in sig.parameters
++    rec = _Recorder()
++    monkeypatch.setattr(qpi, "_qsa_pre_indexer_kernel", rec)
++    _launch(_inputs(device))
++
++    assert len(rec.launches) == 1
++    _grid, args, kwargs = rec.launches[0]
++    kwargs = {k: v for k, v in kwargs.items()
++              if k not in ("num_warps", "num_stages", "num_ctas", "grid")}
++    bound = sig.bind(*args, **kwargs)
++    bound.apply_defaults()
++    skip_ctr = bound.arguments["ring_skip_ctr"]
++    assert skip_ctr.dtype == torch.int64 and skip_ctr.numel() == 3
++    assert skip_ctr.data_ptr() == guard_telemetry.counter(
++        guard_telemetry.SITE_QSA_RING_SKIP, device
++    ).data_ptr()
++    for other in ("rope_guard_ctr", "guard_ctr"):
++        assert bound.arguments[other].data_ptr() != skip_ctr.data_ptr()
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
++def test_negative_control_valid_slots_count_zero():
++    device = torch.device("cuda", torch.cuda.current_device())
++    guard_telemetry.prealloc(device)
++    guard_telemetry.reset_for_test()
++    kw = _inputs(device)
++    _launch(kw)
++    torch.cuda.synchronize()
++    ctr = guard_telemetry.counter(guard_telemetry.SITE_QSA_RING_SKIP, device)
++    assert ctr.tolist() == [0, 0, 0]
++    # and the commit happened: every token's raw key and position tail
++    for t in range(kw["k"].shape[0]):
++        row = kw["state_cache"][0, t, 0, :]
++        assert torch.equal(row[:HEAD_DIM], kw["k"][t])
++        tail = row[HEAD_DIM:HEAD_DIM + 12].contiguous().view(torch.int64)
++        assert tail.tolist() == [t, t, t]
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
++@pytest.mark.parametrize(
++    "bad_index,bad_slot",
++    [(2, -1), (1, RING_CAPACITY), (3, RING_CAPACITY + 5)],
++    ids=["negative-slot", "at-capacity", "past-capacity"],
++)
++def test_positive_control_one_skipped_token_is_counted_and_located(bad_index, bad_slot):
++    """Exactly the skipped token is counted; slot 1 names the token, slot 2
++    carries the offending state slot value; the other rows are still written
++    and the bad token's row is not."""
++    device = torch.device("cuda", torch.cuda.current_device())
++    guard_telemetry.prealloc(device)
++    guard_telemetry.reset_for_test()
++    kw = _inputs(device)
++    kw["state_slots"][bad_index] = bad_slot
++    _launch(kw)
++    torch.cuda.synchronize()
++
++    ctr = guard_telemetry.counter(guard_telemetry.SITE_QSA_RING_SKIP, device)
++    n, row, val = ctr.tolist()
++    assert n == 1, f"expected one skipped token, counter says {n}"
++    assert row - guard_telemetry.GUARD_BIAS == bad_index
++    assert val - guard_telemetry.GUARD_BIAS == bad_slot
++    # neighbours committed (key AND int64 position tail), the bad token's
++    # own ring row untouched over its WHOLE width -- the crash class lives
++    # in the tail, so a key-only check would miss a stray tail write.
++    for t in range(kw["k"].shape[0]):
++        row = kw["state_cache"][0, t, 0, :]
++        if t == bad_index:
++            assert torch.count_nonzero(row) == 0, "skipped row was written"
++        else:
++            assert torch.equal(row[:HEAD_DIM], kw["k"][t])
++            tail = row[HEAD_DIM:HEAD_DIM + 12].contiguous().view(torch.int64)
++            assert tail.tolist() == [t, t, t]
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
++def test_positive_control_two_skipped_tokens_accumulate():
++    device = torch.device("cuda", torch.cuda.current_device())
++    guard_telemetry.prealloc(device)
++    guard_telemetry.reset_for_test()
++    kw = _inputs(device)
++    kw["state_slots"][0] = -1
++    kw["state_slots"][3] = RING_CAPACITY + 1
++    _launch(kw)
++    torch.cuda.synchronize()
++    n, row, val = guard_telemetry.counter(guard_telemetry.SITE_QSA_RING_SKIP, device).tolist()
++    assert n == 2
++    assert row - guard_telemetry.GUARD_BIAS == 3          # max token index
++    assert val - guard_telemetry.GUARD_BIAS == RING_CAPACITY + 1  # max slot value
+diff --git a/vllm/models/qwen4_exp/nvidia/ops/qsa_pre_indexer.py b/vllm/models/qwen4_exp/nvidia/ops/qsa_pre_indexer.py
+index b9a57d5fed..912bef33b7 100644
+--- a/vllm/models/qwen4_exp/nvidia/ops/qsa_pre_indexer.py
++++ b/vllm/models/qwen4_exp/nvidia/ops/qsa_pre_indexer.py
+@@ -201,6 +201,7 @@ def _qsa_pre_indexer_kernel(
+     num_k_work,
+     num_requests,  # bounds-guard instrumentation
+     guard_ctr,  # bounds-guard instrumentation: persistent int64[3]
++    ring_skip_ctr,  # ring-skip telemetry, persistent int64[3], SITE_QSA_RING_SKIP
+     HQ: tl.constexpr,
+     D: tl.constexpr,
+     TILE_T_Q: tl.constexpr,
+@@ -454,6 +455,19 @@ def _qsa_pre_indexer_kernel(
+                 valid_slot = (
+                     valid_token & (slot >= 0) & (slot < num_state_blocks * STATE_SIZE)
+                 )
++                # Ring-skip telemetry: a live token whose slot fails the range check
++                # has its ring row silently NOT written (every store below is
++                # masked by valid_slot). That token's raw key is then absent
++                # from the ring the next step reads (a candidate cause). Count
++                # it -- the write stays skipped, the reconciliation is the ring-row tag fix.
++                skipped = valid_token & ~valid_slot
++                tl.atomic_add(ring_skip_ctr, 1, mask=skipped)
++                tl.atomic_max(
++                    ring_skip_ctr + 1, token.to(tl.int64) + _GUARD_BIAS, mask=skipped
++                )
++                tl.atomic_max(
++                    ring_skip_ctr + 2, slot.to(tl.int64) + _GUARD_BIAS, mask=skipped
++                )
+                 safe_slot = tl.maximum(slot, 0)
+                 state_row = (
+                     state_cache_ptr
+@@ -589,6 +603,7 @@ def qsa_pre_indexer(
+         num_k_work,
+         min(query_start_loc.numel() - 1, state_block_table.shape[0]),
+         guard_telemetry.counter(guard_telemetry.SITE_QSA_PRE_INDEXER, q.device),
++        guard_telemetry.counter(guard_telemetry.SITE_QSA_RING_SKIP, q.device),
+         HQ=num_q_heads,
+         D=head_dim,
+         TILE_T_Q=TILE_T_Q,

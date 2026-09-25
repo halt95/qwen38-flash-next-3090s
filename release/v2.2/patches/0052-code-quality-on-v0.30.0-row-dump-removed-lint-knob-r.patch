@@ -1,0 +1,1666 @@
+From d57d47d8f8bb6db964c7ecce3fb78c1562881e30 Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Wed, 23 Sep 2026 10:06:57 -0400
+Subject: [PATCH 52/58] code quality on v0.30.0: row dump removed, lint, knob
+ read-site census
+
+The debug PLE row dump is deleted; ruff findings on fork lines cleared; a
+read-site census test pins which fork knobs are read and where.
+---
+ tests/kernels/test_top_k_per_row.py           |  30 ++-
+ tests/test_envs.py                            | 186 +++++++++++++++++-
+ tests/test_merlin_e2_toggles.py               |   1 -
+ tests/v1/ple_offload/test_correspondence.py   |  51 +++--
+ tests/v1/ple_offload/test_fatal_rpc.py        |  15 +-
+ .../ple_offload/test_fault_injector_basics.py |   8 +-
+ .../ple_offload/test_fault_injector_gates.py  |  14 +-
+ .../v1/ple_offload/test_fault_wire_frames.py  |   6 +-
+ .../v1/ple_offload/test_ipc_socket_unlink.py  |   3 +-
+ .../v1/ple_offload/test_progress_deadline.py  |  16 +-
+ tests/v1/ple_offload/test_rowdump_deleted.py  |  49 +++++
+ tests/v1/ple_offload/test_shm_unlink.py       |   4 +-
+ tests/v1/ple_offload/test_shutdown_order.py   |   2 +-
+ .../ple_offload/test_spawn_bootstrap_cuda.py  |  15 +-
+ tests/v1/ple_offload/test_test_fault.py       |  20 +-
+ .../ple_offload/test_transport_bounded_io.py  |   5 +-
+ .../test_transport_fatal_helper.py            |   4 +-
+ tests/v1/test_ple_pull_compile_profile.py     |  33 +++-
+ tests/v1/worker/test_e2_memstats.py           |  43 +++-
+ vllm/envs.py                                  |  47 +++--
+ .../qwen4_exp/nvidia/ops/qsa_indexer.py       |   2 +-
+ vllm/v1/ple_offload/connector.py              |  18 +-
+ vllm/v1/ple_offload/fatal.py                  |  19 +-
+ vllm/v1/ple_offload/progress.py               |  15 +-
+ vllm/v1/ple_offload/rowdump.py                |  41 ----
+ vllm/v1/ple_offload/worker.py                 |  19 +-
+ vllm/v1/worker/e2_memstats.py                 | 176 +++++++++++------
+ vllm/v1/worker/gpu/cudagraph_utils.py         |   5 +-
+ vllm_ple_offload_bootstrap/__init__.py        |   6 +-
+ 29 files changed, 566 insertions(+), 287 deletions(-)
+ create mode 100644 tests/v1/ple_offload/test_rowdump_deleted.py
+ delete mode 100644 vllm/v1/ple_offload/rowdump.py
+
+diff --git a/tests/kernels/test_top_k_per_row.py b/tests/kernels/test_top_k_per_row.py
+index 58bcb7f143..e0c3ac6700 100644
+--- a/tests/kernels/test_top_k_per_row.py
++++ b/tests/kernels/test_top_k_per_row.py
+@@ -1081,7 +1081,9 @@ def run_large_context_topk_test(
+             Torch: {torch_vals.sort(descending=True)[0][:10]}"""
+ 
+ 
+-@pytest.mark.skipif(not _has_device_capability(90), reason="cooperative_topk is sm_90+ only")
++@pytest.mark.skipif(
++    not _has_device_capability(90), reason="cooperative_topk is sm_90+ only"
++)
+ @pytest.mark.parametrize("top_k", [512, 1024, 2048])
+ def test_cooperative_topk_cs2(top_k: int) -> None:
+     """The 64-row dispatch uses the two-CTA cooperative kernel.
+@@ -2185,9 +2187,10 @@ def test_persistent_topk_decode_overflow_is_detected() -> None:
+     mid = np.nextafter(np.nextafter(base, np.float32(np.inf)), np.float32(np.inf))
+     high = np.nextafter(np.nextafter(mid, np.float32(np.inf)), np.float32(np.inf))
+     assert base < mid < high
+-    assert (
+-        np.float16(base) == np.float16(mid) == np.float16(high)
+-    ), "the three levels must share one half-precision bin or the row is not adversarial"
++    assert np.float16(base) == np.float16(mid) == np.float16(high), (
++        "the three levels must share one half-precision bin or the row is not "
++        "adversarial"
++    )
+ 
+     logits = torch.full((num_rows, seq_len), float(base), dtype=torch.float32)
+     logits[:, :leaders] = float(high)
+@@ -2630,7 +2633,8 @@ def test_persistent_topk_large_fault_in_nonzero_cta_fails_closed() -> None:
+     monkeypatched inside a session that has already run a top-k kernel. Run
+     this test in its own process:
+ 
+-        MERLIN_TOPK_DET_LARGE=1 MERLIN_TOPK_LARGE_FAULT_INJECT=1             pytest -k large_fault_in_nonzero_cta
++        export MERLIN_TOPK_DET_LARGE=1 MERLIN_TOPK_LARGE_FAULT_INJECT=1
++        pytest -k large_fault_in_nonzero_cta
+ 
+     Setting the injector also suppresses __trap(), so this is the trap-off arm
+     of the policy. The trap-on arm kills the CUDA context by construction and
+@@ -2926,7 +2930,9 @@ def _assert_valid_topk_membership(
+     )
+ 
+ 
+-def _largedet_distribution_impl(kind: str, seq_len: int, top_k: int, seed: int) -> torch.Tensor:
++def _largedet_distribution_impl(
++    kind: str, seq_len: int, top_k: int, seed: int
++) -> torch.Tensor:
+     """One CPU float32 row. All values are positive, so no -0.0/+0.0 hazard."""
+     gen = torch.Generator(device="cpu").manual_seed(seed)
+ 
+@@ -3435,8 +3441,8 @@ def _isolated_decode_drop_fixture(top_k: int) -> tuple[torch.Tensor, torch.Tenso
+         winners = 4 * (warps * 32 + 31) + 3
+         row[winners] = float(np.float32(1.01))
+         row[4096 : 4096 + above] = 2.0
+-    assert 4096 > ISOLATED_DECODE_DBUF
+-    assert 32 <= top_k - above
++    assert ISOLATED_DECODE_DBUF < 4096
++    assert top_k - above >= 32
+     return row, winners
+ 
+ 
+@@ -3630,7 +3636,9 @@ def _isolated_tie_fixture(path: str) -> tuple[torch.Tensor, int, int]:
+ @pytest.mark.parametrize("path", ["decode", "medium"])
+ @pytest.mark.parametrize("want_recent", [True, False])
+ @torch.inference_mode()
+-def test_isolated_tie_det_nonoverflow_cutoff_direction(path: str, want_recent: bool) -> None:
++def test_isolated_tie_det_nonoverflow_cutoff_direction(
++    path: str, want_recent: bool
++) -> None:
+     """Cell 4: MERLIN_TIE_DET's buffered cutoff tie, both directions, oracle.
+ 
+     Why: the mixed-path test's sorted-set equality of two launches is
+@@ -3657,7 +3665,9 @@ def test_isolated_tie_det_nonoverflow_cutoff_direction(path: str, want_recent: b
+     row, top_k, need = _isolated_tie_fixture(path)
+     expected = _largedet_reference(row, top_k, tie_recent=want_recent)
+     other = _largedet_reference(row, top_k, tie_recent=not want_recent)
+-    assert not torch.equal(expected, other), "the fixture cannot tell the directions apart"
++    assert not torch.equal(expected, other), (
++        "the fixture cannot tell the directions apart"
++    )
+ 
+     before = _isolated_counters_or_skip()
+     first = _isolated_launch(row, top_k)
+diff --git a/tests/test_envs.py b/tests/test_envs.py
+index 11700fa7c0..0db9be33b1 100644
+--- a/tests/test_envs.py
++++ b/tests/test_envs.py
+@@ -644,9 +644,15 @@ _FORK_IGNORED = [
+     ("VLLM_PLE_TEST_FAULT", "cut=exc_in_release,ordinal=3,rank=any", None),
+     ("VLLM_PLE_TEST_FAULT_GATE", "/var/tmp/gate", "/var/tmp/gate"),
+     ("VLLM_PLE_TEST_FAULT_LOG", "/var/tmp/fault.log", "/var/tmp/fault.log"),
+-    # Read sites arrive with the slot-ownership assertions.
++    # PLE diagnostics gates, both read through vllm.envs (connector.py / mamba_utils.py);
++    # test_read_site_status_matches_the_tables pins that the readers exist.
+     ("VLLM_E2_PLE_FLAG_CHECK", "1", "warn"),
+     ("VLLM_E2_MAMBA_SLOT_OWNERSHIP", " RAISE ", "raise"),
++    # Medium-path counter reader: a host-side log cadence, and the older slot-count
++    # fallback that this build never consults. Registered and ignored; before
++    # the read-site census neither classification was asserted anywhere.
++    ("MERLIN_TOPK_EXACT_COUNTERS_LOG", "30", 30),
++    ("MERLIN_TOPK_COUNTER_SLOTS", "11", "11"),
+ ]
+ 
+ # Marker fence around the unaudited-knob block in envs.py. The gate below scans
+@@ -915,3 +921,181 @@ def test_fork_cache_factor_lists_are_disjoint_and_registered():
+     assert not hashed & ignored
+     for name in hashed | ignored:
+         assert name in environment_variables, name
++
++
++# ---------------------------------------------------------------------------
++# Read-site census on 0.30. Every table above is a list somebody wrote; none
++# of them is checked against the READ SITES. That is how the 0.30 release tree
++# came to read VLLM_PLE_ROW_DUMP (restored by the pull-transport carry after it was deleted
++# it) and MERLIN_TOPK_COUNTER_SLOTS (the medium-path counter reader) with neither classified,
++# and how MERLIN_TOPK_EXACT_COUNTERS_LOG sat in ignored_factors with no test
++# asserting it. The census closes the loop in both directions:
++#
++#   source -> tables: every fork-family name the tree mentions (Python, C++ and
++#     the two PLE bootstrap packages) is hashed, ignored, fenced as unaudited,
++#     a build-time define, or upstream's own registration.
++#   registry -> tables: every fork-family name registered in envs.py has its
++#     cache-factor classification asserted by one of the tables.
++#
++# A knob that changes compiled code but is missing from the cache key is a
++# correctness bug on an AOT cache-load boot (the loaded artifact skips guard
++# evaluation), so "unclassified" must fail here rather than on the reference host.
++# ---------------------------------------------------------------------------
++
++_FORK_FAMILY = re.compile(
++    r"\b(?:MERLIN_[A-Z0-9_]+|VLLM_(?:E2|PLE|QSA)_[A-Z0-9_]+|VLLM_HOST_EMBED_TABLE)\b"
++)
++
++# Preprocessor defines consumed at BUILD time (-D / #ifndef / #define), never a
++# getenv; test_exact_trap_is_a_build_define_not_an_env_var pins the reasoning
++# for the first, and test_build_defines_are_not_env_reads re-checks them all.
++_BUILD_DEFINES = [
++    "MERLIN_TOPK_EXACT_TRAP",
++    "MERLIN_TOPK_DIAG_DELAY",
++    "MERLIN_TOPK_DIAG_PREREPAIR",
++    "MERLIN_TOPK_DIAG_FORCE_FAULT",
++    "MERLIN_TOPK_DIAG_FORCE_FAULT_CTA",
++    "MERLIN_TOPK_DIAG_ANY",
++]
++
++# In the fork's name family but registered and hashed by UPSTREAM v0.30.0
++# (the pinned-host UVA PLE switch the PLE pull transport refuses).
++_UPSTREAM_OWNED = ["VLLM_PLE_CPU_OFFLOAD"]
++
++_CENSUS_ROOTS = ("vllm", "csrc", "vllm_ple_offload_bootstrap", "vllm_ple_test_fault")
++_CENSUS_SUFFIXES = {".py", ".cu", ".cuh", ".cpp", ".h", ".c"}
++
++
++def _all_tabled() -> set[str]:
++    tables = _FORK_HASHED + _FORK_IGNORED + _TIEDET_HASHED + _TIEDET_KERNEL_SWITCHES
++    return {n for n, _, _ in tables + _LARGEDET_FAULT_INJECTORS}
++
++
++def _classified() -> set[str]:
++    return (
++        _all_tabled() | set(_TIEDET_UNAUDITED) | set(_BUILD_DEFINES) | set(_UPSTREAM_OWNED)
++    )
++
++
++def _census(sources) -> dict[str, set[str]]:
++    """{fork-family name: files mentioning it} over (relpath, text) pairs."""
++    found: dict[str, set[str]] = {}
++    for rel, text in sources:
++        for name in _FORK_FAMILY.findall(text):
++            found.setdefault(name, set()).add(rel)
++    return found
++
++
++def _tree_sources():
++    root = Path(envs.__file__).resolve().parents[1]
++    envs_py = Path(envs.__file__).resolve()
++    for sub in _CENSUS_ROOTS:
++        base = root / sub
++        if not base.is_dir():
++            continue
++        for path in base.rglob("*"):
++            if path.suffix not in _CENSUS_SUFFIXES or path.resolve() == envs_py:
++                continue
++            text = path.read_text(encoding="utf-8", errors="replace")
++            yield str(path.relative_to(root)), text
++
++
++def test_every_fork_knob_in_the_source_is_classified():
++    found = _census(_tree_sources())
++    assert found, "census scanned nothing: the source tree is not beside envs.py"
++    missing = {n: sorted(f) for n, f in found.items() if n not in _classified()}
++    assert not missing, (
++        "fork knobs read or named in the tree but in no classification table "
++        "(hash it, ignore it with a reason, fence it, or delete the reader): "
++        f"{missing}"
++    )
++
++
++def test_every_registered_fork_knob_has_an_asserted_classification():
++    registered = {n for n in environment_variables if _FORK_FAMILY.fullmatch(n)}
++    untested = sorted(registered - _all_tabled() - set(_UPSTREAM_OWNED))
++    assert not untested, (
++        f"registered fork knobs whose hashed/ignored status no test asserts: {untested}"
++    )
++
++
++def test_build_defines_are_not_env_reads():
++    """A name classified as a build define must never be read at run time."""
++    reads = re.compile(r"(?:getenv|environ(?:\.get)?)\s*[\(\[]\s*[\"'](\w+)[\"']")
++    runtime: set[str] = set()
++    for _, text in _tree_sources():
++        runtime.update(reads.findall(text))
++    assert not runtime & set(_BUILD_DEFINES), runtime & set(_BUILD_DEFINES)
++    for name in _BUILD_DEFINES:
++        assert name not in environment_variables, name
++
++
++def test_census_discriminates_both_worlds():
++    """Control: the census must flag an unclassified reader and pass a
++    classified one -- a scan that reports the same thing in both measures
++    nothing."""
++    unknown = [("x.py", 'os.environ.get("VLLM_PLE_EXAMPLE_KNOB", "")')]
++    known = [("x.py", 'os.environ.get("VLLM_QSA_KV_CLIP_COUNT", "")')]
++    cxx = [("x.cu", 'const char* raw = std::getenv("MERLIN_EXAMPLE_SWITCH");')]
++    assert set(_census(unknown)) - _classified() == {"VLLM_PLE_EXAMPLE_KNOB"}
++    assert set(_census(known)) - _classified() == set()
++    assert set(_census(cxx)) - _classified() == {"MERLIN_EXAMPLE_SWITCH"}
++    # Upstream names outside the family never enter the census.
++    assert _census([("x.py", 'os.getenv("VLLM_USE_AOT_COMPILE")')]) == {}
++
++
++# Read sites: the census above proves every knob is CLASSIFIED; it says
++# nothing about whether a knob is READ. The envs.py comments do, and on
++# the earlier base they were right that VLLM_E2_PLE_FLAG_CHECK had no reader. The diagnostics change
++# relanded its reader (connector.py), so the tables now say which knobs must
++# have a read site and which are INERT, and this test checks both against the
++# tree. A regression either way (a reader dropped by a carry, or an inert knob
++# silently wired) fails here instead of in a reference-host arm that reports "zero
++# findings" from an instrument that never ran.
++_MUST_BE_READ = {
++    "VLLM_E2_PLE_FLAG_CHECK": "vllm/v1/ple_offload/connector.py",
++    "VLLM_E2_MAMBA_SLOT_OWNERSHIP": "vllm/v1/worker/mamba_utils.py",
++}
++_INERT_NO_READ_SITE = ["VLLM_PLE_FP8_GLOBAL_SCALE"]
++
++_READ_SITE = re.compile(
++    r"\benvs\.(\w+)\b"
++    r"|(?:getenv|environ(?:\.get)?)\s*[\(\[]\s*[\"'](\w+)[\"']"
++)
++
++
++def _read_sites(sources) -> dict[str, set[str]]:
++    """{name: files that READ it} (envs.<NAME> or an environ/getenv read)."""
++    sites: dict[str, set[str]] = {}
++    for rel, text in sources:
++        for attr, raw in _READ_SITE.findall(text):
++            sites.setdefault(attr or raw, set()).add(rel.replace("\\", "/"))
++    return sites
++
++
++def test_read_site_status_matches_the_tables():
++    sites = _read_sites(_tree_sources())
++    for name, where in _MUST_BE_READ.items():
++        assert where in sites.get(name, set()), (
++            f"{name} must be read in {where}; read sites found: "
++            f"{sorted(sites.get(name, set()))}"
++        )
++    for name in _INERT_NO_READ_SITE:
++        assert name not in sites, (
++            f"{name} is documented INERT but is read in {sorted(sites[name])}: "
++            "move it to the compile factors or out of the inert list"
++        )
++    # Both tables are classified knobs, and disjoint.
++    assert set(_MUST_BE_READ) <= _classified()
++    assert set(_INERT_NO_READ_SITE) <= _classified()
++    assert not set(_MUST_BE_READ) & set(_INERT_NO_READ_SITE)
++
++
++def test_read_site_scan_discriminates_both_worlds():
++    """Control: a mention in a docstring is not a read; envs.X and getenv are."""
++    mention = [("a.py", '"""VLLM_E2_PLE_FLAG_CHECK=off|warn|raise"""')]
++    via_envs = [("a.py", "_M: str = envs.VLLM_E2_PLE_FLAG_CHECK")]
++    via_getenv = [("a.py", 'os.getenv("VLLM_PLE_FP8_GLOBAL_SCALE", "0")')]
++    assert "VLLM_E2_PLE_FLAG_CHECK" not in _read_sites(mention)
++    assert _read_sites(via_envs)["VLLM_E2_PLE_FLAG_CHECK"] == {"a.py"}
++    assert _read_sites(via_getenv)["VLLM_PLE_FP8_GLOBAL_SCALE"] == {"a.py"}
+diff --git a/tests/test_merlin_e2_toggles.py b/tests/test_merlin_e2_toggles.py
+index 3cd3c1f80e..2ded113f3a 100644
+--- a/tests/test_merlin_e2_toggles.py
++++ b/tests/test_merlin_e2_toggles.py
+@@ -20,7 +20,6 @@ import pytest
+ 
+ from vllm.v1.worker import e2_toggles as t
+ 
+-
+ # ------------------------------------------------------------ atoi parity ----
+ ATOI_CASES = [
+     (b"1", 1),
+diff --git a/tests/v1/ple_offload/test_correspondence.py b/tests/v1/ple_offload/test_correspondence.py
+index e8d8b9ed8a..b7eaf9c383 100644
+--- a/tests/v1/ple_offload/test_correspondence.py
++++ b/tests/v1/ple_offload/test_correspondence.py
+@@ -20,16 +20,15 @@ from vllm.v1.worker.gpu.cudagraph_utils import (
+     BatchExecutionDescriptor,
+     CudaGraphManager,
+ )
++from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+ from vllm.v1.worker.gpu.spec_decode.autoregressive.cudagraph_utils import (
+     SpeculatorCudaGraphManager,
+ )
+-from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+ 
+ 
+ class _ConnectorForValidation:
+     _input_ids_buf = torch.empty(4, dtype=torch.int32)
+     _query_start_loc_buf = torch.empty(3, dtype=torch.int32)
+-    _rowdump_n = None
+ 
+     def _signal_dummy_outputs_impl(self, num_tokens: int) -> None:
+         raise AssertionError("must fail before dummy publication")
+@@ -60,9 +59,7 @@ def _runner(query_start_loc: list[int]) -> PleOffloadRunner:
+     runner._worker_targets = {0: {"ple": [target]}}
+     runner._scratch_bufs = {0: {"ple": torch.empty(4, 2)}}
+     query = torch.zeros(3, dtype=torch.int32)
+-    query[: len(query_start_loc)] = torch.tensor(
+-        query_start_loc, dtype=torch.int32
+-    )
++    query[: len(query_start_loc)] = torch.tensor(query_start_loc, dtype=torch.int32)
+     runner._input_bufs = {
+         0: PleOffloadInputBuffers(
+             input_ids_buf=torch.zeros(4, dtype=torch.int32),
+@@ -76,14 +73,14 @@ def _runner(query_start_loc: list[int]) -> PleOffloadRunner:
+ @pytest.mark.parametrize(
+     ("ple_request", "query_start_loc", "match"),
+     [
+-        (PleOffloadRequest(dp_rank=0, num_tokens=3, num_reqs=2), [0, 2, 1],
+-         "query_start_loc"),
+-        (PleOffloadRequest(dp_rank=0, num_tokens=5, num_reqs=1), [0, 1],
+-         "num_tokens"),
+-        (PleOffloadRequest(dp_rank=0, num_tokens=1, num_reqs=3), [0, 1, 1],
+-         "num_reqs"),
+-        (PleOffloadRequest(dp_rank=9, num_tokens=1, num_reqs=1), [0, 1],
+-         "dp_rank=9"),
++        (
++            PleOffloadRequest(dp_rank=0, num_tokens=3, num_reqs=2),
++            [0, 2, 1],
++            "query_start_loc",
++        ),
++        (PleOffloadRequest(dp_rank=0, num_tokens=5, num_reqs=1), [0, 1], "num_tokens"),
++        (PleOffloadRequest(dp_rank=0, num_tokens=1, num_reqs=3), [0, 1, 1], "num_reqs"),
++        (PleOffloadRequest(dp_rank=9, num_tokens=1, num_reqs=1), [0, 1], "dp_rank=9"),
+     ],
+ )
+ def test_invalid_request_fails_before_publication(
+@@ -133,9 +130,7 @@ def test_selected_full_graph_copy_count_precedes_publication() -> None:
+     )
+ 
+     with pytest.raises(RuntimeError, match="selected-forward"):
+-        GPUModelRunner._prepare_ple_forward(
+-            runner, input_batch, desc, dummy_run=False
+-        )
++        GPUModelRunner._prepare_ple_forward(runner, input_batch, desc, dummy_run=False)
+     assert connector.called is False
+ 
+ 
+@@ -150,11 +145,13 @@ def test_production_capture_callback_rejects_actual_ple_copy_mismatch() -> None:
+         num_reqs=1,
+     )
+ 
+-    with pytest.raises(RuntimeError, match="actual PLE copy geometry"):
+-        # This is the production capture scope. The injected observation uses
+-        # the same hook called by the real wait-copy custom-op implementation.
+-        with manager.capture_ple_copy_geometry(desc):
+-            _record_ple_copy_geometry("ple", 12, 16)
++    # capture_ple_copy_geometry is the production capture scope. The injected
++    # observation uses the same hook the real wait-copy custom-op calls.
++    with (
++        pytest.raises(RuntimeError, match="actual PLE copy geometry"),
++        manager.capture_ple_copy_geometry(desc),
++    ):
++        _record_ple_copy_geometry("ple", 12, 16)
+     assert desc not in manager._ple_full_copy_geometry
+ 
+ 
+@@ -169,9 +166,11 @@ def test_speculator_full_capture_refuses_observed_ple_op() -> None:
+         num_reqs=1,
+     )
+ 
+-    with pytest.raises(RuntimeError, match="speculator/draft"):
+-        with manager.capture_ple_copy_geometry(desc):
+-            _record_ple_copy_geometry("unexpected-draft-ple", 8, 16)
++    with (
++        pytest.raises(RuntimeError, match="speculator/draft"),
++        manager.capture_ple_copy_geometry(desc),
++    ):
++        _record_ple_copy_geometry("unexpected-draft-ple", 8, 16)
+     assert desc not in manager._ple_full_copy_geometry
+ 
+ 
+@@ -191,7 +190,5 @@ def test_eager_correspondence_uses_actual_padded_input_view() -> None:
+         num_reqs=1,
+     )
+     with pytest.raises(RuntimeError, match="selected-forward"):
+-        GPUModelRunner._prepare_ple_forward(
+-            runner, input_batch, desc, dummy_run=False
+-        )
++        GPUModelRunner._prepare_ple_forward(runner, input_batch, desc, dummy_run=False)
+     assert connector.called is False
+diff --git a/tests/v1/ple_offload/test_fatal_rpc.py b/tests/v1/ple_offload/test_fatal_rpc.py
+index 1c86f9bea2..2b10492ef5 100644
+--- a/tests/v1/ple_offload/test_fatal_rpc.py
++++ b/tests/v1/ple_offload/test_fatal_rpc.py
+@@ -80,10 +80,12 @@ class _Runner:
+ 
+ def _rpc_loop(where: str, successor_count: Any) -> None:
+     runner = _Runner(where)
+-    try:
++    try:  # noqa: SIM105
+         runner.execute_model()
+     except Exception:
+-        # Mirrors WorkerProc._execute_worker_rpc: this must never regain control.
++        # Mirrors WorkerProc._execute_worker_rpc: this must never regain
++        # control. SIM105 declined -- the point of the fake is to have the
++        # same shape as the code it stands in for.
+         pass
+     with successor_count.get_lock():
+         successor_count.value += 1
+@@ -100,8 +102,9 @@ def test_ple_exception_kills_workerproc_style_rpc(
+         args=(where, successor_count),
+     )
+     process.start()
+-    # Spawned children import vLLM cold (measured 4-8 s on the reference host); the bound is
+-    # about start-up, not the fatal path, which exits immediately.
++    # Spawned children import vLLM cold (measured 4-8 s on the reference
++    # host); the bound is about start-up, not the fatal path, which exits
++    # immediately.
+     process.join(timeout=120)
+     assert not process.is_alive()
+     assert process.exitcode not in (None, 0)
+@@ -115,9 +118,7 @@ def _rpc_loop_connector_only(where: str, successor_count: Any) -> None:
+     connector = _InjectedConnector(where)
+     try:
+         if where == "begin":
+-            PleOffloadConnector.begin_forward(
+-                connector, dummy_run=False, num_tokens=1
+-            )
++            PleOffloadConnector.begin_forward(connector, dummy_run=False, num_tokens=1)
+         elif where == "prepare":
+             PleOffloadConnector.prepare_forward(
+                 connector, 1, 1, False, consumer_num_tokens=1
+diff --git a/tests/v1/ple_offload/test_fault_injector_basics.py b/tests/v1/ple_offload/test_fault_injector_basics.py
+index a47796d9f3..c804729935 100644
+--- a/tests/v1/ple_offload/test_fault_injector_basics.py
++++ b/tests/v1/ple_offload/test_fault_injector_basics.py
+@@ -38,9 +38,7 @@ def test_impossible_role_selectors_are_rejected(monkeypatch, tmp_path, value):
+ 
+ def test_armed_import_requires_dedicated_log(tmp_path):
+     env = dict(os.environ)
+-    env["VLLM_PLE_TEST_FAULT"] = (
+-        "cut=exc_before_prepare,ordinal=1,rank=any"
+-    )
++    env["VLLM_PLE_TEST_FAULT"] = "cut=exc_before_prepare,ordinal=1,rank=any"
+     env.pop("VLLM_PLE_TEST_FAULT_LOG", None)
+     proc = subprocess.run(
+         [sys.executable, "-c", "import vllm_ple_test_fault"],
+@@ -81,9 +79,7 @@ def test_fresh_interpreter_import_identity(tmp_path, order, armed):
+     env.pop("VLLM_PLE_TEST_FAULT", None)
+     env.pop("VLLM_PLE_TEST_FAULT_LOG", None)
+     if armed:
+-        env["VLLM_PLE_TEST_FAULT"] = (
+-            "cut=launch_silent_ready,ordinal=1,rank=any"
+-        )
++        env["VLLM_PLE_TEST_FAULT"] = "cut=launch_silent_ready,ordinal=1,rank=any"
+         env["VLLM_PLE_TEST_FAULT_LOG"] = str(tmp_path / f"{order}.log")
+     script = f"""
+ import sys
+diff --git a/tests/v1/ple_offload/test_fault_injector_gates.py b/tests/v1/ple_offload/test_fault_injector_gates.py
+index 70e0d3e469..116236c06b 100644
+--- a/tests/v1/ple_offload/test_fault_injector_gates.py
++++ b/tests/v1/ple_offload/test_fault_injector_gates.py
+@@ -65,6 +65,7 @@ def test_disarmed_sender_deadline_does_not_enter_logger(monkeypatch):
+ 
+ def test_disarmed_launch_does_not_read_progress_sequence(monkeypatch):
+     import queue
++
+     import vllm.v1.ple_offload.connector as connector_module
+ 
+     monkeypatch.setattr(connector_module, "_FAULT", None)
+@@ -94,7 +95,6 @@ def test_disarmed_release_does_not_read_progress_sequence(monkeypatch):
+     import vllm.v1.ple_offload.connector as connector_module
+ 
+     monkeypatch.setattr(connector_module, "_FAULT", None)
+-    monkeypatch.setattr(connector_module._rowdump, "enabled", lambda: False)
+     event = Mock()
+     stream = Mock()
+     monkeypatch.setattr(connector_module.torch.cuda, "Event", lambda: event)
+@@ -124,9 +124,7 @@ def test_sample_tokens_connector_rank_fatalizes():
+         pass
+ 
+     class Runner:
+-        _ple_offload_connector = SimpleNamespace(
+-            _fail_closed=Mock(side_effect=Reached)
+-        )
++        _ple_offload_connector = SimpleNamespace(_fail_closed=Mock(side_effect=Reached))
+ 
+         @fail_ple_execute_model
+         def sample_tokens(self):
+@@ -458,8 +456,12 @@ def test_every_fault_call_has_one_boolop_guard_and_no_prior_state_read():
+             assert call_index is not None
+             assert guard_index < call_index
+ 
+-            forbidden = {"sequence", "has_pending_completions",
+-                         "completion_is_pending", "fault_transaction"}
++            forbidden = {
++                "sequence",
++                "has_pending_completions",
++                "completion_is_pending",
++                "fault_transaction",
++            }
+             before_guard = owner.values[:guard_index]
+             assert not any(
+                 isinstance(node, ast.Attribute) and node.attr in forbidden
+diff --git a/tests/v1/ple_offload/test_fault_wire_frames.py b/tests/v1/ple_offload/test_fault_wire_frames.py
+index b864355bac..a237eaa74a 100644
+--- a/tests/v1/ple_offload/test_fault_wire_frames.py
++++ b/tests/v1/ple_offload/test_fault_wire_frames.py
+@@ -34,7 +34,11 @@ def test_armed_offload_receive_requires_metadata_frame(monkeypatch):
+ 
+     monkeypatch.setattr(worker_module, "_FAULT", object())
+     request = _request()
+-    metadata = {"serving": True, "transaction": "request:1", "correlation": "sequence:3"}
++    metadata = {
++        "serving": True,
++        "transaction": "request:1",
++        "correlation": "sequence:3",
++    }
+     socket = Mock()
+     socket.recv.side_effect = AssertionError("single-frame read while armed")
+     socket.recv_multipart.return_value = [
+diff --git a/tests/v1/ple_offload/test_ipc_socket_unlink.py b/tests/v1/ple_offload/test_ipc_socket_unlink.py
+index 92fbc42799..0216d01985 100644
+--- a/tests/v1/ple_offload/test_ipc_socket_unlink.py
++++ b/tests/v1/ple_offload/test_ipc_socket_unlink.py
+@@ -2,18 +2,17 @@
+ 
+ import contextlib
+ import os
+-from pathlib import Path
+ import signal
+ import subprocess
+ import sys
+ import tempfile
+ import time
++from pathlib import Path
+ 
+ import pytest
+ 
+ from vllm.v1.ple_offload.worker import PleOffloadWorkerHandle
+ 
+-
+ pytestmark = pytest.mark.skipif(
+     sys.platform != "linux", reason="requires Linux filesystem ipc sockets"
+ )
+diff --git a/tests/v1/ple_offload/test_progress_deadline.py b/tests/v1/ple_offload/test_progress_deadline.py
+index 5e7ca19d7e..ed825b4ac1 100644
+--- a/tests/v1/ple_offload/test_progress_deadline.py
++++ b/tests/v1/ple_offload/test_progress_deadline.py
+@@ -76,8 +76,9 @@ def test_progress_deadline_terminates_alive_silent_worker(
+         args=(block_input, started),
+     )
+     process.start()
+-    # Cold vLLM import in the spawned child takes 4-8 s on the reference host; the deadline
+-    # itself (0.2 s) is only charged after `started` is set.
++    # Cold vLLM import in the spawned child takes 4-8 s on the reference
++    # host; the deadline itself (0.2 s) is only charged after `started` is
++    # set.
+     assert started.wait(timeout=120)
+     process.join(timeout=10)
+     assert not process.is_alive()
+@@ -96,7 +97,6 @@ def _pending_completion_case(use_release_wrapper: bool, started: Any) -> None:
+         connector_module.torch.cuda.current_stream = lambda device=None: stream
+         connector_module.torch.cuda.Event = _PendingEvent
+         connector_module.torch.cuda.is_current_stream_capturing = lambda: False
+-        connector_module._rowdump.enabled = lambda: False
+ 
+         connector = PleOffloadConnector.__new__(PleOffloadConnector)
+         connector.device = torch.device("cpu")
+@@ -104,7 +104,6 @@ def _pending_completion_case(use_release_wrapper: bool, started: Any) -> None:
+         connector.tp_rank = 0
+         connector._layers = {"ple": _FakeLayer()}
+         connector._progress = monitor
+-        connector._rowdump_n = None
+         connector._after_dummy = False
+         monitor.begin(startup=False, num_tokens=8)
+         connector.release_outputs()
+@@ -175,7 +174,9 @@ def _monitor_exception_case(
+     query_entered: Any,
+     diagnostic_path: str,
+ ) -> None:
+-    diagnostic_fd = os.open(diagnostic_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
++    diagnostic_fd = os.open(
++        diagnostic_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600
++    )
+     os.dup2(diagnostic_fd, 2)
+     os.close(diagnostic_fd)
+     monitor = PleProgressMonitor(
+@@ -210,7 +211,4 @@ def test_monitor_thread_exception_is_fatal(tmp_path: Path) -> None:
+     assert process.exitcode not in (None, 0)
+     diagnostic = diagnostic_path.read_text(encoding="utf-8")
+     assert "where=progress-monitor-thread" in diagnostic
+-    assert (
+-        "error=RuntimeError:injected event query failure"
+-        in diagnostic
+-    )
++    assert "error=RuntimeError:injected event query failure" in diagnostic
+diff --git a/tests/v1/ple_offload/test_rowdump_deleted.py b/tests/v1/ple_offload/test_rowdump_deleted.py
+new file mode 100644
+index 0000000000..97216e2824
+--- /dev/null
++++ b/tests/v1/ple_offload/test_rowdump_deleted.py
+@@ -0,0 +1,49 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""The PLE row dump stays deleted on the 0.30 tree.
++
++An earlier cleanup deleted ``vllm/v1/ple_offload/rowdump.py`` and its call
++sites: it was a byte-level push-vs-pull diff for a push transport that no
++longer exists, and nothing reads the ``b"PLER"`` records it writes. The pull-transport
++carry (an earlier commit) restored it verbatim from the E2 base, so the 0.30
++release tree read ``VLLM_PLE_ROW_DUMP`` again -- an unregistered ``VLLM_`` name
++that validate_environ reports as unknown, on the per-step publish path.
++
++Source-level on purpose: importing the connector needs cuda-python, which the
++GPU-free tier does not have, and the property is "no reader and no call site",
++which the source states directly.
++"""
++
++from pathlib import Path
++
++import pytest
++
++_ROOT = Path(__file__).resolve().parents[3]
++_PKG = _ROOT / "vllm" / "v1" / "ple_offload"
++
++
++def _sources():
++    for sub in ("vllm", "vllm_ple_offload_bootstrap", "vllm_ple_test_fault"):
++        base = _ROOT / sub
++        if base.is_dir():
++            yield from base.rglob("*.py")
++
++
++def test_rowdump_module_is_gone():
++    assert _PKG.is_dir(), f"PLE offload package missing at {_PKG}"
++    assert not (_PKG / "rowdump.py").exists()
++
++
++@pytest.mark.parametrize("name", ["connector.py", "worker.py"])
++def test_transport_has_no_rowdump_call_site(name: str):
++    text = (_PKG / name).read_text(encoding="utf-8")
++    assert "rowdump" not in text, f"{name} still imports or calls the row dump"
++
++
++def test_nothing_reads_the_row_dump_env():
++    readers = [
++        str(p.relative_to(_ROOT))
++        for p in _sources()
++        if "VLLM_PLE_ROW_DUMP" in p.read_text(encoding="utf-8", errors="replace")
++    ]
++    assert not readers, f"VLLM_PLE_ROW_DUMP still read by {readers}"
+diff --git a/tests/v1/ple_offload/test_shm_unlink.py b/tests/v1/ple_offload/test_shm_unlink.py
+index 600a7bb7e2..bdb3a98cb1 100644
+--- a/tests/v1/ple_offload/test_shm_unlink.py
++++ b/tests/v1/ple_offload/test_shm_unlink.py
+@@ -1,10 +1,10 @@
+ # SPDX-License-Identifier: Apache-2.0
+ 
+ import os
+-from multiprocessing.reduction import ForkingPickler
+-from pathlib import Path
+ import subprocess
+ import sys
++from multiprocessing.reduction import ForkingPickler
++from pathlib import Path
+ 
+ import pytest
+ import torch
+diff --git a/tests/v1/ple_offload/test_shutdown_order.py b/tests/v1/ple_offload/test_shutdown_order.py
+index 101c3dabcf..0f73a6853d 100644
+--- a/tests/v1/ple_offload/test_shutdown_order.py
++++ b/tests/v1/ple_offload/test_shutdown_order.py
+@@ -4,8 +4,8 @@ import contextlib
+ from types import SimpleNamespace
+ from typing import Any
+ 
+-from vllm.v1.ple_offload.connector import PleOffloadConnector
+ from vllm.v1.ple_offload import worker as ple_worker
++from vllm.v1.ple_offload.connector import PleOffloadConnector
+ from vllm.v1.worker import gpu_worker
+ 
+ 
+diff --git a/tests/v1/ple_offload/test_spawn_bootstrap_cuda.py b/tests/v1/ple_offload/test_spawn_bootstrap_cuda.py
+index c709a93137..1a0d21e022 100644
+--- a/tests/v1/ple_offload/test_spawn_bootstrap_cuda.py
++++ b/tests/v1/ple_offload/test_spawn_bootstrap_cuda.py
+@@ -18,6 +18,7 @@ from pathlib import Path
+ 
+ import pytest
+ 
++
+ def _native_cuda_probe(output_path: str) -> None:
+     """Run during config unpickling, before the bootstrap imports vLLM."""
+     library = ctypes.util.find_library("cudart")
+@@ -28,9 +29,7 @@ def _native_cuda_probe(output_path: str) -> None:
+     Path(output_path).write_text(
+         json.dumps(
+             {
+-                "cuda_visible_devices": os.environ.get(
+-                    "CUDA_VISIBLE_DEVICES"
+-                ),
++                "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+                 "cuda_result": result,
+                 "torch_imported": "torch" in sys.modules,
+                 "vllm_imported": "vllm" in sys.modules,
+@@ -176,7 +175,7 @@ def test_launch_payload_send_has_absolute_deadline() -> None:
+     assert process.returncode == 0, stderr
+     # The injector logs the send entry through vLLM's logger on stdout; read only
+     # the probe's own result line.
+-    result = [line for line in stdout.splitlines() if line.startswith('TIMED_OUT ')]
++    result = [line for line in stdout.splitlines() if line.startswith("TIMED_OUT ")]
+     assert len(result) == 1, stdout
+     marker, elapsed = result[0].split()
+     assert marker == "TIMED_OUT"
+@@ -282,9 +281,7 @@ class _ExecFdProbe:
+             + ","
+             + repr(self.output_path)
+             + ",str(all(not __import__('os').get_inheritable(int(fd)) "
+-            "for fd in __import__('sys').argv[1:])),"
+-            + repr(pairs)
+-            + "])"
++            "for fd in __import__('sys').argv[1:]))," + repr(pairs) + "])"
+         )
+         return eval, (expression,)
+ 
+@@ -330,9 +327,7 @@ def test_actual_bootstrap_restores_cloexec_before_helper_exec(
+     control_child.close()
+     death_child.close()
+     try:
+-        _send_framed_payload(
+-            control.fileno(), payload, time.monotonic() + 10
+-        )
++        _send_framed_payload(control.fileno(), payload, time.monotonic() + 10)
+         assert process.wait(timeout=120) == 0
+     finally:
+         control.close()
+diff --git a/tests/v1/ple_offload/test_test_fault.py b/tests/v1/ple_offload/test_test_fault.py
+index 3dc8470449..a199207cdf 100644
+--- a/tests/v1/ple_offload/test_test_fault.py
++++ b/tests/v1/ple_offload/test_test_fault.py
+@@ -64,9 +64,7 @@ def test_malformed_specs_raise(fault_module, value):
+ 
+ 
+ def test_one_shot_rank_phase_and_ordinal(fault_module, monkeypatch):
+-    spec = fault_module._parse_fault_spec(
+-        "cut=exc_after_prepare,ordinal=2,tp=1,pp=0"
+-    )
++    spec = fault_module._parse_fault_spec("cut=exc_after_prepare,ordinal=2,tp=1,pp=0")
+     assert spec is not None
+ 
+     monkeypatch.setattr(fault_module.os, "getpid", lambda: 123)
+@@ -153,7 +151,6 @@ def test_disarmed_release_site_continues(fault_module, monkeypatch):
+     import vllm.v1.ple_offload.connector as connector_module
+ 
+     monkeypatch.setattr(connector_module, "_FAULT", None)
+-    monkeypatch.setattr(connector_module._rowdump, "enabled", lambda: False)
+ 
+     stream = Mock()
+     completion = Mock()
+@@ -210,25 +207,24 @@ def test_all_injection_sites_use_the_disarmed_short_circuit():
+         sites = [i for i, line in enumerate(lines) if "_FAULT.fires(" in line]
+         assert len(sites) == count, relative
+         for i in sites:
+-            window = "\n".join(lines[max(0, i - 6): i + 1])
++            window = "\n".join(lines[max(0, i - 6) : i + 1])
+             # The None check must precede fires() in the same condition, so a
+             # disarmed process never calls into the fault module.
+             assert "_FAULT is not None" in window, (relative, i + 1)
+-            assert window.index("_FAULT is not None") < window.index("_FAULT.fires("), (relative, i + 1)
++            assert window.index("_FAULT is not None") < window.index("_FAULT.fires("), (
++                relative,
++                i + 1,
++            )
+ 
+ 
+ class _FatalReached(Exception):
+     pass
+ 
+ 
+-def test_exc_in_release_reaches_real_connector_fatal_wrapper(
+-    fault_module, monkeypatch
+-):
++def test_exc_in_release_reaches_real_connector_fatal_wrapper(fault_module, monkeypatch):
+     import vllm.v1.ple_offload.connector as connector_module
+ 
+-    armed = fault_module._parse_fault_spec(
+-        "cut=exc_in_release,ordinal=1,tp=1,pp=0"
+-    )
++    armed = fault_module._parse_fault_spec("cut=exc_in_release,ordinal=1,tp=1,pp=0")
+     assert armed is not None
+     monkeypatch.setattr(connector_module, "_FAULT", armed)
+ 
+diff --git a/tests/v1/ple_offload/test_transport_bounded_io.py b/tests/v1/ple_offload/test_transport_bounded_io.py
+index 78a9db0fd0..e42591a72b 100644
+--- a/tests/v1/ple_offload/test_transport_bounded_io.py
++++ b/tests/v1/ple_offload/test_transport_bounded_io.py
+@@ -275,8 +275,9 @@ def test_real_wait_copy_geometry_rejected_before_graph_publication(
+ 
+     # Go through the op's real entry point, which resolves
+     # the live pointers by layer name from the per-process registry.
+-    from types import SimpleNamespace
+-
++    # (SimpleNamespace is the module-level import: a function-local import
++    # here made the name local to the whole function, so the earlier
++    # `success = SimpleNamespace(...)` raised UnboundLocalError -- ruff F823.)
+     monkeypatch.setitem(
+         ple_layer_module._PULL_LAYERS,
+         "ple",
+diff --git a/tests/v1/ple_offload/test_transport_fatal_helper.py b/tests/v1/ple_offload/test_transport_fatal_helper.py
+index 4e5d5c63d7..f1abd2729a 100644
+--- a/tests/v1/ple_offload/test_transport_fatal_helper.py
++++ b/tests/v1/ple_offload/test_transport_fatal_helper.py
+@@ -27,9 +27,7 @@ def _run_bounded_child(
+         deadline = time.monotonic() + 120
+         while not marker.exists() and time.monotonic() < deadline:
+             time.sleep(0.05)
+-        assert marker.exists(), (
+-            "child did not finish cold startup within 120 seconds"
+-        )
++        assert marker.exists(), "child did not finish cold startup within 120 seconds"
+         process.wait(timeout=5)
+     except subprocess.TimeoutExpired:
+         stayed_alive = True
+diff --git a/tests/v1/test_ple_pull_compile_profile.py b/tests/v1/test_ple_pull_compile_profile.py
+index 0f3ab580fa..d19ec5385f 100644
+--- a/tests/v1/test_ple_pull_compile_profile.py
++++ b/tests/v1/test_ple_pull_compile_profile.py
+@@ -465,7 +465,9 @@ def test_draft_guard_reports_the_draft_architecture() -> None:
+     assert e2_guards._profile(cfg, "target")[0] == ["Qwen4ExpForConditionalGeneration"]
+     assert e2_guards._profile(cfg, "draft")[0] == ["Qwen4ExpMTP"]
+     no_spec = SimpleNamespace(**{**vars(cfg), "speculative_config": None})
+-    assert e2_guards._profile(no_spec, "draft")[0] == ["Qwen4ExpForConditionalGeneration"]
++    assert e2_guards._profile(no_spec, "draft")[0] == [
++        "Qwen4ExpForConditionalGeneration"
++    ]
+ 
+ 
+ def _import_ple_offload_layer(monkeypatch):
+@@ -560,13 +562,19 @@ def test_pull_registry_refuses_unbound_and_clashing_names(monkeypatch) -> None:
+     sem = object()
+     buf = torch.empty(2, 2)
+     with pytest.raises(RuntimeError, match="no _ple_offload_name"):
+-        armed("<unbound>").setup_cross_process_offload(buf, sem, host_output_ptr=1, host_row_bytes=8)
++        armed("<unbound>").setup_cross_process_offload(
++            buf, sem, host_output_ptr=1, host_row_bytes=8
++        )
+     a = armed("L1")
+     a.setup_cross_process_offload(buf, sem, host_output_ptr=1, host_row_bytes=8)
+-    a.setup_cross_process_offload(buf, sem, host_output_ptr=2, host_row_bytes=8)  # re-arm ok
++    a.setup_cross_process_offload(
++        buf, sem, host_output_ptr=2, host_row_bytes=8
++    )  # re-arm ok
+     assert m._PULL_LAYERS["L1"] is a
+     with pytest.raises(RuntimeError, match="two layers armed"):
+-        armed("L1").setup_cross_process_offload(buf, sem, host_output_ptr=3, host_row_bytes=8)
++        armed("L1").setup_cross_process_offload(
++            buf, sem, host_output_ptr=3, host_row_bytes=8
++        )
+ 
+ 
+ def test_nvidia_qwen4exp_ops_carry_no_pointer_like_int_params() -> None:
+@@ -577,21 +585,28 @@ def test_nvidia_qwen4exp_ops_carry_no_pointer_like_int_params() -> None:
+     import pathlib
+ 
+     root = pathlib.Path(__file__).resolve().parents[2] / "vllm"
+-    files = [root / "model_executor/layers/ple_offload_layer.py",
+-             *sorted((root / "models/qwen4_exp/nvidia").rglob("*.py")),
+-             *sorted((root / "v1/ple_offload").rglob("*.py"))]
++    files = [
++        root / "model_executor/layers/ple_offload_layer.py",
++        *sorted((root / "models/qwen4_exp/nvidia").rglob("*.py")),
++        *sorted((root / "v1/ple_offload").rglob("*.py")),
++    ]
+     bad = []
+     for f in files:
+         tree = ast.parse(f.read_text(encoding="utf-8"))
+         funcs = {n.name: n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
+         for node in ast.walk(tree):
+-            if isinstance(node, ast.Call) and getattr(node.func, "id", "") == "direct_register_custom_op":
++            if (
++                isinstance(node, ast.Call)
++                and getattr(node.func, "id", "") == "direct_register_custom_op"
++            ):
+                 kw = {k.arg: k.value for k in node.keywords}
+                 fn = getattr(kw.get("op_func"), "id", None)
+                 if fn not in funcs:
+                     continue
+                 for a in funcs[fn].args.args:
+                     ann = ast.unparse(a.annotation) if a.annotation is not None else ""
+-                    if ann == "int" and any(t in a.arg for t in ("ptr", "addr", "pointer")):
++                    if ann == "int" and any(
++                        t in a.arg for t in ("ptr", "addr", "pointer")
++                    ):
+                         bad.append(f"{f.name}:{fn}({a.arg})")
+     assert not bad, f"pointer-like int op params (AOT-baking hazard): {bad}"
+diff --git a/tests/v1/worker/test_e2_memstats.py b/tests/v1/worker/test_e2_memstats.py
+index c40518746b..bf83e5b78b 100644
+--- a/tests/v1/worker/test_e2_memstats.py
++++ b/tests/v1/worker/test_e2_memstats.py
+@@ -1,5 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+-"""CPU/GPU-free schema and call-order tests for vllm/v1/worker/e2_memstats.py (debug-only telemetry)."""
++"""CPU/GPU-free schema and call-order tests for vllm/v1/worker/e2_memstats.py
++(debug-only telemetry)."""
++
+ from __future__ import annotations
+ 
+ import importlib.util
+@@ -11,7 +13,9 @@ from unittest import mock
+ 
+ import torch
+ 
+-MODULE_PATH = Path(__file__).resolve().parents[3] / "vllm" / "v1" / "worker" / "e2_memstats.py"
++MODULE_PATH = (
++    Path(__file__).resolve().parents[3] / "vllm" / "v1" / "worker" / "e2_memstats.py"
++)
+ HOST_CURRENT_KEYS = {
+     "active_bytes.current",
+     "active_requests.current",
+@@ -27,7 +31,9 @@ def load_disabled_module():
+     if spec is None or spec.loader is None:
+         raise RuntimeError(f"cannot load {MODULE_PATH}")
+     module = importlib.util.module_from_spec(spec)
+-    with mock.patch.dict(os.environ, {"VLLM_E2_MEMSTATS": "", "VLLM_E2_MEMSTATS_DIR": ""}):
++    with mock.patch.dict(
++        os.environ, {"VLLM_E2_MEMSTATS": "", "VLLM_E2_MEMSTATS_DIR": ""}
++    ):
+         spec.loader.exec_module(module)
+     return module
+ 
+@@ -79,15 +85,34 @@ class MemstatsSchemaTest(unittest.TestCase):
+             return host_stats
+ 
+         with (
+-            mock.patch.object(module.torch.cuda, "memory_stats", side_effect=memory_stats),
+-            mock.patch.object(module.torch.cuda, "reset_peak_memory_stats", side_effect=reset_peak_memory_stats),
+-            mock.patch.object(module.torch.cuda, "mem_get_info", side_effect=mem_get_info),
+-            mock.patch.object(module.torch.cuda, "host_memory_stats", side_effect=host_memory_stats),
++            mock.patch.object(
++                module.torch.cuda, "memory_stats", side_effect=memory_stats
++            ),
++            mock.patch.object(
++                module.torch.cuda,
++                "reset_peak_memory_stats",
++                side_effect=reset_peak_memory_stats,
++            ),
++            mock.patch.object(
++                module.torch.cuda, "mem_get_info", side_effect=mem_get_info
++            ),
++            mock.patch.object(
++                module.torch.cuda, "host_memory_stats", side_effect=host_memory_stats
++            ),
+         ):
+             record = module._close_metrics(7)
+ 
+-        # The device read and the peak reset stay adjacent; the host read comes after both.
+-        self.assertEqual(calls, ["memory_stats", "reset_peak_memory_stats", "mem_get_info", "host_memory_stats"])
++        # The device read and the peak reset stay adjacent; the host read
++        # comes after both.
++        self.assertEqual(
++            calls,
++            [
++                "memory_stats",
++                "reset_peak_memory_stats",
++                "mem_get_info",
++                "host_memory_stats",
++            ],
++        )
+         self.assertEqual(
+             set(record),
+             {
+diff --git a/vllm/envs.py b/vllm/envs.py
+index b604b39395..0dca963033 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -339,8 +339,10 @@ if TYPE_CHECKING:
+     # catch-all branch in _get_ple_embedding_quant_method, which lived in the
+     # half of models/qwen4_exp/nvidia/ple_layer.py that #54371 deleted. With no
+     # reader it cannot change an artifact, so hashing it would only invalidate
+-    # caches for nothing; and on this uncompiled NVIDIA path (#55272) there may
+-    # be no AOT artifact to key at all. It gives NO capture protection either.
++    # caches for nothing. (The AOT artifact is real on this tree: #55272
++    # removed torch.compile from the NVIDIA Qwen4Exp path, the compile-profile guard restored it,
++    # and the vLLM 0.30 rebase ran AOT cache-load boots -- so the reason is "no
++    # reader", not "no artifact".) It gives NO capture protection either.
+     # v0.30.0 selects the FP8 PLE method from the CONFIG KEY
+     # text_config.ple_embedding_dtype == "float8_e4m3fn"
+     # (ngram_embedding.py:174-175) -- see
+@@ -428,14 +430,12 @@ if TYPE_CHECKING:
+     # cross-change knob table). Each mirrors its read site's
+     # parse; if a read site changes, the entry here must be reconciled.
+     # (Both read sites below are now live.)
+-    # *** INERT ON THE 0.30 BASE: NO READ SITE. ***
+-    # Its reader is the slot-ownership assertion code (an earlier commit), which edits
+-    # vllm/v1/ple_offload/connector.py -- a module that does not exist on
+-    # v0.30.0. Setting this on the 0.30 base does NOTHING, and NOTHING WARNS
+-    # (validate_environ only reports UNregistered names). Already an ignored
+-    # factor, correctly. Kept registered so the contract is recorded; it
+-    # becomes live again only together with the pull transport
+-    # (the PLE transport choice).
++    # LIVE: read once at
++    # import as envs.VLLM_E2_PLE_FLAG_CHECK by vllm/v1/ple_offload/connector.py
++    # (the PLE pull-transport flag check, rank-gated, off by default). On
++    # the 0.30 base it had NO read site: the PLE-diagnostics half
++    # had not been relanded after the PLE pull-transport port restored connector.py. The
++    # census in tests/test_envs.py now asserts the read site exists.
+     # AOT: no. CAPTURE: no -- strictly host-side and outside capture.
+     # off|warn|raise (1 = warn), normalised by _e2_diagnostic_mode like the
+     # rest of the family. The mamba ownership check moved this gate off a plain
+@@ -487,6 +487,9 @@ if TYPE_CHECKING:
+     VLLM_NIC_SELECTION_VARS: str = ""
+     VLLM_ENABLE_HPC_OPS: bool = False
+     MERLIN_TOPK_EXACT_COUNTERS_LOG: int = 0
++    # Pre-tie-determinism fallback for the counter reader's slot count; runtime-only
++    # (ignored factor), never consulted on this build. See the dict entry.
++    MERLIN_TOPK_COUNTER_SLOTS: str | None = None
+     #
+     # --- determinism toggles -----------------------------------------
+     # The three nondeterminism mechanisms (FULL_K, QSA_SORT, TIE_DET/TIE_RECENT).
+@@ -556,11 +559,13 @@ if TYPE_CHECKING:
+     # The same restart on an overflowing DECODE row.
+     MERLIN_TOPK_EXACT_DECODE: str | None = None
+     # Deterministic placement and tie membership on the LARGE path.
+-    # Registered here ahead of its code, exactly as the four toggles above
+-    # were, so the full tree is complete; its read site is
+-    # det_large_enabled() in topk.cu on the large path. Setting it without that
+-    # code does nothing, which is why it is a passthrough and not a parsed
+-    # bool that would imply this tree can act on it.
++    # LIVE on this tree since the v2.2 kernel port: the
++    # read site is det_large_enabled() in csrc/libtorch_stable/topk.cu, a
++    # std::getenv resolved once per process, and the resolved value reaches
++    # the large-path radix_topk as a launch argument, so a cudagraph bakes it
++    # in. CAPTURE: yes. AOT: not established (built into the extension, not by
++    # the AOT compiler); hashed conservatively like the switches above. A raw
++    # passthrough because the C++ getter is the single source of truth.
+     MERLIN_TOPK_DET_LARGE: str | None = None
+     #
+     # The large-path FAULT INJECTORS. TEST
+@@ -606,8 +611,8 @@ if TYPE_CHECKING:
+     # without first deleting it from the fence -- which means writing down its
+     # AOT and capture identity against its real read site -- is the exact
+     # failure the fork's env rule exists to prevent, and
+-    # tests/test_envs.py::test_unaudited_host_side_knob_stays_listed_until_it_is_classified
+-    # fails on it.
++    # test_unaudited_host_side_knob_stays_listed_until_it_is_classified (in
++    # tests/test_envs.py) fails on it.
+     #
+     # The fence holds NOTHING BUT the names, one per line. Prose belongs out
+     # here: the gate reads the fence as a set of identifiers, and a knob name
+@@ -2582,6 +2587,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     "MERLIN_TOPK_EXACT_COUNTERS_LOG": lambda: int(
+         os.getenv("MERLIN_TOPK_EXACT_COUNTERS_LOG", "0")
+     ),
++    # Fallback slot count for the counter reader on a build WITHOUT the
++    # persistent_topk_exact_counters_slots op (pre-tie-determinism). This tree registers
++    # that op, so topk_counters.slot_count() never consults the variable here.
++    # Raw passthrough: the reader's int(os.getenv(..., "5")) is the parser.
++    "MERLIN_TOPK_COUNTER_SLOTS": lambda: os.getenv("MERLIN_TOPK_COUNTER_SLOTS", None),
+     # Determinism toggles. See the declaration block above for the AOT /
+     # capture classification and for why three of these are raw passthroughs.
+     # All four are absent from ignored_factors on purpose, so all four are
+@@ -2831,6 +2841,9 @@ def compile_factors() -> dict[str, object]:
+         # host-side timer and a snapshot op, and is read by no compiled code, so
+         # hashing it would invalidate every compile cache for a log interval.
+         "MERLIN_TOPK_EXACT_COUNTERS_LOG",
++        # Host-side reader fallback (buffer length for a snapshot op outside
++        # capture); dead on a build that answers the _slots query.
++        "MERLIN_TOPK_COUNTER_SLOTS",
+         # ------------------------------------------------------------------
+     }
+ 
+diff --git a/vllm/models/qwen4_exp/nvidia/ops/qsa_indexer.py b/vllm/models/qwen4_exp/nvidia/ops/qsa_indexer.py
+index 555e445386..8e5da35a4e 100644
+--- a/vllm/models/qwen4_exp/nvidia/ops/qsa_indexer.py
++++ b/vllm/models/qwen4_exp/nvidia/ops/qsa_indexer.py
+@@ -52,7 +52,7 @@ _QSA_SORT = envs.MERLIN_QSA_SORT
+ 
+ 
+ def _qsa_canonicalise(block_indices: torch.Tensor) -> None:
+-    """Sort selected block indices ascending, padding last. In place, shape preserved."""
++    """Sort selected block indices ascending, padding last. In place, same shape."""
+     if not _QSA_SORT:
+         return
+     big = torch.iinfo(block_indices.dtype).max
+diff --git a/vllm/v1/ple_offload/connector.py b/vllm/v1/ple_offload/connector.py
+index 0d5265115b..2cf05bb449 100644
+--- a/vllm/v1/ple_offload/connector.py
++++ b/vllm/v1/ple_offload/connector.py
+@@ -11,9 +11,6 @@ from typing import Any
+ 
+ import msgspec
+ import torch
+-from vllm.v1.ple_offload import rowdump as _rowdump
+-from vllm.v1.ple_offload.fatal import ple_fail_closed
+-from vllm.v1.ple_offload.progress import PleProgressMonitor
+ import torch.nn as nn
+ import zmq
+ from cuda.bindings import driver as cuda_driver
+@@ -28,6 +25,8 @@ from vllm.model_executor.layers.ple_offload_layer import (
+     flag_check_is_authoritative,
+     stale_offload_flags,
+ )
++from vllm.v1.ple_offload.fatal import ple_fail_closed
++from vllm.v1.ple_offload.progress import PleProgressMonitor
+ from vllm.v1.ple_offload.protocol import (
+     PleOffloadRegistration,
+     PleOffloadRequest,
+@@ -284,7 +283,8 @@ class PleOffloadConnector:
+         }
+         if not layers:
+             raise RuntimeError(
+-                "VLLM_E2_PLE_PULL_TRANSPORT is enabled, but the model has no PleOffloadLayer"
++                "VLLM_E2_PLE_PULL_TRANSPORT is enabled, but the model has no "
++                "PleOffloadLayer"
+             )
+ 
+         config = vllm_config.model_config.hf_text_config
+@@ -711,7 +711,6 @@ class PleOffloadConnector:
+                 f"PLE request count {num_reqs} exceeds connector capacity "
+                 f"{self._query_start_loc_buf.shape[0] - 1}"
+             )
+-        self._rowdump_n = None if dummy_run else num_tokens
+         if dummy_run:
+             self._signal_dummy_outputs_impl(num_tokens)
+             return
+@@ -913,15 +912,6 @@ class PleOffloadConnector:
+             correlation_id=correlation_id,
+         ):
+             raise RuntimeError("PLE test fault: exc_in_release")
+-        n = getattr(self, "_rowdump_n", None)
+-        self._rowdump_n = None
+-        if _rowdump.enabled() and n is not None and not torch.cuda.is_current_stream_capturing():
+-            torch.cuda.current_stream(self.device).synchronize()
+-            seq = getattr(self, "_rowdump_seq", 0)
+-            self._rowdump_seq = seq + 1
+-            for layer in self._layers.values():
+-                _rowdump.write(f"gpu-tp{self.tp_rank}", 0, self.tp_rank, seq,
+-                               self._input_ids_source[:n], layer._gpu_output_buffer[:n])
+         # Reset only after the consumer forward so the CPU worker cannot
+         # overwrite an output that a GPU PLE placeholder may still read.
+         stream = torch.cuda.current_stream(self.device)
+diff --git a/vllm/v1/ple_offload/fatal.py b/vllm/v1/ple_offload/fatal.py
+index a80cad4b8d..90ab4a01ef 100644
+--- a/vllm/v1/ple_offload/fatal.py
++++ b/vllm/v1/ple_offload/fatal.py
+@@ -54,11 +54,7 @@ def ple_fail_closed(
+         detail_suffix = ""
+         if trusted_error:
+             args = BaseException.args.__get__(error, error_type)
+-            if (
+-                type(args) is tuple
+-                and len(args) == 1
+-                and type(args[0]) is str
+-            ):
++            if type(args) is tuple and len(args) == 1 and type(args[0]) is str:
+                 detail = args[0][:512].replace("\n", "\\n")
+                 detail_suffix = f":{detail}"
+         message = (
+@@ -105,7 +101,8 @@ def ple_fail_closed(
+         raw = raw[-8192:]
+         os.write(
+             2,
+-            b"PLE fatal traceback (tail) follows:\n" if clipped
++            b"PLE fatal traceback (tail) follows:\n"
++            if clipped
+             else b"PLE fatal traceback follows:\n",
+         )
+         os.write(2, raw)
+@@ -118,9 +115,13 @@ def ple_fail_closed(
+         # Still guarded, because os._exit below must run whatever happens: an
+         # escape from this handler would leave the worker alive in the state
+         # the fail-closed path exists to end.
+-        try:
++        try:  # noqa: SIM105
+             os.write(2, b"PLE fatal: traceback unavailable\n")
+         except BaseException:
++            # SIM105 declined: an earlier revision made this helper call no
++            # exception-defined code on the dying path. contextlib.suppress
++            # runs a Python __exit__ between here and os._exit below; a bare
++            # except keeps that window empty.
+             pass
+     os._exit(1)
+ 
+@@ -143,9 +144,7 @@ def fail_ple_execute_model(func: _F) -> _F:
+             connector = getattr(self, "_ple_offload_connector", None)
+             if connector is None:
+                 model_runner = getattr(self, "model_runner", None)
+-                connector = getattr(
+-                    model_runner, "_ple_offload_connector", None
+-                )
++                connector = getattr(model_runner, "_ple_offload_connector", None)
+             if connector is None:
+                 raise
+             connector._fail_closed(func.__name__, error)
+diff --git a/vllm/v1/ple_offload/progress.py b/vllm/v1/ple_offload/progress.py
+index bf88291e8e..9ea0406156 100644
+--- a/vllm/v1/ple_offload/progress.py
++++ b/vllm/v1/ple_offload/progress.py
+@@ -20,11 +20,7 @@ _POLL_INTERVAL_S = 0.1
+ 
+ def _validate_deadline(value: float, name: str) -> float:
+     value = float(value)
+-    if (
+-        not math.isfinite(value)
+-        or value <= 0
+-        or value > _MAX_PROGRESS_DEADLINE_S
+-    ):
++    if not math.isfinite(value) or value <= 0 or value > _MAX_PROGRESS_DEADLINE_S:
+         raise ValueError(
+             f"{name} must be finite, greater than zero, and no greater than "
+             f"{_MAX_PROGRESS_DEADLINE_S:g} seconds"
+@@ -123,10 +119,7 @@ class PleProgressMonitor:
+             active = self._submission
+             if active is None or active.sequence != sequence:
+                 raise RuntimeError("PLE fault correlation has no active submission")
+-            return (
+-                f"sequence:{active.sequence}"
+-                f"@begin:{active.started:.9f}"
+-            )
++            return f"sequence:{active.sequence}@begin:{active.started:.9f}"
+ 
+     def completion_is_pending(self, sequence: int) -> bool:
+         """Whether this serving sequence has a retained, incomplete event.
+@@ -149,9 +142,7 @@ class PleProgressMonitor:
+ 
+     def begin(self, *, startup: bool, num_tokens: int) -> int:
+         now = time.monotonic()
+-        budget = (
+-            self._startup_deadline_s if startup else self._serving_deadline_s
+-        )
++        budget = self._startup_deadline_s if startup else self._serving_deadline_s
+         with self._condition:
+             active = self._submission
+             if active is not None:
+diff --git a/vllm/v1/ple_offload/rowdump.py b/vllm/v1/ple_offload/rowdump.py
+deleted file mode 100644
+index 95fd3081b6..0000000000
+--- a/vllm/v1/ple_offload/rowdump.py
++++ /dev/null
+@@ -1,41 +0,0 @@
+-# SPDX-License-Identifier: Apache-2.0
+-"""Debug-only PLE row dump for byte-level transport checks (off unless VLLM_PLE_ROW_DUMP=<dir>).
+-
+-Each process appends framed records to <dir>/<tag>-pid<pid>.bin:
+-  b"PLER" | kind u8 (0 = GPU worker: rows its forward consumed; 1 = offload process: rows it published)
+-  | rank u8 | reserved u16 | seq u32 | n u32 | row_bytes u32 | ids int64[n] | rows uint8[n * row_bytes]
+-"""
+-
+-import os
+-import struct
+-import threading
+-
+-import torch
+-
+-_DIR = os.environ.get("VLLM_PLE_ROW_DUMP", "")
+-_LOCK = threading.Lock()
+-_FILES: dict = {}
+-MAGIC = b"PLER"
+-
+-
+-def enabled() -> bool:
+-    return bool(_DIR)
+-
+-
+-def write(tag: str, kind: int, rank: int, seq: int, ids: torch.Tensor, rows: torch.Tensor) -> None:
+-    ids_cpu = ids.detach().to(device="cpu", dtype=torch.int64).contiguous()
+-    rows_cpu = rows.detach().to(device="cpu").contiguous()
+-    n = int(ids_cpu.shape[0])
+-    if rows_cpu.shape[0] != n:
+-        raise RuntimeError(f"PLE row dump: {rows_cpu.shape[0]} rows for {n} ids")
+-    raw = rows_cpu.view(torch.uint8).numpy().tobytes() if n else b""
+-    row_bytes = len(raw) // n if n else 0
+-    record = (MAGIC + struct.pack("<BBHIII", kind, rank, 0, seq, n, row_bytes)
+-              + ids_cpu.numpy().tobytes() + raw)
+-    with _LOCK:
+-        f = _FILES.get(tag)
+-        if f is None:
+-            os.makedirs(_DIR, exist_ok=True)
+-            f = open(os.path.join(_DIR, f"{tag}-pid{os.getpid()}.bin"), "ab", buffering=0)
+-            _FILES[tag] = f
+-        f.write(record)
+diff --git a/vllm/v1/ple_offload/worker.py b/vllm/v1/ple_offload/worker.py
+index a5f039e407..3d294073da 100644
+--- a/vllm/v1/ple_offload/worker.py
++++ b/vllm/v1/ple_offload/worker.py
+@@ -40,7 +40,6 @@ from typing import Any, cast
+ 
+ import msgspec
+ import torch
+-from vllm.v1.ple_offload import rowdump as _rowdump
+ import torch.distributed as dist
+ import zmq
+ 
+@@ -453,26 +452,20 @@ class PleOffloadWorkerHandle:
+             # Keep parent-death supervision connected while SIGTERM lets
+             # proc_main run its shutdown event and finally cleanup.
+             self.proc.terminate()
+-            try:
++            with contextlib.suppress(subprocess.TimeoutExpired):
+                 self.proc.wait(timeout=5)
+-            except subprocess.TimeoutExpired:
+-                pass
+         if self.death_writer is not None:
+             self.death_writer.close()
+             self.death_writer = None
+         if not graceful and self.proc.poll() is None:
+             # Expired launch: retain the immediate EOF -> TERM path.
+             self.proc.terminate()
+-            try:
++            with contextlib.suppress(subprocess.TimeoutExpired):
+                 self.proc.wait(timeout=5)
+-            except subprocess.TimeoutExpired:
+-                pass
+         if self.proc.poll() is None:
+             self.proc.kill()
+-            try:
++            with contextlib.suppress(subprocess.TimeoutExpired):
+                 self.proc.wait(timeout=5)
+-            except subprocess.TimeoutExpired:
+-                pass
+         # The child normally removes the endpoint in proc_main's finally.
+         # Once it has exited, this exact PLE-owned address is safe to remove as
+         # a fallback for SIGKILL or an interrupted child cleanup.
+@@ -1234,12 +1227,6 @@ class PleOffloadRunner:
+                     ngram_context,
+                     output_buffer=self._scratch_bufs[dp_rank][layer_name],
+                 )
+-                if _rowdump.enabled():
+-                    _seq = getattr(self, "_rowdump_seq", 0)
+-                    self._rowdump_seq = _seq + 1
+-                    _rowdump.write(f"offload-dp{dp_rank}", 1, dp_rank, _seq,
+-                                   input_bufs.input_ids_buf[: request.num_tokens], result)
+-
+                 # The result is identical on every TP rank in this DP group.
+                 # A worker's host buffer may be overwritten only after its GPU
+                 # released the previous result (``release_outputs`` stores
+diff --git a/vllm/v1/worker/e2_memstats.py b/vllm/v1/worker/e2_memstats.py
+index 586f8fa61a..9fcbfcfb7b 100644
+--- a/vllm/v1/worker/e2_memstats.py
++++ b/vllm/v1/worker/e2_memstats.py
+@@ -1,40 +1,57 @@
+ # SPDX-License-Identifier: Apache-2.0
+-"""Debug-only allocator telemetry for E2, BOUNDARY-ONLY. Off unless VLLM_E2_MEMSTATS=<ctl poll seconds> and
+-VLLM_E2_MEMSTATS_DIR=<dir>.
+-
+-WHY THIS IS NOT A SAMPLER ANY MORE. An earlier version read torch.cuda.memory_stats() and
+-reset_peak_memory_stats() every VLLM_E2_MEMSTATS seconds. Both take the per-device caching-allocator mutex and the
+-Python bindings do not release the GIL, so the old contract's claim that this thread "takes no lock shared with the
+-model path" was FALSE. Three one-boot runs at one KV pin showed a monotone dose-response: sampling at 4 Hz wedged a
+-stage-0 worker during a 131072-token row; at 1.1 Hz it survived that row and wedged during a 260000-token row; with the
+-thread disabled the run completed every row. Causation is not established at n=1 per run
+-(single runs only), but polling has no place inside a measured region, and it was
+-never necessary: PyTorch maintains the allocator high-water marks itself, so reading them once per window is exact.
+-
+-WHAT THIS THREAD DOES NOW. Between window boundaries it makes NO CUDA calls and touches NO allocator state: its tick
+-is a plain read of <dir>/window.ctl, which holds "<seq> <name>". The gate driver crosses a boundary only while the
+-server is quiet (no request running). On a new seq the thread performs these boundary-only allocator reads:
+-  1. memory_stats()            -> the closing window's exact high-water marks and cumulative retry/OOM counters
+-  2. reset_peak_memory_stats() -> immediately after the read, with no file I/O in the gap
++"""Debug-only allocator telemetry for E2, BOUNDARY-ONLY. Off unless
++VLLM_E2_MEMSTATS=<ctl poll seconds> and VLLM_E2_MEMSTATS_DIR=<dir>.
++
++WHY THIS IS NOT A SAMPLER ANY MORE. An earlier version read
++torch.cuda.memory_stats() and reset_peak_memory_stats() every VLLM_E2_MEMSTATS
++seconds. Both take the per-device caching-allocator mutex and the Python
++bindings do not release the GIL, so the old contract's claim that this thread
++"takes no lock shared with the model path" was FALSE. Three one-boot arms at a
++4.1e9 KV pin showed a monotone dose-response: sampling at 4 Hz wedged a stage-0
++worker during a 131K thinking-on row; at 1.1 Hz it survived that row and wedged during
++a 260K row; with the thread disabled the run completed every row. Causation
++is not established at n=1 per arm (a known limit of
++that capacity probe), but polling has no place
++inside a measured region, and it was never necessary: PyTorch maintains the
++allocator high-water marks itself, so reading them once per window is exact.
++
++WHAT THIS THREAD DOES NOW. Between window boundaries it makes NO CUDA calls and
++touches NO allocator state: its tick is a plain read of <dir>/window.ctl, which
++holds "<seq> <name>". The gate driver crosses a boundary only while the server
++is quiet (no request running). On a new seq the thread performs these
++boundary-only allocator reads:
++  1. memory_stats()            -> the closing window's exact high-water marks
++                                  and cumulative retry/OOM counters
++  2. reset_peak_memory_stats() -> immediately after the read, with no file I/O
++                                  in the gap
+   3. mem_get_info()            -> device free/total AT THAT QUIESCENT INSTANT
+-  4. host_memory_stats()       -> pinned-host allocator current values, outside the read-to-reset gap
+-then writes the "close" record for the old window and the "ack" record for the new one.
++  4. host_memory_stats()       -> pinned-host allocator current values, outside
++                                  the read-to-reset gap
++then writes the "close" record for the old window and the "ack" record for the
++new one.
+ 
+ WHAT THIS MEASURES.
+-  - A row's allocator peak is EXACT for that row's window (not a sampled maximum; it cannot miss a transient).
+-  - Device free/total is observed ONLY at quiescent boundaries. No minimum-free figure exists for the inside of a
+-    row, and none may be reported.
+-  - Retry and OOM counters are cumulative and never reset; per-row deltas come from consecutive close records.
+-  - There is NO interval-level peak. A qualifying interval is narrower than its row and is identified only
+-    afterwards from the scheduler log, so the peak attributable to it is the ROW-level high-water mark, which
+-    over-includes the prefill ramp. This loss of resolution is inherent to the design.
+-
+-Records (one JSON per line): kind start | close | ack | error; rank, local, dev, pid; window, seq; and for close:
+-allocated_bytes.all.current, reserved_bytes.all.current, alloc_peak_w, res_peak_w, retries, ooms, free, total,
+-run_alloc_peak, run_res_peak, and a host object containing every host_memory_stats() key ending in ".current".
+-Records are written with synchronous file I/O, never inside the read-to-reset gap. Nothing
+-here raises into the worker.
++  - A row's allocator peak is EXACT for that row's window (not a sampled
++    maximum; it cannot miss a transient).
++  - Device free/total is observed ONLY at quiescent boundaries. No minimum-free
++    figure exists for the inside of a row, and none may be reported.
++  - Retry and OOM counters are cumulative and never reset; per-row deltas come
++    from consecutive close records.
++  - There is NO interval-level peak. A qualifying interval is narrower
++    than its row and is identified only afterwards from the scheduler log, so
++    the peak attributable to it is the ROW-level high-water mark, which
++    over-includes the prefill ramp. Report this loss of resolution
++    explicitly.
++
++Records (one JSON per line): kind start | close | ack | error; rank, local,
++dev, pid; window, seq; and for close: allocated_bytes.all.current,
++reserved_bytes.all.current, alloc_peak_w, res_peak_w, retries, ooms, free,
++total, run_alloc_peak, run_res_peak, and a host object containing every
++host_memory_stats() key ending in ".current". Records are written with
++synchronous file I/O, never inside the read-to-reset gap. Nothing here raises
++into the worker.
+ """
++
+ import json
+ import os
+ import threading
+@@ -57,17 +74,11 @@ def _close_metrics(dev):
+     free, total = torch.cuda.mem_get_info(dev)
+     host_stats = torch.cuda.host_memory_stats()
+     host = {
+-        key: int(value)
+-        for key, value in host_stats.items()
+-        if key.endswith(".current")
++        key: int(value) for key, value in host_stats.items() if key.endswith(".current")
+     }
+     return {
+-        "allocated_bytes.all.current": int(
+-            s.get("allocated_bytes.all.current", 0)
+-        ),
+-        "reserved_bytes.all.current": int(
+-            s.get("reserved_bytes.all.current", 0)
+-        ),
++        "allocated_bytes.all.current": int(s.get("allocated_bytes.all.current", 0)),
++        "reserved_bytes.all.current": int(s.get("reserved_bytes.all.current", 0)),
+         "alloc_peak_w": ap,
+         "res_peak_w": rp,
+         "retries": int(s.get("num_alloc_retries", 0)),
+@@ -85,9 +96,20 @@ def enabled() -> bool:
+ def ensure_started(worker, armed_by: str = "compile_or_warm_up_model") -> None:
+     if _started:
+         return
+-    dev = torch.cuda.current_device()   # captured on the worker's own thread: every call below passes it explicitly
+-    t = threading.Thread(target=_loop, name="e2-memstats", daemon=True,
+-                         args=(dev, getattr(worker, "rank", -1), getattr(worker, "local_rank", -1), armed_by))
++    dev = (
++        torch.cuda.current_device()
++    )  # captured on the worker's own thread: every call below passes it explicitly
++    t = threading.Thread(
++        target=_loop,
++        name="e2-memstats",
++        daemon=True,
++        args=(
++            dev,
++            getattr(worker, "rank", -1),
++            getattr(worker, "local_rank", -1),
++            armed_by,
++        ),
++    )
+     _started.append(t)
+     t.start()
+ 
+@@ -103,7 +125,13 @@ def _ctl():
+ 
+ def _loop(dev, rank, local, armed_by):
+     os.makedirs(_DIR, exist_ok=True)
+-    f = open(os.path.join(_DIR, f"memstats-rank{rank}-pid{os.getpid()}.jsonl"), "a", buffering=1)
++    # noqa SIM115: the handle lives as long as the telemetry daemon thread
++    # that writes to it; there is no scope to close it in.
++    f = open(  # noqa: SIM115
++        os.path.join(_DIR, f"memstats-rank{rank}-pid{os.getpid()}.jsonl"),
++        "a",
++        buffering=1,
++    )
+     base = {"rank": rank, "local": local, "dev": dev, "pid": os.getpid()}
+ 
+     def w(rec):
+@@ -112,25 +140,61 @@ def _loop(dev, rank, local, armed_by):
+     run_ap = run_rp = 0
+     seq, name = _ctl() or (0, "serve")
+     torch.cuda.reset_peak_memory_stats(dev)
+-    w({"kind": "start", "t": round(time.time(), 4), "m": round(time.monotonic(), 4), "armed_by": armed_by,
+-       "window": name, "seq": seq, "version": VERSION, "poll_s": _SEG})
++    w(
++        {
++            "kind": "start",
++            "t": round(time.time(), 4),
++            "m": round(time.monotonic(), 4),
++            "armed_by": armed_by,
++            "window": name,
++            "seq": seq,
++            "version": VERSION,
++            "poll_s": _SEG,
++        }
++    )
+     while True:
+         time.sleep(_SEG)
+         try:
+-            c = _ctl()                                   # file read only: no CUDA, no allocator lock, no GIL-held call
++            c = _ctl()  # file read only: no CUDA, no allocator lock, no GIL-held call
+             if c is None or c[0] == seq:
+                 continue
+-            # Boundary. The driver only crosses one while the server is quiet, so this is the single point at which
+-            # this thread touches the allocator at all.
++            # Boundary. The driver only crosses one while the server is
++            # quiet, so this is the single point at which this thread
++            # touches the allocator at all.
+             metrics = _close_metrics(dev)
+             ap = metrics["alloc_peak_w"]
+             rp = metrics["res_peak_w"]
+             run_ap, run_rp = max(run_ap, ap), max(run_rp, rp)
+-            w({"kind": "close", "t": round(time.time(), 4), "m": round(time.monotonic(), 4), "window": name,
+-               "seq": seq, **metrics,
+-               "run_alloc_peak": run_ap, "run_res_peak": run_rp})
++            w(
++                {
++                    "kind": "close",
++                    "t": round(time.time(), 4),
++                    "m": round(time.monotonic(), 4),
++                    "window": name,
++                    "seq": seq,
++                    **metrics,
++                    "run_alloc_peak": run_ap,
++                    "run_res_peak": run_rp,
++                }
++            )
+             seq, name = c
+-            w({"kind": "ack", "t": round(time.time(), 4), "m": round(time.monotonic(), 4), "window": name, "seq": seq})
++            w(
++                {
++                    "kind": "ack",
++                    "t": round(time.time(), 4),
++                    "m": round(time.monotonic(), 4),
++                    "window": name,
++                    "seq": seq,
++                }
++            )
+         except Exception as e:  # noqa: BLE001 - telemetry must never raise into the worker
+-            w({"kind": "error", "t": round(time.time(), 4), "m": round(time.monotonic(), 4), "window": name,
+-               "seq": seq, "error": f"{type(e).__name__}: {e}"[:300]})
++            w(
++                {
++                    "kind": "error",
++                    "t": round(time.time(), 4),
++                    "m": round(time.monotonic(), 4),
++                    "window": name,
++                    "seq": seq,
++                    "error": f"{type(e).__name__}: {e}"[:300],
++                }
++            )
+diff --git a/vllm/v1/worker/gpu/cudagraph_utils.py b/vllm/v1/worker/gpu/cudagraph_utils.py
+index 0e132b6afa..91d4d92da3 100644
+--- a/vllm/v1/worker/gpu/cudagraph_utils.py
++++ b/vllm/v1/worker/gpu/cudagraph_utils.py
+@@ -481,7 +481,10 @@ class CudaGraphManager:
+                         if self._capture_mem_samples is not None:
+                             torch.accelerator.synchronize()
+                             free_before = torch.accelerator.get_memory_info()[0]
+-                        with self.capture_ple_copy_geometry(desc):
++                        # noqa SIM117 declined: merging this with the inner
++                        # torch.cuda.graph block would re-indent upstream
++                        # lines this fork has no business reformatting.
++                        with self.capture_ple_copy_geometry(desc):  # noqa: SIM117
+                             with torch.cuda.graph(
+                                 graph, self.pool, stream=self._capture_stream(desc)
+                             ):
+diff --git a/vllm_ple_offload_bootstrap/__init__.py b/vllm_ple_offload_bootstrap/__init__.py
+index 60ddda472d..73f017cde5 100644
+--- a/vllm_ple_offload_bootstrap/__init__.py
++++ b/vllm_ple_offload_bootstrap/__init__.py
+@@ -17,6 +17,8 @@ _FAULT = None
+ if os.environ.get("VLLM_PLE_TEST_FAULT") is not None:
+     from vllm_ple_test_fault import (
+         _FAULT as _FAULT,
++    )
++    from vllm_ple_test_fault import (
+         _block_on_harness_gate,
+     )
+ 
+@@ -160,9 +162,11 @@ def main() -> None:
+     death_pipe = Connection(death_fd)
+ 
+     def monitor_parent() -> None:
+-        try:
++        try:  # noqa: SIM105
+             death_pipe.recv()
+         except (EOFError, OSError):
++            # SIM105 declined: this module's contract is the docstring above --
++            # its import list is the audited surface of the pre-torch child.
+             pass
+         os._exit(1)
+ 

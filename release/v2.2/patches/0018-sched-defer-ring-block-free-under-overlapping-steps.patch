@@ -1,0 +1,253 @@
+From f244baeb68ff2f50aa48f7ebbffe9e39c924dc78 Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Tue, 22 Sep 2026 04:13:09 -0400
+Subject: [PATCH 18/58] sched: defer ring-block free under overlapping steps
+
+A circular-buffer ring block could be freed while an earlier, still-executing
+step was reading it. The free is deferred until the overlapping step has
+committed.
+---
+ tests/v1/core/test_deferred_block_free.py | 154 ++++++++++++++++++++++
+ vllm/v1/core/sched/scheduler.py           |  33 +++++
+ 2 files changed, 187 insertions(+)
+
+diff --git a/tests/v1/core/test_deferred_block_free.py b/tests/v1/core/test_deferred_block_free.py
+index ebbf492e20..0c4738a4fe 100644
+--- a/tests/v1/core/test_deferred_block_free.py
++++ b/tests/v1/core/test_deferred_block_free.py
+@@ -17,8 +17,11 @@ from unittest.mock import PropertyMock, patch
+ 
+ import pytest
+ 
++import torch
++
+ from vllm.config import VllmConfig
+ from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
++from vllm.v1.kv_cache_interface import CircularBufferSpec
+ from vllm.v1.core.sched.output import SchedulerOutput
+ from vllm.v1.outputs import ModelRunnerOutput
+ from vllm.v1.request import RequestStatus
+@@ -544,3 +547,154 @@ def test_cow_retentions_deferred_until_copy_step_processed():
+     assert not scheduler.deferred_frees
+     out2 = scheduler.schedule()
+     assert [r.req_id for r in out2.scheduled_new_reqs] == ["late"]
++
++
++# --------------------------------------------------------------------------
++# Ring-skip telemetry: the ring gate. A CircularBufferSpec group (the QSA raw-key
++# ring, one block per request, rewritten every step) enables deferral under
++# overlapping batches WITHOUT a KV connector.
++# --------------------------------------------------------------------------
++
++def _ring_spec(block_size: int = 16) -> CircularBufferSpec:
++    return CircularBufferSpec(
++        block_size=block_size, num_kv_heads=1, head_size=1, dtype=torch.float32
++    )
++
++
++def test_gate_enabled_for_ring_group_with_overlapping_batches():
++    # Overlap is forced the same way test_gate_enabled_for_async_consumer
++    # forces it: async scheduling is disabled on CPU and PP needs GPUs.
++    with patch.object(
++        VllmConfig,
++        "max_concurrent_batches",
++        new_callable=PropertyMock,
++        return_value=2,
++    ):
++        scheduler = create_scheduler(
++            model=MODEL, async_scheduling=True, kv_cache_spec=_ring_spec()
++        )
++    assert scheduler.defer_block_free
++
++
++def test_gate_disabled_for_ring_group_without_overlap():
++    # One batch in flight at a time: nothing can race the free. The gate must
++    # stay off so the single-step path keeps immediate frees. Overlap is
++    # forced to 1 explicitly: whether async scheduling survives on the test
++    # platform is not the property under test.
++    with patch.object(
++        VllmConfig,
++        "max_concurrent_batches",
++        new_callable=PropertyMock,
++        return_value=1,
++    ):
++        scheduler = create_scheduler(
++            model=MODEL, async_scheduling=True, kv_cache_spec=_ring_spec()
++        )
++    assert not scheduler.defer_block_free
++
++
++def test_gate_disabled_for_non_ring_group_without_connector():
++    # The earlier negative case, restated under the new gate: full attention
++    # + overlap + no connector must still be off.
++    with patch.object(
++        VllmConfig,
++        "max_concurrent_batches",
++        new_callable=PropertyMock,
++        return_value=2,
++    ):
++        scheduler = create_scheduler(model=MODEL, async_scheduling=True)
++    assert not scheduler.defer_block_free
++
++
++def test_ring_preempt_withholds_the_ring_block_until_the_fence():
++    """The property the ring gate buys: a preempted request's ring block does not
++    return to the pool while a step that may still write it is in flight,
++    and it does return once the newest in-flight step's output is processed.
++    """
++    with patch.object(
++        VllmConfig,
++        "max_concurrent_batches",
++        new_callable=PropertyMock,
++        return_value=2,
++    ):
++        scheduler = create_scheduler(
++            model=MODEL, async_scheduling=True, kv_cache_spec=_ring_spec()
++        )
++    assert scheduler.defer_block_free  # via the ring gate, nothing forced
++    pool = scheduler.kv_cache_manager.block_pool
++    num_free_initially = pool.get_num_free_blocks()
++
++    request, out0, out1 = _setup_request_with_inflight_step(scheduler)
++    num_free_running = pool.get_num_free_blocks()
++    # the ring is one block per request for its whole lifetime
++    assert num_free_running == num_free_initially - 1
++
++    scheduler.running.remove(request)
++    scheduler._preempt_request(request, time.monotonic())
++    assert request.status == RequestStatus.PREEMPTED
++    assert len(scheduler.deferred_frees) == 1
++    assert pool.get_num_free_blocks() == num_free_running
++    for manager in scheduler.kv_cache_manager.coordinator.single_type_managers:
++        assert request.request_id not in manager.req_to_blocks
++
++    scheduler.update_from_output(out0, _make_model_runner_output(out0))
++    assert len(scheduler.deferred_frees) == 1
++    assert pool.get_num_free_blocks() == num_free_running
++    scheduler.update_from_output(out1, _make_model_runner_output(out1))
++    assert not scheduler.deferred_frees
++    assert pool.get_num_free_blocks() == num_free_initially
++
++
++def test_deferred_victim_stops_the_preemption_cascade():
++    """Under deferred free a preempted victim returns no blocks
++    until its in-flight step is processed, so the allocation retry must not
++    keep preempting. Two 48-token requests fill a 6-block pool; the first
++    request's speculative decode (token 49) needs a 4th block. Expected: exactly ONE
++    victim (the last running request), the requester stays RUNNING and
++    unscheduled, and after the in-flight step is processed it gets its block.
++    Without the fix this preempts both requests in one schedule() call.
++    """
++    with patch.object(
++        VllmConfig,
++        "max_concurrent_batches",
++        new_callable=PropertyMock,
++        return_value=2,
++    ):
++        # 7 blocks = 6 usable (block 0 is the null block); ring gate irrelevant
++        # here, the cascade is the scheduler's -- force deferral as the
++        # upstream tests do.
++        scheduler = create_scheduler(
++            model=MODEL, async_scheduling=True, num_blocks=7, block_size=16
++        )
++    scheduler.defer_block_free = True
++    pool = scheduler.kv_cache_manager.block_pool
++    assert pool.get_num_free_blocks() == 6
++
++    reqs = create_requests(
++        num_requests=2, num_tokens=48, max_tokens=8, stop_token_ids=[STOP_TOKEN_ID]
++    )
++    for r in reqs:
++        scheduler.add_request(r)
++    out0 = scheduler.schedule()
++    assert sorted(out0.num_scheduled_tokens.values()) == [48, 48]
++    assert pool.get_num_free_blocks() == 0
++
++    # step 2 (step 1 in flight): the first request's decode crosses into a
++    # 4th block -> allocation fails -> the loop preempts the LAST running one.
++    first, second = scheduler.running[0], scheduler.running[1]
++    out1 = scheduler.schedule()
++    assert second.status == RequestStatus.PREEMPTED
++    assert first.status == RequestStatus.RUNNING, "the cascade reached the requester"
++    assert first in scheduler.running
++    assert len(scheduler.deferred_frees) == 1
++    assert pool.get_num_free_blocks() == 0
++    assert first.request_id not in out1.num_scheduled_tokens
++
++    # step 1's output processed: the victim's blocks drain, the requester
++    # is scheduled on the next call.
++    scheduler.update_from_output(out0, _make_model_runner_output(out0))
++    assert not scheduler.deferred_frees
++    assert pool.get_num_free_blocks() == 3
++    out2 = scheduler.schedule()
++    assert first.request_id in out2.num_scheduled_tokens
++    assert first.status == RequestStatus.RUNNING
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 9f2d99d261..f1c9b79b02 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -56,10 +56,12 @@ from vllm.v1.core.sched.request_queue import (
+ from vllm.v1.core.sched.utils import check_stop, remove_all
+ from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
+ from vllm.v1.kv_cache_interface import (
++    CircularBufferSpec,
+     KVCacheConfig,
+     MambaSpec,
+     get_mamba_prefill_checkpoint_position,
+     is_mamba_prefill_checkpoint_valid,
++    iter_layer_specs,
+ )
+ from vllm.v1.metrics.perf import ModelMetrics, PerfStats
+ from vllm.v1.metrics.stats import (
+@@ -177,6 +179,26 @@ class Scheduler(SchedulerInterface):
+ 
+             self.requires_kv_delivery = self.connector.requires_kv_delivery
+ 
++        # Ring-skip telemetry: the QSA ring block (CircularBufferSpec) is rewritten
++        # by every step that touches the request, so with overlapping batches
++        # (async scheduling or PP) an in-flight step may still be committing a
++        # freed/preempted request's suffix rows when the scheduler hands that
++        # block to another request. A KV connector is not the only writer that
++        # can race the stale in-flight write; the next request's own first
++        # step is. Defer the return of freed blocks to the pool until the
++        # newest scheduled step's output has been processed whenever a ring
++        # group exists. Same mechanism and fence as the connector gate above.
++        if (
++            not self.defer_block_free
++            and self.vllm_config.max_concurrent_batches > 1
++            and any(
++                isinstance(spec, CircularBufferSpec)
++                for group in kv_cache_config.kv_cache_groups
++                for spec in iter_layer_specs(group.kv_cache_spec)
++            )
++        ):
++            self.defer_block_free = True
++
+         self.kv_event_publisher = EventPublisherFactory.create(
+             self.kv_events_config,
+             self.parallel_config.data_parallel_index,
+@@ -789,6 +811,7 @@ class Scheduler(SchedulerInterface):
+                     else:
+                         preempted_req = self.running.pop()
+ 
++                    num_deferred_before = len(self.deferred_frees)
+                     self._preempt_request(
+                         preempted_req,
+                         scheduled_timestamp,
+@@ -798,6 +821,16 @@ class Scheduler(SchedulerInterface):
+                     if preempted_req == request:
+                         # No more request to preempt. Cannot schedule this request.
+                         break
++                    if len(self.deferred_frees) > num_deferred_before:
++                        # The ring-skip fix: the victim's blocks are fenced
++                        # behind its in-flight step and return to the pool only
++                        # when that step's output is processed, so retrying the
++                        # allocation now cannot succeed on their account and would
++                        # preempt the next request for nothing -- with every running
++                        # request in flight (PP / async) the whole batch. Stop at one
++                        # deferred victim; this request stays running, unscheduled,
++                        # and retries next step after the drain.
++                        break
+ 
+             if new_blocks is None:
+                 # Cannot schedule this request.

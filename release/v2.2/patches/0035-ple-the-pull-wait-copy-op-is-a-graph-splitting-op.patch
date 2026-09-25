@@ -1,0 +1,64 @@
+From 46ead3f29f03cf92747a353c5096a6badeaaefe4 Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Wed, 23 Sep 2026 07:16:45 -0400
+Subject: [PATCH 35/58] ple: the pull wait/copy op is a graph splitting op
+
+With the wait/copy inside a compiled piece, Inductor's post-grad
+auto-functionalization decomposition failed on the stage-0 ranks.
+---
+ tests/v1/test_ple_pull_compile_profile.py | 14 +++++++++-----
+ vllm/config/compilation.py                |  6 ++++++
+ vllm/v1/e2_guards.py                      |  1 +
+ 3 files changed, 16 insertions(+), 5 deletions(-)
+
+diff --git a/tests/v1/test_ple_pull_compile_profile.py b/tests/v1/test_ple_pull_compile_profile.py
+index f35926db0f..4f7b17516f 100644
+--- a/tests/v1/test_ple_pull_compile_profile.py
++++ b/tests/v1/test_ple_pull_compile_profile.py
+@@ -433,8 +433,12 @@ def test_wait_copy_op_keeps_its_fake_impl() -> None:
+     )
+ 
+ 
+-def test_wait_copy_is_not_a_splitting_op() -> None:
+-    """Add it to splitting_ops only if a reference-host experiment shows
+-    piecewise capture of the pull wait/copy is unsafe. Pinned so a change is
+-    deliberate."""
+-    assert "vllm::ple_offload_wait_copy" not in CompilationConfig._attention_ops
++def test_wait_copy_is_a_splitting_op() -> None:
++    """Resolved on the reference host: inside an
++    Inductor graph the mutating wait/copy failed post-grad ("auto_functionalized
++    was not removed") on both stage-0 ranks, so it is a split point and the
++    guard requires it."""
++    from vllm.v1.e2_guards import REQUIRED_SPLITTING_OPS
++
++    assert "vllm::ple_offload_wait_copy" in CompilationConfig._attention_ops
++    assert "vllm::ple_offload_wait_copy" in REQUIRED_SPLITTING_OPS
+diff --git a/vllm/config/compilation.py b/vllm/config/compilation.py
+index 8cc29736e2..f11bea4e6d 100644
+--- a/vllm/config/compilation.py
++++ b/vllm/config/compilation.py
+@@ -783,6 +783,12 @@ class CompilationConfig:
+         "vllm::qwen4_exp_ple_finalize_prefetch",
+         "vllm::qwen4_exp_ple_short_conv",
+         "vllm::qwen4_exp_qsa_with_output",
++        # Fork (pull transport with the compile-profile guard, found on the reference host): the PLE pull transport's wait+DMA
++        # mutates a module-owned buffer; inside an Inductor graph it failed
++        # post-grad with "auto_functionalized was not removed" on the stage-0
++        # ranks. As a split point it runs between pieces, like attention.
++        "vllm::ple_offload_wait_copy",
++        "vllm::ple_offload_wait",
+         "vllm::linear_attention",
+         "vllm::qwen_gdn_attention_core",
+         "vllm::qwen_gdn_attention_core_fused_norm_packed",
+diff --git a/vllm/v1/e2_guards.py b/vllm/v1/e2_guards.py
+index 1917885117..5f0ed88ad4 100644
+--- a/vllm/v1/e2_guards.py
++++ b/vllm/v1/e2_guards.py
+@@ -61,6 +61,7 @@ REQUIRED_SPLITTING_OPS = (
+     "vllm::qwen4_exp_ple_finalize_prefetch",
+     "vllm::qwen_gdn_attention_core",
+     "vllm::qwen_gdn_attention_core_fused_norm_packed",
++    "vllm::ple_offload_wait_copy",
+ )
+ 
+ #: Upstream v0.30.0 auto-enabled breakable cudagraphs for these; this tree

@@ -1,0 +1,1012 @@
+From 1ef7e6dd371f4b96816dbe5e3a80e8306dee33f3 Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Wed, 23 Sep 2026 10:01:40 -0400
+Subject: [PATCH 51/58] ple, tests: debug-gated pull-flag check; diagnostics
+ report that they ran
+
+The pull-transport flag check is wired in (rank-gated, off by default, warns when enabled). Both
+diagnostic checks log that they ran. Test repairs for helpers v0.30.0 renamed.
+---
+ .../kernels/mamba/test_precopy_mamba_align.py | 158 ++++++++++++
+ .../v1/ple_offload/test_flag_check_wiring.py  | 240 ++++++++++++++++++
+ .../ple_offload/test_stale_flag_assertion.py  | 135 ++++++++++
+ .../worker/gpu/test_mamba_slot_ownership.py   |  40 +++
+ .../gpu/test_pp_deferred_mamba_block_table.py |  11 +-
+ .../layers/ple_offload_layer.py               |  85 +++++++
+ vllm/v1/ple_offload/connector.py              | 151 +++++++++++
+ vllm/v1/worker/mamba_utils.py                 |  20 ++
+ 8 files changed, 836 insertions(+), 4 deletions(-)
+ create mode 100644 tests/v1/ple_offload/test_flag_check_wiring.py
+ create mode 100644 tests/v1/ple_offload/test_stale_flag_assertion.py
+
+diff --git a/tests/kernels/mamba/test_precopy_mamba_align.py b/tests/kernels/mamba/test_precopy_mamba_align.py
+index 1229511f05..460c4b9d29 100644
+--- a/tests/kernels/mamba/test_precopy_mamba_align.py
++++ b/tests/kernels/mamba/test_precopy_mamba_align.py
+@@ -21,7 +21,11 @@ The kernel must also no-op when ``src_col < 0`` (fresh request) or
+ 
+ from __future__ import annotations
+ 
++import ast
++import inspect
+ import os
++import sys
++import textwrap
+ from collections.abc import Callable
+ from types import SimpleNamespace
+ from typing import Any
+@@ -168,6 +172,7 @@ def _reference(convs, ssms, bt, src_col, dst_col, bias, num_reqs, conv_dim_first
+ @_parametrize("token_bias", [0, 1, 2])
+ @_parametrize("has_idx_mapping", [True, False])
+ @_parametrize("temporal_tiles", [1, _TEMPORAL_TILES])
++@_gpu_host_tier
+ @_cuda_required
+ def test_precopy_matches_v1_copy_specs(
+     num_reqs,
+@@ -213,6 +218,11 @@ def test_precopy_matches_v1_copy_specs(
+     )
+     bt_ptrs = torch.tensor([bt.data_ptr()], dtype=torch.int64, device=device)
+     idx_mapping = torch.arange(num_reqs, dtype=torch.int32, device=device)
++    # The bounds-guard instrumentation added block_table_num_rows + guard_ctr after the row
++    # stride. This launch predated them and passed 15 positionals to a
++    # 17-positional kernel, so it could never bind.
++    # test_every_launch_in_this_file_binds_the_kernel_signature pins it GPU-free.
++    guard_ctr = torch.zeros(3, dtype=torch.int64, device=device)
+     grid = (num_reqs, NUM_LAYERS * 2, temporal_tiles)
+     precopy_mamba_align_fused_kernel[grid](
+         dst_col,
+@@ -220,6 +230,8 @@ def test_precopy_matches_v1_copy_specs(
+         bias,
+         bt_ptrs,
+         bt.stride(0),
++        bt.size(0),
++        guard_ctr,
+         base,
+         blk_stride,
+         elem,
+@@ -240,6 +252,152 @@ def test_precopy_matches_v1_copy_specs(
+     for layer in range(NUM_LAYERS):
+         torch.testing.assert_close(convs[layer], conv_ref[layer], rtol=0, atol=0)
+         torch.testing.assert_close(ssms[layer], ssm_ref[layer], rtol=0, atol=0)
++    # Every row is < bt.size(0) here, so a non-zero count is a guard false
++    # positive (or an out-of-range row this setup does not create).
++    assert int(guard_ctr[0]) == 0, "in-range rows must not trip the bounds guard"
++
++
++# The Triton kernels launched in this file, by the name the launch uses.
++_LAUNCHED_KERNELS = {
++    "precopy_mamba_align_fused_kernel": precopy_mamba_align_fused_kernel,
++    "postprocess_mamba_fused_kernel": postprocess_mamba_fused_kernel,
++}
++
++
++def _launch_sites_in_this_file() -> list[tuple[int, str, int, list[str], list]]:
++    """``(lineno, kernel, n_positional, keyword_names, positional_exprs)`` for
++    every ``<kernel>[grid](...)`` call in this module's source."""
++    tree = ast.parse(inspect.getsource(sys.modules[__name__]))
++    sites = []
++    for node in ast.walk(tree):
++        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Subscript)):
++            continue
++        target = node.func.value
++        if not (isinstance(target, ast.Name) and target.id in _LAUNCHED_KERNELS):
++            continue
++        assert not any(isinstance(a, ast.Starred) for a in node.args), (
++            f"line {node.lineno}: a *args launch cannot be checked statically"
++        )
++        sites.append(
++            (
++                node.lineno,
++                target.id,
++                len(node.args),
++                [kw.arg for kw in node.keywords],
++                node.args,
++            )
++        )
++    return sites
++
++
++def launch_arity_findings(sites) -> list[str]:
++    """Every way a launch site fails to bind its kernel's signature.
++
++    The rule this file follows: runtime parameters are passed POSITIONALLY and
++    all of them are passed; ``tl.constexpr`` parameters (read from the kernel's
++    own source annotations, since ``block_size`` is a lower-case constexpr) are
++    passed by keyword. A launch one runtime parameter
++    short does not fail until Triton binds it on a GPU, which is how
++    ``test_precopy_matches_v1_copy_specs`` stayed broken from that change onwards
++    without anyone seeing it (it was never run). Checked here with no device.
++    """
++    findings = []
++    for lineno, name, n_pos, kw_names, pos_exprs in sites:
++        kernel = _LAUNCHED_KERNELS[name]
++        fn = getattr(kernel, "fn", kernel)
++        sig = inspect.signature(fn)
++        [fdef] = [
++            n
++            for n in ast.parse(textwrap.dedent(inspect.getsource(fn))).body
++            if isinstance(n, ast.FunctionDef)
++        ]
++        constexpr = {
++            a.arg
++            for a in fdef.args.args
++            if a.annotation is not None
++            and ast.unparse(a.annotation).endswith("constexpr")
++        }
++        assert constexpr, f"{name}: no tl.constexpr parameters found in source"
++        runtime = [p for p in sig.parameters if p not in constexpr]
++        if n_pos != len(runtime):
++            findings.append(
++                f"line {lineno}: {name} launched with {n_pos} positional "
++                f"argument(s), kernel declares {len(runtime)} runtime "
++                f"parameter(s) {runtime}"
++            )
++            continue
++        try:
++            sig.bind(*([None] * n_pos), **dict.fromkeys(kw_names))
++        except TypeError as error:
++            findings.append(f"line {lineno}: {name}: {error}")
++            continue
++        # The bounds-guard counter slot must be handed a guard counter, not
++        # whatever tensor happened to land in that position.
++        if "guard_ctr" in runtime:
++            expr = pos_exprs[runtime.index("guard_ctr")]
++            text = ast.unparse(expr)
++            if "guard" not in text:
++                findings.append(
++                    f"line {lineno}: {name}: guard_ctr position receives "
++                    f"{text!r}, not a guard counter"
++                )
++    return findings
++
++
++def test_every_launch_in_this_file_binds_the_kernel_signature():
++    """GPU-free: each kernel launch in this module binds its real signature.
++
++    An earlier ``test_precopy_matches_v1_copy_specs`` passed 15 positionals
++    to a kernel that has taken 17 since the bounds-guard instrumentation added
++    ``block_table_num_rows`` and ``guard_ctr``, and nothing noticed because the
++    GPU tier never ran it. FAILING CONTROL: on the unrepaired file this reports
++    the precopy launch as 15 vs 17 (see ``test_arity_check_discriminates``).
++    """
++    sites = _launch_sites_in_this_file()
++    kernels_seen = {name for _l, name, *_rest in sites}
++    assert kernels_seen == set(_LAUNCHED_KERNELS), (
++        f"expected launches of {sorted(_LAUNCHED_KERNELS)}, found "
++        f"{sorted(kernels_seen)}: the scan is not seeing this file's launches"
++    )
++    assert launch_arity_findings(sites) == []
++
++
++def test_arity_check_discriminates():
++    """The check fires on the pre-repair launch shape (the failing control).
++
++    Rebuilds the exact pre-repair precopy launch -- the row stride followed
++    directly by the state metadata, 15 positionals -- and one with the right
++    arity but a non-guard tensor in the counter slot. Both must be reported,
++    or the green result above is a test that cannot fail.
++    """
++    pre_repair = ast.parse(
++        "precopy_mamba_align_fused_kernel[grid](dst_col, src_col, bias, "
++        "bt_ptrs, bt.stride(0), base, blk_stride, elem, inner, width, group, "
++        "drc, drs, idx_mapping, num_reqs, COPY_BLOCK_SIZE=1024, "
++        "CONV_STATE_DIM_FIRST=False, HAS_IDX_MAPPING=True, TEMPORAL_TILES=1)",
++        mode="eval",
++    ).body
++    wrong_slot = ast.parse(
++        "precopy_mamba_align_fused_kernel[grid](dst_col, src_col, bias, "
++        "bt_ptrs, bt.stride(0), bt.size(0), base, base, blk_stride, elem, "
++        "inner, width, group, drc, drs, idx_mapping, num_reqs, "
++        "COPY_BLOCK_SIZE=1024, CONV_STATE_DIM_FIRST=False)",
++        mode="eval",
++    ).body
++
++    def _site(call):
++        return (
++            call.lineno,
++            call.func.value.id,
++            len(call.args),
++            [kw.arg for kw in call.keywords],
++            call.args,
++        )
++
++    [arity] = launch_arity_findings([_site(pre_repair)])
++    assert "15 positional" in arity and "17 runtime" in arity, arity
++    [slot] = launch_arity_findings([_site(wrong_slot)])
++    assert "guard_ctr position receives 'base'" in slot, slot
+ 
+ 
+ def test_ds_conv_copy_spec_reproduces_multi_accept_assert(monkeypatch):
+diff --git a/tests/v1/ple_offload/test_flag_check_wiring.py b/tests/v1/ple_offload/test_flag_check_wiring.py
+new file mode 100644
+index 0000000000..2ee5a0b425
+--- /dev/null
++++ b/tests/v1/ple_offload/test_flag_check_wiring.py
+@@ -0,0 +1,240 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""The PLE flag pre-launch check is WIRED on this tree, not just registered.
++
++Why this file exists (PLE diagnostics port to 0.30). On the pre-fix kernel branch,
++an earlier commit had ``VLLM_E2_PLE_FLAG_CHECK`` registered in ``envs.py`` -- parsed,
++normalized, kept out of the compile factors -- but the connector code that
++reads it had been dropped by the rebase (the PLE-diagnostics changes were replayed onto
++the 0.30 base before the PLE offload package was restored there). A diagnostics run
++with the knob on would have reported "zero findings" from an instrument that
++never ran. ``test_stale_flag_assertion.py`` pins the pure helpers; it cannot
++catch this, because the helpers can exist while nothing calls them.
++
++These tests drive the REAL ``PleOffloadConnector._prepare_forward_impl`` with
++the transport's I/O (``_launch``, the stream synchronize) replaced, and the
++REAL ``stale_offload_flags`` reading real ``CpuGpuSemaphore`` flags. GPU-free.
++
++FAILING CONTROL: on that earlier commit every test in this file fails --
++``_PLE_FLAG_CHECK_MODE`` / ``_check_flags_clear_before_launch`` do not exist and
++``VLLM_E2_PLE_FLAG_CHECK`` has no reader outside ``envs.py``.
++"""
++
++import importlib
++import re
++from pathlib import Path
++from types import SimpleNamespace
++
++import pytest
++import torch
++
++import vllm
++import vllm.envs as envs
++from vllm.model_executor.layers.ple_offload_layer import (
++    CpuGpuSemaphore,
++    PleOffloadLayer,
++)
++from vllm.v1.ple_offload import connector as connector_mod
++from vllm.v1.ple_offload.connector import PleOffloadConnector
++
++HIDDEN = 4
++
++
++class _ProbeLayer(PleOffloadLayer):
++    def forward_impl(self, hidden_states, input_ids, *args, **kwargs):
++        return hidden_states
++
++
++def _layer(flag_value: int) -> _ProbeLayer:
++    layer = _ProbeLayer()
++    layer.setup_cross_process_offload(
++        gpu_output_buffer=torch.zeros(8, HIDDEN, dtype=torch.bfloat16),
++        semaphore=CpuGpuSemaphore.from_ipc_tensor(
++            torch.tensor([flag_value], dtype=torch.int32)
++        ),
++    )
++    return layer
++
++
++class _Harness:
++    """A real connector object with only its I/O edges replaced."""
++
++    def __init__(self, monkeypatch, *, mode: str, tp_rank: int, flag: int):
++        monkeypatch.setattr(connector_mod, "_PLE_FLAG_CHECK_MODE", mode)
++        self.syncs = 0
++        self.launches: list[int] = []
++        self.warnings: list[str] = []
++        self.infos: list[str] = []
++
++        def _sync():
++            self.syncs += 1
++
++        monkeypatch.setattr(
++            torch.cuda,
++            "current_stream",
++            lambda device=None: SimpleNamespace(synchronize=_sync),
++        )
++        monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
++        monkeypatch.setattr(
++            connector_mod.logger,
++            "warning",
++            lambda fmt, *args: self.warnings.append(fmt % args),
++        )
++        monkeypatch.setattr(
++            connector_mod.logger,
++            "info",
++            lambda fmt, *args: self.infos.append(fmt % args),
++        )
++        conn = object.__new__(PleOffloadConnector)
++        conn._input_ids_buf = torch.zeros(64, dtype=torch.int32)
++        conn._query_start_loc_buf = torch.zeros(9, dtype=torch.int32)
++        conn._after_dummy = False
++        conn._rowdump_n = None
++        conn.device = torch.device("cpu")
++        conn.dp_rank, conn.tp_rank, conn.pp_rank = 0, tp_rank, 0
++        conn._layers = {"ple.0": _layer(CpuGpuSemaphore.RESET_VALUE)}
++        conn._layers["ple.1"] = _layer(flag)
++
++        def _launch(num_reqs, num_tokens, **kwargs):
++            self.launches.append(num_tokens)
++
++        conn._launch = _launch
++        self.conn = conn
++
++    def real_forward(self, num_tokens: int = 7) -> None:
++        self.conn._prepare_forward_impl(2, num_tokens, False)
++
++
++STALE = CpuGpuSemaphore.DONE_VALUE
++CLEAR = CpuGpuSemaphore.RESET_VALUE
++
++
++def test_raise_mode_refuses_to_publish_into_a_stale_flag(monkeypatch):
++    h = _Harness(monkeypatch, mode="raise", tp_rank=0, flag=STALE)
++    with pytest.raises(RuntimeError, match=r"#53899.*\('ple\.1', 1\)"):
++        h.real_forward()
++    assert h.launches == [], "published into a stale flag"
++    assert h.syncs == 1, "the read was not ordered behind the model stream"
++
++
++def test_warn_mode_reports_and_still_launches(monkeypatch):
++    h = _Harness(monkeypatch, mode="warn", tp_rank=0, flag=STALE)
++    h.real_forward(num_tokens=11)
++    assert h.launches == [11]
++    assert len(h.warnings) == 1 and "('ple.1', 1)" in h.warnings[0]
++
++
++def test_off_mode_does_no_work_on_the_launch_path(monkeypatch):
++    """Production default: no synchronize, no read, no report."""
++    h = _Harness(monkeypatch, mode="off", tp_rank=0, flag=STALE)
++    h.real_forward()
++    assert h.launches == [7]
++    assert h.syncs == 0 and h.warnings == []
++
++
++def test_clear_flags_on_the_publishing_rank_are_silent(monkeypatch):
++    h = _Harness(monkeypatch, mode="raise", tp_rank=0, flag=CLEAR)
++    h.real_forward()
++    assert h.launches == [7] and h.warnings == [] and h.syncs == 1
++
++
++def test_a_non_publishing_rank_is_not_judged(monkeypatch):
++    """TP1's flag may legitimately carry THIS step's fan-out."""
++    h = _Harness(monkeypatch, mode="raise", tp_rank=1, flag=STALE)
++    h.real_forward()
++    assert h.launches == [7] and h.warnings == [] and h.syncs == 0
++
++
++def test_dummy_forwards_are_not_checked(monkeypatch):
++    h = _Harness(monkeypatch, mode="raise", tp_rank=0, flag=STALE)
++    dummies: list[int] = []
++    h.conn._signal_dummy_outputs_impl = dummies.append
++    h.conn._prepare_forward_impl(1, 5, True)
++    assert dummies == [5] and h.syncs == 0 and h.launches == []
++
++
++def _liveness(h: _Harness) -> list[str]:
++    return [line for line in h.infos if line.startswith("PLE flag check")]
++
++
++def test_the_publishing_rank_reports_that_the_check_ran(monkeypatch):
++    """Liveness: first check and every heartbeat carry a running count.
++
++    Zero findings on a diagnostics run is evidence only if the check ran; this line is
++    what a diagnostics run greps. Heartbeat 2: lines at checks 1 and 2, the
++    third (stale, warn) counted and reported by its own warning.
++    """
++    monkeypatch.setattr(connector_mod, "_E2_CHECK_HEARTBEAT", 2)
++    h = _Harness(monkeypatch, mode="warn", tp_rank=0, flag=CLEAR)
++    h.real_forward()
++    h.real_forward()
++    h.conn._layers["ple.1"] = _layer(STALE)
++    h.real_forward()
++    tail = "(dp_rank=0, tp_rank=0, pp_rank=0)"
++    assert _liveness(h) == [
++        f"PLE flag check (mode=warn): 1 checks run, 0 with findings {tail}",
++        f"PLE flag check (mode=warn): 2 checks run, 0 with findings {tail}",
++    ]
++    assert h.conn._flag_checks_run == 3 and h.conn._flag_check_findings == 1
++    assert len(h.warnings) == 1
++
++
++def test_a_non_publishing_rank_says_once_that_it_does_not_judge(monkeypatch):
++    h = _Harness(monkeypatch, mode="warn", tp_rank=1, flag=STALE)
++    h.real_forward()
++    h.real_forward()
++    assert _liveness(h) == [
++        "PLE flag check (mode=warn): non-publishing rank, not judged here by "
++        "design (dp_rank=0, tp_rank=1, pp_rank=0)"
++    ]
++
++
++def test_off_mode_logs_no_liveness(monkeypatch):
++    h = _Harness(monkeypatch, mode="off", tp_rank=0, flag=CLEAR)
++    h.real_forward()
++    assert _liveness(h) == []
++
++
++@pytest.mark.parametrize(
++    ("raw", "mode"), [(None, "off"), ("1", "warn"), ("raise", "raise")]
++)
++def test_the_connector_mode_is_the_registry_value(monkeypatch, raw, mode):
++    """The module-level mode is read through ``envs``, so the value the
++    registry reports and the value the check applies cannot drift."""
++    if raw is None:
++        monkeypatch.delenv("VLLM_E2_PLE_FLAG_CHECK", raising=False)
++    else:
++        monkeypatch.setenv("VLLM_E2_PLE_FLAG_CHECK", raw)
++    try:
++        reloaded = importlib.reload(connector_mod)
++        assert mode == reloaded._PLE_FLAG_CHECK_MODE
++        assert mode == envs.VLLM_E2_PLE_FLAG_CHECK
++    finally:
++        monkeypatch.delenv("VLLM_E2_PLE_FLAG_CHECK", raising=False)
++        importlib.reload(connector_mod)
++
++
++def _diagnostic_knobs() -> list[str]:
++    source = Path(envs.__file__).read_text(encoding="utf-8")
++    return sorted(set(re.findall(r'_e2_diagnostic_mode\(\s*"(\w+)"', source)))
++
++
++def test_every_e2_diagnostic_knob_has_a_reader_outside_envs():
++    """A registered diagnostic with no reader reports "zero findings" forever.
++
++    Class guard for the defect this port fixes: registration and the read site
++    travelled in different commits and a rebase kept one without the other.
++    """
++    knobs = _diagnostic_knobs()
++    assert {"VLLM_E2_PLE_FLAG_CHECK", "VLLM_E2_MAMBA_SLOT_OWNERSHIP"} <= set(knobs)
++    root = Path(vllm.__file__).parent
++    readers: dict[str, list[str]] = {k: [] for k in knobs}
++    for path in root.rglob("*.py"):
++        if path.name == "envs.py" and path.parent == root:
++            continue
++        text = path.read_text(encoding="utf-8", errors="replace")
++        for knob in knobs:
++            if f"envs.{knob}" in text:
++                readers[knob].append(str(path.relative_to(root)))
++    unread = [k for k, files in readers.items() if not files]
++    assert unread == [], f"registered but never read via envs: {unread}"
+diff --git a/tests/v1/ple_offload/test_stale_flag_assertion.py b/tests/v1/ple_offload/test_stale_flag_assertion.py
+new file mode 100644
+index 0000000000..c6636422e7
+--- /dev/null
++++ b/tests/v1/ple_offload/test_stale_flag_assertion.py
+@@ -0,0 +1,135 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""The pull transport's staleness precondition, read back instead of argued.
++
++vllm#53899 (GB10/sm_121, TP=1, PIECEWISE and FULL_DECODE_ONLY): the capture
++path signalled dummy PLE outputs, the first real step's
++``cuStreamWaitValue32(flag == DONE_VALUE)`` was satisfied by that DUMMY signal,
++its release reset the flag, and the worker's late copy raised it again for the
++next step -- so every forward consumed the PREVIOUS step's PLE rows for the
++life of the server. ``cudagraph_mode=NONE`` was correct.
++
++This tree holds the precondition structurally (``_signal_dummy_outputs_impl``
++-> dummy forward -> ``_release_outputs_impl`` resets every layer and
++synchronizes while ``_after_dummy`` is set -> TP barrier at the dummy->real
++transition), but nothing ever read the flag back. ``stale_offload_flags`` is
++that read, and these tests pin its contract.
++
++No GPU is required: ``CpuGpuSemaphore.from_ipc_tensor`` accepts any int32
++tensor, and only ``reset``/``signal``/``wait_reset`` (never called here) touch
++the CUDA driver. The layer is a real ``PleOffloadLayer`` subclass configured
++through the real ``setup_cross_process_offload``, not a stand-in.
++"""
++
++import torch
++
++from vllm.model_executor.layers.ple_offload_layer import (
++    CpuGpuSemaphore,
++    PleOffloadLayer,
++    flag_check_is_authoritative,
++    stale_offload_flags,
++)
++
++HIDDEN = 4
++
++
++class _ProbeLayer(PleOffloadLayer):
++    """Minimal real subclass: the base class is abstract on forward_impl."""
++
++    def forward_impl(
++        self,
++        hidden_states: torch.Tensor,
++        input_ids: torch.Tensor,
++        *args: object,
++        **kwargs: object,
++    ) -> torch.Tensor:
++        return hidden_states
++
++
++def _layer(flag_value: int) -> _ProbeLayer:
++    layer = _ProbeLayer()
++    flag = torch.tensor([flag_value], dtype=torch.int32)
++    layer.setup_cross_process_offload(
++        gpu_output_buffer=torch.zeros(8, HIDDEN, dtype=torch.bfloat16),
++        semaphore=CpuGpuSemaphore.from_ipc_tensor(flag),
++    )
++    return layer
++
++
++def test_cleared_flags_are_not_reported() -> None:
++    """The correct world: every semaphore clear before a real launch."""
++    layers = {
++        "ple.0": _layer(CpuGpuSemaphore.RESET_VALUE),
++        "ple.1": _layer(CpuGpuSemaphore.RESET_VALUE),
++    }
++    assert stale_offload_flags(layers) == []
++
++
++def test_a_leftover_signal_is_reported_with_its_layer() -> None:
++    """The #53899 world: a signal no forward consumed survives into a launch.
++
++    This is the failing control for the pre-launch assertion. Without it the
++    check would be one that cannot fail: a
++    "same prompt twice" comparison passes in the broken world, because the
++    lag is constant and produces two bit-identical output classes.
++    """
++    layers = {
++        "ple.0": _layer(CpuGpuSemaphore.RESET_VALUE),
++        "ple.1": _layer(CpuGpuSemaphore.DONE_VALUE),
++    }
++    assert stale_offload_flags(layers) == [("ple.1", CpuGpuSemaphore.DONE_VALUE)]
++
++
++def test_every_stale_layer_is_named_not_just_the_first() -> None:
++    """Attribution matters: #53899's fix resets EVERY layer's semaphore."""
++    layers = {f"ple.{i}": _layer(CpuGpuSemaphore.DONE_VALUE) for i in range(3)}
++    assert stale_offload_flags(layers) == [
++        ("ple.0", 1),
++        ("ple.1", 1),
++        ("ple.2", 1),
++    ]
++
++
++def test_a_value_that_is_neither_reset_nor_done_is_reported_verbatim() -> None:
++    """A torn or foreign write is a violation too, and its value is evidence.
++
++    The flag is binary by construction, so any third value means something
++    other than this transport wrote it. Reporting the raw value distinguishes
++    that from an ordinary leftover signal.
++    """
++    layers = {"ple.0": _layer(7)}
++    assert stale_offload_flags(layers) == [("ple.0", 7)]
++
++
++def test_a_layer_without_cross_process_offload_is_skipped() -> None:
++    """Non-offloaded layers have no ``_sem``; reading one would be an error."""
++    layers = {"ple.0": _ProbeLayer(), "ple.1": _layer(CpuGpuSemaphore.DONE_VALUE)}
++    assert stale_offload_flags(layers) == [("ple.1", CpuGpuSemaphore.DONE_VALUE)]
++
++
++# ---------------------------------------------------------------------------
++# Which rank may judge the flag at all
++# ---------------------------------------------------------------------------
++
++
++def test_only_the_publishing_rank_may_judge_the_flag() -> None:
++    """``flag == 0`` before a launch is an invariant on TP0 ONLY.
++
++    ``_launch`` publishes only on TP0. The offload worker then fans the result
++    out to EVERY registered target, each gated only on that target's own flag
++    having been reset. So this interleaving is legal and healthy:
++
++      1. TP0 checks its flag (clear) and publishes step N.
++      2. The worker fills TP1's buffer and sets TP1's flag for step N.
++      3. TP1 reaches its own pre-launch check and reads DONE.
++
++    A rank-blind check calls step 3 a stale signal and terminates a healthy
++    TP2 run. The dummy->real TP barrier is before the checks and does not
++    order this. A non-publishing rank cannot separate "this step's fan-out
++    arrived early" from "last step's signal was never consumed", because the
++    flag is binary and carries no transaction identity -- so it is skipped
++    rather than checked weakly.
++    """
++    assert flag_check_is_authoritative(0) is True
++    for tp_rank in (1, 2, 3, 7):
++        assert flag_check_is_authoritative(tp_rank) is False, tp_rank
+diff --git a/tests/v1/worker/gpu/test_mamba_slot_ownership.py b/tests/v1/worker/gpu/test_mamba_slot_ownership.py
+index 89131efe06..1532bfa0a2 100644
+--- a/tests/v1/worker/gpu/test_mamba_slot_ownership.py
++++ b/tests/v1/worker/gpu/test_mamba_slot_ownership.py
+@@ -159,6 +159,46 @@ def test_an_identity_mapping_hides_the_defect_from_this_check(
+     assert scenario.ctx.last_slot_ownership_violations == []
+ 
+ 
++def test_the_check_reports_that_it_ran(monkeypatch: pytest.MonkeyPatch) -> None:
++    """Liveness (PLE diagnostics on 0.30): zero findings must be told apart from no run.
++
++    A zero-findings result is evidence only if
++    the check executed, so it counts the launches it judged and logs the count
++    on the first check and every ``_E2_CHECK_HEARTBEAT``. Here: two green
++    launches then one red, heartbeat 2 -> lines at checks 1 and 2 only, the
++    red one counted but not logged by the heartbeat.
++    """
++    _arm(monkeypatch, "warn")
++    monkeypatch.setattr(mamba_utils_mod, "_E2_CHECK_HEARTBEAT", 2)
++    lines: list[str] = []
++    monkeypatch.setattr(
++        mamba_utils_mod.logger,
++        "info",
++        lambda fmt, *args: lines.append(fmt % args),
++    )
++    scenario = _build_scenario(slot_mapping=_PERM)
++    _run_deferred(scenario, monkeypatch)
++    _run_deferred(scenario, monkeypatch)
++    monkeypatch.setattr(mamba_utils_mod, "ALIGN_BT_ROW_IS_REQ", False)
++    _run_deferred(scenario, monkeypatch)
++
++    ctx = scenario.ctx
++    assert ctx.slot_ownership_checks_run == 3
++    assert ctx.slot_ownership_checks_with_findings == 1
++    liveness = [ln for ln in lines if ln.startswith("Mamba slot-ownership check")]
++    assert liveness == [
++        "Mamba slot-ownership check (mode=warn): 1 checks run, 0 with findings",
++        "Mamba slot-ownership check (mode=warn): 2 checks run, 0 with findings",
++    ]
++
++
++def test_off_mode_counts_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
++    _arm(monkeypatch, "off")
++    scenario = _build_scenario(slot_mapping=_PERM)
++    _run_deferred(scenario, monkeypatch)
++    assert scenario.ctx.slot_ownership_checks_run == 0
++
++
+ # ---------------------------------------------------------------------------
+ # The three properties, directly on the pure checker
+ # ---------------------------------------------------------------------------
+diff --git a/tests/v1/worker/gpu/test_pp_deferred_mamba_block_table.py b/tests/v1/worker/gpu/test_pp_deferred_mamba_block_table.py
+index df904ff159..3f08d4aab1 100644
+--- a/tests/v1/worker/gpu/test_pp_deferred_mamba_block_table.py
++++ b/tests/v1/worker/gpu/test_pp_deferred_mamba_block_table.py
+@@ -622,16 +622,19 @@ def mask_from_generation_change(
+ 
+     captured: dict[str, object] = {}
+ 
+-    def fake_async_copy_to_gpu(array, device=None):
++    # v0.30.0 (#56888) renamed the H2D helper pp_utils uses from
++    # buffer_utils.async_copy_to_gpu to torch_utils.async_tensor_h2d; the
++    # handler still stages the masked mapping through it, so it is the seam.
++    def fake_async_tensor_h2d(array, device=None, dtype=None, out=None):
+         captured["np"] = np.asarray(array).copy()
+         return torch.as_tensor(np.asarray(array), dtype=torch.int32)
+ 
+-    original = pp_utils_mod.async_copy_to_gpu
+-    pp_utils_mod.async_copy_to_gpu = fake_async_copy_to_gpu
++    original = pp_utils_mod.async_tensor_h2d
++    pp_utils_mod.async_tensor_h2d = fake_async_tensor_h2d
+     try:
+         outputs = handler.get_prev_sampled_outputs()
+     finally:
+-        pp_utils_mod.async_copy_to_gpu = original
++        pp_utils_mod.async_tensor_h2d = original
+ 
+     assert outputs is not None, "the whole batch was excluded"
+     return [int(v) for v in outputs["idx_mapping"].tolist()]
+diff --git a/vllm/model_executor/layers/ple_offload_layer.py b/vllm/model_executor/layers/ple_offload_layer.py
+index cc8bd73bfe..6eab455176 100644
+--- a/vllm/model_executor/layers/ple_offload_layer.py
++++ b/vllm/model_executor/layers/ple_offload_layer.py
+@@ -476,3 +476,88 @@ class PleOffloadLayer(nn.Module, ABC):
+         """Mark the cross-process output buffer reusable on ``stream``."""
+         if self._is_cpu_offloaded:
+             self._sem.reset(stream)
++
++
++# ---------------------------------------------------------------------------
++# Pre-launch staleness check for the pull transport (#53899 class)
++# ---------------------------------------------------------------------------
++# WHAT IT TESTS. The transport's correctness rests on one precondition: when a
++# real request is published, every layer's semaphore must be CLEAR, so the
++# ``cuStreamWaitValue32(flag == DONE_VALUE)`` inside the forward (line 279 for
++# the pull path, line 215 for the IPC push path) can only be satisfied by the
++# copy THIS step publishes. If a leftover ``DONE_VALUE`` survives into a real
++# step, that wait is satisfied immediately by the PREVIOUS step's signal and
++# the forward consumes the previous step's PLE rows. That is vllm#53899 on
++# GB10/sm_121 exactly: "every forward consumes the previous step's PLE
++# outputs", for the life of the server, with ``cudagraph_mode=NONE`` correct.
++#
++# In this tree the precondition is held structurally -- the dummy signal is
++# consumed by the dummy forward, ``_release_outputs_impl`` resets every layer
++# and synchronizes the model stream while ``_after_dummy`` is set, and the
++# dummy->real transition takes a TP barrier -- but nothing ever READ the flag
++# back, so the structural argument had no instrument. This is that instrument.
++#
++# WHY NOT AN EPOCH WORD. The stronger fix is a monotone epoch: the launch
++# writes ``epoch = step``, the worker signals ``epoch``, and the placeholder
++# waits ``EQ(epoch)``, so a stale signal carries the previous epoch and cannot
++# satisfy the wait. It is not implementable on this transport as it stands.
++# The compare value is an IMMEDIATE OPERAND of ``cuStreamWaitValue32``
++# (``_ple_offload_wait_copy_impl``, this file, line 279), and that call is
++# issued inside the model forward, which is captured: PIECEWISE and
++# FULL_AND_PIECEWISE both bake the wait into the graph with the value frozen at
++# capture time. Making the compare value change per replay needs the captured
++# node's parameters rewritten before each launch
++# (``cuGraphExecBatchMemOpNodeSetParams``); nothing in this tree's capture path
++# exposes the graph exec handle to the connector, and the wait is reached
++# through a torch custom op inside a compiled region. An epoch word would
++# therefore work only with ``cudagraph_mode=NONE``, i.e. only in the
++# configuration where #53899 does not reproduce. So: binary flag, read back.
++#
++# The check is HOST-SIDE and needs a stream synchronize to be ordered against
++# a pending reset, so it is never run inside a capture and is off by default.
++# ---------------------------------------------------------------------------
++
++
++def flag_check_is_authoritative(tp_rank: int) -> bool:
++    """Whether ``flag == RESET_VALUE`` before a launch is an INVARIANT here.
++
++    Only on the publishing rank (TP0). Why: the offload worker fans a
++    result out to every registered TP target, each gated only on that target's
++    own flag having been reset, so a non-publishing rank's flag can legitimately
++    carry THIS step's signal before that rank reaches its own pre-launch check.
++    Reading a set flag there and calling it stale terminates a healthy run.
++
++    On TP0 the invariant holds by construction: the worker learns of a request
++    only from ``_launch``, which runs after the check, and the progress monitor
++    refuses overlapping serving submissions, so the previous transaction has
++    been released and (after a stream synchronize) its reset has retired.
++
++    A non-publishing rank cannot tell "this step's fan-out arrived early" from
++    "last step's signal was never consumed", because the flag is BINARY and
++    carries no transaction identity -- the same representational limit that
++    rules out an epoch word. So those ranks are skipped, not checked weakly.
++    """
++    return tp_rank == 0
++
++
++def stale_offload_flags(
++    layers: "dict[str, PleOffloadLayer]",
++) -> list[tuple[str, int]]:
++    """Return ``(layer_name, flag_value)`` for every layer whose flag is set.
++
++    An empty list is the precondition holding. A non-empty list means at least
++    one semaphore still carries a signal that no forward consumed, so the next
++    ``wait`` would be satisfied by the previous step's copy.
++
++    Pure and side-effect free: the caller owns the ordering (synchronize the
++    model stream first, and never call this inside a stream capture). Layers
++    that are not cross-process offloaded have no semaphore and are skipped.
++    """
++    stale: list[tuple[str, int]] = []
++    for name, layer in layers.items():
++        if not getattr(layer, "_is_cpu_offloaded", False):
++            continue
++        value = int(layer._sem.flag_tensor.reshape(-1)[0].item())
++        if value != CpuGpuSemaphore.RESET_VALUE:
++            stale.append((name, value))
++    return stale
+diff --git a/vllm/v1/ple_offload/connector.py b/vllm/v1/ple_offload/connector.py
+index 2779edf3b5..0d5265115b 100644
+--- a/vllm/v1/ple_offload/connector.py
++++ b/vllm/v1/ple_offload/connector.py
+@@ -18,12 +18,15 @@ import torch.nn as nn
+ import zmq
+ from cuda.bindings import driver as cuda_driver
+ 
++import vllm.envs as envs
+ from vllm.config import VllmConfig
+ from vllm.distributed.parallel_state import get_dp_group, get_pp_group, get_tp_group
+ from vllm.logger import init_logger
+ from vllm.model_executor.layers.ple_offload_layer import (
+     CpuGpuSemaphore,
+     PleOffloadLayer,
++    flag_check_is_authoritative,
++    stale_offload_flags,
+ )
+ from vllm.v1.ple_offload.protocol import (
+     PleOffloadRegistration,
+@@ -34,6 +37,30 @@ from vllm_ple_test_fault import _FAULT
+ 
+ logger = init_logger(__name__)
+ 
++# PLE diagnostics / vllm#53899 class: read the pull-transport semaphore back before a real
++# launch and refuse to publish into a flag that is already set. Costs a
++# model-stream synchronize, so it is a diagnostic, not a hot-path guard, and is
++# OFF by default -- the same split VLLM_E2_ZERO_OWNERSHIP_CHECK established in
++# the scheduler (VLLM_E2_ZERO_OWNERSHIP_CHECK).
++#
++# off | warn | raise (1 is accepted as warn). Default off. The default action on
++# a violation is WARN, not raise: this diagnostic could
++# terminate a healthy run, and a diagnostic that kills the qualification boot
++# intended to establish safety is worse than no diagnostic. raise is for a
++# targeted repro.
++#
++# Read through the envs registry, not os.getenv: the registry owns the
++# normalization, so the value reported by
++# `vllm.envs` and the value this check applies cannot drift apart. It is
++# registered as a non-compile factor there. A set-but-unrecognised value
++# raises on first read -- fail closed, because a broken gate that silently
++# disarms its own instrument is the failure mode these checks exist to avoid.
++_PLE_FLAG_CHECK_MODE: str = envs.VLLM_E2_PLE_FLAG_CHECK
++# Liveness cadence for the diagnostic checks: the first check and every Nth
++# are logged with a running count, so "zero findings" can be told apart from
++# "never ran" in a reference-host log.
++_E2_CHECK_HEARTBEAT = 4096
++
+ # CUDA registration alone does not own Python storage. Captured graphs retain
+ # raw addresses, so every successfully registered host allocation remains
+ # strongly referenced until process exit.
+@@ -701,6 +728,8 @@ class PleOffloadConnector:
+                 self.dp_rank,
+                 self.tp_rank,
+             )
++        if _PLE_FLAG_CHECK_MODE != "off":
++            self._check_flags_clear_before_launch(num_tokens)
+         self._launch(
+             num_reqs,
+             num_tokens,
+@@ -709,6 +738,128 @@ class PleOffloadConnector:
+             correlation_id=correlation_id,
+         )
+ 
++    def _check_flags_clear_before_launch(self, num_tokens: int) -> None:
++        """Test the transport's staleness precondition, off by default.
++
++        A real launch publishes rows that the forward will pick up with
++        ``cuStreamWaitValue32(flag == DONE_VALUE)``
++        (``ple_offload_layer.py:279``). That wait is only meaningful if the
++        flag is CLEAR when we publish: a leftover ``DONE_VALUE`` satisfies it
++        from the PREVIOUS step's copy and the forward silently consumes the
++        previous step's PLE outputs -- vllm#53899, where the semaphore stayed
++        one step ahead for the life of the server and ``cudagraph_mode=NONE``
++        was the only correct configuration.
++
++        Nothing here can be inferred from ``_after_dummy``: that is a bool
++        tracking a transition, not the flag's value. The structural argument
++        (dummy signal consumed by the dummy forward, ``_release_outputs_impl``
++        resetting every layer and synchronizing while ``_after_dummy`` is set,
++        a TP barrier at the transition) holds only while every
++        ``prepare_forward`` is matched by a ``release_outputs``. An exception
++        path, an aborted step, or a future capture that signals without a
++        consuming forward leaves the flag at 1, and the #53899 thread's own
++        trap applies: identical sequential requests produce two bit-identical
++        classes, so a "same prompt twice" check passes in the broken world
++        (an instrument must discriminate both worlds).
++
++        PUBLISHING RANK ONLY. ``flag == 0`` before a launch is
++        NOT an invariant on a non-publishing rank, and the first version of
++        this check could terminate a HEALTHY TP2 run because of it. ``_launch``
++        publishes only on TP0 (``if self.tp_rank != 0: return``), and the
++        offload worker then fans the result out to EVERY registered target,
++        each gated only on that target's own flag having been reset
++        (``worker.py``, ``for target in targets: _wait_flag_released(target)
++        ... target.host_flag[0] = 1``). So this legal interleaving exists:
++
++          1. TP0 checks its flag (clear), publishes step N.
++          2. The worker fills TP1's buffer and sets TP1's flag for step N.
++          3. TP1 reaches its own check for step N and reads ``DONE``.
++          4. TP1 reports a stale signal -- for a signal that belongs to the
++             CURRENT step.
++
++        The dummy->real TP barrier is before the checks and does not order this.
++        On TP0 the property does hold, and by construction rather than by
++        timing: the worker learns of a request only from ``_launch``, which is
++        after this check, and ``PleProgressMonitor.begin`` refuses overlapping
++        serving submissions ("Overlapping PLE host submissions violate the
++        serialized single-slot protocol"), so at most one transaction is
++        outstanding and the stream synchronize below has already retired its
++        release. A non-publishing rank cannot distinguish "this step's fan-out
++        arrived early" from "last step's signal was never consumed" with a
++        BINARY flag -- that is the same representational limit that rules out
++        an epoch word (see ``ple_offload_layer.py``), so those ranks are
++        skipped rather than checked weakly.
++
++        VLLM_E2_PLE_FLAG_CHECK=off|warn|raise, default off, default ACTION warn.
++
++        SCOPE. The skip below tests whether a capture
++        is ACTIVE, which is not the same as "this step's forward is eager". A
++        captured replay is not an active capture, and ``prepare_forward`` is
++        host Python that runs ahead of the forward either way, so this check
++        DOES run for steps whose forward is a graph replay. What it does not do
++        is run *inside* a capture, where a host synchronize is illegal. The
++        earlier "eager only" wording confused those two lifecycle states.
++
++        LIVENESS (PLE diagnostics on 0.30). A zero-findings result is only evidence if the
++        check demonstrably RAN, so every rank says once what it does with the
++        check, and the publishing rank logs a running count of checks and
++        findings on its first check and every ``_E2_CHECK_HEARTBEAT`` checks
++        after. A reference-host test arm greps these lines; their absence voids the arm.
++        """
++        if not flag_check_is_authoritative(self.tp_rank):
++            if not getattr(self, "_flag_check_skip_logged", False):
++                self._flag_check_skip_logged = True
++                logger.info(
++                    "PLE flag check (mode=%s): non-publishing rank, not judged "
++                    "here by design (dp_rank=%d, tp_rank=%d, pp_rank=%d)",
++                    _PLE_FLAG_CHECK_MODE,
++                    self.dp_rank,
++                    self.tp_rank,
++                    self.pp_rank,
++                )
++            return
++        if torch.cuda.is_current_stream_capturing():
++            return
++        stream = torch.cuda.current_stream(self.device)
++        # Order the read against any reset still queued on the model stream.
++        # Without this the check reports the pre-reset value and fires on a
++        # correct run -- a guard that fires on correct metadata is worse than
++        # no guard.
++        stream.synchronize()
++        stale = stale_offload_flags(self._layers)
++        runs = self._flag_checks_run = getattr(self, "_flag_checks_run", 0) + 1
++        findings = getattr(self, "_flag_check_findings", 0) + (1 if stale else 0)
++        self._flag_check_findings = findings
++        if runs == 1 or runs % _E2_CHECK_HEARTBEAT == 0:
++            logger.info(
++                "PLE flag check (mode=%s): %d checks run, %d with findings "
++                "(dp_rank=%d, tp_rank=%d, pp_rank=%d)",
++                _PLE_FLAG_CHECK_MODE,
++                runs,
++                findings,
++                self.dp_rank,
++                self.tp_rank,
++                self.pp_rank,
++            )
++        if not stale:
++            return
++        message = (
++            "PLE pull transport: the output semaphore was already signalled "
++            "before this publishing rank published a real request, so the "
++            "forward's cuStreamWaitValue32(flag == 1) would be satisfied by "
++            "the PREVIOUS step's copy and this forward would consume the "
++            "previous step's PLE rows (vllm#53899 one-step-lag class). Stale "
++            f"layers (name, flag): {stale}; expected "
++            f"{CpuGpuSemaphore.RESET_VALUE} for all {len(self._layers)} "
++            f"layer(s). num_tokens={num_tokens}, dp_rank={self.dp_rank}, "
++            f"tp_rank={self.tp_rank}, pp_rank={self.pp_rank}."
++        )
++        if _PLE_FLAG_CHECK_MODE == "raise":
++            # Reaches _fail_closed through prepare_forward, which is the
++            # transport's stated contract for an uncertain correspondence.
++            raise RuntimeError(message)
++        logger.warning("%s", message)
++
+     def signal_dummy_outputs(self, num_tokens: int) -> None:
+         """Locally satisfy PLE waits for dummy and capture forwards."""
+         self._progress.begin(startup=True, num_tokens=num_tokens)
+diff --git a/vllm/v1/worker/mamba_utils.py b/vllm/v1/worker/mamba_utils.py
+index eeeadaea0e..a89383b4c1 100644
+--- a/vllm/v1/worker/mamba_utils.py
++++ b/vllm/v1/worker/mamba_utils.py
+@@ -75,6 +75,9 @@ ALIGN_BT_ROW_IS_REQ = True
+ # registered as a non-compile factor there, and an unrecognised value raises
+ # on first read rather than silently disarming the instrument.
+ _SLOT_OWNERSHIP_MODE: str = envs.VLLM_E2_MAMBA_SLOT_OWNERSHIP
++# Liveness cadence: first check and every Nth are logged with a running count
++# (see MambaSpecDecodeGPUContext.slot_ownership_checks_run).
++_E2_CHECK_HEARTBEAT = 4096
+ 
+ _NULL_BLOCK_ID = 0
+ 
+@@ -1230,6 +1233,11 @@ class MambaSpecDecodeGPUContext:
+     last_slot_ownership_violations: list[str] = dataclasses.field(
+         default_factory=list
+     )
++    # Liveness for the same check (diagnostics on 0.30): how many launches it has
++    # judged and how many had findings. Logged on the first check and every
++    # _E2_CHECK_HEARTBEAT after, so a zero-findings run can prove it ran.
++    slot_ownership_checks_run: int = 0
++    slot_ownership_checks_with_findings: int = 0
+ 
+     @classmethod
+     def create(
+@@ -1932,6 +1940,18 @@ class MambaSpecDecodeGPUContext:
+             block_size=int(self.block_size),
+         )
+         self.last_slot_ownership_violations = violations
++        self.slot_ownership_checks_run += 1
++        if violations:
++            self.slot_ownership_checks_with_findings += 1
++        runs = self.slot_ownership_checks_run
++        if runs == 1 or runs % _E2_CHECK_HEARTBEAT == 0:
++            logger.info(
++                "Mamba slot-ownership check (mode=%s): %d checks run, %d with "
++                "findings",
++                _SLOT_OWNERSHIP_MODE,
++                runs,
++                self.slot_ownership_checks_with_findings,
++            )
+         if not violations:
+             return violations
+         message = (

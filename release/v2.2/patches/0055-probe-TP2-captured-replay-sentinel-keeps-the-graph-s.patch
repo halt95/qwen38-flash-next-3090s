@@ -1,0 +1,406 @@
+From a9bf88f51312186e91472bbbba23acd8af2cd0a7 Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Wed, 23 Sep 2026 15:51:26 -0400
+Subject: [PATCH 55/58] probe: TP2 captured-replay sentinel keeps the graph's
+ static ids alive
+
+Test-harness lifetime fix; no served code.
+---
+ probe/tp2_replay_sentinel.py | 388 +++++++++++++++++++++++++++++++++++
+ 1 file changed, 388 insertions(+)
+ create mode 100644 probe/tp2_replay_sentinel.py
+
+diff --git a/probe/tp2_replay_sentinel.py b/probe/tp2_replay_sentinel.py
+new file mode 100644
+index 0000000000..bf5edc0c9e
+--- /dev/null
++++ b/probe/tp2_replay_sentinel.py
+@@ -0,0 +1,388 @@
++"""Compiled TP2 captured-replay host sentinel (reference host), exact bytes.
++
++What it establishes, on the 0.30 tree at TP=2 over the production collective
++path, for PinnedHostVocabParallelEmbedding (VLLM_HOST_EMBED_TABLE=1 layer):
++
++  E  eager TP2 forward                      -> EXACT base bytes
++  C  torch.compile(fullgraph) TP2 forward   -> EXACT base bytes
++  G  compiled + CUDA-graph captured replay  -> EXACT base bytes
++  M  host rows written AFTER capture, G replayed      -> EXACT mutated bytes
++     (sentinel S0 on rank 0's shard, S1 on rank 1's shard, so each rank's own
++     UVA read AND the all-reduce that carries it to the other rank are covered)
++  R  host rows restored, G replayed         -> EXACT base bytes (two-way)
++  X  REPLAY_SENTINEL_CYCLES more mutate/restore cycles, each with an eager (compiled,
++     not captured) forward -- i.e. an eager all-reduce -- between the host write
++     and the replay: the production interleave of eager and graph collectives
++  P  per-rank PRE-all-reduce partial, its own captured graph (no collective),
++     replayed after every host write: splits a UVA staleness from an
++     all-reduce fault if R/X ever fail
++  I  the captured graph's static input ids are still IDS after every replay
++  Z  POSITIVE CONTROL for the observed R failure signature: static ids overwritten
++     with an id outside both shards -> the replay must give EXACT all-zero
++     bytes (sha ad7facb2586fc6e9), then ids restored -> EXACT base again
++  K  FAILING CONTROL: the same compiled+captured path with the lookup table
++     swapped for a DEVICE copy, host rows mutated after capture -> the replay
++     must still give the BASE bytes, i.e. the M check would FAIL in the
++     "capture baked a device copy" world. If K sees the mutation, the
++     instrument does not discriminate and M proves nothing.
++
++FIX (sentinel fix): the first reference-host run failed R on
++both ranks with sha ad7facb2586fc6e9 = EXACT all-zero output. Cause: capture()
++cloned the static input ids into a local that was never returned, so the
++caching allocator freed that block while the graph still read it (use after
++free of a graph input). G and M passed because no CUDA allocation happened
++between capture and those replays; the eager compiled(ids) call of
++M_compiled_eager reallocated the block and wrote bf16 data over it, which read
++as int32 ids lands outside both shards -> every row masked on both ranks ->
++all-zero all-reduce. capture() now returns and the caller holds static_ids for
++the graph's lifetime; arm I asserts they are intact, arm Z proves the
++signature. REPLAY_SENTINEL_AR=nccl disables the custom all-reduce (discriminating arm).
++
++What it does NOT establish (stated, as the pytest sentinel's docstring does):
++  * It is stock Inductor + a manual torch.cuda.CUDAGraph under vLLM's
++    graph_capture() context -- not VllmBackend's piecewise split inside the
++    served Flash-Next forward. The served-completion half is not covered here.
++  * Observing the mutation proves the replay DEPENDS ON MUTABLE HOST DATA, not
++    exclusive UVA residency (a per-launch host->device copy would also pass).
++
++EXPECTED BYTES -- derived, not observed. The table is a closed form:
++    table[t, j] = bf16((t * HIDDEN + j) % 251)
++Every value 0..250 is an integer below 2**8, so it is EXACT in bf16 (8
++significant bits) and its bf16 bit pattern is the top 16 bits of the float32.
++Sentinels: S0 := bf16 max (0x7F7F), S1 := bf16 lowest (0xFF7F). The TP2
++forward masks the other rank's rows to +0.0 and all-reduces: x + (+0.0) == x
++exactly for every value here (no -0.0 appears, so the signed-zero caveat of the
++real TP path cannot arise). So the output for IDS is the concatenation of the
++table rows, byte for byte. `python tp2_replay_sentinel.py --derive` computes
++the digests with numpy only (no torch, no GPU); the reference-host run recomputes them the
++same way and must match the constants below before any arm is judged.
++
++Run (reference host, from the wrapper script): torchrun --nproc-per-node 2 <this file>
++Env: REPLAY_SENTINEL_AR=custom|nccl (default custom), REPLAY_SENTINEL_CYCLES (default 3),
++     REPLAY_SENTINEL_OUT=<dir> for the per-rank JSON.
++"""
++
++from __future__ import annotations
++
++import hashlib
++import json
++import os
++import sys
++import time
++
++import numpy as np
++
++VOCAB = 4096
++HIDDEN = 256
++SHARD = VOCAB // 2
++S0 = 1234  # rank 0 shard [0, 2048)
++S1 = 3000  # rank 1 shard [2048, 4096)
++IDS = [0, 1, S0, S1, VOCAB - 1, S0, S1, 2048]
++BF16_MAX = 0x7F7F
++BF16_LOWEST = 0xFF7F
++OUT_OF_SHARD_ID = 1 << 30  # outside both shards and the (empty) added vocab
++
++# Derived offline with `--derive` (numpy only) and cross-checked
++# by an independent torch-CPU emulation of the TP2 forward (two shards, mask to
++# +0.0, bf16 sum): both give these digests. The reference-host run re-derives and refuses
++# to judge if they disagree. ZERO is the R_restored sha (all +0.0 bytes).
++EXPECT_BASE_SHA256 = "2de516cb758dbf3475b4d48a474647b27c728421dba7cecb78f0b57786d75bad"
++EXPECT_MUT_SHA256 = "e03d704a409642d0178963db202af4381958ecbbcf4f485e8b1325d154b9de04"
++EXPECT_ZERO_SHA256 = "ad7facb2586fc6e966c004d7d1d16b024f5805ff7cb47c7a85dabd8b48892ca7"
++
++
++def _bf16_bits_of_int(values: np.ndarray) -> np.ndarray:
++    f32 = values.astype(np.float32)
++    assert np.all(f32 == values), "closed form left the exact-integer range"
++    return (f32.view(np.uint32) >> 16).astype(np.uint16)
++
++
++def closed_form_rows(mutated: bool, owner: int | None = None) -> np.ndarray:
++    """uint16 bf16 bit patterns, shape [len(IDS), HIDDEN].
++
++    owner=None: the all-reduced output. owner=r: rank r's pre-all-reduce
++    partial (rows outside rank r's shard are +0.0).
++    """
++    rows = []
++    for t in IDS:
++        if owner is not None and not (owner * SHARD <= t < (owner + 1) * SHARD):
++            rows.append(np.zeros(HIDDEN, dtype=np.uint16))
++        elif mutated and t == S0:
++            rows.append(np.full(HIDDEN, BF16_MAX, dtype=np.uint16))
++        elif mutated and t == S1:
++            rows.append(np.full(HIDDEN, BF16_LOWEST, dtype=np.uint16))
++        else:
++            k = (t * HIDDEN + np.arange(HIDDEN, dtype=np.int64)) % 251
++            rows.append(_bf16_bits_of_int(k))
++    return np.stack(rows)
++
++
++def digest(rows_u16: np.ndarray) -> str:
++    return hashlib.sha256(rows_u16.astype("<u2").tobytes()).hexdigest()
++
++
++def derive() -> dict[str, str]:
++    base, mut = closed_form_rows(False), closed_form_rows(True)
++    assert digest(base) != digest(mut), "sentinel does not change the bytes"
++    d = {"base": digest(base), "mut": digest(mut),
++         "zero": digest(np.zeros_like(base))}
++    for r in (0, 1):
++        d[f"part{r}_base"] = digest(closed_form_rows(False, owner=r))
++        d[f"part{r}_mut"] = digest(closed_form_rows(True, owner=r))
++        assert d[f"part{r}_base"] != d[f"part{r}_mut"], f"rank {r} partial blind"
++    # the bf16 constants are what torch.finfo reports (checked on the reference host too)
++    return d
++
++
++def _log(tag: str, msg: str) -> None:
++    rank = os.environ.get("RANK", "-")
++    print(f"{time.strftime('%H:%M:%S', time.gmtime())} REPLAY_SENTINEL r{rank} {tag} {msg}",
++          flush=True)
++
++
++def main() -> int:  # noqa: C901 -- one linear protocol, kept in one place
++    import torch
++    import torch.nn.functional as F
++
++    from vllm.config import VllmConfig, set_current_vllm_config
++    from vllm.distributed.parallel_state import (
++        ensure_model_parallel_initialized,
++        get_tp_group,
++        graph_capture,
++        init_distributed_environment,
++        set_custom_all_reduce,
++    )
++
++    derived = derive()
++    if (derived["base"], derived["mut"], derived["zero"]) != (
++        EXPECT_BASE_SHA256, EXPECT_MUT_SHA256, EXPECT_ZERO_SHA256
++    ):
++        _log("FAIL", f"derivation drift: derived={derived}")
++        return 2
++    info = torch.finfo(torch.bfloat16)
++    max_bits = int(torch.tensor([info.max], dtype=torch.bfloat16).view(torch.int16)[0]) & 0xFFFF
++    low_bits = int(torch.tensor([info.min], dtype=torch.bfloat16).view(torch.int16)[0]) & 0xFFFF
++    if (max_bits, low_bits) != (BF16_MAX, BF16_LOWEST):
++        _log("FAIL", f"bf16 max/lowest bits {max_bits:#x}/{low_bits:#x}")
++        return 2
++
++    ar_want = os.environ.get("REPLAY_SENTINEL_AR", "custom")
++    if ar_want not in ("custom", "nccl"):
++        _log("FAIL", f"REPLAY_SENTINEL_AR={ar_want!r} (custom|nccl)")
++        return 2
++    cycles = int(os.environ.get("REPLAY_SENTINEL_CYCLES", "3"))
++    set_custom_all_reduce(ar_want == "custom")
++
++    rank = int(os.environ["RANK"])
++    local_rank = int(os.environ["LOCAL_RANK"])
++    world = int(os.environ["WORLD_SIZE"])
++    assert world == 2, "TP2 sentinel"
++    torch.cuda.set_device(local_rank)
++    device = torch.device("cuda", local_rank)
++    results: dict[str, object] = {"rank": rank, "derived": derived}
++    ok = True
++    part_base, part_mut = derived[f"part{rank}_base"], derived[f"part{rank}_mut"]
++
++    def check(arm: str, got: bytes, want: str) -> bool:
++        sha = hashlib.sha256(got).hexdigest()
++        good = sha == want
++        results[arm] = {"sha256": sha, "want": want, "pass": good}
++        _log("PASS" if good else "FAIL", f"arm={arm} sha={sha[:16]} want={want[:16]}")
++        return good
++
++    with set_current_vllm_config(VllmConfig()):
++        init_distributed_environment(
++            world_size=world,
++            rank=rank,
++            distributed_init_method="env://",
++            local_rank=local_rank,
++            backend="nccl",
++        )
++        ensure_model_parallel_initialized(2, 1)
++        import vllm.model_executor.layers.vocab_parallel_embedding as vpe
++
++        if not vpe.PIN_MEMORY:
++            _log("FAIL", "pinned memory unavailable")
++            return 2
++        layer = vpe.PinnedHostVocabParallelEmbedding(
++            VOCAB, HIDDEN, params_dtype=torch.bfloat16
++        )
++        si = layer.shard_indices
++        start, end = si.org_vocab_start_index, si.org_vocab_end_index
++        _log("INFO", f"shard [{start},{end}) weight={tuple(layer.weight.shape)} "
++             f"pinned={layer.weight.is_pinned()} uva={layer.accelerator_weight_view is not None}")
++        assert (start, end) == ((0, SHARD) if rank == 0 else (SHARD, VOCAB))
++        assert layer.weight.is_pinned() and layer.accelerator_weight_view is not None
++        # Fill the shard from the closed form (values exact in bf16).
++        t = torch.arange(start, end, dtype=torch.int64).unsqueeze(1)
++        j = torch.arange(HIDDEN, dtype=torch.int64).unsqueeze(0)
++        layer.weight.data[: end - start].copy_(((t * HIDDEN + j) % 251).to(torch.bfloat16))
++
++        tp = get_tp_group()
++        ca = getattr(tp.device_communicator, "ca_comm", None)
++        ar_path = "custom" if (ca is not None and not ca.disabled) else "nccl"
++        results["allreduce_path"] = ar_path
++        results["allreduce_requested"] = ar_want
++        _log("INFO", f"all-reduce path at capture: {ar_path} (requested {ar_want})")
++        if ar_path != ar_want:
++            _log("FAIL", f"all-reduce path {ar_path} != requested {ar_want}: arm void")
++            return 2
++
++        ids = torch.tensor(IDS, dtype=torch.int32, device=device)
++        ids_bytes = ids.cpu().numpy().tobytes()
++
++        def to_bytes(x: torch.Tensor) -> bytes:
++            return x.contiguous().view(torch.uint8).cpu().numpy().tobytes()
++
++        def set_sentinels(on: bool) -> None:
++            for s, bits in ((S0, BF16_MAX), (S1, BF16_LOWEST)):
++                if start <= s < end:
++                    row = layer.weight.data[s - start]
++                    if on:
++                        row.view(torch.int16).fill_(
++                            bits - 0x10000 if bits >= 0x8000 else bits
++                        )
++                    else:
++                        k = (s * HIDDEN + torch.arange(HIDDEN)) % 251
++                        row.copy_(k.to(torch.bfloat16))
++            torch.distributed.barrier(group=tp.cpu_group)
++
++        def partial(x: torch.Tensor) -> torch.Tensor:
++            # PinnedHostVocabParallelEmbedding.forward minus the all-reduce
++            masked, mask = vpe.get_masked_input_and_mask(
++                x, start, end, si.num_org_vocab_padding,
++                si.added_vocab_start_index, si.added_vocab_end_index,
++            )
++            out = F.embedding(masked.long(), layer._lookup_weight(x))
++            out.masked_fill_(mask.unsqueeze(-1), 0)
++            return out
++
++        # E: eager
++        ok &= check("E_eager", to_bytes(layer(ids)), EXPECT_BASE_SHA256)
++
++        # C: compiled, not captured
++        compiled = torch.compile(layer, fullgraph=True, dynamic=False)
++        for _ in range(2):
++            out_c = compiled(ids)
++        torch.cuda.synchronize()
++        ok &= check("C_compiled", to_bytes(out_c), EXPECT_BASE_SHA256)
++
++        def capture(fn):
++            # static_ids is RETURNED: the graph reads it on every replay, so
++            # the caller must keep it alive for the graph's lifetime (the
++            # observed R failure was this block being freed and reallocated).
++            static_ids = ids.clone()
++            graph = torch.cuda.CUDAGraph()
++            with graph_capture(device) as ctx:
++                with torch.cuda.stream(ctx.stream):
++                    for _ in range(2):  # warm-up off the capture
++                        fn(static_ids)
++                ctx.stream.synchronize()
++                with torch.cuda.graph(graph, stream=ctx.stream):
++                    static_out = fn(static_ids)
++            return graph, static_out, static_ids
++
++        # P: the pre-all-reduce partial, its own graph (no collective inside)
++        # A P-setup failure voids only the P arms (logged VOID), never the run.
++        try:
++            compiled_p = torch.compile(partial, fullgraph=True, dynamic=False)
++            graph_p, out_p, ids_p = capture(compiled_p)
++        except Exception as exc:  # noqa: BLE001 -- diagnostic arm only
++            _log("VOID", f"arm=P setup failed: {type(exc).__name__}: {str(exc)[:160]}")
++            graph_p = out_p = ids_p = None
++        results["P_available"] = graph_p is not None
++
++        def check_partial(arm: str, want: str) -> bool:
++            if graph_p is None:
++                return True
++            graph_p.replay()
++            torch.cuda.synchronize()
++            return check(arm, to_bytes(out_p), want)
++
++        # G / M / R: compiled + captured, sentinel written after capture
++        graph, static_out, static_ids = capture(compiled)
++        graph.replay()
++        torch.cuda.synchronize()
++        ok &= check("G_captured", to_bytes(static_out), EXPECT_BASE_SHA256)
++        ok &= check_partial("P_G", part_base)
++        set_sentinels(True)
++        graph.replay()
++        torch.cuda.synchronize()
++        ok &= check("M_mutated_after_capture", to_bytes(static_out), EXPECT_MUT_SHA256)
++        ok &= check_partial("P_M", part_mut)
++        # the compiled-but-not-captured path must see it too (eager all-reduce)
++        ok &= check("M_compiled_eager", to_bytes(compiled(ids)), EXPECT_MUT_SHA256)
++        set_sentinels(False)
++        graph.replay()
++        torch.cuda.synchronize()
++        ok &= check("R_restored", to_bytes(static_out), EXPECT_BASE_SHA256)
++        ok &= check_partial("P_R", part_base)
++        ok &= check("I_ids_intact_R", to_bytes(static_ids), hashlib.sha256(ids_bytes).hexdigest())
++
++        # X: more cycles, an eager all-reduce between every host write and replay
++        for c in range(cycles):
++            set_sentinels(True)
++            ok &= check(f"X{c}_eager_mut", to_bytes(compiled(ids)), EXPECT_MUT_SHA256)
++            graph.replay()
++            torch.cuda.synchronize()
++            ok &= check(f"X{c}_replay_mut", to_bytes(static_out), EXPECT_MUT_SHA256)
++            ok &= check_partial(f"X{c}_P_mut", part_mut)
++            set_sentinels(False)
++            ok &= check(f"X{c}_eager_base", to_bytes(compiled(ids)), EXPECT_BASE_SHA256)
++            graph.replay()
++            torch.cuda.synchronize()
++            ok &= check(f"X{c}_replay_base", to_bytes(static_out), EXPECT_BASE_SHA256)
++            ok &= check_partial(f"X{c}_P_base", part_base)
++        ok &= check("I_ids_intact_X", to_bytes(static_ids), hashlib.sha256(ids_bytes).hexdigest())
++
++        # Z: positive control for the observed signature (ids outside both shards)
++        static_ids.fill_(OUT_OF_SHARD_ID)
++        graph.replay()
++        torch.cuda.synchronize()
++        ok &= check("Z_ids_out_of_shard", to_bytes(static_out), EXPECT_ZERO_SHA256)
++        static_ids.copy_(ids)
++        graph.replay()
++        torch.cuda.synchronize()
++        ok &= check("Z_ids_restored", to_bytes(static_out), EXPECT_BASE_SHA256)
++        del graph, static_ids, graph_p, ids_p
++
++        # K: failing control -- a device copy baked in before capture.
++        torch._dynamo.reset()
++        uva = layer._uva_weight
++        layer._uva_weight = uva.clone()  # device-resident, NOT host-mapped
++        try:
++            compiled_k = torch.compile(layer, fullgraph=True, dynamic=False)
++            graph_k, out_k, ids_k = capture(compiled_k)
++            set_sentinels(True)
++            graph_k.replay()
++            torch.cuda.synchronize()
++            sha_k = hashlib.sha256(to_bytes(out_k)).hexdigest()
++            discriminates = sha_k == EXPECT_BASE_SHA256 and sha_k != EXPECT_MUT_SHA256
++            results["K_device_copy_control"] = {
++                "sha256": sha_k,
++                "sees_mutation": sha_k == EXPECT_MUT_SHA256,
++                "pass": discriminates,
++            }
++            _log("PASS" if discriminates else "FAIL",
++                 f"arm=K_device_copy_control sha={sha_k[:16]} (must equal base "
++                 f"{EXPECT_BASE_SHA256[:16]}: a device copy cannot see the host write)")
++            ok &= discriminates
++            del graph_k, ids_k
++        finally:
++            set_sentinels(False)
++            layer._uva_weight = uva
++
++    results["pass"] = bool(ok)
++    out = os.environ.get("REPLAY_SENTINEL_OUT")
++    if out:
++        with open(f"{out}/rank{rank}.json", "w") as fh:
++            json.dump(results, fh, indent=1)
++    _log("DONE", f"pass={bool(ok)} ar={ar_path} cycles={cycles}")
++    return 0 if ok else 1
++
++
++if __name__ == "__main__":
++    if "--derive" in sys.argv:
++        print(json.dumps(derive()))
++        sys.exit(0)
++    sys.exit(main())

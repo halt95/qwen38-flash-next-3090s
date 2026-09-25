@@ -1,0 +1,1173 @@
+From d8e843f0b6423561620ee79d817fb66f89ddb4f0 Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Tue, 22 Sep 2026 04:17:29 -0400
+Subject: [PATCH 21/58] spec-decode: structured output under concurrency on a
+ PP shape
+
+Ports upstream vLLM PRs #54442 and #56802 (issue #54437): never sample from an
+unmasked row, and key draft-token hand-off snapshots by scheduler step so an
+alternating PP microbatch cannot overwrite the slot.
+---
+ tests/v1/core/test_scheduler.py               |  19 ++
+ tests/v1/worker/test_draft_tokens_handler.py  | 210 ++++++++++++++++++
+ tests/v1/worker/test_grammar_fail_closed.py   | 151 +++++++++++++
+ .../v1/worker/test_grammar_invalid_drafts.py  |  76 +++++++
+ vllm/v1/core/sched/output.py                  |   9 +
+ vllm/v1/core/sched/scheduler.py               |  13 +-
+ vllm/v1/engine/core.py                        |   4 +-
+ vllm/v1/executor/abstract.py                  |   9 +-
+ vllm/v1/executor/multiproc_executor.py        |   7 +-
+ vllm/v1/executor/uniproc_executor.py          |   9 +-
+ vllm/v1/structured_output/utils.py            |  13 ++
+ vllm/v1/worker/gpu/model_runner.py            |  59 ++++-
+ vllm/v1/worker/gpu/sample/batch_shard.py      |   7 +
+ .../gpu/spec_decode/rejection_sampler.py      |  18 +-
+ vllm/v1/worker/gpu/spec_decode/utils.py       | 148 +++++++++---
+ vllm/v1/worker/gpu_model_runner.py            |   3 +-
+ vllm/v1/worker/gpu_worker.py                  |   4 +-
+ vllm/v1/worker/worker_base.py                 |  33 ++-
+ 18 files changed, 748 insertions(+), 44 deletions(-)
+ create mode 100644 tests/v1/worker/test_draft_tokens_handler.py
+ create mode 100644 tests/v1/worker/test_grammar_fail_closed.py
+ create mode 100644 tests/v1/worker/test_grammar_invalid_drafts.py
+
+diff --git a/tests/v1/core/test_scheduler.py b/tests/v1/core/test_scheduler.py
+index 061c825fc8..07ced9ed4e 100644
+--- a/tests/v1/core/test_scheduler.py
++++ b/tests/v1/core/test_scheduler.py
+@@ -30,6 +30,7 @@ from vllm.multimodal.inputs import (
+     MultiModalKwargsItem,
+     PlaceholderRange,
+ )
++from vllm.platforms import current_platform
+ from vllm.sampling_params import SamplingParams, StructuredOutputsParams
+ from vllm.utils.hashing import sha256
+ from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
+@@ -249,6 +250,24 @@ def test_schedule(enable_prefix_caching: bool, prompt_logprobs: int | None):
+         assert scheduler.running[i] == request
+ 
+ 
++def test_scheduler_output_step_identity_defaults_to_zero():
++    output = SchedulerOutput.make_empty()
++    assert output.scheduler_step == 0
++
++
++def test_scheduler_output_carries_step_identity():
++    if not current_platform.device_type:
++        pytest.skip("No inferred device type in this environment")
++
++    scheduler = create_scheduler()
++    request = create_requests(num_requests=1)[0]
++    scheduler.add_request(request)
++
++    output = scheduler.schedule()
++    assert output.scheduler_step == scheduler.current_step
++    assert output.scheduler_step == 1
++
++
+ def test_scheduler_stats_route_to_existing_output_client():
+     scheduler = create_scheduler()
+     request = create_requests(num_requests=1)[0]
+diff --git a/tests/v1/worker/test_draft_tokens_handler.py b/tests/v1/worker/test_draft_tokens_handler.py
+new file mode 100644
+index 0000000000..bf016ebd8a
+--- /dev/null
++++ b/tests/v1/worker/test_draft_tokens_handler.py
+@@ -0,0 +1,210 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""DraftTokensHandler step identity (#54437 piece 2 / Link A)."""
++
++from types import SimpleNamespace
++
++import pytest
++import torch
++
++from vllm.v1.worker.gpu.spec_decode.utils import DraftTokensHandler
++from vllm.v1.worker.worker_base import WorkerWrapperBase
++
++pytestmark = [pytest.mark.cpu_test, pytest.mark.skip_global_cleanup]
++
++K = 4
++
++
++def _device() -> torch.device:
++    if torch.cuda.is_available():
++        return torch.device("cuda:0")
++    return torch.device("cpu")
++
++
++def _batch(req_ids: list[str], structured: bool) -> SimpleNamespace:
++    return SimpleNamespace(req_ids=list(req_ids), has_structured_output_reqs=structured)
++
++
++def _drafts(start: int, num_reqs: int, device: torch.device) -> torch.Tensor:
++    return torch.arange(
++        start, start + num_reqs * K, dtype=torch.int32, device=device
++    ).reshape(num_reqs, K)
++
++
++def test_consumed_snapshot_survives_later_batch():
++    """Link A: a later execute_model must not erase an earlier step's drafts."""
++    device = _device()
++    handler = DraftTokensHandler(device, max_snapshots=4)
++
++    drafts_a = _drafts(1, 2, device)
++    drafts_b = _drafts(101, 2, device)
++
++    handler.snapshot_consumed_drafts(
++        step_id=1,
++        input_batch=_batch(["gA", "pA"], True),
++        draft_tokens=drafts_a,
++    )
++    got = handler.get_draft_tokens(step_id=1)
++    assert got is not None
++    assert got.req_ids == ["gA", "pA"]
++    assert got.draft_token_ids[0] == [1, 2, 3, 4]
++
++    handler.snapshot_consumed_drafts(
++        step_id=2,
++        input_batch=_batch(["gB", "pB"], True),
++        draft_tokens=drafts_b,
++    )
++    got_b = handler.get_draft_tokens(step_id=2)
++    assert got_b is not None
++    assert got_b.req_ids == ["gB", "pB"]
++
++    got_a = handler.get_draft_tokens(step_id=1)
++    assert got_a is not None
++    assert got_a.req_ids == ["gA", "pA"]
++    assert got_a.draft_token_ids[0] == [1, 2, 3, 4]
++
++
++def test_plain_batch_does_not_evict_structured_snapshot():
++    device = _device()
++    handler = DraftTokensHandler(device, max_snapshots=4)
++    drafts_a = _drafts(1, 2, device)
++    drafts_plain = _drafts(201, 2, device)
++
++    handler.snapshot_consumed_drafts(
++        step_id=1,
++        input_batch=_batch(["gA", "pA"], True),
++        draft_tokens=drafts_a,
++    )
++    handler.snapshot_consumed_drafts(
++        step_id=2,
++        input_batch=_batch(["p1", "p2"], False),
++        draft_tokens=drafts_plain,
++    )
++
++    got = handler.get_draft_tokens(step_id=1)
++    assert got is not None
++    assert got.req_ids == ["gA", "pA"]
++    assert handler.get_draft_tokens(step_id=2) is None
++
++
++def test_unknown_step_returns_none_for_fail_closed_fallback():
++    device = _device()
++    handler = DraftTokensHandler(device)
++    handler.snapshot_consumed_drafts(
++        step_id=3,
++        input_batch=_batch(["gA"], True),
++        draft_tokens=_drafts(1, 1, device),
++    )
++
++    assert handler.get_draft_tokens(step_id=99) is None
++
++
++def test_proposal_slot_without_step_id_stays_latest():
++    """Non-async post_step still reads the latest proposed drafts."""
++    device = _device()
++    handler = DraftTokensHandler(device)
++    handler.set_draft_tokens(_batch(["gA", "pA"], True), _drafts(1, 2, device))
++    handler.set_draft_tokens(_batch(["gB", "pB"], True), _drafts(101, 2, device))
++
++    got = handler.get_draft_tokens()
++    assert got is not None
++    assert got.req_ids == ["gB", "pB"]
++    assert got.draft_token_ids[0] == [101, 102, 103, 104]
++
++
++def test_proposal_plain_batch_returns_placeholders():
++    device = _device()
++    handler = DraftTokensHandler(device)
++    handler.set_draft_tokens(_batch(["p1", "p2"], False), _drafts(1, 2, device))
++
++    got = handler.get_draft_tokens()
++    assert got is not None
++    assert got.req_ids == ["p1", "p2"]
++    assert got.draft_token_ids == [[-1] * K, [-1] * K]
++
++
++def test_consumed_lookup_ignores_proposal_slot():
++    device = _device()
++    handler = DraftTokensHandler(device)
++    handler.snapshot_consumed_drafts(
++        step_id=5,
++        input_batch=_batch(["gA"], True),
++        draft_tokens=_drafts(1, 1, device),
++    )
++    handler.set_draft_tokens(_batch(["gB"], True), _drafts(101, 1, device))
++
++    got = handler.get_draft_tokens(step_id=5)
++    assert got is not None
++    assert got.req_ids == ["gA"]
++    assert got.draft_token_ids[0] == [1, 2, 3, 4]
++
++
++def test_ring_buffer_evicts_oldest_and_misses():
++    device = _device()
++    handler = DraftTokensHandler(device, max_snapshots=2)
++    handler.snapshot_consumed_drafts(
++        step_id=1,
++        input_batch=_batch(["a"], True),
++        draft_tokens=_drafts(1, 1, device),
++    )
++    handler.snapshot_consumed_drafts(
++        step_id=2,
++        input_batch=_batch(["b"], True),
++        draft_tokens=_drafts(11, 1, device),
++    )
++    handler.snapshot_consumed_drafts(
++        step_id=3,
++        input_batch=_batch(["c"], True),
++        draft_tokens=_drafts(21, 1, device),
++    )
++
++    assert handler.get_draft_tokens(step_id=1) is None
++    got = handler.get_draft_tokens(step_id=2)
++    assert got is not None
++    assert got.req_ids == ["b"]
++    got = handler.get_draft_tokens(step_id=3)
++    assert got is not None
++    assert got.req_ids == ["c"]
++
++
++def test_worker_wrapper_drops_unsupported_step_id():
++    wrapper = WorkerWrapperBase(rpc_rank=0)
++    seen: list[tuple] = []
++
++    class PluginWorker:
++        def take_draft_token_ids(self):
++            seen.append(())
++            return "legacy"
++
++    wrapper.worker = PluginWorker()
++    assert wrapper.take_draft_token_ids(step_id=7) == "legacy"
++    assert seen == [()]
++
++
++def test_worker_wrapper_forwards_step_id_when_supported():
++    wrapper = WorkerWrapperBase(rpc_rank=0)
++    seen: list[int | None] = []
++
++    class Worker:
++        def take_draft_token_ids(self, step_id: int | None = None):
++            seen.append(step_id)
++            return "ok"
++
++    wrapper.worker = Worker()
++    assert wrapper.take_draft_token_ids(step_id=7) == "ok"
++    assert wrapper.take_draft_token_ids() == "ok"
++    assert seen == [7, None]
++
++
++def test_worker_wrapper_drops_positional_only_step_id():
++    wrapper = WorkerWrapperBase(rpc_rank=0)
++    seen: list[tuple] = []
++
++    class PluginWorker:
++        def take_draft_token_ids(self, step_id: int | None = None, /):
++            seen.append((step_id,))
++            return "legacy"
++
++    wrapper.worker = PluginWorker()
++    assert wrapper.take_draft_token_ids(step_id=7) == "legacy"
++    assert seen == [(None,)]
+diff --git a/tests/v1/worker/test_grammar_fail_closed.py b/tests/v1/worker/test_grammar_fail_closed.py
+new file mode 100644
+index 0000000000..869cb98038
+--- /dev/null
++++ b/tests/v1/worker/test_grammar_fail_closed.py
+@@ -0,0 +1,151 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Acceptance must stop at the last bitmask row that carries a real mask.
++
++`grammar_bitmask` stops constraining rows once it meets a -1 placeholder in the
++scheduled draft window, and the worker verifies the drafts it holds on the GPU
++rather than the scheduler's padded copy. When the two disagree -- the hand-off
++lost a step's drafts, see #54437 -- acceptance can walk into a row where every
++token is allowed.
++
++The grammar here admits only LEGAL. The scheduled window is back-filled one
++draft deep, so rows 0 and 1 carry a real mask and rows 2.. are `_full_mask`,
++while the drafts on the GPU would carry acceptance into row 2 and emit ILLEGAL.
++"""
++
++from types import SimpleNamespace
++
++import numpy as np
++import pytest
++import torch
++
++from vllm.platforms import current_platform
++from vllm.utils.math_utils import cdiv
++from vllm.v1.core.sched.output import GrammarOutput
++from vllm.v1.worker.gpu.model_runner import GPUModelRunner
++from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS
++from vllm.v1.worker.gpu.spec_decode.rejection_sampler import RejectionSampler
++from vllm.v1.worker.gpu.structured_outputs import StructuredOutputsWorker
++
++VOCAB = 128
++K = 3  # drafts per step
++NUM_LOGITS = K + 1  # + the bonus row
++LEGAL = 7
++ILLEGAL = 99
++# Index of the first -1 in the scheduled window: rows 0..1 are masked.
++NUM_ACCEPTABLE = 1
++
++
++def _bitmask() -> np.ndarray:
++    """Rows 0..NUM_ACCEPTABLE constrained to LEGAL, the rest fully permissive."""
++    mask = np.zeros((NUM_LOGITS, cdiv(VOCAB, 32)), dtype=np.int32)
++    for row in range(NUM_LOGITS):
++        if row <= NUM_ACCEPTABLE:
++            mask[row, LEGAL // 32] = 1 << (LEGAL % 32)
++        else:
++            mask[row, :] = -1  # every token allowed
++    return mask
++
++
++def _input_batch(device: torch.device) -> SimpleNamespace:
++    cu_np = np.array([0, NUM_LOGITS], dtype=np.int32)
++    # draft_sampled = input_ids[logits_indices]; entry i + 1 is draft i, so the
++    # drafts the GPU holds are [LEGAL, LEGAL, ILLEGAL].
++    input_ids = torch.tensor(
++        [LEGAL, LEGAL, LEGAL, ILLEGAL], dtype=torch.int32, device=device
++    )
++    return SimpleNamespace(
++        num_reqs=1,
++        req_ids=["g"],
++        num_draft_tokens=K,
++        num_draft_tokens_per_req=np.array([K], dtype=np.int32),
++        input_ids=input_ids,
++        logits_indices=torch.arange(NUM_LOGITS, dtype=torch.int32, device=device),
++        positions=torch.arange(NUM_LOGITS, dtype=torch.int64, device=device),
++        cu_num_logits_np=cu_np,
++        cu_num_logits=torch.from_numpy(cu_np).to(device),
++        idx_mapping_np=np.array([0], dtype=np.int32),
++        idx_mapping=torch.zeros(1, dtype=torch.int32, device=device),
++        expanded_idx_mapping=torch.zeros(NUM_LOGITS, dtype=torch.int32, device=device),
++        expanded_local_pos=torch.arange(NUM_LOGITS, dtype=torch.int32, device=device),
++        seq_lens=torch.tensor([64], dtype=torch.int32, device=device),
++    )
++
++
++def _logits(device: torch.device) -> torch.Tensor:
++    """Every row prefers its own draft, so nothing but the mask can reject one."""
++    logits = torch.zeros(NUM_LOGITS, VOCAB, dtype=torch.float32, device=device)
++    logits[0, LEGAL] = 10.0
++    logits[1, LEGAL] = 10.0
++    logits[2, ILLEGAL] = 10.0  # row 2 is permissive, so this wins there
++    logits[3, LEGAL] = 10.0
++    return logits
++
++
++def _rejection_sampler(device: torch.device) -> RejectionSampler:
++    sampler = object.__new__(RejectionSampler)
++    sampler.num_speculative_steps = K
++    sampler.enable_adaptive_verification = False
++    sampler.use_block_verification = False
++    sampler.synthetic_conditional_rates = None
++    sampler.watermark_key = None
++    zeros_f = torch.zeros(1, dtype=torch.float32, device=device)  # greedy
++    sampler.sampler = SimpleNamespace(
++        compute_nans=False,
++        logprobs_mode="raw_logprobs",
++        use_fp64_gumbel=False,
++        apply_sampling_params=lambda logits, *args, **kwargs: logits,
++        sampling_states=SimpleNamespace(
++            temperature=SimpleNamespace(gpu=zeros_f),
++            seeds=SimpleNamespace(gpu=torch.zeros(1, dtype=torch.int64, device=device)),
++            max_num_logprobs=lambda _: NO_LOGPROBS,
++        ),
++        req_states=SimpleNamespace(
++            prefill_len=SimpleNamespace(
++                gpu=torch.zeros(1, dtype=torch.int32, device=device)
++            )
++        ),
++    )
++    return sampler
++
++
++@pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")
++def test_acceptance_stops_at_the_last_masked_row():
++    device = torch.device("cuda")
++    input_batch = _input_batch(device)
++    logits = _logits(device)
++
++    runner = object.__new__(GPUModelRunner)
++    runner.device = device
++    runner.vocab_size = VOCAB
++    runner.batch_sharder = None
++    runner.sampler = None
++    runner.model = SimpleNamespace(compute_logits=lambda hidden: logits)
++    runner.rejection_sampler = _rejection_sampler(device)
++    runner.speculator = SimpleNamespace(draft_logits=None)
++    runner.structured_outputs_worker = StructuredOutputsWorker(
++        max_num_logits=NUM_LOGITS,
++        vocab_size=VOCAB,
++        device=device,
++        mask_stride=NUM_LOGITS,
++        num_bonus_tokens=1,
++    )
++
++    grammar_output = GrammarOutput(["g"], _bitmask())
++    # The scheduler reports how many leading drafts the bitmask constrained.
++    # Absent on an older scheduler, where the whole window is invalidated.
++    grammar_output.num_acceptable_drafts = [NUM_ACCEPTABLE]
++
++    hidden = torch.zeros(NUM_LOGITS, 8, dtype=torch.float32, device=device)
++    sampler_output, num_sampled, _ = runner.sample(hidden, input_batch, grammar_output)
++
++    accepted = int(num_sampled[0].item())
++    emitted = sampler_output.sampled_token_ids[0, :accepted].tolist()
++    assert ILLEGAL not in emitted, (
++        f"emitted {emitted}: a draft verified against a permissive row was "
++        f"accepted, so the request sampled with no grammar constraint"
++    )
++    # Draft 0 may be accepted; draft 1 must not be, because accepting it moves
++    # sampling into row 2, which constrains nothing.
++    assert accepted == NUM_ACCEPTABLE + 1
++    assert emitted == [LEGAL] * accepted
+diff --git a/tests/v1/worker/test_grammar_invalid_drafts.py b/tests/v1/worker/test_grammar_invalid_drafts.py
+new file mode 100644
+index 0000000000..476fe761b9
+--- /dev/null
++++ b/tests/v1/worker/test_grammar_invalid_drafts.py
+@@ -0,0 +1,76 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Which speculative drafts a structured-output request may accept.
++
++`StructuredOutputManager.grammar_bitmask` fills row i before it inspects
++`req_tokens[i]`, so with the first -1 placeholder at index j rows 0..j carry a
++real mask and rows j+1.. carry the all-permissive `_full_mask`. Drafts j..K-1
++must therefore be rejected, or the request samples with no grammar constraint
++at a position the model really does sample.
++"""
++
++from unittest.mock import Mock
++
++import numpy as np
++import torch
++
++from vllm.v1.worker.gpu.model_runner import grammar_invalid_draft_positions
++
++
++def _input_batch(req_ids, num_logits_per_req, num_draft_tokens=6):
++    cu = np.concatenate([[0], np.cumsum(num_logits_per_req)]).astype(np.int32)
++    return Mock(
++        req_ids=list(req_ids),
++        cu_num_logits_np=cu,
++        num_draft_tokens=num_draft_tokens,
++    )
++
++
++def _positions(batch, grammar_req_ids, num_acceptable):
++    out = grammar_invalid_draft_positions(
++        batch, grammar_req_ids, num_acceptable, torch.device("cpu")
++    )
++    return None if out is None else out.tolist()
++
++
++def test_positions_reject_whole_window_when_nothing_was_backfilled():
++    # Two requests, 4 logits rows each (1 + 3 drafts). Request "g" is at rows
++    # 0..3, so its drafts sit at draft_sampled[1..3].
++    batch = _input_batch(["g", "p"], [4, 4])
++    assert _positions(batch, ["g"], [0]) == [1, 2, 3]
++
++
++def test_positions_keep_the_drafts_the_bitmask_could_see():
++    batch = _input_batch(["g", "p"], [4, 4])
++    # Two real drafts: they were masked correctly and may be accepted.
++    assert _positions(batch, ["g"], [2]) == [3]
++
++
++def test_positions_reject_nothing_when_fully_backfilled():
++    batch = _input_batch(["g", "p"], [4, 4])
++    assert _positions(batch, ["g"], [3]) is None
++
++
++def test_positions_are_offset_per_request():
++    batch = _input_batch(["p", "g"], [4, 4])
++    # "g" starts at logits row 4, so its drafts are draft_sampled[5..7].
++    assert _positions(batch, ["g"], [0]) == [5, 6, 7]
++
++
++def test_positions_fall_back_to_the_whole_window_without_the_field():
++    # An older scheduler, or warmup, supplies no num_acceptable_drafts; be
++    # conservative rather than accepting drafts whose mask is unknown.
++    batch = _input_batch(["g"], [4])
++    assert _positions(batch, ["g"], None) == [1, 2, 3]
++
++
++def test_no_positions_without_drafts_or_grammar_requests():
++    batch = _input_batch(["g"], [4], num_draft_tokens=0)
++    assert _positions(batch, ["g"], [0]) is None
++    batch = _input_batch(["g"], [4])
++    assert _positions(batch, [], []) is None
++
++
++def test_unknown_request_is_skipped():
++    batch = _input_batch(["p"], [4])
++    assert _positions(batch, ["g"], [0]) is None
+diff --git a/vllm/v1/core/sched/output.py b/vllm/v1/core/sched/output.py
+index 3a46fa40a7..03bb2cd041 100644
+--- a/vllm/v1/core/sched/output.py
++++ b/vllm/v1/core/sched/output.py
+@@ -304,6 +304,10 @@ class SchedulerOutput:
+     # Number of spec tokens to schedule for the next step.
+     num_spec_tokens_to_schedule: int = 0
+ 
++    # Identity of this schedule() call (`Scheduler.current_step`). Used to
++    # retrieve the matching consumption-time draft-token snapshot.
++    scheduler_step: int = 0
++
+     @classmethod
+     def make_empty(cls) -> "SchedulerOutput":
+         return cls(
+@@ -325,3 +329,8 @@ class GrammarOutput:
+     structured_output_request_ids: list[str]
+     # Bitmask ordered as structured_output_request_ids.
+     grammar_bitmask: "npt.NDArray[np.int32]"
++    # Per request, ordered as structured_output_request_ids: how many leading
++    # drafts the bitmask constrained. `grammar_bitmask` fills every row after
++    # the first -1 placeholder with the all-permissive `_full_mask`, so drafts
++    # from this index on must not be accepted. None means nothing to invalidate.
++    num_acceptable_drafts: list[int] | None = None
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 25af1b6c33..b16ae9dcef 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -74,7 +74,8 @@ from vllm.v1.core.sched import e2_alloc_log as _e2_alloc_log
+ from vllm.v1.request import Request, RequestStatus, StreamingUpdate
+ from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
+ from vllm.v1.spec_decode.metrics import SpecDecodingStats
+-from vllm.v1.structured_output import StructuredOutputManager
++from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputManager
++from vllm.v1.structured_output.utils import strip_speculative_padding
+ from vllm.v1.utils import record_function_or_nullcontext
+ 
+ logger = init_logger(__name__)
+@@ -1465,6 +1466,7 @@ class Scheduler(SchedulerInterface):
+             kv_connector_block_state=kv_connector_block_state,
+             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
+             ec_manager_metadata=self.encoder_cache_manager.get_manager_metadata(),
++            scheduler_step=self.current_step,
+         )
+ 
+         # NOTE(Kuntai): this function is designed for multiple purposes:
+@@ -1941,7 +1943,14 @@ class Scheduler(SchedulerInterface):
+             structured_output_request_ids,
+             scheduler_output.scheduled_spec_decode_tokens,
+         )
+-        return GrammarOutput(structured_output_request_ids, bitmask)
++        spec_tokens = scheduler_output.scheduled_spec_decode_tokens
++        num_acceptable_drafts = [
++            len(strip_speculative_padding(spec_tokens.get(req_id, [])))
++            for req_id in structured_output_request_ids
++        ]
++        return GrammarOutput(
++            structured_output_request_ids, bitmask, num_acceptable_drafts
++        )
+ 
+     def update_from_output(
+         self,
+diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
+index ffc9a5de7e..110f56dcde 100644
+--- a/vllm/v1/engine/core.py
++++ b/vllm/v1/engine/core.py
+@@ -725,7 +725,9 @@ class EngineCore:
+             # When draft tokens are used with structured output, validate them
+             # before computing the grammar bitmask for the deferred request.
+             if self.check_for_draft_tokens:
+-                draft_token_ids = self.model_executor.take_draft_token_ids()
++                draft_token_ids = self.model_executor.take_draft_token_ids(
++                    step_id=deferred_scheduler_output.scheduler_step
++                )
+                 if draft_token_ids is not None:
+                     # Update the draft token ids in the scheduler output to
+                     # filter out the invalid spec tokens, which will be padded
+diff --git a/vllm/v1/executor/abstract.py b/vllm/v1/executor/abstract.py
+index 964f16ed24..a24507b577 100644
+--- a/vllm/v1/executor/abstract.py
++++ b/vllm/v1/executor/abstract.py
+@@ -259,8 +259,13 @@ class Executor(ABC):
+     def execute_dummy_batch(self) -> None:
+         self.collective_rpc("execute_dummy_batch")
+ 
+-    def take_draft_token_ids(self) -> DraftTokenIds | None:
+-        output: list[DraftTokenIds] = self.collective_rpc("take_draft_token_ids")
++    def take_draft_token_ids(self, step_id: int | None = None) -> DraftTokenIds | None:
++        # Omit step_id when unset so plugin workers with the documented
++        # no-argument take_draft_token_ids() keep working.
++        kwargs = {} if step_id is None else {"step_id": step_id}
++        output: list[DraftTokenIds] = self.collective_rpc(
++            "take_draft_token_ids", kwargs=kwargs
++        )
+         return output[0]
+ 
+     def profile(self, is_start: bool = True, profile_prefix: str | None = None):
+diff --git a/vllm/v1/executor/multiproc_executor.py b/vllm/v1/executor/multiproc_executor.py
+index aae270fe5b..1ccd23a764 100644
+--- a/vllm/v1/executor/multiproc_executor.py
++++ b/vllm/v1/executor/multiproc_executor.py
+@@ -405,10 +405,13 @@ class MultiprocExecutor(Executor):
+     def execute_dummy_batch(self) -> None:
+         self.collective_rpc("execute_dummy_batch", unique_reply_rank=self.output_rank)
+ 
+-    def take_draft_token_ids(self) -> DraftTokenIds | None:
++    def take_draft_token_ids(self, step_id: int | None = None) -> DraftTokenIds | None:
+         # OPTIMIZATION: Get output only from a single worker (output_rank)
++        kwargs = {} if step_id is None else {"step_id": step_id}
+         return self.collective_rpc(
+-            "take_draft_token_ids", unique_reply_rank=self.output_rank
++            "take_draft_token_ids",
++            unique_reply_rank=self.output_rank,
++            kwargs=kwargs,
+         )
+ 
+     def collective_rpc(  # type: ignore[override]
+diff --git a/vllm/v1/executor/uniproc_executor.py b/vllm/v1/executor/uniproc_executor.py
+index da1f2c588b..dc798cdc5c 100644
+--- a/vllm/v1/executor/uniproc_executor.py
++++ b/vllm/v1/executor/uniproc_executor.py
+@@ -141,8 +141,13 @@ class UniProcExecutor(Executor):
+             single_value=True,
+         )
+ 
+-    def take_draft_token_ids(self) -> DraftTokenIds | None:
+-        return self.collective_rpc("take_draft_token_ids", single_value=True)
++    def take_draft_token_ids(self, step_id: int | None = None) -> DraftTokenIds | None:
++        kwargs = {} if step_id is None else {"step_id": step_id}
++        return self.collective_rpc(
++            "take_draft_token_ids",
++            kwargs=kwargs,
++            single_value=True,
++        )
+ 
+     def check_health(self) -> None:
+         # UniProcExecutor will always be healthy as long as
+diff --git a/vllm/v1/structured_output/utils.py b/vllm/v1/structured_output/utils.py
+index 92122f85d0..7c4af7a469 100644
+--- a/vllm/v1/structured_output/utils.py
++++ b/vllm/v1/structured_output/utils.py
+@@ -573,3 +573,16 @@ def choice_as_grammar(choice: list[str]) -> str:
+     escaped_choices = (escape_ebnf_string(c) for c in choice)
+     grammar = "root ::= " + " | ".join(f'"{c}"' for c in escaped_choices)
+     return grammar
++
++def strip_speculative_padding(token_ids: list[int]) -> list[int]:
++    """Drop speculative-decoding padding from a token block.
++
++    ngram and other speculative backends pad rejected draft positions with a
++    -1 sentinel. Structured-output grammars treat every entry as a real token
++    id, so the sentinels (and everything after the first one) are removed here,
++    before tokens reach any backend, rather than inside a single backend.
++    """
++    for i, token_id in enumerate(token_ids):
++        if token_id < 0:
++            return token_ids[:i]
++    return token_ids
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index e3479c2a7d..744fe5bf00 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -185,6 +185,39 @@ from vllm.v1.worker.workspace import lock_workspace, use_workspace_lane
+ logger = init_logger(__name__)
+ 
+ 
++def grammar_invalid_draft_positions(
++    input_batch: InputBatch,
++    grammar_req_ids: list[str],
++    num_acceptable_drafts: list[int] | None,
++    device: torch.device,
++) -> torch.Tensor | None:
++    """Indices of `draft_sampled` entries whose bitmask row is permissive.
++
++    Drafts from `num_acceptable_drafts` on were verified against rows carrying
++    `_full_mask`, so accepting one would sample with no grammar constraint.
++    Returns None when there is nothing to invalidate.
++    """
++    if not grammar_req_ids or input_batch.num_draft_tokens == 0:
++        return None
++    cu_num_logits = input_batch.cu_num_logits_np.tolist()
++    req_id_to_idx = {req_id: i for i, req_id in enumerate(input_batch.req_ids)}
++    positions: list[int] = []
++    for i, req_id in enumerate(grammar_req_ids):
++        req_idx = req_id_to_idx.get(req_id)
++        if req_idx is None:
++            continue
++        # Without the field (an older scheduler, or warmup) invalidate the whole
++        # window, which is the conservative choice.
++        num_acceptable = (
++            num_acceptable_drafts[i] if num_acceptable_drafts is not None else 0
++        )
++        start = cu_num_logits[req_idx] + 1 + num_acceptable
++        positions.extend(range(start, cu_num_logits[req_idx + 1]))
++    if not positions:
++        return None
++    return torch.tensor(positions, dtype=torch.int64, device=device)
++
++
+ class GPUModelRunner(LoRAModelRunnerMixin):
+     def __init__(self, vllm_config: VllmConfig, device: torch.device):
+         self.vllm_config = vllm_config
+@@ -293,7 +326,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 self.use_aux_hidden_state_outputs = True
+ 
+         # Draft tokens propagation - for spec-dec + struct outputs.
+-        self.draft_tokens_handler = DraftTokensHandler(self.device)
++        self.draft_tokens_handler = DraftTokensHandler(
++            self.device,
++            max_snapshots=max(8, vllm_config.max_concurrent_batches + 1),
++        )
+ 
+         self.pcp_manager: pcp.PCPManager | None = None
+ 
+@@ -1471,6 +1507,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 else None
+             ),
+         )
++        if self.num_speculative_steps > 0:
++            # Snapshot the drafts that were just written into input_ids, tagged
++            # with this scheduler step. Proposal-time drafts (set later in
++            # sample_tokens) are for the next step and must not overwrite this.
++            self.draft_tokens_handler.snapshot_consumed_drafts(
++                scheduler_output.scheduler_step,
++                input_batch,
++                self.req_states.draft_tokens[input_batch.idx_mapping],
++            )
+         input_batch = pcp.maybe_partition_pcp_batch(
+             self.pcp_manager,
+             input_batch,
+@@ -1543,6 +1588,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             sample_hidden_states = hidden_states[input_batch.logits_indices]
+             logits = self.model.compute_logits(sample_hidden_states)
+ 
++        invalid_draft_positions = None
+         if grammar_output is not None:
+             # Apply grammar bitmask to the logits in-place.
+             assert self.structured_outputs_worker is not None
+@@ -1552,6 +1598,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 grammar_output.structured_output_request_ids,
+                 grammar_output.grammar_bitmask,
+             )
++            invalid_draft_positions = grammar_invalid_draft_positions(
++                input_batch,
++                grammar_output.structured_output_request_ids,
++                grammar_output.num_acceptable_drafts,
++                self.device,
++            )
+ 
+         sampler_output: SamplerOutput | None
+         if input_batch.num_reqs == 0:
+@@ -1570,6 +1622,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 input_batch,
+                 # Draft logits are needed for probabilistic rejection sampling.
+                 self.speculator.draft_logits,
++                invalid_draft_positions,
+             )
+ 
+         if shard_metadata is not None:
+@@ -2193,8 +2246,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+ 
+         return async_output
+ 
+-    def take_draft_token_ids(self) -> DraftTokenIds | None:
+-        return self.draft_tokens_handler.get_draft_tokens()
++    def take_draft_token_ids(self, step_id: int | None = None) -> DraftTokenIds | None:
++        return self.draft_tokens_handler.get_draft_tokens(step_id=step_id)
+ 
+     @torch.inference_mode()
+     @step_eplb_after()
+diff --git a/vllm/v1/worker/gpu/sample/batch_shard.py b/vllm/v1/worker/gpu/sample/batch_shard.py
+index 0f484f1a17..07f798728b 100644
+--- a/vllm/v1/worker/gpu/sample/batch_shard.py
++++ b/vllm/v1/worker/gpu/sample/batch_shard.py
+@@ -335,9 +335,16 @@ def _shard_grammar_output(
+         cursor += num_req_logits
+     if not local_ids:
+         return None
++    # num_acceptable_drafts is ordered with structured_output_request_ids.
++    num_acceptable = grammar_output.num_acceptable_drafts
++    if num_acceptable is not None:
++        owned = set(local_ids)
++        ids = grammar_output.structured_output_request_ids
++        num_acceptable = [n for i, n in zip(ids, num_acceptable) if i in owned]
+     return GrammarOutput(
+         structured_output_request_ids=local_ids,
+         grammar_bitmask=grammar_output.grammar_bitmask[keep_indices],
++        num_acceptable_drafts=num_acceptable,
+     )
+ 
+ 
+diff --git a/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py b/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
+index 609924e87f..6c07e6a63b 100644
+--- a/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
++++ b/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
+@@ -176,6 +176,7 @@ class RejectionSampler:
+         idx_mapping_np: np.ndarray,
+         expanded_idx_mapping: torch.Tensor,
+         expanded_local_pos: torch.Tensor,
++        verify_draft_sampled: torch.Tensor,
+     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+         processed_logits = self.sampler.apply_sampling_params(
+             logits,
+@@ -189,7 +190,7 @@ class RejectionSampler:
+         sampled, num_sampled = rejection_sample(
+             processed_logits,
+             draft_logits,
+-            draft_sampled,
++            verify_draft_sampled,
+             cu_num_logits,
+             pos,
+             idx_mapping,
+@@ -216,7 +217,10 @@ class RejectionSampler:
+         pos: torch.Tensor,
+         max_chunk_logits: int,
+         max_num_logprobs: int,
++        verify_draft_sampled: torch.Tensor | None = None,
+     ) -> tuple[torch.Tensor, torch.Tensor, LogprobsTensors | None]:
++        if verify_draft_sampled is None:
++            verify_draft_sampled = draft_sampled
+         cu_num_logits_np = input_batch.cu_num_logits_np
+         use_processed_logits = self.sampler.logprobs_mode in PROCESSED_LOGPROBS_MODES
+         num_reqs = input_batch.num_reqs
+@@ -251,6 +255,7 @@ class RejectionSampler:
+                 input_batch.idx_mapping_np[start:end],
+                 input_batch.expanded_idx_mapping[lo:hi],
+                 input_batch.expanded_local_pos[lo:hi],
++                verify_draft_sampled[lo:hi],
+             )
+             chunk_logprobs = self._get_logprobs_tensors(
+                 sampled,
+@@ -289,6 +294,7 @@ class RejectionSampler:
+         logits: torch.Tensor,
+         input_batch: InputBatch,
+         draft_logits: torch.Tensor | None = None,
++        invalid_draft_positions: torch.Tensor | None = None,
+     ) -> SamplerOutput:
+         # NOTE(woosuk): We intentionally compute num_nans before sampling to make clear
+         # that num_nans is computed before applying penalties and temperature.
+@@ -297,6 +303,15 @@ class RejectionSampler:
+         draft_sampled = input_batch.input_ids[input_batch.logits_indices]
+         pos = input_batch.positions[input_batch.logits_indices]
+ 
++        # Marking a draft invalid (`is_valid_draft = draft_sampled >= 0`) pins the
++        # accepted length before it reaches a permissive bitmask row. Only
++        # verification sees the copy: `apply_sampling_params` and watermarking
++        # keep the real draft ids.
++        verify_draft_sampled = draft_sampled
++        if invalid_draft_positions is not None:
++            verify_draft_sampled = draft_sampled.clone()
++            verify_draft_sampled[invalid_draft_positions] = -1
++
+         max_num_logprobs = self.sampler.sampling_states.max_num_logprobs(
+             input_batch.idx_mapping_np
+         )
+@@ -309,6 +324,7 @@ class RejectionSampler:
+             pos,
+             chunk_logit_limit,
+             max_num_logprobs,
++            verify_draft_sampled,
+         )
+ 
+         num_sampled, num_rejected = get_num_sampled_and_rejected(
+diff --git a/vllm/v1/worker/gpu/spec_decode/utils.py b/vllm/v1/worker/gpu/spec_decode/utils.py
+index f73acb2bda..65ad1603ca 100644
+--- a/vllm/v1/worker/gpu/spec_decode/utils.py
++++ b/vllm/v1/worker/gpu/spec_decode/utils.py
+@@ -1,5 +1,8 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++from collections import deque
++from dataclasses import dataclass
++
+ import numpy as np
+ import torch
+ 
+@@ -10,6 +13,10 @@ from vllm.v1.outputs import DraftTokenIds
+ from vllm.v1.worker.gpu.async_utils import async_copy_to_np
+ from vllm.v1.worker.gpu.input_batch import InputBatch
+ 
++# Keep enough consumption-time snapshots to cover async PP in-flight
++# batches (`max_concurrent_batches` is `pp_size + 1`) with headroom.
++_DEFAULT_MAX_SNAPSHOTS = 8
++
+ logger = init_logger(__name__)
+ 
+ 
+@@ -26,48 +33,135 @@ def get_pp_safe_draft_load_config(load_config: LoadConfig) -> LoadConfig:
+     return load_config
+ 
+ 
++@dataclass
++class _DraftSnapshot:
++    step_id: int | None
++    req_ids: list[str]
++    num_draft_tokens: int
++    draft_tokens_np: np.ndarray | None
++    copy_event: torch.cuda.Event | None
++
++    def to_draft_token_ids(self) -> DraftTokenIds:
++        if self.draft_tokens_np is not None:
++            if self.copy_event is not None:
++                self.copy_event.synchronize()
++            draft_token_ids = self.draft_tokens_np.tolist()
++        else:
++            draft_token_ids = [[-1] * self.num_draft_tokens for _ in self.req_ids]
++        return DraftTokenIds(self.req_ids, draft_token_ids)
++
++
+ class DraftTokensHandler:
+-    def __init__(self, device: torch.device | None = None):
++    def __init__(
++        self,
++        device: torch.device | None = None,
++        max_snapshots: int = _DEFAULT_MAX_SNAPSHOTS,
++    ):
+         self.device = device
+-        self.copy_stream = torch.cuda.Stream(device)
+-        # Blocking (sleep) event to avoid busy-polling the CUDA driver lock.
+-        self.copy_event = torch.cuda.Event(blocking=True)
++        self.copy_stream: torch.cuda.Stream | None = None
++        if device is not None and device.type == "cuda":
++            self.copy_stream = torch.cuda.Stream(device)
++
++        self._max_snapshots = max(1, max_snapshots)
++        # Consumption-time snapshots tagged with scheduler step identity.
++        self._consumed: deque[_DraftSnapshot] = deque(maxlen=self._max_snapshots)
++        # Latest proposal-time drafts for the non-async post_step path.
++        self._proposed: _DraftSnapshot | None = None
++
++    def _copy_drafts(
++        self, draft_tokens: torch.Tensor
++    ) -> tuple[np.ndarray, torch.cuda.Event | None]:
++        if self.copy_stream is None:
++            return draft_tokens.detach().cpu().numpy(), None
+ 
+-        self.req_ids: list[str] = []
+-        self.draft_tokens_np: np.ndarray | None = None
+-        self.num_draft_tokens: int = 0
++        current_stream = torch.cuda.current_stream(self.device)
++        self.copy_stream.wait_stream(current_stream)
++        copy_event = torch.cuda.Event(blocking=True)
++        with torch.cuda.stream(self.copy_stream):
++            draft_tokens_np = async_copy_to_np(draft_tokens)
++            # draft_tokens is a temporary allocation on the main stream and
++            # read here on copy_stream; without record_stream, the caching
++            # allocator may reuse its memory before the async copy executes.
++            draft_tokens.record_stream(self.copy_stream)
++            copy_event.record()
++        return draft_tokens_np, copy_event
++
++    def snapshot_consumed_drafts(
++        self,
++        step_id: int,
++        input_batch: InputBatch,
++        draft_tokens: torch.Tensor,
++    ) -> None:
++        """Record drafts that prepare_inputs fed into input_ids for this step.
++
++        Tagged with the scheduler step so the engine can retrieve the matching
++        snapshot later by equality. Batches without structured-output requests
++        are not stored, so they cannot evict a useful snapshot.
++        """
++        if not input_batch.has_structured_output_reqs:
++            return
++
++        draft_tokens_np, copy_event = self._copy_drafts(draft_tokens)
++        self._consumed.append(
++            _DraftSnapshot(
++                step_id=step_id,
++                req_ids=list(input_batch.req_ids),
++                num_draft_tokens=draft_tokens.shape[1],
++                draft_tokens_np=draft_tokens_np,
++                copy_event=copy_event,
++            )
++        )
+ 
+     def set_draft_tokens(
+         self, input_batch: InputBatch, draft_tokens: torch.Tensor
+     ) -> None:
+-        self.req_ids = input_batch.req_ids
+-        self.num_draft_tokens = draft_tokens.shape[1]
++        req_ids = list(input_batch.req_ids)
++        num_draft_tokens = draft_tokens.shape[1]
+         if not input_batch.has_structured_output_reqs:
+             # No draft token validation needs to be performed by
+             # the scheduler for this batch.
+-            self.draft_tokens_np = None
++            self._proposed = _DraftSnapshot(
++                step_id=None,
++                req_ids=req_ids,
++                num_draft_tokens=num_draft_tokens,
++                draft_tokens_np=None,
++                copy_event=None,
++            )
+             return
+ 
+         # For spec decoding + structured outputs, we must transfer the
+         # draft tokens back to the scheduler for grammar validation.
+-        current_stream = torch.cuda.current_stream(self.device)
+-        self.copy_stream.wait_stream(current_stream)
+-        with torch.cuda.stream(self.copy_stream):
+-            self.draft_tokens_np = async_copy_to_np(draft_tokens)
+-            # draft_tokens is a temporary allocation on the main stream and read here on
+-            # copy_stream; without record_stream, the caching allocator may reuse its
+-            # memory before the async copy executes.
+-            draft_tokens.record_stream(self.copy_stream)
+-            self.copy_event.record()
++        draft_tokens_np, copy_event = self._copy_drafts(draft_tokens)
++        self._proposed = _DraftSnapshot(
++            step_id=None,
++            req_ids=req_ids,
++            num_draft_tokens=num_draft_tokens,
++            draft_tokens_np=draft_tokens_np,
++            copy_event=copy_event,
++        )
+ 
+-    def get_draft_tokens(self) -> DraftTokenIds | None:
+-        if self.draft_tokens_np is not None:
+-            self.copy_event.synchronize()
+-            draft_token_ids = self.draft_tokens_np.tolist()
+-        else:
+-            # This case only happens when async scheduling is disabled.
+-            draft_token_ids = [[-1] * self.num_draft_tokens for _ in self.req_ids]
+-        return DraftTokenIds(self.req_ids, draft_token_ids)
++    def get_draft_tokens(self, step_id: int | None = None) -> DraftTokenIds | None:
++        """Return draft tokens for grammar validation.
++
++        If ``step_id`` is set, look up the consumption-time snapshot for that
++        scheduler step by equality. A miss returns None so placeholders stay
++        -1 and fail-closed invalidation can pin acceptance via is_valid_draft.
++        If ``step_id`` is None, return the latest proposal-time drafts (the
++        non-async post_step path).
++        """
++        if step_id is not None:
++            for snapshot in reversed(self._consumed):
++                if snapshot.step_id == step_id:
++                    return snapshot.to_draft_token_ids()
++            logger.debug(
++                "Draft-token snapshot miss for scheduler step %s",
++                step_id,
++            )
++            return None
++
++        if self._proposed is None:
++            return DraftTokenIds([], [])
++        return self._proposed.to_draft_token_ids()
+ 
+ 
+ def get_parallel_drafting_token_id(hf_config) -> int:
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index 97a59bd273..743c593b8a 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -4895,7 +4895,8 @@ class GPUModelRunner(
+             self.input_batch.num_tokens_no_spec[i] = pos + 1
+         self.input_batch.prev_req_id_to_index = prev_req_id_to_index
+ 
+-    def take_draft_token_ids(self) -> DraftTokenIds | None:
++    def take_draft_token_ids(self, step_id: int | None = None) -> DraftTokenIds | None:
++        del step_id  # V2-only identity; V1 keeps a single proposal slot.
+         if not self.num_spec_tokens or not self._draft_token_req_ids:
+             return None
+         draft_token_ids, req_ids = self._get_draft_token_ids_cpu()
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index eead9c9321..949f29965f 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -1362,8 +1362,8 @@ class Worker(WorkerBase):
+             return self.model_runner.pool()  # type: ignore
+         return None
+ 
+-    def take_draft_token_ids(self) -> DraftTokenIds | None:
+-        return self.model_runner.take_draft_token_ids()
++    def take_draft_token_ids(self, step_id: int | None = None) -> DraftTokenIds | None:
++        return self.model_runner.take_draft_token_ids(step_id=step_id)
+ 
+     def profile(self, is_start: bool = True, profile_prefix: str | None = None):
+         # Check if profiling is enabled
+diff --git a/vllm/v1/worker/worker_base.py b/vllm/v1/worker/worker_base.py
+index cf5b0e7ce3..3bf7ca69ef 100644
+--- a/vllm/v1/worker/worker_base.py
++++ b/vllm/v1/worker/worker_base.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
++import inspect
+ from collections.abc import Callable
+ from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar
+ 
+@@ -24,18 +25,34 @@ from vllm.v1.kv_cache_interface import KVCacheSpec
+ 
+ if TYPE_CHECKING:
+     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
+-    from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
++    from vllm.v1.outputs import AsyncModelRunnerOutput, DraftTokenIds, ModelRunnerOutput
+ else:
+     SchedulerOutput = object
+     GrammarOutput = object
+     AsyncModelRunnerOutput = object
+     ModelRunnerOutput = object
++    DraftTokenIds = object
+ 
+ logger = init_logger(__name__)
+ 
+ _R = TypeVar("_R")
+ 
+ 
++def _callable_accepts_kwarg(func: Callable[..., Any], name: str) -> bool:
++    """Return True if ``func`` can be called with ``name`` as a keyword."""
++    try:
++        params = inspect.signature(func).parameters
++    except (TypeError, ValueError):
++        return False
++    param = params.get(name)
++    if param is not None:
++        return param.kind in (
++            inspect.Parameter.POSITIONAL_OR_KEYWORD,
++            inspect.Parameter.KEYWORD_ONLY,
++        )
++    return any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
++
++
+ class CompilationTimes(NamedTuple):
+     language_model: float
+     encoder: float
+@@ -357,6 +374,20 @@ class WorkerWrapperBase:
+     def __getattr__(self, attr: str):
+         return getattr(self.worker, attr)
+ 
++    def take_draft_token_ids(self, step_id: int | None = None) -> DraftTokenIds | None:
++        """Forward draft-token lookup, dropping ``step_id`` if unsupported.
++
++        Plugin workers are documented to implement no-argument
++        ``take_draft_token_ids()``. Passing ``step_id`` to those methods would
++        raise TypeError; fall back to the legacy call instead.
++        """
++        method = getattr(self.worker, "take_draft_token_ids", None)
++        if method is None:
++            return None
++        if step_id is not None and _callable_accepts_kwarg(method, "step_id"):
++            return method(step_id=step_id)
++        return method()
++
+     def _apply_mm_cache(self, scheduler_output: SchedulerOutput) -> None:
+         mm_cache = self.mm_receiver_cache
+         if mm_cache is None:

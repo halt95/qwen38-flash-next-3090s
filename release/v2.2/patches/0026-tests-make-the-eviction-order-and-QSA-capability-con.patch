@@ -1,0 +1,413 @@
+From b6a3e1c800c40b9f3c4b23fc12111e2769abb409 Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Tue, 22 Sep 2026 04:17:29 -0400
+Subject: [PATCH 26/58] tests: make the eviction-order and QSA capability
+ controls discriminating
+
+The eviction-order test now drives both free paths through production code, and
+the capability tests fail when the overrides are reverted.
+---
+ .../qwen4_exp/test_qsa_backend_capability.py  | 176 ++++++++++++++++++
+ tests/v1/core/test_deferred_block_free.py     | 147 +++++++++++----
+ vllm/models/qwen4_exp/nvidia/qsa.py           |  35 +++-
+ 3 files changed, 321 insertions(+), 37 deletions(-)
+ create mode 100644 tests/models/qwen4_exp/test_qsa_backend_capability.py
+
+diff --git a/tests/models/qwen4_exp/test_qsa_backend_capability.py b/tests/models/qwen4_exp/test_qsa_backend_capability.py
+new file mode 100644
+index 0000000000..81122b9bf9
+--- /dev/null
++++ b/tests/models/qwen4_exp/test_qsa_backend_capability.py
+@@ -0,0 +1,176 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Capability contract of ``Qwen4ExpQSAFlashAttentionBackend``.
++
++QSA stores e4m3 bytes in a uint8 cache written by ``reshape_and_cache_flash``
++and dequantizes them inside its own Triton kernel; flash-attn never runs over
++that cache. The backend therefore overrides two capability classmethods so the
++parent's flash-attn fp8 probe cannot veto the configuration.
++
++``AttentionBackend.validate_configuration`` (vllm/v1/attention/backend.py:262)
++is the entry point that calls both -- ``supports_kv_cache_dtype`` at :289 and
++``supports_combination`` at :335 -- so it is what these tests drive.
++
++ON WHAT THIS DOES AND DOES NOT ESTABLISH. ``Qwen4ExpQSAAttention.__init__``
++(nvidia/qsa.py) assigns ``self.attn_backend = Qwen4ExpQSAFlashAttentionBackend``
++and constructs the impl directly; ``QWEN4_EXP_QSA_TRITON`` is not in the
++selection registry, so a boot does not route this class through
++``platforms/cuda.py``'s ``validate_configuration`` call. These tests therefore
++pin the backend's declared contract, not a boot outcome, and a boot with the
++overrides removed is NOT guaranteed to fail. (``vllm/models/hy_v4/nvidia/
++attention.py:604`` shows the in-tree pattern for a model that does validate its
++own backend explicitly; QSA does not do that today.) The fp8-cache gate that a
++boot actually hits is ``_validated_qsa_fp8_dtype`` plus the
++``_QSA_SUPPORTED_CACHE_DTYPES`` check in ``Qwen4ExpQSAAttention.__init__``.
++"""
++
++import pytest
++import torch
++
++from vllm.config.cache import CacheDType
++from vllm.models.qwen4_exp.nvidia.qsa import Qwen4ExpQSAFlashAttentionBackend
++from vllm.platforms.interface import DeviceCapability
++from vllm.v1.attention.backend import AttentionType
++from vllm.v1.attention.backends.flash_attn import FlashAttentionBackend
++
++pytestmark = pytest.mark.cpu_test
++
++# sm_86: the capability this fork's QSA fp8 path is gated to.
++_SM86 = DeviceCapability(8, 6)
++_FA_PROBE = "vllm.v1.attention.backends.flash_attn.flash_attn_supports_kv_cache_dtype"
++_FP8_REASON = "FP8 KV cache requires"
++_DTYPE_REASON = "kv_cache_dtype not supported"
++
++
++class _NoOverrideBackend(Qwen4ExpQSAFlashAttentionBackend):
++    """The same backend with exactly the two overrides taken away.
++
++    ``__func__`` is unwrapped and re-wrapped so ``cls`` still binds to this
++    subclass: it keeps our ``supported_kv_cache_dtypes`` and differs from the
++    real backend in nothing but the two methods under test. Assigning the bound
++    parent classmethods instead would silently swap the dtype list too, and the
++    control would no longer isolate the overrides.
++    """
++
++    supports_kv_cache_dtype = classmethod(
++        FlashAttentionBackend.supports_kv_cache_dtype.__func__
++    )
++    supports_combination = classmethod(
++        FlashAttentionBackend.supports_combination.__func__
++    )
++
++
++def _validate(backend, kv_cache_dtype: CacheDType | None, **overrides):
++    kwargs = dict(
++        head_size=128,
++        dtype=torch.bfloat16,
++        kv_cache_dtype=kv_cache_dtype,
++        block_size=16,
++        use_mla=False,
++        has_sink=False,
++        use_sparse=True,  # QSA.is_sparse() is True
++        use_mm_prefix=False,
++        use_per_head_quant_scales=False,
++        device_capability=_SM86,
++        attn_type=AttentionType.DECODER,
++    )
++    kwargs.update(overrides)
++    return backend.validate_configuration(**kwargs)
++
++
++def _combination(backend, kv_cache_dtype: CacheDType | None, **overrides):
++    kwargs = dict(
++        head_size=128,
++        dtype=torch.bfloat16,
++        kv_cache_dtype=kv_cache_dtype,
++        block_size=16,
++        use_mla=False,
++        has_sink=False,
++        use_sparse=True,
++        use_mm_prefix=False,
++        device_capability=_SM86,
++    )
++    kwargs.update(overrides)
++    return backend.supports_combination(**kwargs)
++
++
++@pytest.mark.parametrize("kv_cache_dtype", ["fp8", "fp8_e4m3"])
++def test_fp8_survives_validation_with_the_fa_probe_rejecting(
++    monkeypatch, kv_cache_dtype
++):
++    """With the flash-attn fp8 probe forced to reject, the overridden backend
++    must still accept the dtype, and the control without the overrides must not.
++
++    Forcing the probe is what makes this a test that can fail: on a host where
++    flash-attn happens to support fp8 the parent would accept it too, and the
++    override would be indistinguishable from its absence
++    (an instrument must discriminate both worlds).
++
++    Assertions are on the two specific reasons rather than on an empty list,
++    so unrelated reasons a particular host contributes cannot mask or fake the
++    result.
++    """
++    monkeypatch.setattr(_FA_PROBE, lambda *a, **k: False)
++
++    ours = _validate(Qwen4ExpQSAFlashAttentionBackend, kv_cache_dtype)
++    assert _DTYPE_REASON not in ours
++    assert not any(_FP8_REASON in r for r in ours), ours
++
++    # FAILING CONTROL: remove the overrides, keep everything else.
++    control = _validate(_NoOverrideBackend, kv_cache_dtype)
++    assert _DTYPE_REASON in control, (
++        "the parent must reject this dtype once the probe rejects it; if it "
++        "does not, this test proves nothing about the override"
++    )
++    assert any(_FP8_REASON in r for r in control), control
++
++    # The two classes must differ in exactly these reasons and nothing else.
++    assert set(control) - set(ours) == {
++        _DTYPE_REASON,
++        *(r for r in control if _FP8_REASON in r),
++    }
++    assert not set(ours) - set(control)
++
++
++def test_bfloat16_path_is_untouched(monkeypatch):
++    """The overrides must not change the non-quantized cache at all: the parent
++    never consults the fp8 probe for it, so both classes must agree."""
++    monkeypatch.setattr(_FA_PROBE, lambda *a, **k: False)
++    for kv_cache_dtype in ("auto", "bfloat16"):
++        assert _validate(Qwen4ExpQSAFlashAttentionBackend, kv_cache_dtype) == _validate(
++            _NoOverrideBackend, kv_cache_dtype
++        )
++
++
++def test_unsupported_cache_dtype_is_still_rejected():
++    """``supports_kv_cache_dtype`` overrides the flash-attn probe, not the
++    class's own dtype list: a dtype QSA does not store must still fail."""
++    assert not Qwen4ExpQSAFlashAttentionBackend.supports_kv_cache_dtype("fp8_e5m2")
++    assert Qwen4ExpQSAFlashAttentionBackend.supports_kv_cache_dtype(None)
++    assert Qwen4ExpQSAFlashAttentionBackend.supports_kv_cache_dtype("fp8_e4m3")
++    assert _DTYPE_REASON in _validate(Qwen4ExpQSAFlashAttentionBackend, "fp8_e5m2")
++
++
++def test_supports_combination_suppresses_only_the_fp8_clause(monkeypatch):
++    """``supports_combination`` must narrow the parent, not silence it.
++
++    Returning None unconditionally would advertise fewer restrictions than
++    ``forward_qsa`` enforces (it raises on ALiBi, attention sinks and sliding
++    windows), so the parent's other clauses have to survive.
++    """
++    monkeypatch.setattr(_FA_PROBE, lambda *a, **k: False)
++
++    # The fp8 clause is suppressed...
++    assert _combination(Qwen4ExpQSAFlashAttentionBackend, "fp8_e4m3") is None
++    parent_said = _combination(_NoOverrideBackend, "fp8_e4m3")
++    assert parent_said is not None and _FP8_REASON in parent_said
++
++    # ...but the sink/compute-capability clause is not, for fp8 or otherwise.
++    # sm_86 < 9.0, so the parent rejects sinks here and QSA must say so too.
++    for kv_cache_dtype in ("fp8_e4m3", "bfloat16", None):
++        reason = _combination(
++            Qwen4ExpQSAFlashAttentionBackend, kv_cache_dtype, has_sink=True
++        )
++        assert reason is not None, kv_cache_dtype
++        assert "sink" in reason
++        assert reason == _combination(_NoOverrideBackend, kv_cache_dtype, has_sink=True)
+diff --git a/tests/v1/core/test_deferred_block_free.py b/tests/v1/core/test_deferred_block_free.py
+index cbe58f8b43..c45f5a7c4b 100644
+--- a/tests/v1/core/test_deferred_block_free.py
++++ b/tests/v1/core/test_deferred_block_free.py
+@@ -700,6 +700,7 @@ def test_deferred_victim_stops_the_preemption_cascade():
+     assert first.request_id in out2.num_scheduled_tokens
+     assert first.status == RequestStatus.RUNNING
+ 
++
+ def _make_pool_with_cached_blocks(num_blocks: int, block_size: int = 16):
+     """Build a BlockPool holding `num_blocks` allocated, hashed blocks.
+ 
+@@ -727,43 +728,125 @@ def _eviction_order(pool: BlockPool) -> list[int]:
+     return order
+ 
+ 
++def _seed_request_blocks(manager, request_id: str, blocks_per_group: int):
++    """Give every group's single-type manager a real, hashed block list.
++
++    Blocks come from the manager's own pool and are hashed so that
++    ``BlockPool.free_blocks`` routes them down the cached branch, which appends
++    to the back of the free queue in the order it is handed -- that order IS
++    the eviction order. Unhashed blocks are *prepended* instead and would mask
++    what is being measured.
++
++    Returns the per-group block ids in allocation order.
++    """
++    pool = manager.block_pool
++    allocated: list[list[int]] = []
++    for group_id, group_mgr in enumerate(manager.coordinator.single_type_managers):
++        blocks = pool.get_new_blocks(blocks_per_group)
++        for i, block in enumerate(blocks):
++            block.set_block_hash(
++                BlockHashWithGroupId(f"g{group_id}b{i}".encode()),
++                num_tokens=pool.hash_block_size,
++            )
++        group_mgr.req_to_blocks[request_id] = blocks
++        allocated.append([b.block_id for b in blocks])
++    return allocated
++
++
++def _free_through_scheduler(manager, request, defer: bool, ours: set[int]) -> list[int]:
++    """Free ``request`` through the real scheduler helper, one way or the other.
++
++    ``defer=False`` takes ``_free_request_blocks``'s immediate branch
++    (``KVCacheManager.free`` -> ``KVCacheCoordinator.free`` -> one reversed
++    ``free_blocks`` per group). ``defer=True`` takes the deferred branch
++    (``pop_blocks_for_free`` -> ``deferred_frees`` -> ``_drain_deferred_frees``).
++    Both are the production methods; only the gate differs.
++    """
++    scheduler = _create_deferring_scheduler()
++    scheduler.kv_cache_manager = manager
++    scheduler.defer_block_free = defer
++    scheduler.processed_step_seq = 0
++    scheduler.sched_step_seq = 1
++    request.last_sched_seq = 1
++
++    scheduler._free_request_blocks(request)
++    if defer:
++        assert scheduler.deferred_frees, (
++            "last_sched_seq > processed_step_seq must take the deferred branch; "
++            "if it did not, this arm is not testing the deferred path"
++        )
++        scheduler.processed_step_seq = 1
++        scheduler._drain_deferred_frees()
++        assert not scheduler.deferred_frees
++    else:
++        assert not scheduler.deferred_frees
++
++    # The pool also holds blocks this request never owned; they are unhashed,
++    # so `free_blocks` never touched them and they sit ahead of ours in the
++    # queue. Filter to the request's own blocks, whose relative order is
++    # exactly what was handed to `free_blocks`.
++    return [bid for bid in _eviction_order(manager.block_pool) if bid in ours]
++
++
+ def test_deferred_free_matches_immediate_free_eviction_order():
+     """Regression for the deferred-free path collapsing per-group eviction
+     order for multi-group (hybrid) KV caches.
+ 
+-    Group A owns blocks [1, 2, 3] (allocation order) and group B owns
+-    [4, 5, 6]. The immediate-free path frees each group in its own
+-    reversed ``free_blocks`` call; the fixed deferred-free path must
+-    reproduce exactly that order, not a single flattened reversal.
++    Drives BOTH arms through the production code -- ``Scheduler.
++    _free_request_blocks`` over a real two-group ``KVCacheManager``, its real
++    ``KVCacheCoordinator``, the real ``deferred_frees`` deque and the real
++    ``_drain_deferred_frees`` -- and compares the resulting eviction order.
++    Constructing the two orders by hand and calling ``BlockPool.free_blocks``
++    directly would leave every production statement unexercised, so reverting
++    the patch would not fail the test.
++
++    The immediate path frees each group in its own reversed ``free_blocks``
++    call (``SingleTypeKVCacheManager.free``). The deferred path pops all groups
++    into ONE concatenated list and drains it in a single ``free_blocks`` call,
++    so the per-group reversal has to be applied before the concatenation --
++    which is what ``KVCacheCoordinator.pop_blocks_for_free`` now does.
++
++    Reverting the patch (no per-group reverse in ``pop_blocks_for_free``, a
++    ``reversed()`` back in ``_drain_deferred_frees``) makes the deferred arm
++    return ``reversed(g0_alloc + g1_alloc)`` -- whole groups in the wrong order
++    relative to the immediate arm -- which fails both the equality assertion
++    and the explicit pre-patch-shape assertion below.
+     """
+-    group_a_alloc = [1, 2, 3]
+-    group_b_alloc = [4, 5, 6]
+-
+-    # Immediate path: KVCacheCoordinator.free() -> one reversed free_blocks
+-    # call per single-type manager (group).
+-    pool_imm, by_id = _make_pool_with_cached_blocks(6)
+-    for group in (group_a_alloc, group_b_alloc):
+-        pool_imm.free_blocks([by_id[i] for i in reversed(group)])
+-    immediate_order = _eviction_order(pool_imm)
+-
+-    # Fixed deferred path: groups are kept separate (each already reversed)
+-    # and freed in their own call on drain -- mirroring the immediate path.
+-    pool_fixed, by_id = _make_pool_with_cached_blocks(6)
+-    ordered_groups = [list(reversed(group_a_alloc)), list(reversed(group_b_alloc))]
+-    for group in ordered_groups:
+-        pool_fixed.free_blocks([by_id[i] for i in group])
+-    fixed_order = _eviction_order(pool_fixed)
+-
+-    assert fixed_order == immediate_order == [3, 2, 1, 6, 5, 4]
+-
+-    # The old (buggy) deferred path flattened both groups then reversed once,
+-    # which produces a different order. Guard against regressing back to it.
+-    pool_buggy, by_id = _make_pool_with_cached_blocks(6)
+-    flattened = group_a_alloc + group_b_alloc
+-    pool_buggy.free_blocks([by_id[i] for i in reversed(flattened)])
+-    buggy_order = _eviction_order(pool_buggy)
+-    assert buggy_order == [6, 5, 4, 3, 2, 1]
+-    assert buggy_order != immediate_order
++    blocks_per_group = 3
++    request = create_requests(num_requests=1, num_tokens=NUM_PROMPT_TOKENS)[0]
++
++    imm_manager = _make_two_group_kv_cache_manager(num_blocks=20)
++    def_manager = _make_two_group_kv_cache_manager(num_blocks=20)
++    assert len(imm_manager.coordinator.single_type_managers) == 2, (
++        "a single-group config cannot distinguish the two orders at all"
++    )
++
++    allocated = _seed_request_blocks(imm_manager, request.request_id, blocks_per_group)
++    assert allocated == _seed_request_blocks(
++        def_manager, request.request_id, blocks_per_group
++    ), "the two arms must start from identical per-group allocations"
++    assert not set(allocated[0]) & set(allocated[1]), (
++        "groups must own disjoint block ids or a group mix-up is invisible"
++    )
++    ours = {bid for group in allocated for bid in group}
++
++    immediate_order = _free_through_scheduler(imm_manager, request, False, ours)
++    deferred_order = _free_through_scheduler(def_manager, request, True, ours)
++
++    # Pin the shape as well as the equality: tail-first within a group, groups
++    # in their coordinator order.
++    expected = [bid for group in allocated for bid in reversed(group)]
++    assert immediate_order == expected
++    assert deferred_order == immediate_order
++
++    # The pre-patch deferred implementation flattened every group then reversed
++    # once. Assert the observed order is not that, so a revert cannot pass.
++    pre_patch_order = list(reversed([bid for group in allocated for bid in group]))
++    assert pre_patch_order != expected, (
++        "the fixture does not separate the two implementations; with this "
++        "shape the test could not fail on a revert"
++    )
++    assert deferred_order != pre_patch_order
+ 
+ 
+ def test_pop_blocks_for_free_returns_eviction_order():
+diff --git a/vllm/models/qwen4_exp/nvidia/qsa.py b/vllm/models/qwen4_exp/nvidia/qsa.py
+index f4fa56be0f..adb057d1eb 100644
+--- a/vllm/models/qwen4_exp/nvidia/qsa.py
++++ b/vllm/models/qwen4_exp/nvidia/qsa.py
+@@ -333,11 +333,36 @@ class Qwen4ExpQSAFlashAttentionBackend(FlashAttentionBackend):
+         use_mm_prefix: bool,
+         device_capability: DeviceCapability,
+     ) -> str | None:
+-        # Same reason: the parent's "FP8 KV cache requires FA3 on SM90 or FA4
+-        # on SM100" rejection is about flash-attn's own kernels, which QSA does
+-        # not use. The real device gate for our fp8 path is
+-        # `_validated_qsa_fp8_dtype`, which raises on any capability != 86.
+-        return None
++        # Suppress ONLY the parent's fp8 clause ("FP8 KV cache requires FA3 on
++        # SM90 or FA4 on SM100"), which is about flash-attn's own kernels and
++        # so does not apply to a cache QSA reads in Triton. The real device
++        # gate for our fp8 path is `_validated_qsa_fp8_dtype`, which raises on
++        # any capability != 86.
++        #
++        # Everything else the parent rejects still holds and is returned
++        # unchanged: the sink/compute-capability clause and the
++        # mm-prefix/FA-version clause. Returning None for every combination
++        # would advertise fewer restrictions than `forward_qsa` enforces (it
++        # raises on ALiBi, sinks and sliding windows).
++        #
++        # Same shape as the impl constructor: hide the fp8 dtype from the
++        # probe, keep the rest of the parent's behaviour.
++        probe_kv_cache_dtype = kv_cache_dtype
++        if probe_kv_cache_dtype is not None and _is_qsa_fp8_cache_dtype(
++            probe_kv_cache_dtype
++        ):
++            probe_kv_cache_dtype = None
++        return super().supports_combination(
++            head_size,
++            dtype,
++            probe_kv_cache_dtype,
++            block_size,
++            use_mla,
++            has_sink,
++            use_sparse,
++            use_mm_prefix,
++            device_capability,
++        )
+ 
+     @staticmethod
+     def get_name() -> str:

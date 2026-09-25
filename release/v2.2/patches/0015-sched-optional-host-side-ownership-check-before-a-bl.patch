@@ -1,0 +1,76 @@
+From ec66324bfd3a794d28d8bd2ed60b69f82e28cdf1 Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Tue, 22 Sep 2026 04:13:08 -0400
+Subject: [PATCH 15/58] sched: optional host-side ownership check before a
+ block is zeroed
+
+Host-side diagnostic behind VLLM_E2_ZERO_OWNERSHIP_CHECK, off by default.
+---
+ vllm/v1/core/sched/scheduler.py | 38 +++++++++++++++++++++++++++++++++
+ 1 file changed, 38 insertions(+)
+
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index daf2b316d0..9f2d99d261 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import itertools
++import os
+ import time
+ from collections import defaultdict, deque
+ from collections.abc import Iterable
+@@ -75,6 +76,10 @@ from vllm.v1.utils import record_function_or_nullcontext
+ 
+ logger = init_logger(__name__)
+ 
++# Bounds-guard instrumentation: verify KVBlockZeroer's exclusive-ownership precondition before a
++# block is zeroed. Off by default, so it costs nothing.
++_ZERO_OWNERSHIP_CHECK = os.getenv("VLLM_E2_ZERO_OWNERSHIP_CHECK") == "1"
++
+ 
+ class Scheduler(SchedulerInterface):
+     def __init__(
+@@ -1472,8 +1477,41 @@ class Scheduler(SchedulerInterface):
+             new_block_ids_to_zero = [b for b in new_block_ids_to_zero if b not in skip]
+             skip.clear()
+ 
++        if new_block_ids_to_zero and _ZERO_OWNERSHIP_CHECK:
++            self._check_zero_block_ownership(new_block_ids_to_zero)
++
+         return new_block_ids_to_zero or None
+ 
++    def _check_zero_block_ownership(self, block_ids: list[int]) -> None:
++        """Test KVBlockZeroer's stated precondition, host side, off by default.
++
++        worker/utils.py justifies zeroing a whole tile with "block IDs are
++        global pool indices and a newly allocated block owns its whole tile".
++        Ownership is visible only here, in the scheduler process, so the check
++        lives here rather than in the zeroer. A block about to be zeroed should
++        be referenced by exactly one live request. More than one means a stale
++        reference survived into the zeroing, and the kernel is about to destroy
++        state another request still points at -- the stale-reference shape.
++
++        VLLM_E2_ZERO_OWNERSHIP_CHECK=1. O(live blocks) per step.
++        """
++        pending = set(block_ids)
++        owners: dict[int, set[str]] = {}
++        for mgr in self.kv_cache_manager.coordinator.single_type_managers:
++            for req_id, blocks in mgr.req_to_blocks.items():
++                for blk in blocks:
++                    if blk.block_id in pending:
++                        owners.setdefault(blk.block_id, set()).add(req_id)
++        for block_id, req_ids in sorted(owners.items()):
++            if len(req_ids) > 1:
++                logger.warning(
++                    "KV zeroing ownership violation: block %d is about to be "
++                    "zeroed but is referenced by %d live requests (%s).",
++                    block_id,
++                    len(req_ids),
++                    ", ".join(sorted(req_ids)[:4]),
++                )
++
+     def _preempt_request(
+         self, request: Request, timestamp: float, drop_stale_output: bool = False
+     ) -> None:

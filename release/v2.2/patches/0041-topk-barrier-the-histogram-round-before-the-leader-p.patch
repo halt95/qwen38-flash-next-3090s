@@ -1,0 +1,37 @@
+From f4122c1c500d25b4d95160f3e88336dc28bde846 Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Wed, 23 Sep 2026 08:31:18 -0400
+Subject: [PATCH 41/58] topk: barrier the histogram round before the leader
+ publishes arrival
+
+In radix_topk's large-path round loop the leader published arrival with no
+block barrier after the histogram merge, so a peer CTA could observe an
+incomplete histogram. Inherited by earlier releases; fixed below the placement
+work so both arms of any comparison carry it.
+---
+ csrc/libtorch_stable/persistent_topk.cuh | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/csrc/libtorch_stable/persistent_topk.cuh b/csrc/libtorch_stable/persistent_topk.cuh
+index 8bfb4b9429..c5d27d90a9 100644
+--- a/csrc/libtorch_stable/persistent_topk.cuh
++++ b/csrc/libtorch_stable/persistent_topk.cuh
+@@ -1179,6 +1179,18 @@ __device__ void radix_topk(const float* __restrict__ row_input,
+       }
+     }
+ 
++    // The arrival publication below is made by thread 0
++    // ALONE, and `red_release`'s `fence.acq_rel.gpu` orders only the issuing
++    // thread's own prior accesses.  Without this barrier thread 0 could signal
++    // arrival while other warps of this CTA had not yet merged their bins into
++    // `current_hist`, or (in CTA 0) had not finished zeroing `next_hist`.  A
++    // peer CTA that observes the completed arrival count then leaves its own
++    // `wait_ge` -- whose `__syncthreads()` is AFTER arrival, so it orders
++    // nothing here -- and reads a half-written histogram, which changes the
++    // pivot.  The barrier must be between the producing stores and the leader's
++    // publication; program order in one thread is not cross-thread ordering.
++    __syncthreads();
++
+     if (tx == 0) {
+       red_release(&state->arrival_counter, 1);
+     }

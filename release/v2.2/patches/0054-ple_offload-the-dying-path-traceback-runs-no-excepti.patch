@@ -1,0 +1,283 @@
+From 34869cce2ea0dff793a499b83f65239d7e136ec2 Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Wed, 23 Sep 2026 12:30:20 -0400
+Subject: [PATCH 54/58] ple_offload: the dying-path traceback runs no exception
+ code
+
+ple_fail_closed formatted its traceback with traceback.format_exception, which
+runs exception-defined __str__/__getattribute__; if one blocked, the rank never
+reached os._exit(1) and kept its GPUs. A safe formatter reads frames and plain
+string arguments only.
+---
+ tests/v1/ple_offload/test_test_fault.py       |  11 +-
+ .../test_transport_fatal_helper.py            |  69 ++++++++++
+ vllm/v1/ple_offload/fatal.py                  | 125 +++++++++++++++++-
+ 3 files changed, 196 insertions(+), 9 deletions(-)
+
+diff --git a/tests/v1/ple_offload/test_test_fault.py b/tests/v1/ple_offload/test_test_fault.py
+index a199207cdf..ace9fab26d 100644
+--- a/tests/v1/ple_offload/test_test_fault.py
++++ b/tests/v1/ple_offload/test_test_fault.py
+@@ -270,11 +270,12 @@ def test_partial_ready_times_out_and_terminates_production_child(
+         f"cut={cut},ordinal=1,rank=any",
+     )
+     monkeypatch.setenv("VLLM_PLE_TEST_FAULT_LOG", str(tmp_path / "fault.log"))
+-    monkeypatch.setattr(
+-        worker_module.envs,
+-        "VLLM_PLE_OFFLOAD_READY_TIMEOUT",
+-        1.0,
+-    )
++    # setenv, not setattr(envs, ...): envs serves this name from a module
++    # __getattr__, so monkeypatch's undo would setattr the pre-test default
++    # (600.0) back as a REAL module attribute that shadows __getattr__ for the
++    # rest of the session -- tests/test_envs.py then reads 600.0 whatever the
++    # environment says (a test-ordering failure seen on the reference host).
++    monkeypatch.setenv("VLLM_PLE_OFFLOAD_READY_TIMEOUT", "1")
+ 
+     handle = worker_module.PleOffloadWorker.make_process(
+         object(),  # The bootstrap fault fires before config reconstruction.
+diff --git a/tests/v1/ple_offload/test_transport_fatal_helper.py b/tests/v1/ple_offload/test_transport_fatal_helper.py
+index f1abd2729a..16aaaf9c40 100644
+--- a/tests/v1/ple_offload/test_transport_fatal_helper.py
++++ b/tests/v1/ple_offload/test_transport_fatal_helper.py
+@@ -107,6 +107,18 @@ elif scenario == "str-subclass-argument":
+             threading.Event().wait()
+ 
+     error = RuntimeError(BlockingString("detail"))
++elif scenario == "blocking-str-cause":
++    class Cause(Exception):
++        def __str__(self):
++            threading.Event().wait()
++
++    try:
++        try:
++            raise Cause()
++        except Cause as cause:
++            raise RuntimeError("outer") from cause
++    except RuntimeError as outer:
++        error = outer
+ elif scenario == "huge-string":
+     error = RuntimeError("x" * (32 << 20))
+ else:
+@@ -149,6 +161,7 @@ def test_fatal_helper_avoids_exception_controlled_descriptors(
+         "blocking-str-method",
+         "overridden-getattribute",
+         "str-subclass-argument",
++        "blocking-str-cause",
+         "huge-string",
+     ],
+ )
+@@ -164,6 +177,62 @@ def test_fatal_helper_hard_exit_controls(
+     )
+ 
+ 
++_FATAL_TRACEBACK_SOURCE = r"""
++from vllm.v1.ple_offload.fatal import ple_fail_closed
++
++
++class AcceleratorLikeError(RuntimeError):
++    pass
++
++
++def launch_kernel():
++    raise ValueError("root cause detail")
++
++
++def step():
++    try:
++        launch_kernel()
++    except ValueError as cause:
++        raise AcceleratorLikeError("CUDA error: an illegal memory access") from cause
++
++
++try:
++    step()
++except BaseException as error:
++    ple_fail_closed(
++        where="transport-traceback",
++        rank=0,
++        layer="ple",
++        sequence=7,
++        error=error,
++    )
++"""
++
++
++def test_fatal_helper_traceback_names_subclass_frames_and_cause() -> None:
++    """The dying-path traceback still carries what the early boot lacked: the
++    real (subclass) type, its message, the raising frames and the chain."""
++    completed = subprocess.run(
++        [sys.executable, "-c", _FATAL_TRACEBACK_SOURCE],
++        stdout=subprocess.DEVNULL,
++        stderr=subprocess.PIPE,
++        timeout=120,
++    )
++    stderr = completed.stderr.decode("utf-8", "replace")
++    assert completed.returncode == 1, stderr
++    assert "PLE fatal: where=transport-traceback" in stderr
++    assert "PLE fatal traceback follows:" in stderr
++    assert "AcceleratorLikeError: CUDA error: an illegal memory access" in stderr
++    assert "ValueError: root cause detail" in stderr
++    assert "direct cause of the following exception" in stderr
++    assert "in launch_kernel" in stderr
++    assert "in step" in stderr
++    # Interpreter order: the cause's block precedes the outer exception's.
++    assert stderr.index("ValueError: root cause detail") < stderr.index(
++        "AcceleratorLikeError: CUDA error"
++    )
++
++
+ @pytest.mark.skipif(sys.platform == "win32", reason="process groups are POSIX-only")
+ def test_wait_for_ready_rejects_non_string_status_without_comparison(
+     tmp_path: Path,
+diff --git a/vllm/v1/ple_offload/fatal.py b/vllm/v1/ple_offload/fatal.py
+index 90ab4a01ef..a96515f25d 100644
+--- a/vllm/v1/ple_offload/fatal.py
++++ b/vllm/v1/ple_offload/fatal.py
+@@ -5,8 +5,8 @@
+ import functools
+ import os
+ import time
+-import traceback
+ from collections.abc import Callable
++from types import TracebackType
+ from typing import Any, NoReturn, TypeVar
+ 
+ _F = TypeVar("_F", bound=Callable[..., Any])
+@@ -26,6 +26,122 @@ _TRUSTED_ERROR_LABELS = (
+     (KeyboardInterrupt, "KeyboardInterrupt"),
+ )
+ 
++# Slot readers for the dying path. Each is the C getter of the base type,
++# called directly, so no __getattribute__, property, metaclass attribute or
++# descriptor defined by the exception (or its class) can run. The traceback
++# module is NOT safe here: traceback.format_exception calls str(error) (and
++# str() on every chained exception) and reads error.__traceback__ through the
++# instance's own __getattribute__, so an exception whose __str__ or
++# __getattribute__ blocks kept the process alive forever -- the fail-closed
++# path hung instead of dying (found by the blocking-exception transport tests).
++_EXC_ARGS = BaseException.args.__get__
++_EXC_TRACEBACK = BaseException.__traceback__.__get__
++_EXC_CAUSE = BaseException.__cause__.__get__
++_EXC_CONTEXT = BaseException.__context__.__get__
++_EXC_SUPPRESS_CONTEXT = BaseException.__suppress_context__.__get__
++_TYPE_QUALNAME = type.__dict__["__qualname__"].__get__
++_TYPE_MODULE = type.__dict__["__module__"].__get__
++_MAX_CHAIN = 16
++_MAX_ARG_CHARS = 1024
++
++
++def _safe_type_label(cls: type) -> str:
++    """``module.qualname`` of ``cls`` without running class-defined code."""
++    try:
++        qualname = _TYPE_QUALNAME(cls)
++        module = _TYPE_MODULE(cls)
++    except BaseException:
++        return "<unknown type>"
++    if type(qualname) is not str:
++        qualname = "<unknown type>"
++    if type(module) is str and module != "builtins":
++        return f"{module}.{qualname}"
++    return qualname
++
++
++def _safe_exception_line(error: BaseException) -> str:
++    """Type label plus the exact-``str``/``int`` args; nothing else is shown."""
++    label = _safe_type_label(type(error))
++    args = _EXC_ARGS(error)
++    if type(args) is not tuple or len(args) == 0:
++        return label
++    parts = []
++    for arg in args[:4]:
++        if type(arg) is str:
++            parts.append(arg[:_MAX_ARG_CHARS])
++        elif type(arg) is int and -(10**18) < arg < 10**18:
++            parts.append(str(arg))
++        else:
++            parts.append(f"<{_safe_type_label(type(arg))}>")
++    if len(args) > 4:
++        parts.append("...")
++    if len(args) == 1:
++        return f"{label}: {parts[0]}"
++    return f"{label}: ({', '.join(parts)})"
++
++
++def _safe_frames(error: BaseException) -> list[str]:
++    lines = []
++    tb = _EXC_TRACEBACK(error)
++    while type(tb) is TracebackType:
++        code = tb.tb_frame.f_code
++        filename = code.co_filename
++        name = code.co_qualname
++        lineno = tb.tb_lineno
++        lines.append(
++            f'  File "{filename if type(filename) is str else "?"}", '
++            f"line {lineno if type(lineno) is int else '?'}, "
++            f"in {name if type(name) is str else '?'}\n"
++        )
++        tb = tb.tb_next
++    return lines
++
++
++def _safe_format_exception(error: BaseException) -> str:
++    """A traceback.format_exception look-alike that runs no exception code.
++
++    Frames come from the traceback objects (file, line, function; no source
++    lines, which would mean file I/O on the dying path); the message is the
++    exception's exact-``str`` args, never ``str(error)``. Chains follow
++    ``__cause__`` / ``__context__`` like the interpreter, bounded and
++    cycle-safe.
++    """
++    chain: list[tuple[BaseException, str]] = []
++    seen: set[int] = set()
++    current: BaseException | None = error
++    link = ""
++    while current is not None and len(chain) < _MAX_CHAIN:
++        if id(current) in seen:
++            break
++        seen.add(id(current))
++        chain.append((current, link))
++        cause = _EXC_CAUSE(current)
++        if cause is not None:
++            current = cause
++            link = (
++                "\nThe above exception was the direct cause of the "
++                "following exception:\n\n"
++            )
++        elif _EXC_SUPPRESS_CONTEXT(current) is not True:
++            current = _EXC_CONTEXT(current)
++            link = (
++                "\nDuring handling of the above exception, another "
++                "exception occurred:\n\n"
++            )
++        else:
++            current = None
++    out: list[str] = []
++    # Innermost first, as the interpreter prints; each outer exception's link
++    # text sits between it and the exception it chains to.
++    for index in range(len(chain) - 1, -1, -1):
++        exc, _ = chain[index]
++        out.append("Traceback (most recent call last):\n")
++        out.extend(_safe_frames(exc))
++        out.append(_safe_exception_line(exc) + "\n")
++        if index > 0:
++            out.append(chain[index][1])
++    return "".join(out)
++
+ 
+ def ple_fail_closed(
+     *,
+@@ -88,9 +204,10 @@ def ple_fail_closed(
+         # Three-arg form: it does not depend on being inside an active except
+         # block, and this function is called from one frame further out than
+         # the raise.
+-        tb = "".join(
+-            traceback.format_exception(type(error), error, error.__traceback__)
+-        )
++        # _safe_format_exception, not traceback.format_exception: see the note
++        # above _EXC_ARGS -- the stdlib formatter calls str(error), which is
++        # exception-defined code and can block the dying process forever.
++        tb = _safe_format_exception(error)
+         raw = tb.encode("utf-8", "backslashreplace")
+         # Truncate from the END, not the start. format_exception puts the
+         # frames first and the exception TYPE AND MESSAGE last, so a head-side

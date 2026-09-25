@@ -1,0 +1,396 @@
+From a7456495af6a7495df3edc75a0497c16e5824384 Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Tue, 22 Sep 2026 04:13:02 -0400
+Subject: [PATCH 09/58] mamba: bound the state-copy block-table lookups
+
+Ports the check from upstream vLLM PR #50021; a hit is reported through the
+guard telemetry instead of reading out of bounds.
+---
+ tests/v1/worker/test_mamba_utils.py |  75 ++++++++++++
+ vllm/v1/worker/mamba_utils.py       | 179 +++++++++++++++++++++++++++-
+ 2 files changed, 249 insertions(+), 5 deletions(-)
+
+diff --git a/tests/v1/worker/test_mamba_utils.py b/tests/v1/worker/test_mamba_utils.py
+index 2ab23ceae5..b6bad93629 100644
+--- a/tests/v1/worker/test_mamba_utils.py
++++ b/tests/v1/worker/test_mamba_utils.py
+@@ -1072,6 +1072,81 @@ class TestPostprocessMambaFusedKernel:
+         torch.testing.assert_close(conv_state, conv_state_orig)
+         torch.testing.assert_close(temporal_state, temporal_state_orig)
+ 
++    # Ported verbatim from upstream vLLM PR #50021 (bounds-guard instrumentation, copy-state guard). The
++    # four cases are exactly the four block-table lookups the guard bounds:
++    # an in-row NULL_BLOCK_ID destination, a destination column past the row,
++    # a source column past the row, and a temporal bias that crosses the row
++    # boundary. Without the guard the last three read the NEXT request's row
++    # and copy state from or to a block this request does not own.
++    @pytest.mark.parametrize(
++        ("num_computed", "source_col", "destination_col", "conv_unchanged"),
++        [
++            (60, 1, 3, True),  # destination is an in-row NULL_BLOCK_ID
++            (76, 1, 4, True),  # destination is the next row's first column
++            (60, 4, 3, True),  # source is the next row's first column
++            (60, 3, 3, False),  # temporal bias crosses into the next row
++        ],
++    )
++    def test_invalid_block_table_lookup_does_not_copy_state(
++        self,
++        device,
++        num_computed,
++        source_col,
++        destination_col,
++        conv_unchanged,
++    ):
++        """Invalid columns and NULL_BLOCK_ID must not reach state address math."""
++        cfg = _TestConfig(num_blocks=8)
++        layer_names = ["layer_0"]
++        kv_cache_config = _make_kv_cache_config(cfg, layer_names)
++        conv_state = torch.randn(
++            cfg.num_blocks,
++            cfg.conv_width,
++            cfg.conv_inner_dim,
++            dtype=cfg.dtype,
++            device=device,
++        )
++        temporal_state = torch.randn(
++            cfg.num_blocks,
++            cfg.temporal_state_dim,
++            dtype=cfg.dtype,
++            device=device,
++        )
++        conv_before = conv_state.clone()
++        temporal_before = temporal_state.clone()
++        forward_context = {"layer_0": _make_mock_attention(conv_state, temporal_state)}
++        gpu_ctx = _make_gpu_ctx(cfg, kv_cache_config, device)
++
++        block_table_storage = torch.zeros(2, 4, dtype=torch.int32, device=device)
++        block_table_storage[0, 1] = 1
++        if destination_col < block_table_storage.stride(0):
++            is_null_destination = (
++                destination_col == 3 and num_computed == 60 and source_col == 1
++            )
++            block_table_storage[0, destination_col] = 0 if is_null_destination else 3
++        block_table_storage[1, 0] = 2
++
++        _run_gpu_postprocess(
++            gpu_ctx,
++            kv_cache_config=kv_cache_config,
++            forward_context=forward_context,
++            copy_funcs=_COPY_FUNCS,
++            block_table=block_table_storage[:1],
++            req_ids=["req_0"],
++            num_accepted_tokens=[3],
++            mamba_state_idx=[source_col],
++            num_scheduled_tokens={"req_0": 3},
++            num_computed_tokens=[num_computed],
++            num_draft_tokens={},
++            device=device,
++        )
++
++        expected_destination = (num_computed + 3 + 3 - 1) // cfg.block_size - 1
++        assert expected_destination == destination_col
++        if conv_unchanged:
++            torch.testing.assert_close(conv_state, conv_before)
++        torch.testing.assert_close(temporal_state, temporal_before)
++
+     @pytest.mark.parametrize("num_reqs", [1, 2, 8, 16])
+     def test_various_batch_sizes(self, device, test_config, num_reqs):
+         """Verify kernel works correctly with different batch sizes."""
+diff --git a/vllm/v1/worker/mamba_utils.py b/vllm/v1/worker/mamba_utils.py
+index 621efcbb24..39d71b3a77 100644
+--- a/vllm/v1/worker/mamba_utils.py
++++ b/vllm/v1/worker/mamba_utils.py
+@@ -26,14 +26,26 @@ from vllm.v1.kv_cache_interface import (
+     UniformTypeKVCacheSpecs,
+ )
+ from vllm.v1.utils import CpuGpuBuffer
++from vllm.v1.worker import guard_telemetry
+ from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
+ 
+ logger = init_logger(__name__)
+ 
++# Bias so a negative row/index survives atomic_max on a zeroed counter
++# -- it MUST be a tl.constexpr: a plain module-level int is not readable
++# from a @triton.jit body -- an earlier build shipped one and every guarded kernel died
++# with "NameError: Cannot access global variable _GUARD_BIAS" on the smoke.
++_GUARD_BIAS = tl.constexpr(guard_telemetry.GUARD_BIAS)
++
+ # 16 saturates HBM on H100/GB200 across the reqs=8..128 range in
+ # microbenchmarks
+ _TEMPORAL_TILES = 16
+ 
++# Row bound used when no trustworthy row count is available: large enough never
++# to reject a real request slot, so the guard degrades to "reject negatives"
++# rather than to "reject correct metadata". See initialize_from_forward_context.
++_UNBOUNDED_ROWS = 1 << 30
++
+ 
+ @triton.jit(do_not_specialize=["num_requests"])
+ def get_aligned_state_indices_multi_group_kernel(
+@@ -196,6 +208,8 @@ def _copy_mamba_state_block(
+     token_bias,
+     block_table_ptrs_ptr,
+     block_table_stride_req,
++    block_table_num_rows,
++    guard_ctr,
+     state_base_addrs_ptr,
+     state_block_strides_ptr,
+     state_elem_sizes_ptr,
+@@ -243,12 +257,39 @@ def _copy_mamba_state_block(
+     group_idx = tl.load(state_group_indices_ptr + state_idx).to(tl.int64)
+     group_base_addr = tl.load(block_table_ptrs_ptr + group_idx)
+     block_table_typed = group_base_addr.to(tl.pointer_type(tl.int32))
++    # Bounds-guard instrumentation: bound the ROW as well as the column. #50021 bounds which
++    # column is read within a row; this bounds which row. CAN fire on
++    # postprocess_mamba_fused_kernel, where bt_row_idx comes from a device
++    # idx_mapping value. CANNOT fire on precopy_mamba_align_fused_kernel, whose
++    # bt_row_idx is program_id(0) bounded by num_reqs <= rows -- that path has a
++    # TEMPORAL staleness problem, fixed separately, not a spatial one.
++    if (bt_row_idx < 0) or (bt_row_idx >= block_table_num_rows):
++        tl.atomic_add(guard_ctr, 1)
++        tl.atomic_max(guard_ctr + 1, (bt_row_idx).to(tl.int64) + _GUARD_BIAS)
++        tl.atomic_max(guard_ctr + 2, _GUARD_BIAS + (-1))
++        return
+     block_table_base = block_table_typed + bt_row_idx * block_table_stride_req
+ 
+     # Widen block ids to int64 before they reach `block_id * state_block_stride`
+     # below: state_block_stride can exceed 2**31 bytes for large mamba caches,
+     # and Triton would otherwise do the multiply in int32 and wrap.
+-    dest_block_id = tl.load(block_table_base + dst_col).to(tl.int64)
++    # PR #50021 (upstream :178): these columns are derived from per-request
++    # accepted-token counts. A wrong count walks the read past this request's
++    # row; the loaded int32 is then multiplied by state_block_stride and
++    # dereferenced, so an out-of-range column becomes a wild (and possibly
++    # misaligned) address rather than merely a wrong copy. Only the
++    # out-of-range case is counted: `<= 0` also matches NULL_BLOCK_ID (0),
++    # which is the ordinary unallocated marker and not a fault.
++    dst_col_ok = (dst_col >= 0) & (dst_col < block_table_stride_req)
++    if (dst_col < 0) or (dst_col >= block_table_stride_req):
++        tl.atomic_add(guard_ctr, 1)
++        tl.atomic_max(guard_ctr + 1, (bt_row_idx).to(tl.int64) + _GUARD_BIAS)
++        tl.atomic_max(guard_ctr + 2, (dst_col).to(tl.int64) + _GUARD_BIAS)
++    dest_block_id = tl.load(
++        block_table_base + dst_col, mask=dst_col_ok, other=-1
++    ).to(tl.int64)
++    if dest_block_id <= 0:
++        return
+     dst_addr = state_base_addr + dest_block_id * state_block_stride
+ 
+     is_conv_state = conv_width > 0
+@@ -259,7 +300,16 @@ def _copy_mamba_state_block(
+         if tile_idx > 0:
+             return
+         # DS conv layout: state_len is the slide axis; copy per dim row.
+-        src_block_id = tl.load(block_table_base + src_col).to(tl.int64)
++        src_col_ok = (src_col >= 0) & (src_col < block_table_stride_req)
++        if (src_col < 0) or (src_col >= block_table_stride_req):
++            tl.atomic_add(guard_ctr, 1)
++            tl.atomic_max(guard_ctr + 1, (bt_row_idx).to(tl.int64) + _GUARD_BIAS)
++            tl.atomic_max(guard_ctr + 2, (src_col).to(tl.int64) + _GUARD_BIAS)
++        src_block_id = tl.load(
++            block_table_base + src_col, mask=src_col_ok, other=-1
++        ).to(tl.int64)
++        if src_block_id <= 0:
++            return
+         dim_rows = tl.load(state_dim_row_count_ptr + state_idx)
+         row_stride = tl.load(state_dim_row_stride_ptr + state_idx)
+         src_block_addr = state_base_addr + src_block_id * state_block_stride
+@@ -310,7 +360,16 @@ def _copy_mamba_state_block(
+         # SD conv: copy
+         #   state[bt[src_col], token_bias:] ->
+         #   state[bt[dst_col], :conv_width - token_bias]
+-        src_block_id = tl.load(block_table_base + src_col).to(tl.int64)
++        src_col_ok = (src_col >= 0) & (src_col < block_table_stride_req)
++        if (src_col < 0) or (src_col >= block_table_stride_req):
++            tl.atomic_add(guard_ctr, 1)
++            tl.atomic_max(guard_ctr + 1, (bt_row_idx).to(tl.int64) + _GUARD_BIAS)
++            tl.atomic_max(guard_ctr + 2, (src_col).to(tl.int64) + _GUARD_BIAS)
++        src_block_id = tl.load(
++            block_table_base + src_col, mask=src_col_ok, other=-1
++        ).to(tl.int64)
++        if src_block_id <= 0:
++            return
+         src_block_addr = state_base_addr + src_block_id * state_block_stride
+         token_bytes = state_inner_size * state_elem_size
+         num_dst_tokens = conv_width - token_bias
+@@ -349,7 +408,17 @@ def _copy_mamba_state_block(
+     # Temporal state: copy state[bt[src_col + token_bias]] -> state[bt[dst_col]]
+     # Body u64 range is partitioned across TEMPORAL_TILES CTAs to keep the
+     # SMs filled at small batch.
+-    actual_src_block_id = tl.load(block_table_base + src_col + token_bias).to(tl.int64)
++    tmp_col = src_col + token_bias
++    tmp_col_ok = (tmp_col >= 0) & (tmp_col < block_table_stride_req)
++    if (tmp_col < 0) or (tmp_col >= block_table_stride_req):
++        tl.atomic_add(guard_ctr, 1)
++        tl.atomic_max(guard_ctr + 1, (bt_row_idx).to(tl.int64) + _GUARD_BIAS)
++        tl.atomic_max(guard_ctr + 2, (tmp_col).to(tl.int64) + _GUARD_BIAS)
++    actual_src_block_id = tl.load(
++        block_table_base + tmp_col, mask=tmp_col_ok, other=-1
++    ).to(tl.int64)
++    if actual_src_block_id <= 0:
++        return
+     src_addr = state_base_addr + actual_src_block_id * state_block_stride
+     # Use natural block data size (inner_size * elem_size), NOT
+     # state_block_stride which is the page stride and can exceed the
+@@ -378,6 +447,8 @@ def postprocess_mamba_fused_kernel(
+     # block table.
+     block_table_ptrs_ptr,
+     block_table_stride_req: tl.int64,  # stride between requests (in elements)
++    block_table_num_rows: tl.int64,  # bounds-guard instrumentation
++    guard_ctr,  # bounds-guard instrumentation: persistent int64[3]
+     # Mamba state metadata, flattened across all layer/state tensors. Different
+     # Mamba groups may contribute different numbers of state tensors.
+     state_base_addrs_ptr,  # base address of each state tensor
+@@ -502,6 +573,8 @@ def postprocess_mamba_fused_kernel(
+         accept_token_bias,
+         block_table_ptrs_ptr,
+         block_table_stride_req,
++        block_table_num_rows,
++        guard_ctr,
+         state_base_addrs_ptr,
+         state_block_strides_ptr,
+         state_elem_sizes_ptr,
+@@ -573,6 +646,8 @@ def precopy_mamba_align_fused_kernel(
+     # Same flattened state-layout metadata as postprocess_mamba_fused_kernel
+     block_table_ptrs_ptr,
+     block_table_stride_req: tl.int64,
++    block_table_num_rows: tl.int64,  # bounds-guard instrumentation
++    guard_ctr,  # bounds-guard instrumentation: persistent int64[3]
+     state_base_addrs_ptr,
+     state_block_strides_ptr,
+     state_elem_sizes_ptr,
+@@ -633,6 +708,8 @@ def precopy_mamba_align_fused_kernel(
+         token_bias,
+         block_table_ptrs_ptr,
+         block_table_stride_req,
++        block_table_num_rows,
++        guard_ctr,
+         state_base_addrs_ptr,
+         state_block_strides_ptr,
+         state_elem_sizes_ptr,
+@@ -1131,9 +1208,89 @@ class MambaSpecDecodeGPUContext:
+             f"all mamba block tables must share stride(0), got {strides}"
+         )
+         self.block_table_stride_req = int(next(iter(strides)))
++        # Bounds-guard instrumentation: row bound for the guard in _copy_mamba_state_block.
++        #
++        # NOT from `block_tables`. Every caller passes a per-batch VIEW --
++        # get_device_tensor(num_reqs) at :1690 and :1838, a num_reqs_padded
++        # slice at mamba_hybrid.py:196 -- and this function runs once, so a
++        # bound taken from shape[0] here freezes at the first batch's request
++        # count and rejects every higher row in every later batch. The guard
++        # would then skip real state copies and report masked faults that never
++        # happened. (stride(0) is unaffected: it is max_num_blocks and survives
++        # a row slice, which is why the existing stride assert never caught
++        # this.)
++        #
++        # The persistent tables ARE [max_num_reqs, ...], so use them when they
++        # are registered. When they are not there is no correct row count at
++        # this point, and a wrong bound is worse than a loose one: fall back to
++        # a sentinel that still rejects negative rows -- the case the poison
++        # guard row exercises and the only one that reads outside the tensor --
++        # while never rejecting a real request slot.
++        rows = {bt.shape[0] for bt in block_tables}
++        assert len(rows) == 1, (
++            f"all mamba block tables must share shape[0], got {rows}"
++        )
++        self.block_table_num_rows = _UNBOUNDED_ROWS
+         for i, bt in enumerate(block_tables):
+             self.block_table_ptrs[i] = _reinterpret_u64_as_i64(bt.data_ptr())
+ 
++        # Same capture for the persistent per-req-slot tables. `input_block_tables`
++        # is `torch.zeros_like` of these (block_table.py:74-76), so stride(0) is
++        # identical and `block_table_stride_req` covers both; assert it rather
++        # than assume.
++        if persistent_block_tables is not None:
++            assert len(persistent_block_tables) == self.num_groups, (
++                f"expected {self.num_groups} persistent block tables, "
++                f"got {len(persistent_block_tables)}"
++            )
++            persistent_strides = {bt.stride(0) for bt in persistent_block_tables}
++            assert persistent_strides == strides, (
++                "persistent block tables must share stride(0) with the gathered "
++                f"tables, got {persistent_strides} vs {strides}"
++            )
++            assert self.persistent_block_table_ptrs is not None
++            for i, bt in enumerate(persistent_block_tables):
++                self.persistent_block_table_ptrs[i] = _reinterpret_u64_as_i64(
++                    bt.data_ptr()
++                )
++            # The align paths index the PERSISTENT tables by req_idx while
++            # every other geometry scalar is measured from the GATHERED ones
++            # (by design). Two different scalars, two different treatments:
++            #
++            #  * the STRIDE is load-bearing -- it is the multiplier in
++            #    `block_table_typed + bt_row_idx * block_table_stride_req`, so
++            #    a mismatch reads the wrong row entirely. It is ASSERTED equal
++            #    just above; there is no correct behaviour if it differs.
++            #  * the ROW COUNT is not required to be equal (the fixture in
++            #    test_pp_deferred_mamba_block_table.py builds a 2-row gathered
++            #    table against an 8-row persistent one on purpose), so it is
++            #    CARRIED separately. Anything bounding a row against the
++            #    persistent tables must use this scalar; using
++            #    block_table_num_rows would falsely reject a valid request slot
++            #    whenever the gathered buffer is narrower, and a guard that
++            #    fires on correct metadata is worse than no guard.
++            persistent_rows = {bt.shape[0] for bt in persistent_block_tables}
++            assert len(persistent_rows) == 1, (
++                f"all persistent block tables must share shape[0], got "
++                f"{persistent_rows}"
++            )
++            self.persistent_block_table_num_rows = int(next(iter(persistent_rows)))
++            # ...and this is the only trustworthy row count in this object, so
++            # the same-step guard takes it too.
++            self.block_table_num_rows = self.persistent_block_table_num_rows
++            self.has_persistent_block_tables = True
++        else:
++            # Legal for V1 callers, which never reach the V2 align
++            # post-process. If a V2 align launch does happen on such a context,
++            # `run_fused_postprocess_align` raises rather than falling back to
++            # the batch-order gather: that fallback is exactly the earlier
++            # wrong-row bug.
++            logger.warning_once(
++                "Mamba align context initialized without the persistent "
++                "per-req-slot block tables. The V1 paths are unaffected; a V2 "
++                "align post-process launch on this context will raise."
++            )
++
+         self.is_initialized = True
+ 
+     def compute_aligned_state_indices(
+@@ -1215,6 +1372,10 @@ class MambaSpecDecodeGPUContext:
+             num_draft_tokens_gpu,
+             self.block_table_ptrs,
+             self.block_table_stride_req,
++            self.block_table_num_rows,
++            guard_telemetry.counter(
++                guard_telemetry.SITE_MAMBA_COPY, self.state_base_addrs.device
++            ),
+             self.state_base_addrs,
+             self.state_block_strides,
+             self.state_elem_sizes,
+@@ -1261,6 +1422,10 @@ class MambaSpecDecodeGPUContext:
+             token_bias_gpu,
+             self.block_table_ptrs,
+             self.block_table_stride_req,
++            self.block_table_num_rows,
++            guard_telemetry.counter(
++                guard_telemetry.SITE_MAMBA_COPY, self.state_base_addrs.device
++            ),
+             self.state_base_addrs,
+             self.state_block_strides,
+             self.state_elem_sizes,
+@@ -1340,8 +1505,12 @@ class MambaSpecDecodeGPUContext:
+             None,  # num_scheduled: unused under PRECOMPUTED_NEW_COMPUTED
+             new_num_computed_tokens_gpu,
+             None,  # num_draft: unused under PRECOMPUTED_NEW_COMPUTED
+-            self.block_table_ptrs,
++            block_table_ptrs,
+             self.block_table_stride_req,
++            self.persistent_block_table_num_rows,
++            guard_telemetry.counter(
++                guard_telemetry.SITE_MAMBA_COPY, self.state_base_addrs.device
++            ),
+             self.state_base_addrs,
+             self.state_block_strides,
+             self.state_elem_sizes,

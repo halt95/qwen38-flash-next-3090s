@@ -1,0 +1,420 @@
+From 24663dc54189aaf13470d257ee7aed5873b1a1f0 Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Tue, 22 Sep 2026 04:11:36 -0400
+Subject: [PATCH 04/58] ple_offload: standalone fault-injection singleton used
+ by the offload transport
+
+A stdlib-only, one-shot, rank-selective fault selector shared by the PLE
+offload transport and its tests. Inert unless armed: disarmed, every site is a
+single None check outside any compiled or captured region.
+---
+ vllm/v1/ple_offload/test_fault.py |   9 +
+ vllm_ple_test_fault/__init__.py   | 383 ++++++++++++++++++++++++++++++
+ 2 files changed, 392 insertions(+)
+ create mode 100644 vllm/v1/ple_offload/test_fault.py
+ create mode 100644 vllm_ple_test_fault/__init__.py
+
+diff --git a/vllm/v1/ple_offload/test_fault.py b/vllm/v1/ple_offload/test_fault.py
+new file mode 100644
+index 0000000000..3546a1f089
+--- /dev/null
++++ b/vllm/v1/ple_offload/test_fault.py
+@@ -0,0 +1,9 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Compatibility exports for the top-level test-only fault singleton."""
++
++from vllm_ple_test_fault import (  # noqa: F401
++    FaultSpec as FaultSpec,
++    _FAULT as _FAULT,
++    _parse_fault_spec as _parse_fault_spec,
++)
+diff --git a/vllm_ple_test_fault/__init__.py b/vllm_ple_test_fault/__init__.py
+new file mode 100644
+index 0000000000..e8fe835ad3
+--- /dev/null
++++ b/vllm_ple_test_fault/__init__.py
+@@ -0,0 +1,383 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Stdlib-only, test-only PLE fault injection.
++
++This package intentionally lives outside ``vllm`` so the offload bootstrap can
++import the same singleton without pre-populating part of the vLLM package tree.
++"""
++
++import os
++import re
++import threading
++import time
++from dataclasses import dataclass, field
++
++_ENV_NAME = "VLLM_PLE_TEST_FAULT"
++_LOG_ENV_NAME = "VLLM_PLE_TEST_FAULT_LOG"
++_UINT_RE = re.compile(r"(?:0|[1-9][0-9]*)\Z")
++_POSITIVE_INT_RE = re.compile(r"[1-9][0-9]*\Z")
++_TOKEN_RE = re.compile(r"[A-Za-z0-9_.:/@+-]+\Z")
++_MAX_RECORD_BYTES = 512
++
++# cut -> (role, counting unit, TP0-only)
++_CUT_META = {
++    "exc_before_prepare": ("gpu", "runner-forward", False),
++    "exc_after_prepare": ("gpu", "runner-forward", False),
++    "exc_in_release": ("gpu", "connector-release", False),
++    "exc_after_release": ("gpu", "runner-forward", False),
++    "exc_async_output": ("gpu", "runner-output-relay", False),
++    "drop_request": ("gpu", "connector-request", True),
++    "block_input_completion": ("gpu", "connector-request", True),
++    "park_before_publish": ("offload", "offload-request", False),
++    "park_before_publish_ack": ("offload", "offload-request", False),
++    "launch_park_before_payload_read": (
++        "bootstrap",
++        "bootstrap-launch",
++        False,
++    ),
++    "launch_partial_ready": ("bootstrap", "bootstrap-launch", False),
++    "launch_partial_ready_header": (
++        "bootstrap",
++        "bootstrap-launch",
++        False,
++    ),
++    "launch_silent_ready": ("bootstrap", "bootstrap-launch", False),
++    "launch_block_reconstruction": (
++        "bootstrap",
++        "bootstrap-reconstruction",
++        False,
++    ),
++    "launch_block_worker_import": (
++        "bootstrap",
++        "bootstrap-import",
++        False,
++    ),
++}
++
++
++def _pid_start_time(pid: int | None = None) -> int:
++    """Return Linux /proc stat field 22 without trusting the comm field."""
++    if pid is None:
++        pid = os.getpid()
++    with open(f"/proc/{pid}/stat", encoding="ascii") as stream:
++        stat = stream.read()
++    close_paren = stat.rfind(")")
++    if close_paren < 0:
++        raise RuntimeError("invalid /proc stat record")
++    fields_from_three = stat[close_paren + 2 :].split()
++    if len(fields_from_three) <= 19:
++        raise RuntimeError("truncated /proc stat record")
++    value = fields_from_three[19]
++    if _POSITIVE_INT_RE.fullmatch(value) is None:
++        raise RuntimeError("invalid /proc start time")
++    return int(value)
++
++
++def _record_token(value: str | int | None) -> str:
++    if value is None:
++        return "-"
++    token = str(value).replace("\n", "\\n").replace(" ", "_")[:160]
++    if not token or _TOKEN_RE.fullmatch(token) is None:
++        raise ValueError("fault diagnostic fields must be non-empty tokens")
++    return token
++
++
++def _block_on_harness_gate() -> None:
++    """Wait in a FIFO read that releases the GIL."""
++    path = os.environ.get("VLLM_PLE_TEST_FAULT_GATE")
++    if path is None or not path:
++        raise RuntimeError(
++            "VLLM_PLE_TEST_FAULT_GATE is required for this bootstrap cut"
++        )
++    fd = os.open(path, os.O_RDONLY)
++    try:
++        if os.read(fd, 1) == b"":
++            raise EOFError("PLE bootstrap fault gate closed")
++    finally:
++        os.close(fd)
++
++
++@dataclass
++class _FaultState:
++    count: int = 0
++    fired: bool = False
++    diagnostic_failed: bool = False
++    lock: threading.Lock = field(default_factory=threading.Lock)
++
++
++@dataclass(frozen=True)
++class FaultSpec:
++    """Immutable fault selection with process-local one-shot runtime state."""
++
++    cut: str
++    ordinal: int
++    tp_rank: int | None
++    pp_rank: int | None
++    phase: str
++    role: str
++    unit: str
++    log_fd: int = field(compare=False, repr=False)
++    _state: _FaultState = field(
++        default_factory=_FaultState,
++        compare=False,
++        repr=False,
++    )
++
++    def _emit(
++        self,
++        *,
++        count: int,
++        role: str,
++        unit: str,
++        tp_rank: int | None,
++        pp_rank: int | None,
++        dp_rank: int | None,
++        transaction_id: str | int | None,
++        correlation_id: str | int | None,
++        bytes_written: int | None = None,
++        bytes_sent: int | None = None,
++        frame_size: int | None = None,
++    ) -> bool:
++        try:
++            pid = os.getpid()
++            suffix = ""
++            if bytes_written is not None:
++                if bytes_sent is not None or frame_size is None:
++                    return False
++                suffix = (
++                    f" bytes_written={int(bytes_written)}"
++                    f" frame_size={int(frame_size)}"
++                )
++            elif bytes_sent is not None:
++                if frame_size is None:
++                    return False
++                suffix = (
++                    f" bytes_sent={int(bytes_sent)}"
++                    f" frame_size={int(frame_size)}"
++                )
++            elif frame_size is not None:
++                return False
++            message = (
++                f"PLE_TEST_FAULT v=1 cut={self.cut} ordinal={self.ordinal} "
++                f"count={count} unit={_record_token(unit)} "
++                f"role={_record_token(role)} "
++                f"tp={tp_rank if tp_rank is not None else '-'} "
++                f"pp={pp_rank if pp_rank is not None else '-'} "
++                f"dp={dp_rank if dp_rank is not None else '-'} "
++                f"pid={pid} pid_start={_pid_start_time(pid)} "
++                f"transaction={_record_token(transaction_id)} "
++                f"correlation={_record_token(correlation_id)} "
++                f"monotonic={time.monotonic():.9f} "
++                f"wall={time.time():.9f}{suffix}\n"
++            ).encode("ascii", "strict")
++            if len(message) > _MAX_RECORD_BYTES:
++                return False
++            return os.write(self.log_fd, message) == len(message)
++        except BaseException:
++            return False
++
++    def fires(
++        self,
++        cut: str,
++        *,
++        role: str,
++        unit: str,
++        eligible: bool,
++        tp_rank: int | None = None,
++        pp_rank: int | None = None,
++        dp_rank: int | None = None,
++        transaction_id: str | int | None = None,
++        correlation_id: str | int | None = None,
++        bytes_written: int | None = None,
++        frame_size: int | None = None,
++    ) -> bool:
++        """Count an eligible unit and fire only after a complete marker write."""
++        if cut != self.cut or role != self.role or unit != self.unit:
++            return False
++        # phase=any does not make profile, warm-up, or dummy GPU work serving.
++        if not eligible:
++            return False
++        if self.role == "gpu":
++            if tp_rank is None or pp_rank is None or dp_rank is None:
++                raise ValueError("GPU fault sites must provide TP, PP, and DP ranks")
++            if self.tp_rank is not None and tp_rank != self.tp_rank:
++                return False
++            if self.pp_rank is not None and pp_rank != self.pp_rank:
++                return False
++        elif tp_rank is not None or pp_rank is not None:
++            raise ValueError(f"{self.role} fault sites must not provide GPU ranks")
++
++        with self._state.lock:
++            if self._state.fired or self._state.diagnostic_failed:
++                return False
++            self._state.count += 1
++            count = self._state.count
++            if count != self.ordinal:
++                return False
++            if not self._emit(
++                count=count,
++                role=role,
++                unit=unit,
++                tp_rank=tp_rank,
++                pp_rank=pp_rank,
++                dp_rank=dp_rank,
++                transaction_id=transaction_id,
++                correlation_id=correlation_id,
++                bytes_written=bytes_written,
++                frame_size=frame_size,
++            ):
++                self._state.diagnostic_failed = True
++                return False
++            self._state.fired = True
++            return True
++
++    def acknowledge_launch_send(self, *, bytes_sent: int, frame_size: int) -> bool:
++        """Emit bounded send progress only for the CPU-scoped launch-send gate."""
++        if self.cut != "launch_park_before_payload_read":
++            return False
++        with self._state.lock:
++            if self._state.diagnostic_failed:
++                return False
++            ok = self._emit(
++                count=self.ordinal,
++                role="launch-parent",
++                unit="launch-send",
++                tp_rank=None,
++                pp_rank=None,
++                dp_rank=None,
++                transaction_id="launch:1",
++                correlation_id="launch:1",
++                bytes_sent=bytes_sent,
++                frame_size=frame_size,
++            )
++            if not ok:
++                self._state.diagnostic_failed = True
++            return ok
++
++
++@dataclass(frozen=True)
++class _FaultReconstructionPayload:
++    """Pickle wrapper whose reducer is the reconstruction fault boundary."""
++
++    payload: bytes
++
++    def __reduce__(self):
++        return (_reconstruct_configuration_payload, (self.payload,))
++
++
++def _reconstruct_configuration_payload(payload: bytes) -> bytes:
++    fault = _FAULT
++    if fault is not None and fault.fires(
++        "launch_block_reconstruction",
++        role="bootstrap",
++        unit="bootstrap-reconstruction",
++        eligible=True,
++        transaction_id="reducer:configuration",
++        correlation_id="launch:1",
++    ):
++        _block_on_harness_gate()
++    return payload
++
++
++def _parse_uint(value: str, name: str, *, positive: bool = False) -> int:
++    pattern = _POSITIVE_INT_RE if positive else _UINT_RE
++    if pattern.fullmatch(value) is None:
++        requirement = "a positive integer" if positive else "a non-negative integer"
++        raise ValueError(f"{_ENV_NAME}: {name} must be {requirement}")
++    return int(value)
++
++
++def _open_fault_log() -> int:
++    path = os.environ.get(_LOG_ENV_NAME)
++    if path is None or not path or path != path.strip():
++        raise ValueError(
++            f"{_LOG_ENV_NAME} is required and must be a non-empty path "
++            f"when {_ENV_NAME} is armed"
++        )
++    flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NONBLOCK
++    try:
++        return os.open(path, flags, 0o600)
++    except OSError as error:
++        raise ValueError(f"{_LOG_ENV_NAME}: cannot open {path!r}") from error
++
++
++def _parse_fault_spec(value: str | None) -> FaultSpec | None:
++    """Strictly parse the environment representation."""
++    if value is None:
++        return None
++    if not value or value != value.strip():
++        raise ValueError(f"{_ENV_NAME}: spec must be non-empty with no outer whitespace")
++
++    fields: dict[str, str] = {}
++    for item in value.split(","):
++        if item.count("=") != 1:
++            raise ValueError(f"{_ENV_NAME}: every field must be key=value")
++        key, field_value = item.split("=", 1)
++        if (
++            not key
++            or not field_value
++            or key != key.strip()
++            or field_value != field_value.strip()
++        ):
++            raise ValueError(f"{_ENV_NAME}: fields must not contain whitespace")
++        if key in fields:
++            raise ValueError(f"{_ENV_NAME}: duplicate field {key!r}")
++        fields[key] = field_value
++
++    allowed = {"cut", "ordinal", "rank", "tp", "pp", "phase"}
++    unknown = set(fields).difference(allowed)
++    if unknown:
++        raise ValueError(f"{_ENV_NAME}: unknown field(s): {sorted(unknown)}")
++    missing = {"cut", "ordinal"}.difference(fields)
++    if missing:
++        raise ValueError(f"{_ENV_NAME}: missing field(s): {sorted(missing)}")
++
++    cut = fields["cut"]
++    if cut not in _CUT_META:
++        raise ValueError(f"{_ENV_NAME}: unknown cut {cut!r}")
++    ordinal = _parse_uint(fields["ordinal"], "ordinal", positive=True)
++    role, unit, tp0_only = _CUT_META[cut]
++
++    has_any_rank = "rank" in fields
++    has_specific_rank = "tp" in fields or "pp" in fields
++    if has_any_rank:
++        if fields["rank"] != "any":
++            raise ValueError(f"{_ENV_NAME}: rank must be exactly 'any'")
++        if has_specific_rank:
++            raise ValueError(f"{_ENV_NAME}: rank=any cannot be combined with tp or pp")
++        tp_rank = None
++        pp_rank = None
++    else:
++        if not has_specific_rank:
++            raise ValueError(f"{_ENV_NAME}: specify rank=any, tp, or pp")
++        tp_rank = _parse_uint(fields["tp"], "tp") if "tp" in fields else None
++        pp_rank = _parse_uint(fields["pp"], "pp") if "pp" in fields else None
++
++    if role in {"offload", "bootstrap"} and not has_any_rank:
++        raise ValueError(
++            f"{_ENV_NAME}: {role} cut {cut!r} requires rank=any; "
++            "it has no TP/PP rank"
++        )
++    if role == "gpu":
++        if pp_rank is not None and pp_rank != 0:
++            raise ValueError(f"{_ENV_NAME}: cut {cut!r} exists only on PP rank zero")
++        if tp0_only and tp_rank is not None and tp_rank != 0:
++            raise ValueError(f"{_ENV_NAME}: cut {cut!r} exists only on TP rank zero")
++
++    phase = fields.get("phase", "serving")
++    if phase not in {"serving", "any"}:
++        raise ValueError(f"{_ENV_NAME}: phase must be 'serving' or 'any'")
++
++    return FaultSpec(
++        cut=cut,
++        ordinal=ordinal,
++        tp_rank=tp_rank,
++        pp_rank=pp_rank,
++        phase=phase,
++        role=role,
++        unit=unit,
++        log_fd=_open_fault_log(),
++    )
++
++
++_FAULT = _parse_fault_spec(os.environ.get(_ENV_NAME))

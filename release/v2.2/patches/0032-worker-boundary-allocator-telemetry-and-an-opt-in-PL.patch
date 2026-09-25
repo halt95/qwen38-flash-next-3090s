@@ -1,0 +1,362 @@
+From 9ee518139488292222644515ef3b1be8175c8cb6 Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Wed, 23 Sep 2026 00:01:58 -0400
+Subject: [PATCH 32/58] worker: boundary allocator telemetry and an opt-in PLE
+ row dump
+
+Env-gated diagnostics, inert unless set. Allocator telemetry is read only at
+step boundaries, armed after warm-up and capture.
+---
+ tests/v1/worker/test_e2_memstats.py | 113 +++++++++++++++++++++++
+ vllm/v1/ple_offload/rowdump.py      |  41 +++++++++
+ vllm/v1/ple_offload/worker.py       |   1 +
+ vllm/v1/worker/e2_memstats.py       | 136 ++++++++++++++++++++++++++++
+ vllm/v1/worker/gpu_worker.py        |   5 +
+ 5 files changed, 296 insertions(+)
+ create mode 100644 tests/v1/worker/test_e2_memstats.py
+ create mode 100644 vllm/v1/ple_offload/rowdump.py
+ create mode 100644 vllm/v1/worker/e2_memstats.py
+
+diff --git a/tests/v1/worker/test_e2_memstats.py b/tests/v1/worker/test_e2_memstats.py
+new file mode 100644
+index 0000000000..c40518746b
+--- /dev/null
++++ b/tests/v1/worker/test_e2_memstats.py
+@@ -0,0 +1,113 @@
++# SPDX-License-Identifier: Apache-2.0
++"""CPU/GPU-free schema and call-order tests for vllm/v1/worker/e2_memstats.py (debug-only telemetry)."""
++from __future__ import annotations
++
++import importlib.util
++import os
++import sys
++import unittest
++from pathlib import Path
++from unittest import mock
++
++import torch
++
++MODULE_PATH = Path(__file__).resolve().parents[3] / "vllm" / "v1" / "worker" / "e2_memstats.py"
++HOST_CURRENT_KEYS = {
++    "active_bytes.current",
++    "active_requests.current",
++    "allocated_bytes.current",
++    "allocations.current",
++}
++
++
++def load_disabled_module():
++    name = "e2_memstats_under_test"
++    sys.modules.pop(name, None)
++    spec = importlib.util.spec_from_file_location(name, MODULE_PATH)
++    if spec is None or spec.loader is None:
++        raise RuntimeError(f"cannot load {MODULE_PATH}")
++    module = importlib.util.module_from_spec(spec)
++    with mock.patch.dict(os.environ, {"VLLM_E2_MEMSTATS": "", "VLLM_E2_MEMSTATS_DIR": ""}):
++        spec.loader.exec_module(module)
++    return module
++
++
++class MemstatsSchemaTest(unittest.TestCase):
++    def test_disabled_import_has_no_cuda_or_thread_side_effect(self):
++        initialized = torch.cuda.is_initialized()
++        module = load_disabled_module()
++        self.assertFalse(module.enabled())
++        self.assertEqual(module._started, [])
++        self.assertEqual(torch.cuda.is_initialized(), initialized)
++
++    def test_close_metrics_schema_and_call_order(self):
++        module = load_disabled_module()
++        initialized = torch.cuda.is_initialized()
++        calls: list[str] = []
++        device_stats = {
++            "allocated_bytes.all.current": 11,
++            "reserved_bytes.all.current": 12,
++            "allocated_bytes.all.peak": 21,
++            "reserved_bytes.all.peak": 22,
++            "num_alloc_retries": 3,
++            "num_ooms": 0,
++        }
++        host_stats = {
++            "active_bytes.current": 31,
++            "active_requests.current": 32,
++            "allocated_bytes.current": 33,
++            "allocations.current": 34,
++            "allocated_bytes.peak": 99,
++        }
++
++        def memory_stats(dev):
++            self.assertEqual(dev, 7)
++            calls.append("memory_stats")
++            return device_stats
++
++        def reset_peak_memory_stats(dev):
++            self.assertEqual(dev, 7)
++            calls.append("reset_peak_memory_stats")
++
++        def mem_get_info(dev):
++            self.assertEqual(dev, 7)
++            calls.append("mem_get_info")
++            return 41, 42
++
++        def host_memory_stats():
++            calls.append("host_memory_stats")
++            return host_stats
++
++        with (
++            mock.patch.object(module.torch.cuda, "memory_stats", side_effect=memory_stats),
++            mock.patch.object(module.torch.cuda, "reset_peak_memory_stats", side_effect=reset_peak_memory_stats),
++            mock.patch.object(module.torch.cuda, "mem_get_info", side_effect=mem_get_info),
++            mock.patch.object(module.torch.cuda, "host_memory_stats", side_effect=host_memory_stats),
++        ):
++            record = module._close_metrics(7)
++
++        # The device read and the peak reset stay adjacent; the host read comes after both.
++        self.assertEqual(calls, ["memory_stats", "reset_peak_memory_stats", "mem_get_info", "host_memory_stats"])
++        self.assertEqual(
++            set(record),
++            {
++                "allocated_bytes.all.current",
++                "reserved_bytes.all.current",
++                "alloc_peak_w",
++                "res_peak_w",
++                "retries",
++                "ooms",
++                "free",
++                "total",
++                "host",
++            },
++        )
++        self.assertEqual(set(record["host"]), HOST_CURRENT_KEYS)
++        self.assertEqual(record["host"]["allocated_bytes.current"], 33)
++        self.assertEqual(record["allocated_bytes.all.current"], 11)
++        self.assertEqual(record["reserved_bytes.all.current"], 12)
++        self.assertEqual(torch.cuda.is_initialized(), initialized)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/vllm/v1/ple_offload/rowdump.py b/vllm/v1/ple_offload/rowdump.py
+new file mode 100644
+index 0000000000..95fd3081b6
+--- /dev/null
++++ b/vllm/v1/ple_offload/rowdump.py
+@@ -0,0 +1,41 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Debug-only PLE row dump for byte-level transport checks (off unless VLLM_PLE_ROW_DUMP=<dir>).
++
++Each process appends framed records to <dir>/<tag>-pid<pid>.bin:
++  b"PLER" | kind u8 (0 = GPU worker: rows its forward consumed; 1 = offload process: rows it published)
++  | rank u8 | reserved u16 | seq u32 | n u32 | row_bytes u32 | ids int64[n] | rows uint8[n * row_bytes]
++"""
++
++import os
++import struct
++import threading
++
++import torch
++
++_DIR = os.environ.get("VLLM_PLE_ROW_DUMP", "")
++_LOCK = threading.Lock()
++_FILES: dict = {}
++MAGIC = b"PLER"
++
++
++def enabled() -> bool:
++    return bool(_DIR)
++
++
++def write(tag: str, kind: int, rank: int, seq: int, ids: torch.Tensor, rows: torch.Tensor) -> None:
++    ids_cpu = ids.detach().to(device="cpu", dtype=torch.int64).contiguous()
++    rows_cpu = rows.detach().to(device="cpu").contiguous()
++    n = int(ids_cpu.shape[0])
++    if rows_cpu.shape[0] != n:
++        raise RuntimeError(f"PLE row dump: {rows_cpu.shape[0]} rows for {n} ids")
++    raw = rows_cpu.view(torch.uint8).numpy().tobytes() if n else b""
++    row_bytes = len(raw) // n if n else 0
++    record = (MAGIC + struct.pack("<BBHIII", kind, rank, 0, seq, n, row_bytes)
++              + ids_cpu.numpy().tobytes() + raw)
++    with _LOCK:
++        f = _FILES.get(tag)
++        if f is None:
++            os.makedirs(_DIR, exist_ok=True)
++            f = open(os.path.join(_DIR, f"{tag}-pid{os.getpid()}.bin"), "ab", buffering=0)
++            _FILES[tag] = f
++        f.write(record)
+diff --git a/vllm/v1/ple_offload/worker.py b/vllm/v1/ple_offload/worker.py
+index 43caf80962..24beebdea6 100644
+--- a/vllm/v1/ple_offload/worker.py
++++ b/vllm/v1/ple_offload/worker.py
+@@ -40,6 +40,7 @@ from typing import Any, cast
+ 
+ import msgspec
+ import torch
++from vllm.v1.ple_offload import rowdump as _rowdump
+ import torch.distributed as dist
+ import zmq
+ 
+diff --git a/vllm/v1/worker/e2_memstats.py b/vllm/v1/worker/e2_memstats.py
+new file mode 100644
+index 0000000000..586f8fa61a
+--- /dev/null
++++ b/vllm/v1/worker/e2_memstats.py
+@@ -0,0 +1,136 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Debug-only allocator telemetry for E2, BOUNDARY-ONLY. Off unless VLLM_E2_MEMSTATS=<ctl poll seconds> and
++VLLM_E2_MEMSTATS_DIR=<dir>.
++
++WHY THIS IS NOT A SAMPLER ANY MORE. An earlier version read torch.cuda.memory_stats() and
++reset_peak_memory_stats() every VLLM_E2_MEMSTATS seconds. Both take the per-device caching-allocator mutex and the
++Python bindings do not release the GIL, so the old contract's claim that this thread "takes no lock shared with the
++model path" was FALSE. Three one-boot runs at one KV pin showed a monotone dose-response: sampling at 4 Hz wedged a
++stage-0 worker during a 131072-token row; at 1.1 Hz it survived that row and wedged during a 260000-token row; with the
++thread disabled the run completed every row. Causation is not established at n=1 per run
++(single runs only), but polling has no place inside a measured region, and it was
++never necessary: PyTorch maintains the allocator high-water marks itself, so reading them once per window is exact.
++
++WHAT THIS THREAD DOES NOW. Between window boundaries it makes NO CUDA calls and touches NO allocator state: its tick
++is a plain read of <dir>/window.ctl, which holds "<seq> <name>". The gate driver crosses a boundary only while the
++server is quiet (no request running). On a new seq the thread performs these boundary-only allocator reads:
++  1. memory_stats()            -> the closing window's exact high-water marks and cumulative retry/OOM counters
++  2. reset_peak_memory_stats() -> immediately after the read, with no file I/O in the gap
++  3. mem_get_info()            -> device free/total AT THAT QUIESCENT INSTANT
++  4. host_memory_stats()       -> pinned-host allocator current values, outside the read-to-reset gap
++then writes the "close" record for the old window and the "ack" record for the new one.
++
++WHAT THIS MEASURES.
++  - A row's allocator peak is EXACT for that row's window (not a sampled maximum; it cannot miss a transient).
++  - Device free/total is observed ONLY at quiescent boundaries. No minimum-free figure exists for the inside of a
++    row, and none may be reported.
++  - Retry and OOM counters are cumulative and never reset; per-row deltas come from consecutive close records.
++  - There is NO interval-level peak. A qualifying interval is narrower than its row and is identified only
++    afterwards from the scheduler log, so the peak attributable to it is the ROW-level high-water mark, which
++    over-includes the prefill ramp. This loss of resolution is inherent to the design.
++
++Records (one JSON per line): kind start | close | ack | error; rank, local, dev, pid; window, seq; and for close:
++allocated_bytes.all.current, reserved_bytes.all.current, alloc_peak_w, res_peak_w, retries, ooms, free, total,
++run_alloc_peak, run_res_peak, and a host object containing every host_memory_stats() key ending in ".current".
++Records are written with synchronous file I/O, never inside the read-to-reset gap. Nothing
++here raises into the worker.
++"""
++import json
++import os
++import threading
++import time
++
++import torch
++
++_SEG = float(os.environ.get("VLLM_E2_MEMSTATS", "0") or 0)
++_DIR = os.environ.get("VLLM_E2_MEMSTATS_DIR", "")
++_started = []
++VERSION = "e2_memstats/5-boundary-current-host"
++
++
++def _close_metrics(dev):
++    """Read one quiescent boundary; kept separate for CPU-only testing."""
++    s = torch.cuda.memory_stats(dev)
++    ap = int(s.get("allocated_bytes.all.peak", 0))
++    rp = int(s.get("reserved_bytes.all.peak", 0))
++    torch.cuda.reset_peak_memory_stats(dev)  # no file I/O in the gap
++    free, total = torch.cuda.mem_get_info(dev)
++    host_stats = torch.cuda.host_memory_stats()
++    host = {
++        key: int(value)
++        for key, value in host_stats.items()
++        if key.endswith(".current")
++    }
++    return {
++        "allocated_bytes.all.current": int(
++            s.get("allocated_bytes.all.current", 0)
++        ),
++        "reserved_bytes.all.current": int(
++            s.get("reserved_bytes.all.current", 0)
++        ),
++        "alloc_peak_w": ap,
++        "res_peak_w": rp,
++        "retries": int(s.get("num_alloc_retries", 0)),
++        "ooms": int(s.get("num_ooms", 0)),
++        "free": int(free),
++        "total": int(total),
++        "host": host,
++    }
++
++
++def enabled() -> bool:
++    return _SEG > 0 and bool(_DIR)
++
++
++def ensure_started(worker, armed_by: str = "compile_or_warm_up_model") -> None:
++    if _started:
++        return
++    dev = torch.cuda.current_device()   # captured on the worker's own thread: every call below passes it explicitly
++    t = threading.Thread(target=_loop, name="e2-memstats", daemon=True,
++                         args=(dev, getattr(worker, "rank", -1), getattr(worker, "local_rank", -1), armed_by))
++    _started.append(t)
++    t.start()
++
++
++def _ctl():
++    try:
++        with open(os.path.join(_DIR, "window.ctl")) as f:
++            seq, name = f.read().split(None, 1)
++        return int(seq), name.strip()
++    except (OSError, ValueError):
++        return None
++
++
++def _loop(dev, rank, local, armed_by):
++    os.makedirs(_DIR, exist_ok=True)
++    f = open(os.path.join(_DIR, f"memstats-rank{rank}-pid{os.getpid()}.jsonl"), "a", buffering=1)
++    base = {"rank": rank, "local": local, "dev": dev, "pid": os.getpid()}
++
++    def w(rec):
++        f.write(json.dumps({**base, **rec}, separators=(",", ":")) + "\n")
++
++    run_ap = run_rp = 0
++    seq, name = _ctl() or (0, "serve")
++    torch.cuda.reset_peak_memory_stats(dev)
++    w({"kind": "start", "t": round(time.time(), 4), "m": round(time.monotonic(), 4), "armed_by": armed_by,
++       "window": name, "seq": seq, "version": VERSION, "poll_s": _SEG})
++    while True:
++        time.sleep(_SEG)
++        try:
++            c = _ctl()                                   # file read only: no CUDA, no allocator lock, no GIL-held call
++            if c is None or c[0] == seq:
++                continue
++            # Boundary. The driver only crosses one while the server is quiet, so this is the single point at which
++            # this thread touches the allocator at all.
++            metrics = _close_metrics(dev)
++            ap = metrics["alloc_peak_w"]
++            rp = metrics["res_peak_w"]
++            run_ap, run_rp = max(run_ap, ap), max(run_rp, rp)
++            w({"kind": "close", "t": round(time.time(), 4), "m": round(time.monotonic(), 4), "window": name,
++               "seq": seq, **metrics,
++               "run_alloc_peak": run_ap, "run_res_peak": run_rp})
++            seq, name = c
++            w({"kind": "ack", "t": round(time.time(), 4), "m": round(time.monotonic(), 4), "window": name, "seq": seq})
++        except Exception as e:  # noqa: BLE001 - telemetry must never raise into the worker
++            w({"kind": "error", "t": round(time.time(), 4), "m": round(time.monotonic(), 4), "window": name,
++               "seq": seq, "error": f"{type(e).__name__}: {e}"[:300]})
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index 43bc705f97..cafeb73c99 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -89,6 +89,7 @@ from vllm.v1.outputs import (
+ )
+ from vllm.v1.ple_offload.fatal import fail_ple_execute_model
+ from vllm.v1.utils import compute_iteration_details, report_usage_stats
++from vllm.v1.worker import e2_memstats as _e2_memstats
+ from vllm.v1.worker import guard_telemetry
+ from vllm.v1.worker.sentinel.gpu_worker_sentinel import WorkerSentinel
+ from vllm.v1.worker.startup_plan import (
+@@ -1098,6 +1099,10 @@ class Worker(WorkerBase):
+         # intra-op parallelism.
+         set_torch_threads_for_runtime()
+ 
++        # Allocator telemetry: armed only after warm-up and CUDA-graph capture (env-gated).
++        if _e2_memstats.enabled():
++            _e2_memstats.ensure_started(self)
++
+         return CompilationTimes(
+             language_model=self.compilation_config.compilation_time,
+             encoder=self.compilation_config.encoder_compilation_time,

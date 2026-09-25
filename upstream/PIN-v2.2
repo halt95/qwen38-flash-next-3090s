@@ -1,0 +1,58 @@
+# Flash-Next v2.2.0: the vLLM source this repo serves with (the published form of the tree the reference host serves;
+# README, "Published source versus the qualified tree").
+#   base: vllm-project/vllm tag v0.30.0 (ced6857afa, the public release; no nightly and no community branch)
+#   + 58 commits (release/v2.2/patches, reading aid; the series is linear and replays with
+#     `git am --keep-non-patch` onto v0.30.0 to the same tree), authored halt95, upstream ports credited by PR
+#     number in the messages and in NOTICE
+#   The bundle is the source artefact; scripts/build-v2.2.sh verifies commit AND tree.
+repo=https://github.com/vllm-project/vllm.git
+base_commit=ced6857afa0ea7b2e3f0846a62e1394e90f15607
+# bundle prerequisites: the public v0.30.0 commit only (fetched by full SHA at depth 1)
+prereqs="ced6857afa0ea7b2e3f0846a62e1394e90f15607"
+bundle=v2.2.0-from-upstream-v0.30.0.bundle
+bundle_sha256=599b77644d661a2aae8c5ac69576deac1bca93d4820b6e08f5b9ca6b5d8e2f16
+# the bundle carries one branch head (not a tag); build-v2.2.sh fetches it and checks out the commit
+ref=refs/heads/v2.2.0-public
+# the release name the build script prints; the source is identified by commit and tree, not by a tag
+tag=v2.2.0
+commit=9c27ca9a0657338852c7d3e59561d424fc036fde
+# git tree hash of the release source (content-only, stable); build-v2.2.sh checks it after checkout
+tree=eebcd6480dba463294e9ca34f24eb770a45e11fe
+# The tree the release was qualified on (not published) differs from this one in comments, docstrings, log/error
+# text and test labels, identifier renames (the MERLIN_* switch prefix and a few test-helper names), two internal
+# notes not shipped and nineteen renamed test/probe files (README, "Published source versus the qualified tree").
+# Compiled ops. Unlike v2.0.1, the v2.2.0 delta changes csrc (the top-k kernels and the Marlin MoE split-K
+# switch), so two extensions are built from this tree for sm_86; every other build product is the stock
+# vLLM 0.30.0 wheel's, byte for byte (checked on the reference host). build-artifacts.list enumerates all 23 paths.
+own_extensions="vllm/_C_stable_libtorch.abi3.so vllm/_moe_C_stable_libtorch.abi3.so"
+own_C_sha256=6cb8bc7770112a9b31cf0b721a3b3c858a37f0104d06d355afb7ff02b041b4d4
+own_moe_C_sha256=66acb123e71ba0c7b6e1573418b241c93aa83b3f6d7efa3ef4a9ed4ebf191526
+# both built from this tree in the Ubuntu 22.04 root described below. Device code (cuobjdump -sass, per-build
+# anonymous-namespace hashes normalised) is identical to the qualified builds for every kernel this release
+# changes and every kernel on this model's path; 24 upstream kernels on paths this model does not use
+# (MiniMax-M3 / Kimi-K3 fused ops, DeepGEMM fp8 silu-mul quant, fp8 MoE finalize) differ, most likely because of
+# the host toolchain (gcc 11 here, gcc 14 on the reference host), which was not isolated as the cause.
+# the reference build: an Ubuntu 22.04 root (glibc 2.35, gcc 11.4, so the products need glibc >= 2.34), cmake + ninja,
+# TORCH_CUDA_ARCH_LIST=8.6, CUDA 13.3 (nvcc V13.3.33), Release, build dir outside the tree; targets _C_stable_libtorch
+# and _moe_C_stable_libtorch. A local rebuild is not expected to be byte-identical.
+build_cuda=13.3
+build_arch=8.6
+stock_wheel_version=0.30.0
+stock_wheel_url=https://files.pythonhosted.org/packages/1a/25/f5087a8f382e197a73672768b389d020b9d92e38371c3b0fc6dd883bbb34/vllm-0.30.0-cp38-abi3-manylinux_2_28_x86_64.whl
+stock_wheel_sha256=ef52ee58c410ead0b8afb190838fa4cbcb52075596f67862a03859d984966ac4
+# The stock 0.30.0 wheel's build products plus the two extensions built from this tree in the Ubuntu 22.04 root
+# (not the reference host's serving builds), as one tarball (241 MB, 2,005 files; not in git):
+artifacts_tar=build-artifacts-sm86-py313-cu130-v2.2.0.tar.gz
+artifacts_sha256=cdca5ffcb3003d15e00896f0969134e16d7bfbe0a3c6dfe10698bec32573f592
+# python / torch / runtime the reference venv pins (release/v2.2/requirements-pinned.txt is the full set)
+python=3.13
+torch=2.13.0
+torch_cuda=13.0
+triton=3.7.1
+flashinfer=0.6.18.post1
+# runtime kernel compilation (FlashInfer JIT, Triton launchers): the CUDA 13.0 nvcc/crt/nvvm/cccl wheels in
+# requirements-pinned.txt (PTX a CUDA >= 13.0 driver accepts); serve-v2.2.sh points CUDA_HOME at them
+jit_cuda=13.0
+# build-time tools installed next to the pins (not runtime dependencies)
+build_tools_pip="pip==26.2.1"
+build_tools="setuptools-rust==1.13.0 setuptools-scm==10.3.4 vcs-versioning==2.5.0 semantic-version==2.10.0"

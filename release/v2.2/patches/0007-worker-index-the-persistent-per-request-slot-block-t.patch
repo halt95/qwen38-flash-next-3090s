@@ -1,0 +1,1605 @@
+From 6106ec35acedb9500435458bcac0803e27fec3ab Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Tue, 22 Sep 2026 04:12:35 -0400
+Subject: [PATCH 07/58] worker: index the persistent per-request-slot block
+ table under PP
+
+Under pipeline parallelism the Mamba/GDN state-copy path indexed a block-table
+row gathered for a different step. The align post-process now indexes the
+persistent per-request-slot table, and fails closed when it is absent.
+---
+ tests/v1/worker/gpu/__init__.py               |   2 +
+ .../gpu/test_pp_deferred_mamba_block_table.py | 706 ++++++++++++++++++
+ .../worker/gpu/test_pp_deferred_mamba_gpu.py  | 542 ++++++++++++++
+ tests/v1/worker/test_mamba_utils.py           |  25 +-
+ vllm/v1/worker/gpu/model_runner.py            |   4 +
+ vllm/v1/worker/gpu/model_states/interface.py  |   8 +
+ .../worker/gpu/model_states/mamba_hybrid.py   |  19 +
+ vllm/v1/worker/mamba_utils.py                 |  83 +-
+ 8 files changed, 1381 insertions(+), 8 deletions(-)
+ create mode 100644 tests/v1/worker/gpu/__init__.py
+ create mode 100644 tests/v1/worker/gpu/test_pp_deferred_mamba_block_table.py
+ create mode 100644 tests/v1/worker/gpu/test_pp_deferred_mamba_gpu.py
+
+diff --git a/tests/v1/worker/gpu/__init__.py b/tests/v1/worker/gpu/__init__.py
+new file mode 100644
+index 0000000000..208f01a7cb
+--- /dev/null
++++ b/tests/v1/worker/gpu/__init__.py
+@@ -0,0 +1,2 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+diff --git a/tests/v1/worker/gpu/test_pp_deferred_mamba_block_table.py b/tests/v1/worker/gpu/test_pp_deferred_mamba_block_table.py
+new file mode 100644
+index 0000000000..30bed0a8f8
+--- /dev/null
++++ b/tests/v1/worker/gpu/test_pp_deferred_mamba_block_table.py
+@@ -0,0 +1,706 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Which block-table row the align post-process kernel reads.
++
++Under pipeline parallelism the Mamba align post-process is *deferred*: it is
++enqueued by ``update_pp_decode_requests`` at the top of ``execute_model``
++(``model_runner.py:1644``), before this step's ``gather_block_tables``
++(``model_runner.py:1442`` -> ``block_table.py:149``), and the ``idx_mapping`` it
++carries was captured ``pp_size`` steps earlier on a ``PendingRecv``
++(``pp_utils.py:57-58, 258-271``). There is exactly one gathered destination
++buffer, reused in place for the engine's lifetime (``block_table.py:74-76``), so
++at that moment it holds the batch of step T-1 while the mapping describes the
++batch of step T-2. With two-way PP micro-batch alternation those are different
++micro-batches by construction, so ``bt_row_idx = batch_idx``
++(``mamba_utils.py:481``) resolved a *different request's* row.
++
++These tests model the row selection on CPU: they drive the production plumbing
++(``MambaHybridModelState._ensure_align_ctx`` ->
++``MambaSpecDecodeGPUContext.initialize_from_forward_context`` ->
++``run_fused_postprocess_align``), capture the launch instead of running Triton,
++and then replay the kernel's index arithmetic against the two candidate tables.
++
++No GPU is required.
++"""
++
++import inspect
++from types import SimpleNamespace
++from unittest.mock import MagicMock
++
++import numpy as np
++import pytest
++import torch
++
++from vllm.model_executor.layers.mamba.mamba_utils import (
++    MambaStateCopyFuncsByType,
++    get_conv_copy_spec,
++    get_temporal_copy_spec,
++)
++from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
++from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec, MambaSpec
++from vllm.v1.worker import mamba_utils as mamba_utils_mod
++from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
++from vllm.v1.worker.mamba_utils import MambaSpecDecodeGPUContext
++
++MAX_NUM_REQS = 8
++MAX_NUM_BLOCKS = 6
++MAMBA_BLOCK_SIZE = 16
++NUM_PHYS_BLOCKS = 64
++CONV_WIDTH = 4
++CONV_INNER = 8
++TEMPORAL_DIM = 16
++DTYPE = torch.float16
++
++_COPY_FUNCS: MambaStateCopyFuncsByType = {
++    MambaAttentionBackendEnum.GDN_ATTN: (get_conv_copy_spec, get_temporal_copy_spec),
++}
++
++# Captured before any monkeypatching so the replay binds against the real
++# kernel signature; a launch that stops matching it fails loudly here.
++_POSTPROCESS_SIG = inspect.signature(
++    mamba_utils_mod.postprocess_mamba_fused_kernel.fn
++)
++_PRECOPY_SIG = inspect.signature(
++    mamba_utils_mod.precopy_mamba_align_fused_kernel.fn
++)
++
++
++class _MockCpuGpuBuffer:
++    """CpuGpuBuffer stand-in that needs no pinned memory."""
++
++    def __init__(self, size: int, dtype: torch.dtype, device: torch.device):
++        self.cpu = torch.zeros(size, dtype=dtype, device="cpu")
++        self.gpu = torch.zeros(size, dtype=dtype, device=device)
++        self.np = self.cpu.numpy()
++
++    def copy_to_gpu(self, n: int | None = None) -> torch.Tensor:
++        if n is None:
++            self.gpu.copy_(self.cpu)
++            return self.gpu
++        self.gpu[:n].copy_(self.cpu[:n])
++        return self.gpu[:n]
++
++
++class _RecordingKernel:
++    """Stands in for a triton.jit kernel and records the launch."""
++
++    def __init__(self) -> None:
++        self.launches: list[tuple[tuple[int, ...], tuple, dict]] = []
++
++    def __getitem__(self, grid):
++        def launch(*args, **kwargs):
++            self.launches.append((grid, args, kwargs))
++
++        return launch
++
++
++def _ptr_to_int(value: int) -> int:
++    """Undo ``_reinterpret_u64_as_i64`` (mamba_utils.py:186-189)."""
++    return value + (1 << 64) if value < 0 else value
++
++
++def _gather_rows(
++    persistent: torch.Tensor,
++    num_blocks: list[int],
++    idx_mapping: list[int],
++    num_reqs_padded: int,
++    dst: torch.Tensor,
++) -> None:
++    """CPU port of ``_gather_block_tables_kernel`` (block_table.py:236-273).
++
++    Row ``batch_idx`` of ``dst`` receives ``num_blocks[req_idx]`` entries of
++    persistent row ``req_idx``; rows in ``[num_reqs, num_reqs_padded)`` are
++    zeroed whole; rows at or beyond ``num_reqs_padded`` are left holding the
++    previous gather's content.
++    """
++    num_reqs = len(idx_mapping)
++    for batch_idx in range(num_reqs_padded):
++        if batch_idx >= num_reqs:
++            dst[batch_idx].zero_()
++            continue
++        req_idx = idx_mapping[batch_idx]
++        nb = num_blocks[req_idx]
++        dst[batch_idx, :nb] = persistent[req_idx, :nb]
++
++
++def _make_kv_cache_config() -> KVCacheConfig:
++    spec = MambaSpec(
++        block_size=MAMBA_BLOCK_SIZE,
++        shapes=((CONV_WIDTH, CONV_INNER), (TEMPORAL_DIM,)),
++        dtypes=(DTYPE, DTYPE),
++        mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
++        mamba_cache_mode="align",
++        num_speculative_blocks=3,
++    )
++    return KVCacheConfig(
++        num_blocks=NUM_PHYS_BLOCKS,
++        kv_cache_tensors=[],
++        kv_cache_groups=[KVCacheGroupSpec(["layer_0"], spec)],
++    )
++
++
++def _make_forward_context() -> dict:
++    attention = MagicMock()
++    attention.kv_cache = [
++        torch.zeros(NUM_PHYS_BLOCKS, CONV_WIDTH, CONV_INNER, dtype=DTYPE),
++        torch.zeros(NUM_PHYS_BLOCKS, TEMPORAL_DIM, dtype=DTYPE),
++    ]
++    return {"layer_0": attention}
++
++
++def _register_block_tables(state: MambaHybridModelState, block_tables) -> bool:
++    """Hand the runner's persistent ``BlockTables`` to the model state.
++
++    Deliberately tolerant: on a tree without the fix the hook does not exist, and
++    the point of these tests is to report *which row the kernel reads*, not to
++    die on a missing attribute.
++    """
++    setter = getattr(state, "set_block_tables", None)
++    if setter is None:
++        return False
++    setter(block_tables)
++    return True
++
++
++def _build_scenario(
++    device: torch.device = torch.device("cpu"),
++    slot_mapping: list[int] = (0, 1, 2),
++    t1_mapping: list[int] = (2,),
++    register: bool = True,
++):
++    """T-2 gathers ``slot_mapping``; T-1 re-gathers ``t1_mapping`` into the same
++    buffer; the deferred post-process then runs with T-2's mapping.
++
++    ``slot_mapping`` is the batch-row -> req-slot mapping carried on the
++    PendingRecv. Making it non-identity is what separates "the kernel used the
++    persistent table" from "the kernel used req_idx as the row": with an
++    identity mapping ``batch_idx == req_idx`` and the two are indistinguishable.
++    """
++    kv_cache_config = _make_kv_cache_config()
++    forward_context = _make_forward_context()
++
++    # Persistent per-req-slot table (block_table.py:53-59). Row r owns block
++    # ids 10*(r+1) + col, so a row is identifiable from any single entry.
++    persistent = torch.zeros(
++        MAX_NUM_REQS, MAX_NUM_BLOCKS, dtype=torch.int32, device=device
++    )
++    for r in range(MAX_NUM_REQS):
++        for c in range(MAX_NUM_BLOCKS):
++            persistent[r, c] = 10 * (r + 1) + c
++    num_blocks = [3] * MAX_NUM_REQS
++
++    # The single gathered destination buffer (block_table.py:74-76).
++    slot_mapping = list(slot_mapping)
++    t1_mapping = list(t1_mapping)
++    gathered = torch.zeros_like(persistent)
++    _gather_rows(persistent, num_blocks, slot_mapping, len(slot_mapping) + 1, gathered)
++    _gather_rows(persistent, num_blocks, t1_mapping, len(t1_mapping) + 1, gathered)
++
++    ctx = MambaSpecDecodeGPUContext.create(
++        max_num_reqs=MAX_NUM_REQS,
++        kv_cache_config=kv_cache_config,
++        copy_funcs=_COPY_FUNCS,
++        device=device,
++        make_buffer=lambda n, dtype: _MockCpuGpuBuffer(n, dtype, device),
++    )
++
++    state = object.__new__(MambaHybridModelState)
++    state.device = device
++    state.max_num_reqs = MAX_NUM_REQS
++    state._align_mode = True
++    state._mamba_ctx = ctx
++    state._mamba_group_ids = []
++    state._mamba_spec = None
++    state._mamba_state_copy_funcs = _COPY_FUNCS
++    # object.__new__ skips __init__, so mirror the attribute it would set.
++    state._runner_block_tables = None
++    state.vllm_config = SimpleNamespace(
++        compilation_config=SimpleNamespace(static_forward_context=forward_context)
++    )
++    registered = (
++        _register_block_tables(
++            state,
++            SimpleNamespace(block_tables=[SimpleNamespace(gpu=persistent)]),
++        )
++        if register
++        else False
++    )
++
++    # What the runner hands prepare_attn/preprocess_state: the T-1 gather view.
++    gathered_view = gathered[: len(t1_mapping) + 1]
++    state._ensure_align_ctx(kv_cache_config, [0], (gathered_view,))
++
++    tables_by_ptr = {
++        persistent.data_ptr(): ("persistent", persistent),
++        gathered.data_ptr(): ("gathered", gathered),
++    }
++    return SimpleNamespace(
++        ctx=ctx,
++        state=state,
++        slot_mapping=slot_mapping,
++        persistent=persistent,
++        gathered=gathered,
++        tables_by_ptr=tables_by_ptr,
++        registered=registered,
++    )
++
++
++def _replay_row(scenario, launch, batch_idx: int) -> tuple[str, int, dict]:
++    """Replay the kernel's row selection (mamba_utils.py:437-490) for one row.
++
++    Returns ``(table_name, bt_row_idx, predicate)``.
++    """
++    grid, args, kwargs = launch
++    bound = _POSTPROCESS_SIG.bind(*args, **kwargs)
++    bound.apply_defaults()
++    a = bound.arguments
++
++    num_reqs = a["num_reqs"]
++    assert grid[0] == num_reqs, (grid, num_reqs)
++    assert batch_idx < num_reqs
++
++    has_idx_mapping = bool(a["HAS_IDX_MAPPING"])
++    # Absent on a tree without the fix; the kernel then always uses batch_idx.
++    bt_row_is_req = bool(a.get("BT_ROW_IS_REQ", False))
++
++    if has_idx_mapping:
++        req_idx = int(a["idx_mapping_ptr"][batch_idx])
++        if req_idx < 0:
++            return ("skipped", -1, {})
++    else:
++        req_idx = batch_idx
++
++    num_accepted = int(a["num_accepted_tokens_ptr"][req_idx])
++    src_block_idx = int(a["mamba_state_idx_ptr"][req_idx])
++    assert bool(a["PRECOMPUTED_NEW_COMPUTED"]), "V2 align path only"
++    new_num_computed = int(a["num_computed_tokens_ptr"][req_idx])
++    block_size = int(a["block_size"])
++
++    num_tokens_running_state = new_num_computed - num_accepted + 1
++    aligned_new_computed = (new_num_computed // block_size) * block_size
++    needs_copy = aligned_new_computed >= num_tokens_running_state
++    accept_token_bias = aligned_new_computed - num_tokens_running_state
++    dest_block_idx = aligned_new_computed // block_size - 1
++    predicate = {
++        "needs_copy": needs_copy,
++        "num_accepted": num_accepted,
++        "new_num_computed_mod_block": new_num_computed % block_size,
++        "src_col": src_block_idx,
++        "dst_col": dest_block_idx,
++        "token_bias": accept_token_bias,
++        "src_eq_dst": src_block_idx == dest_block_idx,
++    }
++
++    if bt_row_is_req:
++        bt_row_idx = req_idx
++    else:
++        bt_row_idx = batch_idx if has_idx_mapping else req_idx
++
++    group_idx = int(a["state_group_indices_ptr"][0])
++    ptr = _ptr_to_int(int(a["block_table_ptrs_ptr"][group_idx]))
++    name, _table = scenario.tables_by_ptr[ptr]
++    return (name, bt_row_idx, predicate)
++
++
++def _block_ids(scenario, launch, batch_idx: int) -> dict:
++    name, bt_row_idx, predicate = _replay_row(scenario, launch, batch_idx)
++    table = next(
++        tbl for label, tbl in scenario.tables_by_ptr.values() if label == name
++    )
++    return {
++        "table": name,
++        "row": bt_row_idx,
++        "src_block_id": int(table[bt_row_idx, predicate["src_col"]]),
++        "dst_block_id": int(table[bt_row_idx, predicate["dst_col"]]),
++        "temporal_src_block_id": int(
++            table[bt_row_idx, predicate["src_col"] + predicate["token_bias"]]
++        ),
++        **predicate,
++    }
++
++
++def _run_deferred(scenario, monkeypatch: pytest.MonkeyPatch) -> _RecordingKernel:
++    recorder = _RecordingKernel()
++    monkeypatch.setattr(
++        mamba_utils_mod, "postprocess_mamba_fused_kernel", recorder
++    )
++    device = scenario.persistent.device
++
++    def t(values):
++        return torch.tensor(values, dtype=torch.int32, device=device)
++
++    # Per-req-SLOT decision arrays (mamba_utils.py:439-458 reads them at
++    # req_idx, never at batch_idx), so they are keyed by the slot mapping.
++    copier, *bystanders = scenario.slot_mapping
++    num_accepted = torch.ones(MAX_NUM_REQS, dtype=torch.int32, device=device)
++    state_idx = torch.zeros(MAX_NUM_REQS, dtype=torch.int32, device=device)
++    new_num_computed = torch.zeros(MAX_NUM_REQS, dtype=torch.int32, device=device)
++    # Only the first batch row crosses a block boundary inside its accepted
++    # window: 32 % 16 = 0 < num_accepted 2.
++    num_accepted[copier] = 2
++    new_num_computed[copier] = 32
++    for slot in bystanders:
++        num_accepted[slot] = 2
++        new_num_computed[slot] = 40  # 40 % 16 = 8 >= 2 -> no copy
++
++    scenario.ctx.run_fused_postprocess_align(
++        num_reqs=len(scenario.slot_mapping),
++        num_accepted_tokens_gpu=num_accepted,
++        state_idx_gpu=state_idx,
++        new_num_computed_tokens_gpu=new_num_computed,
++        idx_mapping=t(scenario.slot_mapping),  # captured at T-2
++    )
++    return recorder
++
++
++def test_gather_port_matches_production_semantics() -> None:
++    """Instrument check: the CPU gather port must reproduce block_table.py."""
++    persistent = torch.arange(
++        MAX_NUM_REQS * MAX_NUM_BLOCKS, dtype=torch.int32
++    ).reshape(MAX_NUM_REQS, MAX_NUM_BLOCKS)
++    dst = torch.full_like(persistent, -7)
++    num_blocks = [2] * MAX_NUM_REQS
++
++    _gather_rows(persistent, num_blocks, [3, 1], 3, dst)
++
++    # Gathered rows carry only the first num_blocks entries...
++    assert dst[0, :2].tolist() == persistent[3, :2].tolist()
++    assert dst[1, :2].tolist() == persistent[1, :2].tolist()
++    # ...the tail of a gathered row is untouched (block_table.py:269-273),
++    assert dst[0, 2:].tolist() == [-7] * (MAX_NUM_BLOCKS - 2)
++    # ...padded rows in [num_reqs, num_reqs_padded) are zeroed whole,
++    assert dst[2].tolist() == [0] * MAX_NUM_BLOCKS
++    # ...and rows at or beyond num_reqs_padded keep the previous content.
++    assert dst[3].tolist() == [-7] * MAX_NUM_BLOCKS
++
++
++def test_deferred_postprocess_resolves_the_requests_own_row(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """r0's deferred copy must land on r0's blocks, not on r2's.
++
++    T-2 gathered [r0, r1, r2]; T-1 re-gathered [r2] into the same buffer, so
++    gathered row 0 now holds r2. The deferred launch still carries T-2's
++    mapping, so ``batch_idx = 0`` means r0.
++    """
++    scenario = _build_scenario()
++    recorder = _run_deferred(scenario, monkeypatch)
++    assert len(recorder.launches) == 1
++    launch = recorder.launches[0]
++
++    row0 = _block_ids(scenario, launch, 0)
++    why = (
++        f"resolved={row0} "
++        f"runner_hook_registered={scenario.registered} "
++        f"(a missing runner hook leaves the kernel on the batch-order gather)"
++    )
++
++    # The copy predicate really fires for this row, so the kernel does
++    # dereference the block table here (mamba_utils.py:462-479).
++    assert row0["needs_copy"] is True, why
++    assert row0["src_eq_dst"] is False, why
++    assert (row0["src_col"], row0["dst_col"], row0["token_bias"]) == (0, 1, 1), why
++
++    # The gathered buffer holds r2 at batch row 0 after the T-1 gather, so a
++    # kernel that still indexes it by batch_idx corrupts r2 on r0's behalf.
++    assert scenario.gathered[0, 0].item() == 30
++
++    # r0's persistent row is 10, 11, 12, ...
++    assert row0["table"] == "persistent", why
++    assert row0["row"] == 0, why
++    assert row0["src_block_id"] == 10, why
++    assert row0["dst_block_id"] == 11, why
++    assert row0["temporal_src_block_id"] == 11, why
++    assert scenario.registered, why
++
++
++def test_deferred_postprocess_skips_rows_without_a_boundary_crossing(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """The other two rows do not reach the block table at all."""
++    scenario = _build_scenario()
++    recorder = _run_deferred(scenario, monkeypatch)
++    launch = recorder.launches[0]
++
++    for batch_idx in (1, 2):
++        _name, _row, predicate = _replay_row(scenario, launch, batch_idx)
++        assert predicate["needs_copy"] is False, (batch_idx, predicate)
++
++
++def test_precopy_still_uses_the_same_step_gather(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """The pre-copy site must keep batch-order rows.
++
++    ``precopy_mamba_align_fused_kernel`` (mamba_utils.py:613-615) runs from
++    ``preprocess_state``, five lines after the gather that feeds it
++    (``model_runner.py:1718`` -> ``:1723``), so batch row i *is* this request.
++    Switching it to req rows would break it.
++    """
++    scenario = _build_scenario()
++    recorder = _RecordingKernel()
++    monkeypatch.setattr(
++        mamba_utils_mod, "precopy_mamba_align_fused_kernel", recorder
++    )
++    device = scenario.persistent.device
++    z = torch.zeros(MAX_NUM_REQS, dtype=torch.int32, device=device)
++
++    scenario.ctx.run_fused_precopy(
++        num_reqs=3,
++        state_idx_gpu=z.clone(),
++        src_col_gpu=z.clone(),
++        token_bias_gpu=z.clone(),
++        idx_mapping=torch.tensor([0, 1, 2], dtype=torch.int32, device=device),
++    )
++
++    assert len(recorder.launches) == 1
++    _grid, args, kwargs = recorder.launches[0]
++    bound = _PRECOPY_SIG.bind(*args, **kwargs)
++    bound.apply_defaults()
++    ptr = _ptr_to_int(int(bound.arguments["block_table_ptrs_ptr"][0]))
++    assert scenario.tables_by_ptr[ptr][0] == "gathered"
++    assert bound.arguments["HAS_IDX_MAPPING"] is True
++    assert "BT_ROW_IS_REQ" not in bound.arguments
++
++
++def test_deferred_postprocess_uses_req_rows_under_a_non_identity_mapping(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """Batch row 0 -> request slot 5, so batch_idx and req_idx disagree.
++
++    The identity-mapping case above pins *which table*; this one pins *which
++    row*. Every wrong combination lands on a different set of block ids:
++
++    ==========================  ==========  ==================
++    table / row                 resolves    block ids
++    ==========================  ==========  ==================
++    persistent[req_idx=5]       correct     60, 61
++    persistent[batch_idx=0]     wrong row   10, 11
++    gathered[batch_idx=0]       old         30, 31 (r2, from T-1)
++    gathered[req_idx=5]         wrong both  0, 0 (never written)
++    ==========================  ==========  ==================
++    """
++    scenario = _build_scenario(slot_mapping=[5, 1, 2], t1_mapping=[2])
++    recorder = _run_deferred(scenario, monkeypatch)
++    assert len(recorder.launches) == 1
++    launch = recorder.launches[0]
++
++    _grid, args, kwargs = launch
++    bound = _POSTPROCESS_SIG.bind(*args, **kwargs)
++    bound.apply_defaults()
++    # The constexpr itself, not just its effect.
++    assert bound.arguments["BT_ROW_IS_REQ"] is True
++    assert bound.arguments["HAS_IDX_MAPPING"] is True
++
++    row0 = _block_ids(scenario, launch, 0)
++    why = f"resolved={row0} runner_hook_registered={scenario.registered}"
++
++    assert row0["needs_copy"] is True, why
++    assert row0["src_eq_dst"] is False, why
++    assert (row0["src_col"], row0["dst_col"], row0["token_bias"]) == (0, 1, 1), why
++
++    # The row index is the request slot, not the batch row.
++    assert row0["table"] == "persistent", why
++    assert row0["row"] == 5, why
++    assert row0["src_block_id"] == 60, why
++    assert row0["dst_block_id"] == 61, why
++    assert row0["temporal_src_block_id"] == 61, why
++
++    # None of the three wrong coordinates.
++    assert scenario.persistent[0, 0].item() == 10  # persistent, batch row
++    assert scenario.gathered[0, 0].item() == 30  # gathered, batch row
++    assert scenario.gathered[5, 0].item() == 0  # gathered, req row: never written
++    assert row0["src_block_id"] not in (10, 30, 0), why
++
++
++def test_align_postprocess_fails_closed_without_persistent_tables(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """No silent fallback to the batch-order gather.
++
++    A context that never received the persistent tables is a caller bug: the
++    only other thing the kernel could index is the stale gather, which is the
++    corruption this change exists to remove. It must raise, and it must raise
++    before mutating the accepted-token snapshot.
++    """
++    scenario = _build_scenario(slot_mapping=[5, 1, 2], t1_mapping=[2], register=False)
++    assert scenario.registered is False
++    assert scenario.ctx.has_persistent_block_tables is False
++
++    recorder = _RecordingKernel()
++    monkeypatch.setattr(
++        mamba_utils_mod, "postprocess_mamba_fused_kernel", recorder
++    )
++    device = scenario.persistent.device
++    before = scenario.ctx.num_accepted_tokens_out.clone()
++    num_accepted = torch.full(
++        (MAX_NUM_REQS,), 7, dtype=torch.int32, device=device
++    )
++
++    with pytest.raises(RuntimeError, match="persistent per-req-slot block tables"):
++        scenario.ctx.run_fused_postprocess_align(
++            num_reqs=3,
++            num_accepted_tokens_gpu=num_accepted,
++            state_idx_gpu=torch.zeros(MAX_NUM_REQS, dtype=torch.int32, device=device),
++            new_num_computed_tokens_gpu=torch.full(
++                (MAX_NUM_REQS,), 32, dtype=torch.int32, device=device
++            ),
++            idx_mapping=torch.tensor([5, 1, 2], dtype=torch.int32, device=device),
++        )
++
++    assert recorder.launches == []
++    torch.testing.assert_close(scenario.ctx.num_accepted_tokens_out, before)
++
++
++def test_precopy_still_works_without_persistent_tables(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """The V1 pre-copy contract is untouched by the fail-closed rule.
++
++    Only the V2 align post-process needs per-req-slot rows; the pre-copy reads
++    the same-step gather and must keep launching on a context that never
++    received the persistent tables.
++    """
++    scenario = _build_scenario(register=False)
++    assert scenario.ctx.has_persistent_block_tables is False
++    recorder = _RecordingKernel()
++    monkeypatch.setattr(
++        mamba_utils_mod, "precopy_mamba_align_fused_kernel", recorder
++    )
++    device = scenario.persistent.device
++    z = torch.zeros(MAX_NUM_REQS, dtype=torch.int32, device=device)
++
++    scenario.ctx.run_fused_precopy(
++        num_reqs=1,
++        state_idx_gpu=z.clone(),
++        src_col_gpu=torch.full_like(z, -1),
++        token_bias_gpu=z.clone(),
++        idx_mapping=None,
++    )
++
++    assert len(recorder.launches) == 1
++    _grid, args, kwargs = recorder.launches[0]
++    bound = _PRECOPY_SIG.bind(*args, **kwargs)
++    bound.apply_defaults()
++    ptr = _ptr_to_int(int(bound.arguments["block_table_ptrs_ptr"][0]))
++    assert scenario.tables_by_ptr[ptr][0] == "gathered"
++
++
++# ---------------------------------------------------- generation masking (CPU)
++
++
++def mask_from_generation_change(
++    idx_mapping: list[int],
++    reused_slot_rows: list[int],
++) -> list[int]:
++    """Run the real generation masking and return the mapping it produces.
++
++    Drives ``PPHandler.get_prev_sampled_outputs`` (pp_utils.py:132-140) rather
++    than hand-writing a -1: a slot whose generation counter moved between
++    ``receive`` and consumption has been freed and handed to a new request, and
++    the handler must replace its row with -1 so the kernel skips it
++    (mamba_utils.py:441-442).
++
++    Exported so the GPU suite can consume a mapping that a real reuse produced.
++    """
++    from collections import deque
++
++    from vllm.v1.worker.gpu import pp_utils as pp_utils_mod
++
++    num_reqs = len(idx_mapping)
++    idx_np = np.asarray(idx_mapping, dtype=np.intp)
++
++    handler = object.__new__(pp_utils_mod.PPHandler)
++    handler.device = torch.device("cpu")
++    handler.main_stream = SimpleNamespace(wait_event=lambda event: None)
++    # Slot generation counters as they stand now.
++    handler.req_idx_gen_np = np.zeros(max(int(idx_np.max()) + 1, 1), dtype=np.int32)
++    # Snapshot taken at receive time; a reused slot has since been bumped.
++    gen_at_receive = handler.req_idx_gen_np[idx_np].copy()
++    for row in reused_slot_rows:
++        handler.req_idx_gen_np[idx_np[row]] += 1
++
++    slot = pp_utils_mod.PendingRecv(
++        event=object(),
++        sampled_tokens=torch.zeros(num_reqs, 1, dtype=torch.int64),
++        num_sampled=torch.ones(num_reqs, dtype=torch.int32),
++        num_rejected=torch.zeros(num_reqs, dtype=torch.int32),
++        idx_mapping=torch.as_tensor(idx_np, dtype=torch.int32),
++        idx_mapping_np=idx_np,
++        need_sampled_mask=np.ones(num_reqs, dtype=bool),
++        gen_at_receive_np=gen_at_receive,
++    )
++    handler.queue = deque([slot])
++
++    captured: dict[str, object] = {}
++
++    def fake_async_copy_to_gpu(array, device=None):
++        captured["np"] = np.asarray(array).copy()
++        return torch.as_tensor(np.asarray(array), dtype=torch.int32)
++
++    original = pp_utils_mod.async_copy_to_gpu
++    pp_utils_mod.async_copy_to_gpu = fake_async_copy_to_gpu
++    try:
++        outputs = handler.get_prev_sampled_outputs()
++    finally:
++        pp_utils_mod.async_copy_to_gpu = original
++
++    assert outputs is not None, "the whole batch was excluded"
++    return [int(v) for v in outputs["idx_mapping"].tolist()]
++
++
++def test_generation_change_masks_only_the_reused_row():
++    """A slot handed to a new request between capture and use becomes -1."""
++    assert mask_from_generation_change([5, 1, 2], [1]) == [5, -1, 2]
++    assert mask_from_generation_change([5, 1, 2], [0, 2]) == [-1, 1, -1]
++    # No reuse: the handler returns the original tensor untouched.
++    assert mask_from_generation_change([5, 1, 2], []) == [5, 1, 2]
++
++
++def test_kernel_rejects_negative_req_idx_before_any_load_that_uses_it():
++    """Structural check: the guard precedes every load indexed by req_idx.
++
++    ``mamba_utils.py:441-442`` returns on ``req_idx < 0``; the decision loads at
++    ``:445-446`` index by ``req_idx``. If a future edit reordered them, a masked
++    row would dereference index -1 before being rejected. The GPU suite plants
++    poison at index -1 to catch that at runtime; this catches it on CPU, in the
++    source, with no device.
++    """
++    import ast
++    import textwrap
++
++    source = textwrap.dedent(
++        inspect.getsource(mamba_utils_mod.postprocess_mamba_fused_kernel.fn)
++    )
++    tree = ast.parse(source)
++    func = tree.body[0]
++
++    guard_lines = [
++        node.lineno
++        for node in ast.walk(func)
++        if isinstance(node, ast.If)
++        and isinstance(node.test, ast.Compare)
++        and isinstance(node.test.left, ast.Name)
++        and node.test.left.id == "req_idx"
++        and any(isinstance(op, ast.Lt) for op in node.test.ops)
++        and any(isinstance(stmt, ast.Return) for stmt in node.body)
++    ]
++    assert guard_lines, "no `if req_idx < 0: return` guard found in the kernel"
++    guard_line = min(guard_lines)
++
++    # Every expression that adds req_idx to a pointer, i.e. every load or store
++    # that would dereference a negative index.
++    uses = [
++        node.lineno
++        for node in ast.walk(func)
++        if isinstance(node, ast.BinOp)
++        and isinstance(node.op, ast.Add)
++        and isinstance(node.right, ast.Name)
++        and node.right.id == "req_idx"
++    ]
++    assert uses, "no pointer arithmetic on req_idx found; has the kernel moved?"
++    assert min(uses) > guard_line, (
++        f"a req_idx-indexed access at line {min(uses)} precedes the "
++        f"`req_idx < 0` guard at line {guard_line} (offsets are relative to the "
++        f"kernel body)"
++    )
+diff --git a/tests/v1/worker/gpu/test_pp_deferred_mamba_gpu.py b/tests/v1/worker/gpu/test_pp_deferred_mamba_gpu.py
+new file mode 100644
+index 0000000000..f03622773a
+--- /dev/null
++++ b/tests/v1/worker/gpu/test_pp_deferred_mamba_gpu.py
+@@ -0,0 +1,542 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""GPU correctness for the deferred-PP align post-process row selection.
++
++The CPU model in ``test_pp_deferred_mamba_block_table.py`` pins which pointer
++and which row the launcher passes; it replaces the Triton body with a recorder,
++so it proves nothing about the bytes the kernel moves. These tests launch the
++real kernel and check the destination state, including that the request the
++first-cut coordinate would have hit is left alone.
++
++Scenario, shared by every case and identical to the CPU model's:
++
++    step T-2   gather [r5, r1, r2] into the shared destination buffer
++    step T-1   gather [r2]          into the same buffer
++    step T     the deferred post-process runs with T-2's mapping
++
++so batch row 0 means request slot 5, while buffer row 0 holds r2. The four
++possible coordinates resolve to four different physical blocks:
++
++    persistent[req_idx=5]    correct
++    persistent[batch_idx=0]  wrong row   -> r0's blocks
++    gathered[batch_idx=0]    first cut   -> r2's blocks (the victim)
++    gathered[req_idx=5]      wrong both  -> never written, block 0
++
++Requires CUDA **and** an explicit opt-in: set ``VLLM_E2_GPU_TESTS=1``. The reference host
++always reports CUDA available, and the reference host spends most of its time running
++long serving runs and sanitizer runs that should not share a device with a
++test suite, so `torch.cuda.is_available()` is not a sufficient gate here. Run
++this when the GPU is otherwise idle:
++
++    export VLLM_E2_GPU_TESTS=1
++    export PYTHONPATH=<worktree>:<dir-with-pytest>
++    python -m pytest -q tests/v1/worker/gpu/test_pp_deferred_mamba_gpu.py
++"""
++
++import os
++from dataclasses import dataclass
++from unittest.mock import MagicMock
++
++import pytest
++import torch
++
++from vllm.model_executor.layers.mamba.mamba_utils import (
++    MambaStateCopyFuncsByType,
++    get_conv_copy_spec,
++    get_temporal_copy_spec,
++    is_conv_state_dim_first,
++)
++from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
++from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec, MambaSpec
++from vllm.v1.worker.mamba_utils import MambaSpecDecodeGPUContext
++
++pytestmark = [
++    pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
++    pytest.mark.skipif(
++        os.environ.get("VLLM_E2_GPU_TESTS") != "1",
++        reason="set VLLM_E2_GPU_TESTS=1 to run GPU tests (shared GPU host)",
++    ),
++]
++
++MAX_NUM_REQS = 8
++BLOCKS_PER_REQ = 6
++NUM_PHYS_BLOCKS = MAX_NUM_REQS * BLOCKS_PER_REQ
++# Two extra physical blocks, reachable only through the block-table guard row
++# that a negative req_idx would address: CANARY_DST sits at the poison
++# destination column and CANARY_SRC everywhere else, so a negative-index load
++# would produce a visible copy between them. See _build()'s backing tensors.
++# Block ids are 1-based (see phys()), so the canaries sit above the last real
++# id, NUM_PHYS_BLOCKS, rather than on it.
++CANARY_DST = NUM_PHYS_BLOCKS + 1
++CANARY_SRC = NUM_PHYS_BLOCKS + 2
++TOTAL_BLOCKS = NUM_PHYS_BLOCKS + 3
++# Decision values planted at index -1 of every per-req array. They describe a
++# copy (new=48, a=4 -> aligned=48, running=45, bias=3, dst_col=2, src_col=0),
++# so a missing `req_idx < 0` guard is a write, not a silent no-op.
++POISON = (4, 0, 48)  # (num_accepted, state_idx, new_num_computed)
++POISON_DST_COL = 2
++MAMBA_BLOCK_SIZE = 16
++NUM_SPEC_BLOCKS = 3
++CONV_WIDTH = 4
++CONV_INNER = 64
++TEMPORAL_DIM = 128
++DTYPE = torch.float16
++
++_COPY_FUNCS: MambaStateCopyFuncsByType = {
++    MambaAttentionBackendEnum.GDN_ATTN: (get_conv_copy_spec, get_temporal_copy_spec),
++}
++
++
++def phys(req_slot: int, col: int) -> int:
++    """Physical block id owned by ``req_slot`` at logical column ``col``.
++
++    Disjoint per request, so a stray write is attributable.
++
++    ONE-BASED, and that is load-bearing rather than cosmetic. Block id 0 is
++    NULL_BLOCK_ID (v1/attention/backends/utils.py:46); the block pool pops it
++    out of the free queue at construction "to represent a placeholder block
++    with block_id=0" (v1/core/block_pool.py:188-191), so no request ever owns
++    it. A fixture that hands out id 0 as a real block is asking the kernel to
++    copy from the null block, and the bounds guards -- correctly, and following
++    upstream #50021 -- refuse. Numbering from 0 made this fixture the one place
++    in the tree where a legitimate block id was 0.
++    """
++    return req_slot * BLOCKS_PER_REQ + col + 1
++
++
++class _MockCpuGpuBuffer:
++    def __init__(self, size: int, dtype: torch.dtype, device: torch.device):
++        self.cpu = torch.zeros(size, dtype=dtype, device="cpu")
++        self.gpu = torch.zeros(size, dtype=dtype, device=device)
++        self.np = self.cpu.numpy()
++
++    def copy_to_gpu(self, n: int | None = None) -> torch.Tensor:
++        if n is None:
++            self.gpu.copy_(self.cpu)
++            return self.gpu
++        self.gpu[:n].copy_(self.cpu[:n])
++        return self.gpu[:n]
++
++
++def _make_kv_cache_config() -> KVCacheConfig:
++    spec = MambaSpec(
++        block_size=MAMBA_BLOCK_SIZE,
++        shapes=((CONV_WIDTH, CONV_INNER), (TEMPORAL_DIM,)),
++        dtypes=(DTYPE, DTYPE),
++        mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
++        mamba_cache_mode="align",
++        num_speculative_blocks=NUM_SPEC_BLOCKS,
++    )
++    return KVCacheConfig(
++        num_blocks=TOTAL_BLOCKS,
++        kv_cache_tensors=[],
++        kv_cache_groups=[KVCacheGroupSpec(["layer_0"], spec)],
++    )
++
++
++def _gather_rows(persistent, num_blocks, idx_mapping, num_reqs_padded, dst) -> None:
++    """Host port of ``_gather_block_tables_kernel`` (block_table.py:236-273)."""
++    num_reqs = len(idx_mapping)
++    for batch_idx in range(num_reqs_padded):
++        if batch_idx >= num_reqs:
++            dst[batch_idx].zero_()
++            continue
++        req_idx = idx_mapping[batch_idx]
++        nb = num_blocks[req_idx]
++        dst[batch_idx, :nb] = persistent[req_idx, :nb]
++
++
++@dataclass
++class _Fixture:
++    device: torch.device
++    ctx: MambaSpecDecodeGPUContext
++    conv: torch.Tensor
++    temporal: torch.Tensor
++    conv0: torch.Tensor
++    temporal0: torch.Tensor
++    persistent: torch.Tensor
++    gathered: torch.Tensor
++
++
++def _build(slot_mapping=(5, 1, 2), t1_mapping=(2,)) -> _Fixture:
++    device = torch.device("cuda:0")
++    torch.manual_seed(1234)
++
++    conv = torch.randn(
++        TOTAL_BLOCKS, CONV_WIDTH, CONV_INNER, dtype=DTYPE, device=device
++    )
++    temporal = torch.randn(TOTAL_BLOCKS, TEMPORAL_DIM, dtype=DTYPE, device=device)
++    attention = MagicMock()
++    attention.kv_cache = [conv, temporal]
++
++    # The block tables and the per-req decision arrays each get one extra
++    # leading row/element that the kernel is never supposed to reach. Because
++    # the real tensors are views starting one row/element in, index -1 in
++    # pointer arithmetic lands on that guard row -- so a kernel that failed to
++    # reject req_idx < 0 would load the poison decisions below and write into
++    # canaries. See test_freed_slot_is_rejected_before_any_negative_index_load.
++    persistent_backing = torch.zeros(
++        MAX_NUM_REQS + 1, BLOCKS_PER_REQ, dtype=torch.int32, device=device
++    )
++    persistent_backing[0, :] = CANARY_SRC
++    persistent_backing[0, POISON_DST_COL] = CANARY_DST
++    persistent = persistent_backing[1:]
++    for r in range(MAX_NUM_REQS):
++        for c in range(BLOCKS_PER_REQ):
++            persistent[r, c] = phys(r, c)
++    num_blocks = [BLOCKS_PER_REQ] * MAX_NUM_REQS
++
++    gathered_backing = torch.zeros_like(persistent_backing)
++    gathered_backing[0, :] = CANARY_SRC
++    gathered_backing[0, POISON_DST_COL] = CANARY_DST
++    gathered = gathered_backing[1:]
++    slot_mapping = [s for s in slot_mapping if s >= 0]
++    _gather_rows(persistent, num_blocks, slot_mapping, len(slot_mapping) + 1, gathered)
++    _gather_rows(
++        persistent, num_blocks, list(t1_mapping), len(t1_mapping) + 1, gathered
++    )
++
++    kv_cache_config = _make_kv_cache_config()
++    ctx = MambaSpecDecodeGPUContext.create(
++        max_num_reqs=MAX_NUM_REQS,
++        kv_cache_config=kv_cache_config,
++        copy_funcs=_COPY_FUNCS,
++        device=device,
++        make_buffer=lambda n, dtype: _MockCpuGpuBuffer(n, dtype, device),
++    )
++    ctx.initialize_from_forward_context(
++        kv_cache_config,
++        {"layer_0": attention},
++        _COPY_FUNCS,
++        [gathered],
++        persistent_block_tables=[persistent],
++    )
++    assert ctx.has_persistent_block_tables
++
++    return _Fixture(
++        device=device,
++        ctx=ctx,
++        conv=conv,
++        temporal=temporal,
++        conv0=conv.clone(),
++        temporal0=temporal.clone(),
++        persistent=persistent,
++        gathered=gathered,
++    )
++
++
++def _launch(fx: _Fixture, mapping, per_slot):
++    """Run the deferred align post-process.
++
++    ``per_slot`` maps req slot -> (num_accepted, state_idx, new_num_computed).
++    """
++    device = fx.device
++
++    def backed(fill: int, poison: int) -> torch.Tensor:
++        """A [MAX_NUM_REQS] view whose index -1 holds ``poison``."""
++        backing = torch.full(
++            (MAX_NUM_REQS + 1,), fill, dtype=torch.int32, device=device
++        )
++        backing[0] = poison
++        return backing[1:]
++
++    poison_acc, poison_sidx, poison_computed = POISON
++    num_accepted = backed(1, poison_acc)
++    state_idx = backed(0, poison_sidx)
++    new_computed = backed(0, poison_computed)
++    for slot, (acc, sidx, computed) in per_slot.items():
++        num_accepted[slot] = acc
++        state_idx[slot] = sidx
++        new_computed[slot] = computed
++    fx.ctx.run_fused_postprocess_align(
++        num_reqs=len(mapping),
++        num_accepted_tokens_gpu=num_accepted,
++        state_idx_gpu=state_idx,
++        new_num_computed_tokens_gpu=new_computed,
++        idx_mapping=torch.tensor(mapping, dtype=torch.int32, device=device),
++    )
++    torch.accelerator.synchronize()
++    return num_accepted
++
++
++def _assert_bitwise(actual: torch.Tensor, expected: torch.Tensor, what: str) -> None:
++    """Compare the integer view, so "bit-identical" means what it says.
++
++    A zero-tolerance float compare establishes numeric equality, not bit
++    identity: +0.0 and -0.0 compare equal and NaN payloads compare unequal.
++    These are byte copies, so the integer view is the right instrument.
++
++    """
++    assert actual.dtype == expected.dtype
++    lhs = actual.contiguous().view(torch.int16)
++    rhs = expected.contiguous().view(torch.int16)
++    assert torch.equal(lhs, rhs), (
++        f"{what}: {int((lhs != rhs).sum().item())} of {lhs.numel()} 16-bit "
++        f"words differ"
++    )
++
++
++def _assert_only_blocks_changed(fx: _Fixture, changed: set[int]) -> None:
++    """Every physical block outside ``changed`` must be bit-identical.
++
++    The canary blocks (``CANARY_DST``, ``CANARY_SRC``) are included: they are
++    only reachable through the guard row a negative ``req_idx`` would select.
++    """
++    for block in range(TOTAL_BLOCKS):
++        if block in changed:
++            continue
++        _assert_bitwise(fx.conv[block], fx.conv0[block], f"conv[{block}]")
++        _assert_bitwise(fx.temporal[block], fx.temporal0[block], f"temporal[{block}]")
++
++
++@pytest.mark.skipif(
++    is_conv_state_dim_first(),
++    reason="expected-bytes model assumes the SD conv layout",
++)
++def test_positive_bias_copy_lands_on_the_requests_own_blocks():
++    """batch row 0 -> req slot 5, num_accepted 4, so token_bias is 3.
++
++    new=48, a=4 -> aligned=48, running=45, needs_copy; bias=3; dst_col=2.
++    state_idx=0, so conv reads column 0 and temporal reads column
++    ``src_col + bias`` = 3 -- three distinct columns, so a wrong row cannot be
++    masked by a coincidental self-copy.
++    """
++    fx = _build()
++    _launch(fx, [5, 1, 2], {5: (4, 0, 48), 1: (2, 0, 40), 2: (2, 0, 40)})
++
++    dst = phys(5, 2)
++    conv_src = phys(5, 0)
++    temporal_src = phys(5, 3)
++
++    # conv: state[bt[src_col], bias:] -> state[bt[dst_col], :width - bias]
++    _assert_bitwise(fx.conv[dst][: CONV_WIDTH - 3], fx.conv0[conv_src][3:], "conv dst")
++    # the tail of the destination conv window is not written
++    _assert_bitwise(
++        fx.conv[dst][CONV_WIDTH - 3 :], fx.conv0[dst][CONV_WIDTH - 3 :], "conv tail"
++    )
++    # temporal: state[bt[src_col + bias]] -> state[bt[dst_col]]
++    _assert_bitwise(fx.temporal[dst], fx.temporal0[temporal_src], "temporal dst")
++
++    # Nothing else moved -- in particular not the victim r2 (the first-cut row) and
++    # not r0 (the "persistent table but batch row" mistake).
++    _assert_only_blocks_changed(fx, {dst})
++    victim = phys(2, 2)  # gathered[batch row 0] column 2 -- the first-cut destination
++    _assert_bitwise(fx.conv[victim], fx.conv0[victim], "victim conv")
++    _assert_bitwise(fx.temporal[victim], fx.temporal0[victim], "victim temporal")
++    wrong_row = phys(0, 2)  # persistent[batch row 0] column 2
++    _assert_bitwise(fx.conv[wrong_row], fx.conv0[wrong_row], "wrong-row conv")
++
++
++@pytest.mark.skipif(
++    is_conv_state_dim_first(),
++    reason="expected-bytes model assumes the SD conv layout",
++)
++def test_zero_bias_migration_copies_the_whole_window():
++    """new=48, a=1 -> aligned=48, running=48, bias=0, dst_col=2, src_col=0.
++
++    src != dst so the self-copy exit does not fire, and the whole conv window
++    plus the temporal block migrate.
++    """
++    fx = _build()
++    _launch(fx, [5, 1, 2], {5: (1, 0, 48), 1: (2, 0, 40), 2: (2, 0, 40)})
++
++    dst = phys(5, 2)
++    src = phys(5, 0)
++    _assert_bitwise(fx.conv[dst], fx.conv0[src], "conv dst")
++    _assert_bitwise(fx.temporal[dst], fx.temporal0[src], "temporal dst")
++    _assert_only_blocks_changed(fx, {dst})
++
++
++def test_self_copy_exits_without_touching_state_and_resets_num_accepted():
++    """src_block_idx == dest_block_idx and bias == 0 -> return (mamba_utils:478).
++
++    new=33, a=2 -> aligned=32, running=32, needs_copy true, bias=0, dst_col=1;
++    state_idx=1 makes src == dst. Seeding num_accepted at 2 rather than 1 is
++    what makes the reset store observable: the kernel must write
++    num_accepted_tokens_out[req] = 1 (mamba_utils.py:473-475) *before* the early
++    return, so deleting that store now fails the test. (A prior version seeded 1 and
++    asserted 1, which a deleted store would have passed.)
++
++    Limit, stated rather than papered over: unchanged bytes cannot distinguish
++    "returned at the guard" from "fell through and memcpy'd a block onto
++    itself", because those are byte-identical by construction. What the reset
++    store does establish is that the kernel got past `needs_copy` and evaluated
++    `src == dst`, so it is the *guard* that stopped it and not an earlier
++    return. The conjunction itself is covered by the next test.
++    """
++    fx = _build()
++    num_accepted = _launch(
++        fx, [5, 1, 2], {5: (2, 1, 33), 1: (2, 0, 40), 2: (2, 0, 40)}
++    )
++
++    _assert_only_blocks_changed(fx, set())
++    assert int(num_accepted[5].item()) == 1
++
++
++@pytest.mark.skipif(
++    is_conv_state_dim_first(),
++    reason="expected-bytes model assumes the SD conv layout",
++)
++def test_same_column_with_positive_bias_copies_and_still_resets():
++    """The early-exit guard is a conjunction, and this is the other conjunct.
++
++    new=33, a=4 -> aligned=32, running=30, needs_copy; bias = 4-1-1 = 2;
++    dst_col = 1; state_idx = 1, so src_block_idx == dest_block_idx but
++    token_bias != 0. The kernel must NOT return: conv takes the same-block
++    memmove branch (mamba_utils.py:320-336) and temporal reads
++    ``src_col + token_bias`` = column 3, a different physical block.
++
++    Together with the previous test this makes the exit observable in both
++    directions: same column and zero bias moves nothing, same column and
++    positive bias moves bytes.
++    """
++    fx = _build()
++    num_accepted = _launch(
++        fx, [5, 1, 2], {5: (4, 1, 33), 1: (2, 0, 40), 2: (2, 0, 40)}
++    )
++
++    blk = phys(5, 1)  # both the conv source and the destination
++    temporal_src = phys(5, 3)  # src_col + bias = 3
++
++    # conv, same block, shifted left by token_bias = 2
++    _assert_bitwise(fx.conv[blk][: CONV_WIDTH - 2], fx.conv0[blk][2:], "conv shift")
++    _assert_bitwise(
++        fx.conv[blk][CONV_WIDTH - 2 :], fx.conv0[blk][CONV_WIDTH - 2 :], "conv tail"
++    )
++    # temporal, from a different block
++    _assert_bitwise(fx.temporal[blk], fx.temporal0[temporal_src], "temporal dst")
++
++    _assert_only_blocks_changed(fx, {blk})
++    # The reset store fires here too: it is guarded only on src == dst.
++    assert int(num_accepted[5].item()) == 1
++
++
++@pytest.mark.skipif(
++    is_conv_state_dim_first(),
++    reason="expected-bytes model assumes the SD conv layout",
++)
++def test_freed_slot_is_rejected_before_any_negative_index_load():
++    """A -1 row must be rejected *before* the decision arrays are read.
++
++    ``mamba_utils.py:441-442`` returns on ``req_idx < 0`` before the loads at
++    ``:445-446``. A prior version of this test seeded decisions at some other
++    slot, which the kernel would never have touched either way, so it proved
++    nothing about the guard. This one plants the poison
++    where a missing guard would actually look: index -1 of every per-req array
++    and row -1 of the block table, which are real memory owned by the backing
++    tensors in ``_build``.
++
++    If the guard were deleted, the kernel would read
++    ``num_accepted=4, state_idx=0, new_num_computed=48`` -> a copy with bias 3
++    into block-table row -1, writing CANARY_DST from CANARY_SRC. Both canaries
++    are covered by ``_assert_only_blocks_changed``, so that write fails the
++    test.
++
++    The row after the -1 must also still copy correctly, which is the
++    positioning check.
++    """
++    fx = _build(slot_mapping=(5, 1, 2))
++    _launch(fx, [-1, 5, 2], {5: (4, 0, 48), 2: (2, 0, 40)})
++
++    dst = phys(5, 2)
++    _assert_bitwise(
++        fx.conv[dst][: CONV_WIDTH - 3], fx.conv0[phys(5, 0)][3:], "conv dst"
++    )
++    _assert_bitwise(fx.temporal[dst], fx.temporal0[phys(5, 3)], "temporal dst")
++    _assert_only_blocks_changed(fx, {dst})
++
++
++def test_generation_masked_reuse_is_skipped_end_to_end():
++    """The -1 above, but produced by the real generation masking.
++
++    ``mask_from_generation_change`` in the CPU sibling test drives
++    ``PPHandler.get_prev_sampled_outputs`` (pp_utils.py:132-140) and returns
++    the mapping it computes; here that mapping is fed to the kernel. Slot 1 is
++    the one whose generation moved -- it was freed and its slot handed to a new
++    request between capture and use -- so its row must copy nothing even though
++    slot 1 now carries decisions that would copy.
++    """
++    from tests.v1.worker.gpu.test_pp_deferred_mamba_block_table import (
++        mask_from_generation_change,
++    )
++
++    mapping = mask_from_generation_change(
++        idx_mapping=[5, 1, 2], reused_slot_rows=[1]
++    )
++    assert mapping == [5, -1, 2], mapping
++
++    fx = _build(slot_mapping=(5, 1, 2))
++    _launch(fx, mapping, {5: (4, 0, 48), 1: (4, 0, 48), 2: (2, 0, 40)})
++
++    dst = phys(5, 2)
++    _assert_bitwise(
++        fx.conv[dst][: CONV_WIDTH - 3], fx.conv0[phys(5, 0)][3:], "conv dst"
++    )
++    _assert_bitwise(fx.temporal[dst], fx.temporal0[phys(5, 3)], "temporal dst")
++    # Slot 1's own blocks are untouched despite its copy-shaped decisions.
++    _assert_only_blocks_changed(fx, {dst})
++
++
++@pytest.mark.skipif(
++    is_conv_state_dim_first(),
++    reason="expected-bytes model assumes the SD conv layout",
++)
++def test_same_step_identity_mapping_is_unaffected():
++    """The last-rank / no-PP path: batch order == req order, gather is current.
++
++    req_idx == batch_idx here, so the change must be a no-op relative to the first cut.
++    """
++    fx = _build(slot_mapping=(0, 1, 2), t1_mapping=(0, 1, 2))
++    _launch(fx, [0, 1, 2], {0: (4, 0, 48), 1: (2, 0, 40), 2: (2, 0, 40)})
++
++    dst = phys(0, 2)
++    _assert_bitwise(
++        fx.conv[dst][: CONV_WIDTH - 3], fx.conv0[phys(0, 0)][3:], "conv dst"
++    )
++    _assert_bitwise(fx.temporal[dst], fx.temporal0[phys(0, 3)], "temporal dst")
++    _assert_only_blocks_changed(fx, {dst})
++
++
++def test_align_launch_raises_without_persistent_tables():
++    """Fail closed on real hardware too, before any kernel is enqueued."""
++    device = torch.device("cuda:0")
++    conv = torch.randn(
++        TOTAL_BLOCKS, CONV_WIDTH, CONV_INNER, dtype=DTYPE, device=device
++    )
++    temporal = torch.randn(TOTAL_BLOCKS, TEMPORAL_DIM, dtype=DTYPE, device=device)
++    attention = MagicMock()
++    attention.kv_cache = [conv, temporal]
++    gathered = torch.zeros(
++        MAX_NUM_REQS, BLOCKS_PER_REQ, dtype=torch.int32, device=device
++    )
++
++    kv_cache_config = _make_kv_cache_config()
++    ctx = MambaSpecDecodeGPUContext.create(
++        max_num_reqs=MAX_NUM_REQS,
++        kv_cache_config=kv_cache_config,
++        copy_funcs=_COPY_FUNCS,
++        device=device,
++        make_buffer=lambda n, dtype: _MockCpuGpuBuffer(n, dtype, device),
++    )
++    ctx.initialize_from_forward_context(
++        kv_cache_config, {"layer_0": attention}, _COPY_FUNCS, [gathered]
++    )
++    assert ctx.has_persistent_block_tables is False
++
++    snapshot = conv.clone()
++    with pytest.raises(RuntimeError, match="persistent per-req-slot block tables"):
++        ctx.run_fused_postprocess_align(
++            num_reqs=1,
++            num_accepted_tokens_gpu=torch.full(
++                (MAX_NUM_REQS,), 4, dtype=torch.int32, device=device
++            ),
++            state_idx_gpu=torch.zeros(
++                MAX_NUM_REQS, dtype=torch.int32, device=device
++            ),
++            new_num_computed_tokens_gpu=torch.full(
++                (MAX_NUM_REQS,), 48, dtype=torch.int32, device=device
++            ),
++            idx_mapping=torch.tensor([5], dtype=torch.int32, device=device),
++        )
++    torch.accelerator.synchronize()
++    _assert_bitwise(conv, snapshot, "conv unchanged")
+diff --git a/tests/v1/worker/test_mamba_utils.py b/tests/v1/worker/test_mamba_utils.py
+index a162c39a86..2ab23ceae5 100644
+--- a/tests/v1/worker/test_mamba_utils.py
++++ b/tests/v1/worker/test_mamba_utils.py
+@@ -277,8 +277,14 @@ def test_gpu_context_reinterprets_high_data_ptrs_for_int64_metadata():
+     )
+     forward_context = {"layer_0": _make_mock_attention(conv_state, temporal_state)}
+ 
++    # V1: batch order == req-slot order, so the same tensor is both the
++    # gathered and the persistent table.
+     gpu_ctx.initialize_from_forward_context(
+-        kv_cache_config, forward_context, _COPY_FUNCS, [block_table]
++        kv_cache_config,
++        forward_context,
++        _COPY_FUNCS,
++        [block_table],
++        persistent_block_tables=[block_table],
+     )
+ 
+     assert gpu_ctx.state_base_addrs.tolist() == [
+@@ -548,6 +554,7 @@ def test_mamba_groups_support_different_state_specs():
+         forward_context,
+         _COPY_FUNCS,
+         block_tables,
++        persistent_block_tables=block_tables,
+     )
+     assert ctx.is_initialized
+     assert ctx.state_group_indices.tolist() == [0, 0, 0, 0, 1]
+@@ -628,11 +635,13 @@ def test_mamba_groups_support_mixed_specs_in_uniform_group():
+         ),
+         "ple.0": MagicMock(kv_cache=(torch.empty(8, 12, 8, dtype=torch.float16),)),
+     }
++    group_table = torch.zeros(4, 8, dtype=torch.int32)
+     ctx.initialize_from_forward_context(
+         kv_cache_config,
+         forward_context,
+         _COPY_FUNCS,
+-        [torch.zeros(4, 8, dtype=torch.int32)],
++        [group_table],
++        persistent_block_tables=[group_table],
+     )
+     assert ctx.state_group_indices.tolist() == [0, 0, 0, 0, 0]
+     assert ctx.state_conv_widths.tolist() == [4, 0, 4, 0, 12]
+@@ -777,11 +786,13 @@ def test_gpu_context_ignores_auxiliary_cache_tensors() -> None:
+     ]
+     context = _make_gpu_ctx(config, kv_cache_config, device)
+ 
++    stub_table = torch.zeros(1, 1, dtype=torch.int32)
+     context.initialize_from_forward_context(
+         kv_cache_config,
+         {"layer_0": attention},
+         _COPY_FUNCS,
+-        [torch.zeros(1, 1, dtype=torch.int32)],
++        [stub_table],
++        persistent_block_tables=[stub_table],
+     )
+ 
+     assert context.is_initialized
+@@ -812,8 +823,14 @@ def _run_gpu_postprocess(
+     def t(values):
+         return torch.tensor(values, dtype=torch.int32, device=device)
+ 
++    # V1: batch order == req-slot order, so the same tensor is both the
++    # gathered and the persistent table.
+     gpu_ctx.initialize_from_forward_context(
+-        kv_cache_config, forward_context, copy_funcs, [block_table]
++        kv_cache_config,
++        forward_context,
++        copy_funcs,
++        [block_table],
++        persistent_block_tables=[block_table],
+     )
+     gpu_ctx.run_fused_postprocess(
+         num_reqs=len(req_ids),
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index f162cb51ff..e3479c2a7d 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -677,6 +677,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             cp_rank=self.dcp_rank,
+             cp_interleave=self.cp_interleave,
+         )
++        # Mamba "align" indexes a block table from the PP-deferred post-process,
++        # which runs pp_size steps after the gather that produced its
++        # idx_mapping; give the model state the persistent per-req-slot tables.
++        self.model_state.set_block_tables(self.block_tables)
+         self.pcp_manager = pcp.maybe_build_pcp_manager(
+             self.vllm_config,
+             self.device,
+diff --git a/vllm/v1/worker/gpu/model_states/interface.py b/vllm/v1/worker/gpu/model_states/interface.py
+index a5c8d6f4cf..8ce5121222 100644
+--- a/vllm/v1/worker/gpu/model_states/interface.py
++++ b/vllm/v1/worker/gpu/model_states/interface.py
+@@ -126,6 +126,14 @@ class ModelState(ABC):
+     def apply_staged_writes(self) -> None:
+         return None
+ 
++    def set_block_tables(self, block_tables: Any) -> None:
++        """Register the runner's `BlockTables` once it exists.
++
++        Model states that index a block table outside the step that gathered it
++        (mamba "align" + the PP-deferred post-process) need the persistent
++        per-req-slot tables, not the batch-order gather. No-op by default."""
++        return None
++
+     def get_additional_cg_support(self) -> tuple[AttentionCGSupport, str | None]:
+         """Cudagraph support of attention groups this ModelState builds outside
+         ``init_attn_backend`` (e.g. encoder-only layers).
+diff --git a/vllm/v1/worker/gpu/model_states/mamba_hybrid.py b/vllm/v1/worker/gpu/model_states/mamba_hybrid.py
+index 0ac3f2f63b..0a8b5d70ef 100644
+--- a/vllm/v1/worker/gpu/model_states/mamba_hybrid.py
++++ b/vllm/v1/worker/gpu/model_states/mamba_hybrid.py
+@@ -94,6 +94,9 @@ class MambaHybridModelState(DefaultModelState):
+         # kernel reusing the postprocess copy machinery, so the per-step src
+         # columns and the running state_idx are kept GPU-resident.
+         self._align_mode = self.cache_config.mamba_cache_mode == "align"
++        # Set by the runner via `set_block_tables`; the align post-process needs
++        # the persistent per-req-slot tables, not the per-step gather.
++        self._runner_block_tables: Any = None
+         self.recoverssm = (
+             RecoverSSMState() if self.cache_config.use_kda_recoverssm else None
+         )
+@@ -112,6 +115,9 @@ class MambaHybridModelState(DefaultModelState):
+             self._mamba_spec: MambaSpec | None = None
+             self._mamba_state_copy_funcs: MambaStateCopyFuncsByType | None = None
+ 
++    def set_block_tables(self, block_tables: Any) -> None:
++        self._runner_block_tables = block_tables
++
+     def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
+         super().add_request(req_index, new_req_data)
+         # Must reset the speculative acceptance count in this idx which could be stale.
+@@ -172,11 +178,24 @@ class MambaHybridModelState(DefaultModelState):
+             # block_tables are batch-order slices of the persistent
+             # input_block_tables (stable data_ptr), so the metadata is captured
+             # once here and reused across steps.
++            #
++            # Also hand over the per-req-slot tables the gather reads from
++            # (block_table.py:53-59). The align post-process can run pp_size
++            # steps after the gather that produced its idx_mapping, at which
++            # point the batch-order buffer belongs to another micro-batch; it
++            # indexes these by req slot instead.
++            persistent_block_tables = None
++            if self._runner_block_tables is not None:
++                persistent_block_tables = [
++                    self._runner_block_tables.block_tables[gid].gpu
++                    for gid in mamba_group_ids
++                ]
+             ctx.initialize_from_forward_context(
+                 kv_cache_config,
+                 forward_context,
+                 copy_funcs,
+                 [block_tables[gid] for gid in mamba_group_ids],
++                persistent_block_tables=persistent_block_tables,
+             )
+         return ctx
+ 
+diff --git a/vllm/v1/worker/mamba_utils.py b/vllm/v1/worker/mamba_utils.py
+index 1deb89bda6..621efcbb24 100644
+--- a/vllm/v1/worker/mamba_utils.py
++++ b/vllm/v1/worker/mamba_utils.py
+@@ -409,6 +409,14 @@ def postprocess_mamba_fused_kernel(
+     # PRECOMPUTED_NEW_COMPUTED: when True, num_computed_tokens_ptr already holds
+     # the post-step new_num_computed value (V2 supplies the advanced count).
+     PRECOMPUTED_NEW_COMPUTED: tl.constexpr = False,
++    # BT_ROW_IS_REQ: when True, block_table_ptrs_ptr points at the *persistent*
++    # per-req-slot block tables (BlockTables.block_tables[i].gpu,
++    # block_table.py:53-59), whose rows are request state slots, so the row
++    # index is req_idx rather than batch_idx. When False it points at the
++    # batch-order gather (BlockTables.input_block_tables, block_table.py:74-76)
++    # and batch_idx is the row. Required by the PP-deferred post-process, which
++    # runs pp_size steps after the gather that produced its idx_mapping.
++    BT_ROW_IS_REQ: tl.constexpr = False,
+     # TEMPORAL_TILES: when > 1, the temporal copy body is partitioned across
+     # TEMPORAL_TILES CTAs along the u64 inner range. Callers must launch a
+     # 3D grid (num_reqs, total_states, TEMPORAL_TILES). Default 1 preserves
+@@ -477,7 +485,15 @@ def postprocess_mamba_fused_kernel(
+     if src_block_idx == dest_block_idx and accept_token_bias == 0:
+         return
+ 
+-    bt_row_idx = batch_idx if HAS_IDX_MAPPING else req_idx
++    if BT_ROW_IS_REQ:
++        # Persistent per-req-slot table: the row is the request's own slot, so
++        # it stays correct however many steps separate the gather from this
++        # launch (the PP-deferred post-process is enqueued at the top of
++        # execute_model, before this step's gather, with an idx_mapping
++        # captured pp_size steps earlier).
++        bt_row_idx = req_idx
++    else:
++        bt_row_idx = batch_idx if HAS_IDX_MAPPING else req_idx
+     _copy_mamba_state_block(
+         state_idx,
+         bt_row_idx,
+@@ -812,6 +828,24 @@ class MambaSpecDecodeGPUContext:
+     block_table_ptrs: torch.Tensor
+     block_table_stride_req: int = 0
+ 
++    # Per-group *persistent* per-req-slot block-table addresses: int64[num_groups].
++    # `block_table_ptrs` above addresses the batch-order gather
++    # (BlockTables.input_block_tables, block_table.py:74-76), which is rewritten
++    # in place every step and is only valid for the step that gathered it. These
++    # address BlockTables.block_tables[i].gpu (block_table.py:53-59), the
++    # persistent [max_num_reqs, max_num_blocks] tables the gather reads from
++    # (their data_ptrs are already held device-side at block_table.py:94-96).
++    # Rows there are request state slots, so they can be indexed by req_idx from
++    # any later step. Used only by the align post-process (BT_ROW_IS_REQ).
++    persistent_block_table_ptrs: torch.Tensor | None = None
++    has_persistent_block_tables: bool = False
++    # shape[0] of the persistent tables; see the note in set_block_tables.
++    # -1, not 0: this is the ROW BOUND the align post-process uses, and a 0
++    # default bounds EVERY row out, so a context that never registered the
++    # persistent tables would report guard hits on correct metadata instead of
++    # copying state. -1 is unusable on purpose and is asserted before use.
++    persistent_block_table_num_rows: int = -1
++
+     # persistent output for the once-per-step, all-group aligned-index launch.
+     # shape: [num_groups, max_num_reqs, 1 + num_speculative_blocks].
+     aligned_state_indices: torch.Tensor | None = None
+@@ -902,6 +936,9 @@ class MambaSpecDecodeGPUContext:
+             block_table_ptrs=torch.zeros(
+                 len(mamba_group_ids), dtype=torch.int64, device=device
+             ),
++            persistent_block_table_ptrs=torch.zeros(
++                len(mamba_group_ids), dtype=torch.int64, device=device
++            ),
+             aligned_state_indices=torch.empty(
+                 (
+                     len(mamba_group_ids),
+@@ -926,6 +963,7 @@ class MambaSpecDecodeGPUContext:
+         forward_context: dict[str, Any],
+         mamba_state_copy_funcs: MambaStateCopyFuncsByType,
+         block_tables: list[torch.Tensor],
++        persistent_block_tables: list[torch.Tensor] | None = None,
+     ) -> None:
+         """
+         Extract and cache memory layout metadata from Mamba state tensors.
+@@ -957,9 +995,14 @@ class MambaSpecDecodeGPUContext:
+                 have a `kv_cache` attribute containing the list of state tensors.
+             mamba_state_copy_funcs: Mapping from MambaAttentionBackendEnum to
+                 copy functions.
+-            block_tables: per-mamba-group persistent block-table tensors, in
+-                the same order as `mamba_group_ids`. Their `data_ptr()` /
+-                `stride(0)` are captured once for the kernel to index into.
++            block_tables: per-mamba-group *gathered*, batch-order block-table
++                tensors, in the same order as `mamba_group_ids`. Their
++                `data_ptr()` / `stride(0)` are captured once for the kernel to
++                index into by batch row.
++            persistent_block_tables: per-mamba-group *persistent* per-req-slot
++                block-table tensors (`BlockTables.block_tables[i].gpu`), same
++                order. Captured separately so the align post-process can index
++                by req slot; see `persistent_block_table_ptrs`.
+         """
+         if self.is_initialized:
+             return
+@@ -970,6 +1013,7 @@ class MambaSpecDecodeGPUContext:
+                 forward_context,
+                 mamba_state_copy_funcs,
+                 block_tables,
++                persistent_block_tables,
+             )
+ 
+     def _populate_metadata(
+@@ -978,6 +1022,7 @@ class MambaSpecDecodeGPUContext:
+         forward_context: dict[str, Any],
+         mamba_state_copy_funcs: MambaStateCopyFuncsByType,
+         block_tables: list[torch.Tensor],
++        persistent_block_tables: list[torch.Tensor] | None = None,
+     ) -> None:
+         idx = 0
+         for group_local_idx, mamba_group_id in enumerate(self.mamba_group_ids):
+@@ -1253,6 +1298,35 @@ class MambaSpecDecodeGPUContext:
+         if num_reqs == 0 or not self.is_initialized:
+             return
+ 
++        # Fail closed. Under PP this launch is the *deferred* post-process: it
++        # is enqueued by `update_pp_decode_requests` at the top of
++        # `execute_model` (model_runner.py:1644), before that step's
++        # `prepare_attn` (model_runner.py:1718) and the
++        # `gather_block_tables` inside it (:1442 / block_table.py:149), and
++        # `idx_mapping` was captured pp_size steps earlier
++        # (pp_utils.py:57-58, 258-271). The single batch-order gather buffer
++        # therefore holds a different micro-batch's rows and `batch_idx`
++        # resolves to the wrong request. This path MUST index the persistent
++        # per-req-slot tables by `req_idx`; there is no safe fallback, so a
++        # context without them is a bug in the caller, not a degraded mode.
++        # (`req_idx` is also correct on the same-step last-rank / no-PP path.)
++        if not self.has_persistent_block_tables:
++            raise RuntimeError(
++                "MambaSpecDecodeGPUContext was initialized without the "
++                "persistent per-req-slot block tables, so the V2 align "
++                "post-process cannot index them by req slot. Falling back to "
++                "the batch-order gather is the known deferred-PP wrong-row "
++                "corruption, so this raises instead. The runner must call "
++                "ModelState.set_block_tables() before the first align step."
++            )
++        block_table_ptrs = self.persistent_block_table_ptrs
++        assert self.persistent_block_table_num_rows > 0, (
++            "persistent_block_table_num_rows was never set, so the row bound "
++            "in _copy_mamba_state_block would reject every row and report "
++            "guard hits on correct metadata. set_block_tables() must run "
++            "before the first align post-process."
++        )
++
+         # V2 reads non-contiguous idx_mapping positions, so snapshot the whole
+         # decision buffer rather than only [:num_reqs].
+         num_accepted_tokens_snapshot = self.num_accepted_tokens_out
+@@ -1284,6 +1358,7 @@ class MambaSpecDecodeGPUContext:
+             CONV_STATE_DIM_FIRST=is_conv_state_dim_first(),
+             HAS_IDX_MAPPING=True,
+             PRECOMPUTED_NEW_COMPUTED=True,
++            BT_ROW_IS_REQ=True,
+             TEMPORAL_TILES=_TEMPORAL_TILES,
+         )
+ 

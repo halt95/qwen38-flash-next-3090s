@@ -1,0 +1,1842 @@
+From 20c854a5e1ee541bab4f3611de54cc7bd347ed62 Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Tue, 22 Sep 2026 04:20:50 -0400
+Subject: [PATCH 28/58] envs, tests: register the fork's knobs by cache
+ identity; lint; gpu test marker
+
+- Every fork knob is registered in envs.py and classified as a compile/capture
+  factor or runtime-only; envs.py documents that capture identity and AOT
+  cache identity are different things.
+- ruff findings cleared on lines this fork authored; upstream lines untouched.
+- A `gpu` pytest marker so the GPU-free tier can be selected, not just skipped.
+- Duplicate knob-table entries from two branches reconciled onto one
+  off|warn|raise normaliser.
+---
+ pyproject.toml                                |   1 +
+ tests/conftest.py                             |  19 ++
+ .../qwen4_exp/test_host_uva_embedding.py      |   6 +-
+ tests/test_envs.py                            | 129 +++++++++++
+ .../test_multiproc_executor_parent_death.py   |  10 +-
+ .../v1/worker/gpu/test_block_table_guards.py  |  11 +-
+ .../gpu/test_guard_reader_nonblocking.py      |  81 ++++---
+ .../test_guard_telemetry_defaults_drain.py    |  15 +-
+ .../worker/gpu/test_guard_telemetry_replay.py |   4 +-
+ .../gpu/test_pp_deferred_mamba_block_table.py |  46 ++--
+ .../worker/gpu/test_pp_deferred_mamba_gpu.py  |  32 +--
+ .../gpu/test_qsa_ring_skip_telemetry.py       |  86 ++++---
+ .../gpu/test_qsa_rope_position_guard.py       | 151 ++++++++----
+ tests/v1/worker/test_grammar_fail_closed.py   |   3 +-
+ vllm/envs.py                                  | 219 +++++++++++++++++-
+ vllm/models/qwen4_exp/nvidia/qsa.py           |   7 +-
+ vllm/v1/core/sched/e2_alloc_log.py            | 148 +++++++++---
+ vllm/v1/ple_offload/test_fault.py             |   6 +-
+ vllm/v1/worker/guard_telemetry.py             |  37 +--
+ vllm/v1/worker/mamba_utils.py                 |   2 +-
+ vllm_ple_test_fault/__init__.py               |  15 +-
+ 21 files changed, 770 insertions(+), 258 deletions(-)
+
+diff --git a/pyproject.toml b/pyproject.toml
+index 1a77433f9c..6a72b74ae7 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -114,6 +114,7 @@ markers = [
+     "cpu_test: mark test as CPU-only test",
+     "split: run this test as part of a split",
+     "distributed: run this test only in distributed GPU tests",
++    "gpu: requires a CUDA device; auto-skipped when none is present, and deselectable as a tier with -m 'not gpu'",
+     "optional: optional tests that are automatically skipped, include --optional to run them",
+ ]
+ 
+diff --git a/tests/conftest.py b/tests/conftest.py
+index 5fd594a04a..982caee675 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -1600,6 +1600,25 @@ def pytest_addoption(parser):
+ 
+ 
+ def pytest_collection_modifyitems(config, items):
++    # Flash-Next fork (v2.2): one place that decides what a GPU test is.
++    # `@pytest.mark.gpu` auto-skips without a device and makes the GPU-free tier
++    # SELECTABLE as `-m "not gpu"`, which a per-test skipif cannot do -- a
++    # skipif still reports the item as a skip rather than removing it.
++    #
++    # What this does NOT do: it does not make collection
++    # GPU-dependency-free. This hook runs after every module has been imported
++    # and every item collected, so a module whose import reaches CUDA, Triton or
++    # an absent vLLM extension still fails at COLLECTION, before any marker is
++    # consulted. Making the CPU tier collect cleanly is a separate job: defer
++    # those imports, or run the tier on its declared supported platform.
++    # The marker is also not authorization to use a busy shared device --
++    # test_pp_deferred_mamba_gpu.py keeps its separate VLLM_E2_GPU_TESTS opt-in.
++    if not torch.cuda.is_available():
++        skip_gpu = pytest.mark.skip(reason="no CUDA device (pytest marker: gpu)")
++        for item in items:
++            if "gpu" in item.keywords:
++                item.add_marker(skip_gpu)
++
+     if config.getoption("--optional"):
+         # --optional given in cli: do not skip optional tests
+         return
+diff --git a/tests/models/qwen4_exp/test_host_uva_embedding.py b/tests/models/qwen4_exp/test_host_uva_embedding.py
+index e55d5d53d2..4edc157ecd 100644
+--- a/tests/models/qwen4_exp/test_host_uva_embedding.py
++++ b/tests/models/qwen4_exp/test_host_uva_embedding.py
+@@ -19,7 +19,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
+     host_embed_table_enabled,
+ )
+ 
+-
+ VOCAB = 67
+ HIDDEN = 16
+ 
+@@ -479,10 +478,7 @@ def test_u4_outer_post_load_preserves_pinned_uva_storage(monkeypatch):
+     loaded_weight = _weight(vocab, hidden)
+     local_table_bytes = layer.weight.numel() * layer.weight.element_size()
+ 
+-    assert (
+-        layer.weight_loader.__func__
+-        is VocabParallelEmbedding.weight_loader
+-    )
++    assert layer.weight_loader.__func__ is VocabParallelEmbedding.weight_loader
+     layer.weight_loader(layer.weight, loaded_weight)
+ 
+     model = nn.Module()
+diff --git a/tests/test_envs.py b/tests/test_envs.py
+index 1ef40cde0c..3e65518db7 100644
+--- a/tests/test_envs.py
++++ b/tests/test_envs.py
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
+ import os
++from pathlib import Path
+ from unittest.mock import patch
+ 
+ import pytest
+@@ -587,3 +588,131 @@ class TestVllmMaxNSequences:
+ 
+         with pytest.raises(VLLMValidationError, match="n must be at most 128"):
+             SamplingParams(n=129)
++
++
++# ---------------------------------------------------------------------------
++# Flash-Next fork: the cache-factor contract (v2.2 fork knobs)
++#
++# compile_factors() is a deny-list, so a knob's classification is invisible
++# unless something asserts it. These tests are that assertion. They are CPU-only
++# and import nothing beyond vllm.envs, so they belong to the GPU-free tier.
++#
++# AOT identity vs CAPTURE identity: compile_factors() keys only the first. A
++# knob listed as hashed is genuinely protected across processes; a knob that is
++# only a capture factor is hashed conservatively and its capture safety still
++# rests on not changing the value between capture and replay in one process.
++# These tests check the AOT side, which is the side this file can check.
++#
++# Each row is (name, value to set, value the getter must then return). The
++# expected value matters: a getter that ignored the environment would still
++# satisfy a bare membership check, so every row proves the entry is live.
++# ---------------------------------------------------------------------------
++
++_FORK_HASHED = [
++    ("VLLM_HOST_EMBED_TABLE", "1", True),
++    ("VLLM_PLE_FP8_GLOBAL_SCALE", "1", True),
++    ("VLLM_QSA_KV_CLIP_COUNT", "7", "7"),
++    ("VLLM_QSA_KV_COLLECT", "/var/tmp/qsa-absmax", "/var/tmp/qsa-absmax"),
++    # Capture-configuration factor read in C++ (topk.cu exact_medium_enabled);
++    # the Python entry is a raw passthrough, never a second parser.
++    ("MERLIN_TOPK_EXACT_MEDIUM", "0", "0"),
++]
++
++_FORK_IGNORED = [
++    ("VLLM_QSA_KV_SCALES", "/var/tmp/scales.json", "/var/tmp/scales.json"),
++    # "WARN" also checks the .strip().lower() mirror of the read site.
++    ("VLLM_E2_GUARD_MODE", " WARN ", "warn"),
++    ("VLLM_E2_GUARD_INTERVAL", "0.25", "0.25"),
++    ("VLLM_E2_MEMSTATS", "2", "2"),
++    ("VLLM_E2_MEMSTATS_DIR", "/var/tmp/memstats", "/var/tmp/memstats"),
++    ("VLLM_E2_SCHED_LOG", "/var/tmp/sched.jsonl", "/var/tmp/sched.jsonl"),
++    ("VLLM_E2_ZERO_OWNERSHIP_CHECK", "1", True),
++    ("VLLM_PLE_OFFLOAD_HOME_DEVICE", "2", "2"),
++    ("VLLM_PLE_OFFLOAD_READY_TIMEOUT", "1800", 1800.0),
++    ("VLLM_PLE_OFFLOAD_WAIT_TIMEOUT", "45", 45.0),
++    ("VLLM_PLE_PROGRESS_DEADLINE_S", "30", 30.0),
++    ("VLLM_PLE_STARTUP_DEADLINE_S", "60", 60.0),
++    ("VLLM_PLE_TEST_FAULT", "cut=exc_in_release,ordinal=3,rank=any", None),
++    ("VLLM_PLE_TEST_FAULT_GATE", "/var/tmp/gate", "/var/tmp/gate"),
++    ("VLLM_PLE_TEST_FAULT_LOG", "/var/tmp/fault.log", "/var/tmp/fault.log"),
++    # Read sites arrive with the slot-ownership assertions.
++    ("VLLM_E2_PLE_FLAG_CHECK", "1", "warn"),
++    ("VLLM_E2_MAMBA_SLOT_OWNERSHIP", " RAISE ", "raise"),
++]
++
++# Not in this repository at all: a reference-host-side patch stack. Named in
++# the TODO block in envs.py and deliberately unregistered until someone reads
++# their real read sites and classifies both identities.
++_FORK_UNAUDITED = [
++    "MERLIN_FULL_K",
++    "MERLIN_QSA_SORT",
++    "MERLIN_TIE_DET",
++    "MERLIN_TIE_RECENT",
++    "MERLIN_PIN_BSM",
++]
++
++
++def _fresh_env_value(name: str):
++    if hasattr(envs.__getattr__, "cache_clear"):
++        envs.__getattr__.cache_clear()
++    return getattr(envs, name)
++
++
++@pytest.mark.parametrize(("name", "value", "expected"), _FORK_HASHED)
++def test_fork_knob_is_a_cache_factor(
++    name: str, value: str, expected, monkeypatch: pytest.MonkeyPatch
++):
++    """A knob that can change a compiled or captured artifact must be hashed,
++    and the hashed value must follow the environment."""
++    assert name in environment_variables
++    monkeypatch.setenv(name, value)
++    assert _fresh_env_value(name) == expected
++    factors = envs.compile_factors()
++    assert name in factors
++    assert factors[name] == expected
++
++
++@pytest.mark.parametrize(("name", "value", "expected"), _FORK_IGNORED)
++def test_fork_runtime_knob_is_not_a_cache_factor(
++    name: str, value: str, expected, monkeypatch: pytest.MonkeyPatch
++):
++    """A path, timeout, log cadence or host-side assertion must never
++    invalidate the compile cache -- while still being read."""
++    assert name in environment_variables
++    monkeypatch.setenv(name, value)
++    if expected is not None:
++        assert _fresh_env_value(name) == expected
++    assert name not in envs.compile_factors()
++
++
++@pytest.mark.parametrize("name", _FORK_UNAUDITED)
++def test_unaudited_host_side_knob_stays_listed_until_it_is_classified(name: str):
++    """The TODO block in envs.py is a gate, not a note.
++
++    Registering one of these without classifying it -- which means deleting it
++    from that block once its AOT and capture identity are written down against
++    its real read site -- is the exact failure the fork's env rule
++    exists to prevent, so it fails here.
++    """
++    source = Path(envs.__file__).read_text(encoding="utf-8")
++    listed = name in source
++    if name in environment_variables:
++        assert not listed, (
++            f"{name} is registered but still named in the envs.py TODO block: "
++            "classify its AOT and capture identity from its real read site and "
++            "remove it from that block"
++        )
++    else:
++        assert listed, (
++            f"{name} is neither registered nor named in the envs.py TODO block; "
++            "every fork knob must be accounted for"
++        )
++
++
++def test_fork_cache_factor_lists_are_disjoint_and_registered():
++    """Negative control for the two tables above."""
++    hashed = {n for n, _, _ in _FORK_HASHED}
++    ignored = {n for n, _, _ in _FORK_IGNORED}
++    assert not hashed & ignored
++    for name in hashed | ignored:
++        assert name in environment_variables, name
+diff --git a/tests/v1/executor/test_multiproc_executor_parent_death.py b/tests/v1/executor/test_multiproc_executor_parent_death.py
+index c39718fa79..111fca6733 100644
+--- a/tests/v1/executor/test_multiproc_executor_parent_death.py
++++ b/tests/v1/executor/test_multiproc_executor_parent_death.py
+@@ -70,9 +70,7 @@ def _run_fake_worker_main(
+             self.peer_response_handles = []
+ 
+         def monitor_death_pipe(self, pipe, shutdown_requested):
+-            return real_worker_proc.monitor_death_pipe(
+-                self, pipe, shutdown_requested
+-            )
++            return real_worker_proc.monitor_death_pipe(self, pipe, shutdown_requested)
+ 
+         def worker_busy_loop(self):
+             if block_mode == "gil-spin":
+@@ -271,11 +269,7 @@ def _wait_for_state(
+ def _wait_for_exit(pid: int, start_time: str, deadline: float) -> float | None:
+     while time.monotonic() < deadline:
+         identity = _proc_identity(pid)
+-        if (
+-            identity is None
+-            or identity[0] in {"X", "Z"}
+-            or identity[1] != start_time
+-        ):
++        if identity is None or identity[0] in {"X", "Z"} or identity[1] != start_time:
+             return time.monotonic()
+         time.sleep(0.01)
+     return None
+diff --git a/tests/v1/worker/gpu/test_block_table_guards.py b/tests/v1/worker/gpu/test_block_table_guards.py
+index d15093cd96..b4f0450dd1 100644
+--- a/tests/v1/worker/gpu/test_block_table_guards.py
++++ b/tests/v1/worker/gpu/test_block_table_guards.py
+@@ -20,9 +20,7 @@ from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+ from vllm.v1.worker import guard_telemetry
+ from vllm.v1.worker.gpu.block_table import BlockTables
+ 
+-pytestmark = pytest.mark.skipif(
+-    not torch.cuda.is_available(), reason="CUDA required"
+-)
++pytestmark = pytest.mark.gpu
+ 
+ MAX_REQS = 8
+ BLOCKS = 4
+@@ -67,8 +65,7 @@ def test_gather_and_slot_mapping_launch_and_are_correct():
+     # A legal batch must leave both counters at zero. A guard that fires here
+     # is reporting a masked fault on correct metadata, which is worse than no
+     # guard -- see the row-bound defect.
+-    for site in (guard_telemetry.SITE_BT_GATHER,
+-                 guard_telemetry.SITE_SLOT_MAPPING):
++    for site in (guard_telemetry.SITE_BT_GATHER, guard_telemetry.SITE_SLOT_MAPPING):
+         ctr = guard_telemetry.counter(site, device)
+         assert int(ctr[0].item()) == 0, guard_telemetry.snapshot()
+ 
+@@ -80,7 +77,7 @@ def test_gather_guard_fires_and_zeroes_the_row():
+     bt = _tables(device)
+ 
+     idx = torch.arange(NUM_REQS, dtype=torch.int32, device=device)
+-    idx[2] = MAX_REQS + 3          # a request row that does not exist
++    idx[2] = MAX_REQS + 3  # a request row that does not exist
+     (gathered,) = bt.gather_block_tables(idx, num_reqs_padded=NUM_REQS)
+     torch.cuda.synchronize()
+ 
+@@ -103,7 +100,7 @@ def test_slot_mapping_guard_pads_the_bad_request():
+     bt = _tables(device)
+ 
+     idx = torch.arange(NUM_REQS, dtype=torch.int32, device=device)
+-    idx[1] = -1                    # the freed-slot sentinel
++    idx[1] = -1  # the freed-slot sentinel
+     qsl = torch.tensor([0, 4, 8, 12, 16], dtype=torch.int32, device=device)
+     pos = torch.arange(NUM_TOKENS, dtype=torch.int64, device=device)
+     slots = bt.compute_slot_mappings(idx, qsl, pos, num_tokens_padded=NUM_TOKENS)
+diff --git a/tests/v1/worker/gpu/test_guard_reader_nonblocking.py b/tests/v1/worker/gpu/test_guard_reader_nonblocking.py
+index 94721e1da2..4fc79957bf 100644
+--- a/tests/v1/worker/gpu/test_guard_reader_nonblocking.py
++++ b/tests/v1/worker/gpu/test_guard_reader_nonblocking.py
+@@ -1,11 +1,15 @@
+ # SPDX-License-Identifier: Apache-2.0
+-"""the instrumentation readers must never wait on the compute stream.
+-
+-The first cadence reader did a synchronous pageable ``tolist()`` from its thread; the driver held the CUDA context lock
+-while that copy waited for the stream, and a pending PLE pull-transport wait on the stream (whose producer needs the
+-same lock) deadlocked the worker. These tests park a kernel on the current (compute) stream and require a reader tick
+-to return while it is still running. On the pre-fix reader the first GPU test blocks for the kernel's duration.
++"""v2 reader fix: the instrumentation readers must never wait on
++the compute stream.
++
++The earlier cadence reader did a synchronous pageable ``tolist()`` from its thread;
++the driver held the CUDA context lock while that copy waited for the stream,
++and a pending PLE pull-transport wait on the stream (whose producer needs the
++same lock) deadlocked the worker. These tests park a kernel on the current
++(compute) stream and require a reader tick to return while it is still running.
++On the pre-fix reader the first GPU test blocks for the kernel's duration.
+ """
++
+ import threading
+ import time
+ 
+@@ -14,7 +18,9 @@ import torch
+ 
+ from vllm.v1.worker import guard_telemetry
+ 
+-SLEEP_CYCLES = 4_000_000_000  # ~2 s on a 3090 (torch.cuda._sleep spins for this many cycles)
++SLEEP_CYCLES = (
++    4_000_000_000  # ~2 s on a 3090 (torch.cuda._sleep spins for this many cycles)
++)
+ 
+ 
+ def test_cpu_tensor_reads_directly():
+@@ -27,7 +33,8 @@ def test_cpu_tensor_reads_directly():
+ 
+ 
+ def test_register_refuses_to_run_inside_a_capture(monkeypatch):
+-    """Creating the side stream inside a cudagraph capture is not capture-safe."""
++    """Creating the side stream inside a cudagraph capture is
++    not capture-safe."""
+     r = guard_telemetry.NonBlockingReader()
+     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+     if not torch.cuda.is_available():
+@@ -38,17 +45,18 @@ def test_register_refuses_to_run_inside_a_capture(monkeypatch):
+ 
+ 
+ def test_report_waits_for_the_confirming_tick_cpu():
+-    """A count rise seen in copy k is reported from copy k+1 (maxima current by then)."""
++    """A count rise seen in copy k is reported from copy k+1
++    (maxima current by then)."""
+     device = torch.device("cpu")
+     guard_telemetry.reset_for_test()
+-    buf = guard_telemetry.counter(0, device)  # allocates the cpu buffer
++    guard_telemetry.counter(0, device)  # allocates the cpu buffer
+     full = guard_telemetry._buffers[device]
+     site = guard_telemetry.SITE_MAMBA_COPY
+-    full[site, 0] = 2                       # count written, maxima not yet
+-    guard_telemetry._poll_once()            # rise seen -> pending, nothing reported
++    full[site, 0] = 2  # count written, maxima not yet
++    guard_telemetry._poll_once()  # rise seen -> pending, nothing reported
+     assert guard_telemetry._seen.get((device, site), 0) == 0
+-    full[site, 1] = 9 + guard_telemetry.GUARD_BIAS   # maxima land before the next tick
+-    guard_telemetry._poll_once()            # confirming tick reports count 2 with row 9
++    full[site, 1] = 9 + guard_telemetry.GUARD_BIAS  # maxima land before the next tick
++    guard_telemetry._poll_once()  # confirming tick reports count 2 with row 9
+     assert guard_telemetry._seen.get((device, site), 0) == 2
+     snap = guard_telemetry.snapshot()
+     key = f"{device}:{guard_telemetry.SITE_NAMES[site]}"
+@@ -58,13 +66,16 @@ def test_report_waits_for_the_confirming_tick_cpu():
+ 
+ def test_module_reader_is_the_non_blocking_kind():
+     assert isinstance(guard_telemetry._nb_reader, guard_telemetry.NonBlockingReader)
+-    src = open(guard_telemetry.__file__, encoding="utf-8").read()
+-    body = src[src.index("def _poll_once"):src.index("def _arm(")]
+-    assert ".tolist()" not in body.replace("host.tolist()", ""), "the cadence reader must not read the device buffer synchronously"
++    with open(guard_telemetry.__file__, encoding="utf-8") as fh:
++        src = fh.read()
++    body = src[src.index("def _poll_once") : src.index("def _arm(")]
++    assert ".tolist()" not in body.replace("host.tolist()", ""), (
++        "the cadence reader must not read the device buffer synchronously"
++    )
+     assert "poll_one(" in body
+ 
+ 
+-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
++@pytest.mark.gpu
+ def test_reader_tick_returns_while_the_compute_stream_is_busy():
+     device = torch.device("cuda", torch.cuda.current_device())
+     guard_telemetry.prealloc(device)
+@@ -83,15 +94,23 @@ def test_reader_tick_returns_while_the_compute_stream_is_busy():
+     t1 = time.monotonic()
+     torch.cuda.synchronize(device)
+     busy = time.monotonic() - t1
+-    # The tick assertion comes first: a blocking reader spends the whole sleep inside the tick and would then make
+-    # the busy control read ~0 (negative control).
+-    assert tick < 0.25, f"reader tick took {tick:.3f}s while the compute stream was busy: it waited on the stream (reader/compute-stream deadlock)"
+-    assert tick + busy > 0.5, f"control failed: the parked kernel finished in {tick + busy:.3f}s, the test cannot discriminate"
+-
+-
+-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
++    # The tick assertion comes first: a blocking reader spends the whole
++    # sleep inside the tick and would then make the busy control read ~0
++    # (negative control).
++    assert tick < 0.25, (
++        f"reader tick took {tick:.3f}s while the compute stream was busy: "
++        f"it waited on the stream (reader/compute-stream deadlock)"
++    )
++    assert tick + busy > 0.5, (
++        f"control failed: the parked kernel finished in {tick + busy:.3f}s, "
++        f"the test cannot discriminate"
++    )
++
++
++@pytest.mark.gpu
+ def test_reader_tick_from_a_thread_returns_while_the_compute_stream_is_busy():
+-    """The production shape: the tick runs on the reader thread while the main thread owns the stream."""
++    """The production shape: the tick runs on the reader thread while the
++    main thread owns the stream."""
+     device = torch.device("cuda", torch.cuda.current_device())
+     guard_telemetry.prealloc(device)
+     guard_telemetry.reset_for_test()
+@@ -110,13 +129,17 @@ def test_reader_tick_from_a_thread_returns_while_the_compute_stream_is_busy():
+     threading.Thread(target=tick, name="test-guard-reader", daemon=True).start()
+     finished = done.wait(timeout=1.0)
+     torch.cuda.synchronize(device)
+-    assert finished, "the reader tick did not return within 1 s while the compute stream was busy (reader/compute-stream deadlock)"
++    assert finished, (
++        "the reader tick did not return within 1 s while the compute stream "
++        "was busy (reader/compute-stream deadlock)"
++    )
+     assert elapsed["tick"] < 0.25
+ 
+ 
+-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
++@pytest.mark.gpu
+ def test_hits_written_before_a_stall_are_still_reported():
+-    """Non-blocking must not mean lossy: a count written on the compute stream is reported once the copy lands."""
++    """Non-blocking must not mean lossy: a count written on the compute
++    stream is reported once the copy lands."""
+     device = torch.device("cuda", torch.cuda.current_device())
+     guard_telemetry.prealloc(device)
+     guard_telemetry.reset_for_test()
+diff --git a/tests/v1/worker/gpu/test_guard_telemetry_defaults_drain.py b/tests/v1/worker/gpu/test_guard_telemetry_defaults_drain.py
+index 6799a80c4b..606292e2aa 100644
+--- a/tests/v1/worker/gpu/test_guard_telemetry_defaults_drain.py
++++ b/tests/v1/worker/gpu/test_guard_telemetry_defaults_drain.py
+@@ -13,15 +13,12 @@
+ """
+ 
+ import importlib
+-import os
+ import sys
+ 
+ import pytest
+ import torch
+ 
+-pytestmark = pytest.mark.skipif(
+-    not torch.cuda.is_available(), reason="CUDA required"
+-)
++pytestmark = pytest.mark.gpu
+ 
+ 
+ def _fresh(monkeypatch, **env):
+@@ -36,7 +33,7 @@ def _fresh(monkeypatch, **env):
+ def test_release_defaults_with_env_absent(monkeypatch):
+     gt = _fresh(monkeypatch)
+     assert gt._MODE == "off"  # v2: default off
+-    assert gt._INTERVAL == pytest.approx(0.05)
++    assert pytest.approx(0.05) == gt._INTERVAL
+ 
+ 
+ @pytest.mark.parametrize("bad", ["nan", "inf", "-inf", "0", "-1", "abc"])
+@@ -46,7 +43,9 @@ def test_bad_interval_rejected_at_import(monkeypatch, bad):
+ 
+ 
+ def test_reader_loss_arms_the_stop(monkeypatch):
+-    gt = _fresh(monkeypatch, VLLM_E2_GUARD_MODE="warn")  # the reader exists only when opted in (default off)
++    gt = _fresh(
++        monkeypatch, VLLM_E2_GUARD_MODE="warn"
++    )  # the reader exists only when opted in (default off)
+     device = torch.device("cuda:0")
+     gt.prealloc(device)
+     gt.reset_for_test()
+@@ -64,7 +63,9 @@ def test_reader_loss_arms_the_stop(monkeypatch):
+ 
+ 
+ def test_drain_reports_last_step_hit_and_raises_for_fatal_site(monkeypatch):
+-    gt = _fresh(monkeypatch, VLLM_E2_GUARD_MODE="warn")  # warn mode (opt-in since v2.0.1): a plain site must NOT raise
++    gt = _fresh(
++        monkeypatch, VLLM_E2_GUARD_MODE="warn"
++    )  # warn mode (opt-in): a plain site must NOT raise
+     device = torch.device("cuda:0")
+     gt.prealloc(device)
+     gt.reset_for_test()
+diff --git a/tests/v1/worker/gpu/test_guard_telemetry_replay.py b/tests/v1/worker/gpu/test_guard_telemetry_replay.py
+index 52327abdad..a987a024dd 100644
+--- a/tests/v1/worker/gpu/test_guard_telemetry_replay.py
++++ b/tests/v1/worker/gpu/test_guard_telemetry_replay.py
+@@ -27,9 +27,7 @@ from vllm.third_party.flash_linear_attention.ops import (
+ )
+ from vllm.v1.worker import guard_telemetry
+ 
+-pytestmark = pytest.mark.skipif(
+-    not torch.cuda.is_available(), reason="CUDA required"
+-)
++pytestmark = pytest.mark.gpu
+ 
+ REPLAYS = 5
+ 
+diff --git a/tests/v1/worker/gpu/test_pp_deferred_mamba_block_table.py b/tests/v1/worker/gpu/test_pp_deferred_mamba_block_table.py
+index 30bed0a8f8..df904ff159 100644
+--- a/tests/v1/worker/gpu/test_pp_deferred_mamba_block_table.py
++++ b/tests/v1/worker/gpu/test_pp_deferred_mamba_block_table.py
+@@ -42,6 +42,9 @@ from vllm.v1.worker import mamba_utils as mamba_utils_mod
+ from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
+ from vllm.v1.worker.mamba_utils import MambaSpecDecodeGPUContext
+ 
++# Module-level singleton so the helper default is not a call (ruff B008).
++_CPU = torch.device("cpu")
++
+ MAX_NUM_REQS = 8
+ MAX_NUM_BLOCKS = 6
+ MAMBA_BLOCK_SIZE = 16
+@@ -57,12 +60,8 @@ _COPY_FUNCS: MambaStateCopyFuncsByType = {
+ 
+ # Captured before any monkeypatching so the replay binds against the real
+ # kernel signature; a launch that stops matching it fails loudly here.
+-_POSTPROCESS_SIG = inspect.signature(
+-    mamba_utils_mod.postprocess_mamba_fused_kernel.fn
+-)
+-_PRECOPY_SIG = inspect.signature(
+-    mamba_utils_mod.precopy_mamba_align_fused_kernel.fn
+-)
++_POSTPROCESS_SIG = inspect.signature(mamba_utils_mod.postprocess_mamba_fused_kernel.fn)
++_PRECOPY_SIG = inspect.signature(mamba_utils_mod.precopy_mamba_align_fused_kernel.fn)
+ 
+ 
+ class _MockCpuGpuBuffer:
+@@ -163,7 +162,7 @@ def _register_block_tables(state: MambaHybridModelState, block_tables) -> bool:
+ 
+ 
+ def _build_scenario(
+-    device: torch.device = torch.device("cpu"),
++    device: torch.device = _CPU,
+     slot_mapping: list[int] = (0, 1, 2),
+     t1_mapping: list[int] = (2,),
+     register: bool = True,
+@@ -291,7 +290,8 @@ def _replay_row(scenario, launch, batch_idx: int) -> tuple[str, int, dict]:
+         "src_eq_dst": src_block_idx == dest_block_idx,
+     }
+ 
+-    if bt_row_is_req:
++    if bt_row_is_req:  # noqa: SIM108 -- the ternary ruff proposes nests two
++        # conditionals on one line; the block states the three cases plainly.
+         bt_row_idx = req_idx
+     else:
+         bt_row_idx = batch_idx if has_idx_mapping else req_idx
+@@ -304,9 +304,7 @@ def _replay_row(scenario, launch, batch_idx: int) -> tuple[str, int, dict]:
+ 
+ def _block_ids(scenario, launch, batch_idx: int) -> dict:
+     name, bt_row_idx, predicate = _replay_row(scenario, launch, batch_idx)
+-    table = next(
+-        tbl for label, tbl in scenario.tables_by_ptr.values() if label == name
+-    )
++    table = next(tbl for label, tbl in scenario.tables_by_ptr.values() if label == name)
+     return {
+         "table": name,
+         "row": bt_row_idx,
+@@ -321,9 +319,7 @@ def _block_ids(scenario, launch, batch_idx: int) -> dict:
+ 
+ def _run_deferred(scenario, monkeypatch: pytest.MonkeyPatch) -> _RecordingKernel:
+     recorder = _RecordingKernel()
+-    monkeypatch.setattr(
+-        mamba_utils_mod, "postprocess_mamba_fused_kernel", recorder
+-    )
++    monkeypatch.setattr(mamba_utils_mod, "postprocess_mamba_fused_kernel", recorder)
+     device = scenario.persistent.device
+ 
+     def t(values):
+@@ -355,9 +351,9 @@ def _run_deferred(scenario, monkeypatch: pytest.MonkeyPatch) -> _RecordingKernel
+ 
+ def test_gather_port_matches_production_semantics() -> None:
+     """Instrument check: the CPU gather port must reproduce block_table.py."""
+-    persistent = torch.arange(
+-        MAX_NUM_REQS * MAX_NUM_BLOCKS, dtype=torch.int32
+-    ).reshape(MAX_NUM_REQS, MAX_NUM_BLOCKS)
++    persistent = torch.arange(MAX_NUM_REQS * MAX_NUM_BLOCKS, dtype=torch.int32).reshape(
++        MAX_NUM_REQS, MAX_NUM_BLOCKS
++    )
+     dst = torch.full_like(persistent, -7)
+     num_blocks = [2] * MAX_NUM_REQS
+ 
+@@ -439,9 +435,7 @@ def test_precopy_still_uses_the_same_step_gather(
+     """
+     scenario = _build_scenario()
+     recorder = _RecordingKernel()
+-    monkeypatch.setattr(
+-        mamba_utils_mod, "precopy_mamba_align_fused_kernel", recorder
+-    )
++    monkeypatch.setattr(mamba_utils_mod, "precopy_mamba_align_fused_kernel", recorder)
+     device = scenario.persistent.device
+     z = torch.zeros(MAX_NUM_REQS, dtype=torch.int32, device=device)
+ 
+@@ -528,14 +522,10 @@ def test_align_postprocess_fails_closed_without_persistent_tables(
+     assert scenario.ctx.has_persistent_block_tables is False
+ 
+     recorder = _RecordingKernel()
+-    monkeypatch.setattr(
+-        mamba_utils_mod, "postprocess_mamba_fused_kernel", recorder
+-    )
++    monkeypatch.setattr(mamba_utils_mod, "postprocess_mamba_fused_kernel", recorder)
+     device = scenario.persistent.device
+     before = scenario.ctx.num_accepted_tokens_out.clone()
+-    num_accepted = torch.full(
+-        (MAX_NUM_REQS,), 7, dtype=torch.int32, device=device
+-    )
++    num_accepted = torch.full((MAX_NUM_REQS,), 7, dtype=torch.int32, device=device)
+ 
+     with pytest.raises(RuntimeError, match="persistent per-req-slot block tables"):
+         scenario.ctx.run_fused_postprocess_align(
+@@ -564,9 +554,7 @@ def test_precopy_still_works_without_persistent_tables(
+     scenario = _build_scenario(register=False)
+     assert scenario.ctx.has_persistent_block_tables is False
+     recorder = _RecordingKernel()
+-    monkeypatch.setattr(
+-        mamba_utils_mod, "precopy_mamba_align_fused_kernel", recorder
+-    )
++    monkeypatch.setattr(mamba_utils_mod, "precopy_mamba_align_fused_kernel", recorder)
+     device = scenario.persistent.device
+     z = torch.zeros(MAX_NUM_REQS, dtype=torch.int32, device=device)
+ 
+diff --git a/tests/v1/worker/gpu/test_pp_deferred_mamba_gpu.py b/tests/v1/worker/gpu/test_pp_deferred_mamba_gpu.py
+index f03622773a..376494ee17 100644
+--- a/tests/v1/worker/gpu/test_pp_deferred_mamba_gpu.py
++++ b/tests/v1/worker/gpu/test_pp_deferred_mamba_gpu.py
+@@ -22,7 +22,8 @@ possible coordinates resolve to four different physical blocks:
+     gathered[batch_idx=0]    first cut   -> r2's blocks (the victim)
+     gathered[req_idx=5]      wrong both  -> never written, block 0
+ 
+-Requires CUDA **and** an explicit opt-in: set ``VLLM_E2_GPU_TESTS=1``. The reference host
++Requires CUDA **and** an explicit opt-in: set ``VLLM_E2_GPU_TESTS=1``. The
++reference host
+ always reports CUDA available, and the reference host spends most of its time running
+ long serving runs and sanitizer runs that should not share a device with a
+ test suite, so `torch.cuda.is_available()` is not a sufficient gate here. Run
+@@ -51,7 +52,7 @@ from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec, MambaSpe
+ from vllm.v1.worker.mamba_utils import MambaSpecDecodeGPUContext
+ 
+ pytestmark = [
+-    pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
++    pytest.mark.gpu,
+     pytest.mark.skipif(
+         os.environ.get("VLLM_E2_GPU_TESTS") != "1",
+         reason="set VLLM_E2_GPU_TESTS=1 to run GPU tests (shared GPU host)",
+@@ -162,9 +163,7 @@ def _build(slot_mapping=(5, 1, 2), t1_mapping=(2,)) -> _Fixture:
+     device = torch.device("cuda:0")
+     torch.manual_seed(1234)
+ 
+-    conv = torch.randn(
+-        TOTAL_BLOCKS, CONV_WIDTH, CONV_INNER, dtype=DTYPE, device=device
+-    )
++    conv = torch.randn(TOTAL_BLOCKS, CONV_WIDTH, CONV_INNER, dtype=DTYPE, device=device)
+     temporal = torch.randn(TOTAL_BLOCKS, TEMPORAL_DIM, dtype=DTYPE, device=device)
+     attention = MagicMock()
+     attention.kv_cache = [conv, temporal]
+@@ -271,8 +270,7 @@ def _assert_bitwise(actual: torch.Tensor, expected: torch.Tensor, what: str) ->
+     lhs = actual.contiguous().view(torch.int16)
+     rhs = expected.contiguous().view(torch.int16)
+     assert torch.equal(lhs, rhs), (
+-        f"{what}: {int((lhs != rhs).sum().item())} of {lhs.numel()} 16-bit "
+-        f"words differ"
++        f"{what}: {int((lhs != rhs).sum().item())} of {lhs.numel()} 16-bit words differ"
+     )
+ 
+ 
+@@ -365,9 +363,7 @@ def test_self_copy_exits_without_touching_state_and_resets_num_accepted():
+     return. The conjunction itself is covered by the next test.
+     """
+     fx = _build()
+-    num_accepted = _launch(
+-        fx, [5, 1, 2], {5: (2, 1, 33), 1: (2, 0, 40), 2: (2, 0, 40)}
+-    )
++    num_accepted = _launch(fx, [5, 1, 2], {5: (2, 1, 33), 1: (2, 0, 40), 2: (2, 0, 40)})
+ 
+     _assert_only_blocks_changed(fx, set())
+     assert int(num_accepted[5].item()) == 1
+@@ -391,9 +387,7 @@ def test_same_column_with_positive_bias_copies_and_still_resets():
+     positive bias moves bytes.
+     """
+     fx = _build()
+-    num_accepted = _launch(
+-        fx, [5, 1, 2], {5: (4, 1, 33), 1: (2, 0, 40), 2: (2, 0, 40)}
+-    )
++    num_accepted = _launch(fx, [5, 1, 2], {5: (4, 1, 33), 1: (2, 0, 40), 2: (2, 0, 40)})
+ 
+     blk = phys(5, 1)  # both the conv source and the destination
+     temporal_src = phys(5, 3)  # src_col + bias = 3
+@@ -460,9 +454,7 @@ def test_generation_masked_reuse_is_skipped_end_to_end():
+         mask_from_generation_change,
+     )
+ 
+-    mapping = mask_from_generation_change(
+-        idx_mapping=[5, 1, 2], reused_slot_rows=[1]
+-    )
++    mapping = mask_from_generation_change(idx_mapping=[5, 1, 2], reused_slot_rows=[1])
+     assert mapping == [5, -1, 2], mapping
+ 
+     fx = _build(slot_mapping=(5, 1, 2))
+@@ -500,9 +492,7 @@ def test_same_step_identity_mapping_is_unaffected():
+ def test_align_launch_raises_without_persistent_tables():
+     """Fail closed on real hardware too, before any kernel is enqueued."""
+     device = torch.device("cuda:0")
+-    conv = torch.randn(
+-        TOTAL_BLOCKS, CONV_WIDTH, CONV_INNER, dtype=DTYPE, device=device
+-    )
++    conv = torch.randn(TOTAL_BLOCKS, CONV_WIDTH, CONV_INNER, dtype=DTYPE, device=device)
+     temporal = torch.randn(TOTAL_BLOCKS, TEMPORAL_DIM, dtype=DTYPE, device=device)
+     attention = MagicMock()
+     attention.kv_cache = [conv, temporal]
+@@ -530,9 +520,7 @@ def test_align_launch_raises_without_persistent_tables():
+             num_accepted_tokens_gpu=torch.full(
+                 (MAX_NUM_REQS,), 4, dtype=torch.int32, device=device
+             ),
+-            state_idx_gpu=torch.zeros(
+-                MAX_NUM_REQS, dtype=torch.int32, device=device
+-            ),
++            state_idx_gpu=torch.zeros(MAX_NUM_REQS, dtype=torch.int32, device=device),
+             new_num_computed_tokens_gpu=torch.full(
+                 (MAX_NUM_REQS,), 48, dtype=torch.int32, device=device
+             ),
+diff --git a/tests/v1/worker/gpu/test_qsa_ring_skip_telemetry.py b/tests/v1/worker/gpu/test_qsa_ring_skip_telemetry.py
+index 04682881b2..84f109df78 100644
+--- a/tests/v1/worker/gpu/test_qsa_ring_skip_telemetry.py
++++ b/tests/v1/worker/gpu/test_qsa_ring_skip_telemetry.py
+@@ -23,8 +23,8 @@ from vllm.v1.worker import guard_telemetry
+ COMPRESS_RATIO = 4
+ HEAD_DIM = 128
+ N_HEADS = 4
+-STATE_SIZE = 8          # ring capacity
+-ROW_WIDTH = 140         # head dim + the int64 position triple in the tail
++STATE_SIZE = 8  # ring capacity
++ROW_WIDTH = 140  # head dim + the int64 position triple in the tail
+ MAX_MODEL_LEN = 4096
+ NUM_BLOCKS = 8
+ RING_CAPACITY = NUM_BLOCKS * STATE_SIZE
+@@ -56,7 +56,9 @@ def _inputs(device, num_tokens=4):
+         MAX_MODEL_LEN, HEAD_DIM // 2, dtype=torch.bfloat16, device=device
+     )
+     ones = torch.ones(HEAD_DIM, dtype=torch.bfloat16, device=device)
+-    q_out = torch.empty(num_tokens, N_HEADS, HEAD_DIM, dtype=torch.bfloat16, device=device)
++    q_out = torch.empty(
++        num_tokens, N_HEADS, HEAD_DIM, dtype=torch.bfloat16, device=device
++    )
+     state_cache = torch.zeros(
+         NUM_BLOCKS, STATE_SIZE, 1, ROW_WIDTH, dtype=torch.bfloat16, device=device
+     )
+@@ -72,23 +74,45 @@ def _inputs(device, num_tokens=4):
+         max(num_tokens // COMPRESS_RATIO, 1), 2, dtype=torch.int32, device=device
+     )
+     return dict(
+-        q=q, k=k, positions=positions, cos_sin_cache=cos_sin,
+-        q_norm_weight=ones, k_norm_weight=ones, eps=1e-6, q_out=q_out,
+-        state_cache=state_cache, state_slots=state_slots,
+-        state_block_table=state_table, query_start_loc=qsl,
+-        logical_positions=logical, compressed_cache=comp_cache,
+-        compressed_slots=comp_slots, k_work_metadata=kwb,
++        q=q,
++        k=k,
++        positions=positions,
++        cos_sin_cache=cos_sin,
++        q_norm_weight=ones,
++        k_norm_weight=ones,
++        eps=1e-6,
++        q_out=q_out,
++        state_cache=state_cache,
++        state_slots=state_slots,
++        state_block_table=state_table,
++        query_start_loc=qsl,
++        logical_positions=logical,
++        compressed_cache=comp_cache,
++        compressed_slots=comp_slots,
++        k_work_metadata=kwb,
+     )
+ 
+ 
+ def _launch(kw):
+     qpi.qsa_pre_indexer(
+-        kw["q"], kw["k"], kw["positions"], kw["cos_sin_cache"],
+-        kw["q_norm_weight"], kw["k_norm_weight"], kw["eps"], kw["q_out"],
+-        kw["state_cache"], kw["state_slots"], kw["state_block_table"],
+-        kw["query_start_loc"], kw["logical_positions"], kw["compressed_cache"],
+-        kw["compressed_slots"], kw["k_work_metadata"],
+-        compress_ratio=COMPRESS_RATIO, mrope_section=(11, 11, 10),
++        kw["q"],
++        kw["k"],
++        kw["positions"],
++        kw["cos_sin_cache"],
++        kw["q_norm_weight"],
++        kw["k_norm_weight"],
++        kw["eps"],
++        kw["q_out"],
++        kw["state_cache"],
++        kw["state_slots"],
++        kw["state_block_table"],
++        kw["query_start_loc"],
++        kw["logical_positions"],
++        kw["compressed_cache"],
++        kw["compressed_slots"],
++        kw["k_work_metadata"],
++        compress_ratio=COMPRESS_RATIO,
++        mrope_section=(11, 11, 10),
+         rope_pos_offset=HEAD_DIM,
+     )
+ 
+@@ -121,20 +145,26 @@ def test_launcher_passes_the_ring_skip_counter(monkeypatch):
+ 
+     assert len(rec.launches) == 1
+     _grid, args, kwargs = rec.launches[0]
+-    kwargs = {k: v for k, v in kwargs.items()
+-              if k not in ("num_warps", "num_stages", "num_ctas", "grid")}
++    kwargs = {
++        k: v
++        for k, v in kwargs.items()
++        if k not in ("num_warps", "num_stages", "num_ctas", "grid")
++    }
+     bound = sig.bind(*args, **kwargs)
+     bound.apply_defaults()
+     skip_ctr = bound.arguments["ring_skip_ctr"]
+     assert skip_ctr.dtype == torch.int64 and skip_ctr.numel() == 3
+-    assert skip_ctr.data_ptr() == guard_telemetry.counter(
+-        guard_telemetry.SITE_QSA_RING_SKIP, device
+-    ).data_ptr()
++    assert (
++        skip_ctr.data_ptr()
++        == guard_telemetry.counter(
++            guard_telemetry.SITE_QSA_RING_SKIP, device
++        ).data_ptr()
++    )
+     for other in ("rope_guard_ctr", "guard_ctr"):
+         assert bound.arguments[other].data_ptr() != skip_ctr.data_ptr()
+ 
+ 
+-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
++@pytest.mark.gpu
+ def test_negative_control_valid_slots_count_zero():
+     device = torch.device("cuda", torch.cuda.current_device())
+     guard_telemetry.prealloc(device)
+@@ -148,11 +178,11 @@ def test_negative_control_valid_slots_count_zero():
+     for t in range(kw["k"].shape[0]):
+         row = kw["state_cache"][0, t, 0, :]
+         assert torch.equal(row[:HEAD_DIM], kw["k"][t])
+-        tail = row[HEAD_DIM:HEAD_DIM + 12].contiguous().view(torch.int64)
++        tail = row[HEAD_DIM : HEAD_DIM + 12].contiguous().view(torch.int64)
+         assert tail.tolist() == [t, t, t]
+ 
+ 
+-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
++@pytest.mark.gpu
+ @pytest.mark.parametrize(
+     "bad_index,bad_slot",
+     [(2, -1), (1, RING_CAPACITY), (3, RING_CAPACITY + 5)],
+@@ -184,11 +214,11 @@ def test_positive_control_one_skipped_token_is_counted_and_located(bad_index, ba
+             assert torch.count_nonzero(row) == 0, "skipped row was written"
+         else:
+             assert torch.equal(row[:HEAD_DIM], kw["k"][t])
+-            tail = row[HEAD_DIM:HEAD_DIM + 12].contiguous().view(torch.int64)
++            tail = row[HEAD_DIM : HEAD_DIM + 12].contiguous().view(torch.int64)
+             assert tail.tolist() == [t, t, t]
+ 
+ 
+-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
++@pytest.mark.gpu
+ def test_positive_control_two_skipped_tokens_accumulate():
+     device = torch.device("cuda", torch.cuda.current_device())
+     guard_telemetry.prealloc(device)
+@@ -198,7 +228,9 @@ def test_positive_control_two_skipped_tokens_accumulate():
+     kw["state_slots"][3] = RING_CAPACITY + 1
+     _launch(kw)
+     torch.cuda.synchronize()
+-    n, row, val = guard_telemetry.counter(guard_telemetry.SITE_QSA_RING_SKIP, device).tolist()
++    n, row, val = guard_telemetry.counter(
++        guard_telemetry.SITE_QSA_RING_SKIP, device
++    ).tolist()
+     assert n == 2
+-    assert row - guard_telemetry.GUARD_BIAS == 3          # max token index
++    assert row - guard_telemetry.GUARD_BIAS == 3  # max token index
+     assert val - guard_telemetry.GUARD_BIAS == RING_CAPACITY + 1  # max slot value
+diff --git a/tests/v1/worker/gpu/test_qsa_rope_position_guard.py b/tests/v1/worker/gpu/test_qsa_rope_position_guard.py
+index 9539aa7761..0628dd2215 100644
+--- a/tests/v1/worker/gpu/test_qsa_rope_position_guard.py
++++ b/tests/v1/worker/gpu/test_qsa_rope_position_guard.py
+@@ -33,8 +33,8 @@ from vllm.v1.worker import guard_telemetry
+ COMPRESS_RATIO = 4
+ HEAD_DIM = 128
+ N_HEADS = 4
+-STATE_SIZE = 8          # ring capacity
+-ROW_WIDTH = 140         # head dim + the int64 position triple in the tail
++STATE_SIZE = 8  # ring capacity
++ROW_WIDTH = 140  # head dim + the int64 position triple in the tail
+ MAX_MODEL_LEN = 4096
+ NUM_BLOCKS = 8
+ 
+@@ -65,7 +65,9 @@ def _inputs(device, num_tokens=4):
+         MAX_MODEL_LEN, HEAD_DIM // 2, dtype=torch.bfloat16, device=device
+     )
+     ones = torch.ones(HEAD_DIM, dtype=torch.bfloat16, device=device)
+-    q_out = torch.empty(num_tokens, N_HEADS, HEAD_DIM, dtype=torch.bfloat16, device=device)
++    q_out = torch.empty(
++        num_tokens, N_HEADS, HEAD_DIM, dtype=torch.bfloat16, device=device
++    )
+     state_cache = torch.zeros(
+         NUM_BLOCKS, STATE_SIZE, 1, ROW_WIDTH, dtype=torch.bfloat16, device=device
+     )
+@@ -81,12 +83,22 @@ def _inputs(device, num_tokens=4):
+         max(num_tokens // COMPRESS_RATIO, 1), 2, dtype=torch.int32, device=device
+     )
+     return dict(
+-        q=q, k=k, positions=positions, cos_sin_cache=cos_sin,
+-        q_norm_weight=ones, k_norm_weight=ones, eps=1e-6, q_out=q_out,
+-        state_cache=state_cache, state_slots=state_slots,
+-        state_block_table=state_table, query_start_loc=qsl,
+-        logical_positions=logical, compressed_cache=comp_cache,
+-        compressed_slots=comp_slots, k_work_metadata=kwb,
++        q=q,
++        k=k,
++        positions=positions,
++        cos_sin_cache=cos_sin,
++        q_norm_weight=ones,
++        k_norm_weight=ones,
++        eps=1e-6,
++        q_out=q_out,
++        state_cache=state_cache,
++        state_slots=state_slots,
++        state_block_table=state_table,
++        query_start_loc=qsl,
++        logical_positions=logical,
++        compressed_cache=comp_cache,
++        compressed_slots=comp_slots,
++        k_work_metadata=kwb,
+     )
+ 
+ 
+@@ -104,21 +116,35 @@ def test_launcher_passes_the_real_cos_sin_row_count(monkeypatch):
+     monkeypatch.setattr(qpi, "_qsa_pre_indexer_kernel", rec)
+     kw = _inputs(device)
+     qpi.qsa_pre_indexer(
+-        kw.pop("q"), kw.pop("k"), kw.pop("positions"), kw.pop("cos_sin_cache"),
+-        kw.pop("q_norm_weight"), kw.pop("k_norm_weight"), kw.pop("eps"),
+-        kw.pop("q_out"), kw.pop("state_cache"), kw.pop("state_slots"),
+-        kw.pop("state_block_table"), kw.pop("query_start_loc"),
+-        kw.pop("logical_positions"), kw.pop("compressed_cache"),
+-        kw.pop("compressed_slots"), kw.pop("k_work_metadata"),
+-        compress_ratio=COMPRESS_RATIO, mrope_section=(11, 11, 10),
++        kw.pop("q"),
++        kw.pop("k"),
++        kw.pop("positions"),
++        kw.pop("cos_sin_cache"),
++        kw.pop("q_norm_weight"),
++        kw.pop("k_norm_weight"),
++        kw.pop("eps"),
++        kw.pop("q_out"),
++        kw.pop("state_cache"),
++        kw.pop("state_slots"),
++        kw.pop("state_block_table"),
++        kw.pop("query_start_loc"),
++        kw.pop("logical_positions"),
++        kw.pop("compressed_cache"),
++        kw.pop("compressed_slots"),
++        kw.pop("k_work_metadata"),
++        compress_ratio=COMPRESS_RATIO,
++        mrope_section=(11, 11, 10),
+         rope_pos_offset=HEAD_DIM,
+     )
+ 
+     assert len(rec.launches) == 1
+     _grid, args, kwargs = rec.launches[0]
+     # Triton launch options are not kernel parameters.
+-    kwargs = {k: v for k, v in kwargs.items()
+-              if k not in ("num_warps", "num_stages", "num_ctas", "grid")}
++    kwargs = {
++        k: v
++        for k, v in kwargs.items()
++        if k not in ("num_warps", "num_stages", "num_ctas", "grid")
++    }
+     bound = sig.bind(*args, **kwargs)
+     bound.apply_defaults()
+     assert bound.arguments["cos_sin_rows"] == MAX_MODEL_LEN
+@@ -134,12 +160,16 @@ def test_launcher_passes_the_real_cos_sin_row_count(monkeypatch):
+     req_ctr = bound.arguments["guard_ctr"]
+     for ctr in (rope_ctr, req_ctr):
+         assert ctr.dtype == torch.int64 and ctr.numel() == 3
+-    assert rope_ctr.data_ptr() == guard_telemetry.counter(
+-        guard_telemetry.SITE_QSA_ROPE_POS, device
+-    ).data_ptr()
+-    assert req_ctr.data_ptr() == guard_telemetry.counter(
+-        guard_telemetry.SITE_QSA_PRE_INDEXER, device
+-    ).data_ptr()
++    assert (
++        rope_ctr.data_ptr()
++        == guard_telemetry.counter(guard_telemetry.SITE_QSA_ROPE_POS, device).data_ptr()
++    )
++    assert (
++        req_ctr.data_ptr()
++        == guard_telemetry.counter(
++            guard_telemetry.SITE_QSA_PRE_INDEXER, device
++        ).data_ptr()
++    )
+     assert rope_ctr.data_ptr() != req_ctr.data_ptr()
+ 
+ 
+@@ -151,13 +181,10 @@ def test_rope_site_aborts_the_stage_even_in_warn_mode():
+     still there to do it again. warn is the right default for a guard whose
+     masked value dies with the step; it is the wrong default for this one.
+     """
+-    assert (
+-        guard_telemetry.SITE_QSA_ROPE_POS
+-        in guard_telemetry._ALWAYS_FATAL_SITES
+-    )
++    assert guard_telemetry.SITE_QSA_ROPE_POS in guard_telemetry._ALWAYS_FATAL_SITES
+ 
+ 
+-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
++@pytest.mark.gpu
+ def test_ring_filler_bytes_are_masked_and_counted():
+     """Positive control: the ring-residue crash case, verbatim.
+ 
+@@ -196,13 +223,17 @@ def test_ring_filler_bytes_are_masked_and_counted():
+     # start must be unaligned: 6 gives first_position 4 < chunk_start 6.
+     start = 6
+     assert start % COMPRESS_RATIO != 0, "an aligned chunk start never crosses"
+-    kw["logical_positions"] = (
+-        torch.arange(start, start + kw["logical_positions"].numel(),
+-                     dtype=kw["logical_positions"].dtype, device=device)
++    kw["logical_positions"] = torch.arange(
++        start,
++        start + kw["logical_positions"].numel(),
++        dtype=kw["logical_positions"].dtype,
++        device=device,
+     )
+     chunk_end = start + kw["logical_positions"].numel() - 1
+     chunk_start = chunk_end - kw["logical_positions"].numel() + 1
+-    first_boundary = ((chunk_start + COMPRESS_RATIO) // COMPRESS_RATIO) * COMPRESS_RATIO - 1
++    first_boundary = (
++        (chunk_start + COMPRESS_RATIO) // COMPRESS_RATIO
++    ) * COMPRESS_RATIO - 1
+     first_position = first_boundary - (COMPRESS_RATIO - 1)
+     assert first_position < chunk_start, (
+         f"first_position {first_position} >= chunk_start {chunk_start}: this "
+@@ -216,15 +247,27 @@ def test_ring_filler_bytes_are_masked_and_counted():
+     kw["k_work_metadata"][:, 1] = 0
+ 
+     qpi.qsa_pre_indexer(
+-        kw["q"], kw["k"], kw["positions"], kw["cos_sin_cache"],
+-        kw["q_norm_weight"], kw["k_norm_weight"], kw["eps"], kw["q_out"],
+-        kw["state_cache"], kw["state_slots"], kw["state_block_table"],
+-        kw["query_start_loc"], kw["logical_positions"], kw["compressed_cache"],
+-        kw["compressed_slots"], kw["k_work_metadata"],
+-        compress_ratio=COMPRESS_RATIO, mrope_section=(11, 11, 10),
++        kw["q"],
++        kw["k"],
++        kw["positions"],
++        kw["cos_sin_cache"],
++        kw["q_norm_weight"],
++        kw["k_norm_weight"],
++        kw["eps"],
++        kw["q_out"],
++        kw["state_cache"],
++        kw["state_slots"],
++        kw["state_block_table"],
++        kw["query_start_loc"],
++        kw["logical_positions"],
++        kw["compressed_cache"],
++        kw["compressed_slots"],
++        kw["k_work_metadata"],
++        compress_ratio=COMPRESS_RATIO,
++        mrope_section=(11, 11, 10),
+         rope_pos_offset=HEAD_DIM,
+     )
+-    torch.cuda.synchronize()          # the pre-guard build faults here
++    torch.cuda.synchronize()  # the pre-guard build faults here
+ 
+     ctr = guard_telemetry.counter(guard_telemetry.SITE_QSA_ROPE_POS, device)
+     n_masked = int(ctr[0].item())
+@@ -239,7 +282,7 @@ def test_ring_filler_bytes_are_masked_and_counted():
+     )
+ 
+ 
+-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
++@pytest.mark.gpu
+ @pytest.mark.parametrize("axis,axis_id", [("t", 0), ("h", 1), ("w", 2)])
+ @pytest.mark.parametrize("sign", ["mixed", "negative_only"])
+ def test_a_single_bad_axis_is_caught_and_named(axis, axis_id, sign):
+@@ -264,7 +307,7 @@ def test_a_single_bad_axis_is_caught_and_named(axis, axis_id, sign):
+     kw["positions"] = kw["positions"].clone()
+     if sign == "mixed":
+         kw["positions"][row, 0] = MAX_MODEL_LEN + 7  # out of range, positive
+-        kw["positions"][row, 1] = -5                 # out of range, negative
++        kw["positions"][row, 1] = -5  # out of range, negative
+         expected_worst = MAX_MODEL_LEN + 7
+     else:
+         # NEGATIVE ONLY. Every offender below zero is the case
+@@ -279,12 +322,24 @@ def test_a_single_bad_axis_is_caught_and_named(axis, axis_id, sign):
+     from vllm.models.qwen4_exp.nvidia.ops.qsa_pre_indexer import qsa_pre_indexer
+ 
+     qsa_pre_indexer(
+-        kw["q"], kw["k"], kw["positions"], kw["cos_sin_cache"],
+-        kw["q_norm_weight"], kw["k_norm_weight"], kw["eps"], kw["q_out"],
+-        kw["state_cache"], kw["state_slots"], kw["state_block_table"],
+-        kw["query_start_loc"], kw["logical_positions"], kw["compressed_cache"],
+-        kw["compressed_slots"], kw["k_work_metadata"],
+-        compress_ratio=COMPRESS_RATIO, mrope_section=(11, 11, 10),
++        kw["q"],
++        kw["k"],
++        kw["positions"],
++        kw["cos_sin_cache"],
++        kw["q_norm_weight"],
++        kw["k_norm_weight"],
++        kw["eps"],
++        kw["q_out"],
++        kw["state_cache"],
++        kw["state_slots"],
++        kw["state_block_table"],
++        kw["query_start_loc"],
++        kw["logical_positions"],
++        kw["compressed_cache"],
++        kw["compressed_slots"],
++        kw["k_work_metadata"],
++        compress_ratio=COMPRESS_RATIO,
++        mrope_section=(11, 11, 10),
+         rope_pos_offset=HEAD_DIM,
+     )
+     torch.cuda.synchronize()
+diff --git a/tests/v1/worker/test_grammar_fail_closed.py b/tests/v1/worker/test_grammar_fail_closed.py
+index 869cb98038..eeb68396a1 100644
+--- a/tests/v1/worker/test_grammar_fail_closed.py
++++ b/tests/v1/worker/test_grammar_fail_closed.py
+@@ -19,7 +19,6 @@ import numpy as np
+ import pytest
+ import torch
+ 
+-from vllm.platforms import current_platform
+ from vllm.utils.math_utils import cdiv
+ from vllm.v1.core.sched.output import GrammarOutput
+ from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+@@ -109,7 +108,7 @@ def _rejection_sampler(device: torch.device) -> RejectionSampler:
+     return sampler
+ 
+ 
+-@pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")
++@pytest.mark.gpu
+ def test_acceptance_stops_at_the_last_masked_row():
+     device = torch.device("cuda")
+     input_batch = _input_batch(device)
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 157dfaf901..588ca59107 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -304,6 +304,132 @@ if TYPE_CHECKING:
+     # AOT cache on it; the layer itself still reads os.environ directly.
+     VLLM_HOST_EMBED_TABLE: bool = False
+     VLLM_PLE_OFFLOAD_READY_TIMEOUT: float = 600.0
++    # --- Flash-Next fork knobs (v2.2) --------------------------------
++    # Every name below was read straight from os.environ at its use site, so
++    # envs.validate_environ() logged it as unknown on every boot that set one
++    # and compile_factors() could not see it. Registering makes the hash
++    # complete; the read sites are unchanged (they still parse and fail closed
++    # themselves, which registration must not weaken). Runtime-only entries are
++    # listed in compile_factors().ignored_factors with their reason.
++    #
++    # TWO IDENTITIES, NOT ONE. "Read once at startup"
++    # settles neither of them, so every entry below is labelled with both:
++    #
++    #   AOT identity     -- does the value change the torch.compile / AOT
++    #                       artifact? This is the ONLY identity compile_factors()
++    #                       keys. It protects against reusing another process's
++    #                       cached artifact.
++    #   CAPTURE identity -- does the value change what a cudagraph capture bakes
++    #                       in (ops present, launch constants, shapes)? Nothing
++    #                       in this tree keys anything on capture identity: the
++    #                       env is read before capture, in-process, so capture
++    #                       identity is protected only by "do not change the
++    #                       value between capture and replay in one process".
++    #
++    # So a knob that is a capture factor but NOT an AOT factor gets no
++    # protection from being registered here. Registering it is a contract
++    # statement and a cross-process guard, not a mechanism. Where the two
++    # identities are not both established by reading the code, the knob is
++    # hashed anyway: a spurious cache miss costs a recompile, a missed one costs
++    # a wrong graph.
++    #
++    # COMPILE/CAPTURE FACTORS (hashed):
++    # AOT: yes. CAPTURE: yes. PLE table is FP8-with-global-scale ->
++    # Qwen4ExpPLEFp8EmbeddingMethod instead of the checkpoint's method:
++    # different weight dtype and a different embedding forward.
++    VLLM_PLE_FP8_GLOBAL_SCALE: bool = False
++    # CAPTURE: yes, established -- clip counting allocates persistent per-layer
++    # int64 counters and its increment ops are CAPTURED into the cudagraph (see
++    # the graph-safety note in models/qwen4_exp/nvidia/qsa.py); unset, those ops
++    # are absent. AOT: not established (the QSA forward is a custom op); hashed
++    # conservatively.
++    VLLM_QSA_KV_CLIP_COUNT: str = ""
++    # CAPTURE: n/a -- collection requires --enforce-eager, so an enabled run
++    # does not capture at all. AOT: adds absmax reduction ops to the attention
++    # forward; hashed conservatively.
++    VLLM_QSA_KV_COLLECT: str = ""
++    # CAPTURE: yes -- the resolved value is a launch constant baked into the
++    # graph at capture (csrc/libtorch_stable/persistent_topk.cuh:143-148).
++    # AOT: not established. Hashed conservatively.
++    # NOT A PYTHON READ SITE: the value is resolved once per process by
++    # exact_medium_enabled() in csrc/libtorch_stable/topk.cu:30-36, which is the
++    # single source of truth. This entry is a raw passthrough so nothing can
++    # mistake it for a second parser; do not use envs.MERLIN_TOPK_EXACT_MEDIUM
++    # to decide behaviour. Registered with the medium-path exact restart
++    # so the cache-factor contract is complete.
++    MERLIN_TOPK_EXACT_MEDIUM: str | None = None
++    #
++    # RUNTIME-ONLY (registered for validate_environ + a single cached read):
++    # Static K/V scale sidecar: fill_()ed into existing fp32 device buffers
++    # after load and before capture, and the kernel does tl.load(k_scale_ptr),
++    # so the value is never a constexpr and the graph is identical.
++    VLLM_QSA_KV_SCALES: str = ""
++    # Guard telemetry: mode raise|warn|off and the reader poll interval in
++    # seconds. counter() returns a real tensor in every mode, so the Triton
++    # arguments and the captured graph do not depend on either.
++    VLLM_E2_GUARD_MODE: str = "off"
++    VLLM_E2_GUARD_INTERVAL: str = "0.05"
++    # Debug allocator telemetry (poll seconds + output directory) and the
++    # scheduler allocation log path.
++    VLLM_E2_MEMSTATS: str = "0"
++    VLLM_E2_MEMSTATS_DIR: str = ""
++    VLLM_E2_SCHED_LOG: str = ""
++    # O(live blocks) host-side ownership assertion in the scheduler, which is
++    # plain Python and never compiled.
++    VLLM_E2_ZERO_OWNERSHIP_CHECK: bool = False
++    # PLE offload child placement: rewrites CUDA_VISIBLE_DEVICES for the child
++    # only (CUDA_VISIBLE_DEVICES is itself an ignored factor).
++    VLLM_PLE_OFFLOAD_HOME_DEVICE: str = ""
++    # PLE timeouts / deadlines, in seconds.
++    VLLM_PLE_OFFLOAD_WAIT_TIMEOUT: float = 120.0
++    VLLM_PLE_PROGRESS_DEADLINE_S: float = 300.0
++    VLLM_PLE_STARTUP_DEADLINE_S: float = 1800.0
++    # Test-only PLE fault injection: cut spec, marker log, bootstrap gate.
++    # AOT: no. CAPTURE: no. Read once at import by the vllm_ple_test_fault
++    # singleton, but the process that reads them is a real engine, so
++    # validate_environ sees them.
++    VLLM_PLE_TEST_FAULT: str | None = None
++    VLLM_PLE_TEST_FAULT_GATE: str | None = None
++    VLLM_PLE_TEST_FAULT_LOG: str | None = None
++    #
++    # --- Knobs registered ahead of their read sites (v2.2) -----------
++    # Registered ahead of their code so the MERGED tree is complete and
++    # validate_environ is quiet from the first boot (a
++    # cross-change knob table). Each mirrors its read site's
++    # parse; if a read site changes, the entry here must be reconciled.
++    # (Both read sites below are now live.)
++    # AOT: no. CAPTURE: no -- strictly host-side and outside capture.
++    # off|warn|raise (1 = warn), normalised by _e2_diagnostic_mode like the
++    # rest of the family. The mamba ownership check moved this gate off a plain
++    # boolean; reconciled here.
++    # Read site returns with the deferred PLE transport.
++    VLLM_E2_PLE_FLAG_CHECK: str = "off"
++    # AOT: no. CAPTURE: no -- strictly host-side. off|warn|raise (1 = warn).
++    # the mamba slot-ownership check, v1/worker/mamba_utils.py:74.
++    VLLM_E2_MAMBA_SLOT_OWNERSHIP: str = "off"
++    #
++    # --- TODO: knobs that are NOT in this tree at all ----------
++    # The tie-determinism toggles and the BSM pin live in a separate
++    # patch stack, not in v2.0.1 and not in this tree:
++    #
++    #     MERLIN_FULL_K  MERLIN_QSA_SORT  MERLIN_TIE_DET  MERLIN_TIE_RECENT
++    #     MERLIN_PIN_BSM
++    #
++    # They are therefore UNAUDITED: nothing in this repository shows what they
++    # change, and this file will not classify code it cannot read. The rule they
++    # fall under is the standing one -- an os.environ (or std::getenv) knob that
++    # changes a compiled or captured artifact is not in the cache key unless it
++    # is registered here. From what is known of them (Marlin split-K, a
++    # persistent_topk ordering change and a cutoff tie-break) they are very
++    # likely capture factors and possibly AOT factors, which is exactly why a
++    # guess is not good enough.
++    #
++    # WHEN THE PATCHES LAND, for each name: register it below, label both
++    # identities from its actual read site, hash it unless exclusion is proven,
++    # and delete it from this block. tests/test_envs.py holds a test that fails
++    # if a name is registered while still listed here, so the classification
++    # cannot be skipped silently.
++    # ----------------------------------------------------------------------
+     VLLM_LOG_MODEL_INSPECTION: bool = False
+     VLLM_DEBUG_MFU_METRICS: bool = False
+     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
+@@ -2072,6 +2198,43 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     "VLLM_PLE_OFFLOAD_READY_TIMEOUT": lambda: float(
+         os.getenv("VLLM_PLE_OFFLOAD_READY_TIMEOUT", "600")
+     ),
++    # --- Flash-Next fork knobs (v2.2); see the TYPE_CHECKING block for
++    # which of these are compile/capture factors and which are ignored.
++    # Compile/capture factors.
++    "VLLM_PLE_FP8_GLOBAL_SCALE": lambda: (
++        os.getenv("VLLM_PLE_FP8_GLOBAL_SCALE", "") == "1"
++    ),
++    "VLLM_QSA_KV_CLIP_COUNT": lambda: os.getenv("VLLM_QSA_KV_CLIP_COUNT", "").strip(),
++    "VLLM_QSA_KV_COLLECT": lambda: os.getenv("VLLM_QSA_KV_COLLECT", "").strip(),
++    # Capture-configuration factor, read in C++; raw passthrough on purpose.
++    "MERLIN_TOPK_EXACT_MEDIUM": lambda: os.getenv("MERLIN_TOPK_EXACT_MEDIUM", None),
++    # Runtime only; all of the following are in compile_factors.ignored_factors.
++    "VLLM_QSA_KV_SCALES": lambda: os.getenv("VLLM_QSA_KV_SCALES", "").strip(),
++    "VLLM_E2_GUARD_MODE": lambda: (
++        os.getenv("VLLM_E2_GUARD_MODE", "off").strip().lower()
++    ),
++    "VLLM_E2_GUARD_INTERVAL": lambda: os.getenv("VLLM_E2_GUARD_INTERVAL", "0.05"),
++    "VLLM_E2_MEMSTATS": lambda: os.getenv("VLLM_E2_MEMSTATS", "0"),
++    "VLLM_E2_MEMSTATS_DIR": lambda: os.getenv("VLLM_E2_MEMSTATS_DIR", ""),
++    "VLLM_E2_SCHED_LOG": lambda: os.getenv("VLLM_E2_SCHED_LOG", ""),
++    "VLLM_E2_ZERO_OWNERSHIP_CHECK": lambda: (
++        os.getenv("VLLM_E2_ZERO_OWNERSHIP_CHECK", "") == "1"
++    ),
++    "VLLM_PLE_OFFLOAD_HOME_DEVICE": lambda: os.getenv(
++        "VLLM_PLE_OFFLOAD_HOME_DEVICE", ""
++    ).strip(),
++    "VLLM_PLE_OFFLOAD_WAIT_TIMEOUT": lambda: float(
++        os.getenv("VLLM_PLE_OFFLOAD_WAIT_TIMEOUT", "120")
++    ),
++    "VLLM_PLE_PROGRESS_DEADLINE_S": lambda: float(
++        os.getenv("VLLM_PLE_PROGRESS_DEADLINE_S", "300")
++    ),
++    "VLLM_PLE_STARTUP_DEADLINE_S": lambda: float(
++        os.getenv("VLLM_PLE_STARTUP_DEADLINE_S", "1800")
++    ),
++    "VLLM_PLE_TEST_FAULT": lambda: os.getenv("VLLM_PLE_TEST_FAULT", None),
++    "VLLM_PLE_TEST_FAULT_GATE": lambda: os.getenv("VLLM_PLE_TEST_FAULT_GATE", None),
++    "VLLM_PLE_TEST_FAULT_LOG": lambda: os.getenv("VLLM_PLE_TEST_FAULT_LOG", None),
+     # Log model inspection after loading.
+     # If enabled, logs a transformers-style hierarchical view of the model
+     # with quantization methods and attention backends.
+@@ -2314,13 +2477,6 @@ def compile_factors() -> dict[str, object]:
+         "VLLM_DEBUG_DUMP_PATH",
+         "VLLM_PORT",
+         "VLLM_CACHE_ROOT",
+-        # PLE host-side diagnostics: both gate Python that runs outside any
+-        # capture and neither adds a node to a compiled graph, so hashing them
+-        # would invalidate every compile cache the moment a diagnostic boot is
+-        # taken -- which is exactly when the cache is wanted. Remove from this
+-        # set if either ever grows a device-side component.
+-        "VLLM_E2_PLE_FLAG_CHECK",
+-        "VLLM_E2_MAMBA_SLOT_OWNERSHIP",
+         # Runtime memory-plan persistence; does not affect compiled graphs.
+         "VLLM_ENABLE_STARTUP_PLAN",
+         # Location-only derived paths: where a cache/config directory lives
+@@ -2397,6 +2553,55 @@ def compile_factors() -> dict[str, object]:
+         "LOCAL_RANK",
+         "CUDA_VISIBLE_DEVICES",
+         "NO_COLOR",
++        # --- Flash-Next fork knobs that are runtime-only (v2.2) ------
++        # Registering a name in environment_variables makes it a compile
++        # factor by default (this function is a deny-list), so every fork knob
++        # that cannot change a compiled or captured artifact is listed here
++        # with its reason. Hashing them would invalidate the whole AOT cache on
++        # a log path, a timeout or a guard-mode flip.
++        #
++        # Static QSA K/V scales: fill_()ed into existing fp32 device buffers
++        # after load and before capture; the kernel reads them with
++        # tl.load(k_scale_ptr), never as a constexpr.
++        "VLLM_QSA_KV_SCALES",
++        # Guard telemetry: counter() returns a real [3] int64 view in every
++        # mode, so the Triton arguments and the captured graph are identical;
++        # the mode only gates the side reader thread and the check_pending
++        # raise, and the interval is that thread's poll cadence.
++        "VLLM_E2_GUARD_MODE",
++        "VLLM_E2_GUARD_INTERVAL",
++        # Debug telemetry cadence and output locations.
++        "VLLM_E2_MEMSTATS",
++        "VLLM_E2_MEMSTATS_DIR",
++        "VLLM_E2_SCHED_LOG",
++        # Host-side scheduler assertion; the scheduler is never compiled.
++        "VLLM_E2_ZERO_OWNERSHIP_CHECK",
++        # Placement only: rewrites CUDA_VISIBLE_DEVICES for the PLE offload
++        # child, and CUDA_VISIBLE_DEVICES is already ignored above.
++        "VLLM_PLE_OFFLOAD_HOME_DEVICE",
++        # Timeouts and deadlines, in seconds. VLLM_PLE_OFFLOAD_READY_TIMEOUT
++        # was registered in the v2 host-embed commit and left hashed by
++        # oversight: serve-v2.sh sets it to 1800, so every boot that changed it
++        # missed the AOT cache for no reason.
++        "VLLM_PLE_OFFLOAD_READY_TIMEOUT",
++        "VLLM_PLE_OFFLOAD_WAIT_TIMEOUT",
++        "VLLM_PLE_PROGRESS_DEADLINE_S",
++        "VLLM_PLE_STARTUP_DEADLINE_S",
++        # Test-only fault injection: a cut spec, a marker log path and a
++        # bootstrap gate file. None of them reaches a kernel or a graph.
++        "VLLM_PLE_TEST_FAULT",
++        "VLLM_PLE_TEST_FAULT_GATE",
++        "VLLM_PLE_TEST_FAULT_LOG",
++        # Diagnostic knobs, both strictly host-side and outside capture, so
++        # neither AOT nor capture identity depends on them. Hashing
++        # them would invalidate every compile cache the moment a diagnostic
++        # boot is taken -- exactly when the cache is wanted. Remove from this
++        # set if either ever grows a device-side component.
++        # MERLIN_TOPK_EXACT_MEDIUM is deliberately NOT here: it is a capture
++        # configuration factor and is hashed conservatively.
++        "VLLM_E2_PLE_FLAG_CHECK",
++        "VLLM_E2_MAMBA_SLOT_OWNERSHIP",
++        # ------------------------------------------------------------------
+     }
+ 
+     from vllm.config.utils import normalize_value
+diff --git a/vllm/models/qwen4_exp/nvidia/qsa.py b/vllm/models/qwen4_exp/nvidia/qsa.py
+index adb057d1eb..91f34dead8 100644
+--- a/vllm/models/qwen4_exp/nvidia/qsa.py
++++ b/vllm/models/qwen4_exp/nvidia/qsa.py
+@@ -162,7 +162,10 @@ if _qsa_clip_raw and not (math.isfinite(_qsa_clip_interval) and _qsa_clip_interv
+ _qsa_clip_counters: dict[str, torch.Tensor] = {}
+ # v2 reader fix: the reader must never block on the compute
+ # stream; see guard_telemetry.NonBlockingReader.
+-from vllm.v1.worker.guard_telemetry import NonBlockingReader as _NonBlockingReader  # noqa: E402
++from vllm.v1.worker.guard_telemetry import (  # noqa: E402
++    NonBlockingReader as _NonBlockingReader,
++)
++
+ _qsa_clip_nb = _NonBlockingReader()
+ _qsa_clip_reader_started = False
+ _qsa_clip_lock = threading.Lock()
+@@ -217,7 +220,7 @@ def _qsa_clip_reader() -> None:
+ 
+ 
+ def _qsa_clip_count(
+-    layer: "Qwen4ExpQSAAttention",
++    layer: Qwen4ExpQSAAttention,
+     key: torch.Tensor,
+     value: torch.Tensor,
+     slot_mapping: torch.Tensor | None = None,
+diff --git a/vllm/v1/core/sched/e2_alloc_log.py b/vllm/v1/core/sched/e2_alloc_log.py
+index 0efcbd74f0..6fa2354feb 100644
+--- a/vllm/v1/core/sched/e2_alloc_log.py
++++ b/vllm/v1/core/sched/e2_alloc_log.py
+@@ -1,23 +1,45 @@
+ # SPDX-License-Identifier: Apache-2.0
+-"""Debug-only scheduler allocation log for KV capacity probes (off unless VLLM_E2_SCHED_LOG=<path>).
++"""Debug-only scheduler allocation log for KV-capacity probes (off unless
++VLLM_E2_SCHED_LOG=<path>).
+ 
+-One JSON line per scheduler update while any request exists, and one "fin" line per request as it is freed:
+-  {"t": wall, "m": monotonic, "step": n, "total": pool blocks, "free": free blocks, "running": r, "waiting": w,
++One JSON line per scheduler update while any request exists, and one "fin" line
++per request as it is freed:
++  {"t": wall, "m": monotonic, "step": n, "total": pool blocks,
++   "free": free blocks, "running": r, "waiting": w,
+    "tot": tokens scheduled this step,
+-   "reqs": [[id, prompt, computed, output, cached, preemptions, spec_scheduled, status, [blocks per group],
++   "reqs": [[id, prompt, computed, output, cached, preemptions,
++             spec_scheduled, status, [blocks per group],
+              tokens scheduled for this request this step]]}
+-  {"t": wall, "m": monotonic, "fin": [id, prompt, computed, output, cached, preemptions, status, [blocks per group]]}
+-Blocks are counted per KV-cache group, null blocks excluded. A logging failure writes an "error" line and never
+-raises into the scheduler. Unset = the scheduler only pays one env check per update.
++  {"t": wall, "m": monotonic,
++   "fin": [id, prompt, computed, output, cached, preemptions, status,
++           [blocks per group]]}
++Blocks are counted per KV-cache group, null blocks excluded. A logging failure
++writes an "error" line and never raises into the scheduler. Unset = the
++scheduler only pays one env check per update.
+ """
++
+ import json
+ import os
+ import time
+ 
+ _PATH = os.environ.get("VLLM_E2_SCHED_LOG", "")
+-_state = {"f": None, "step": 0, "flush": 0.0, "wrapped": False, "errors": 0, "checked": False}
+-REQ_FIELDS = ("request_id", "num_prompt_tokens", "num_computed_tokens", "num_output_tokens", "num_preemptions",
+-              "status", "prefill_stats")
++_state = {
++    "f": None,
++    "step": 0,
++    "flush": 0.0,
++    "wrapped": False,
++    "errors": 0,
++    "checked": False,
++}
++REQ_FIELDS = (
++    "request_id",
++    "num_prompt_tokens",
++    "num_computed_tokens",
++    "num_output_tokens",
++    "num_preemptions",
++    "status",
++    "prefill_stats",
++)
+ 
+ 
+ def enabled() -> bool:
+@@ -25,8 +47,10 @@ def enabled() -> bool:
+ 
+ 
+ def _blocks(sched, rid):
+-    return [sum(1 for b in m.req_to_blocks.get(rid, ()) if not b.is_null)
+-            for m in sched.kv_cache_manager.coordinator.single_type_managers]
++    return [
++        sum(1 for b in m.req_to_blocks.get(rid, ()) if not b.is_null)
++        for m in sched.kv_cache_manager.coordinator.single_type_managers
++    ]
+ 
+ 
+ def _status(r):
+@@ -34,28 +58,41 @@ def _status(r):
+ 
+ 
+ def _cached(r):
+-    """Prefix-cache hit for this request. vLLM keeps it in `request.prefill_stats` (PrefillStats.num_cached_tokens =
+-    local + external); the output processor takes those stats after the first prefill (`take_prefill_stats` sets the
+-    attribute to None), so -1 means "no longer knowable from the scheduler", never a silent zero."""
++    """Prefix-cache hit for this request. vLLM keeps it in
++    `request.prefill_stats` (PrefillStats.num_cached_tokens = local +
++    external); the output processor takes those stats after the first prefill
++    (`take_prefill_stats` sets the attribute to None), so -1 means "no longer
++    knowable from the scheduler", never a silent zero."""
+     ps = getattr(r, "prefill_stats", None)
+     return int(getattr(ps, "num_cached_tokens", -1)) if ps is not None else -1
+ 
+ 
+ def _contract(r):
+-    """Once per process: every field this log reads must exist on the real Request object. A missing field is written
+-    once as a schema_error record — the evaluator fails closed on it — instead of turning every row into an error."""
++    """Once per process: every field this log reads must exist on the real Request
++    object. A missing field is written once as a schema_error record — the evaluator
++    fails closed on it — instead of turning every row into an error."""
+     if _state["checked"]:
+         return
+     _state["checked"] = True
+     missing = [f for f in REQ_FIELDS if not hasattr(r, f)]
+     if missing:
+-        _write({"t": round(time.time(), 4), "m": round(time.monotonic(), 4), "schema_error": missing}, force=True)
++        _write(
++            {
++                "t": round(time.time(), 4),
++                "m": round(time.monotonic(), 4),
++                "schema_error": missing,
++            },
++            force=True,
++        )
+ 
+ 
+ def _write(rec, force=False):
+     f = _state["f"]
+     if f is None:
+-        f = _state["f"] = open(_PATH, "a", buffering=1 << 16)
++        # noqa SIM115: one append handle for the process lifetime, kept in
++        # _state and flushed on a cadence; a context manager would reopen the
++        # log on every scheduler update.
++        f = _state["f"] = open(_PATH, "a", buffering=1 << 16)  # noqa: SIM115
+     f.write(json.dumps(rec, separators=(",", ":")) + "\n")
+     if force or rec["t"] - _state["flush"] > 0.5:
+         f.flush()
+@@ -65,10 +102,19 @@ def _write(rec, force=False):
+ def _error(e):
+     _state["errors"] += 1
+     if _state["errors"] <= 20:
+-        try:
+-            _write({"t": round(time.time(), 4), "m": round(time.monotonic(), 4),
+-                    "error": f"{type(e).__name__}: {e}"[:300]}, force=True)
++        try:  # noqa: SIM105
++            _write(
++                {
++                    "t": round(time.time(), 4),
++                    "m": round(time.monotonic(), 4),
++                    "error": f"{type(e).__name__}: {e}"[:300],
++                },
++                force=True,
++            )
+         except Exception:  # noqa: BLE001
++            # SIM105: this module imports json, os and time only, so that an
++            # enabled log costs the scheduler nothing it can see; the
++            # last-resort writer does not earn a contextlib import.
+             pass
+ 
+ 
+@@ -77,10 +123,23 @@ def _wrap_free(sched):
+ 
+     def _free_request(request, *args, **kwargs):
+         try:
+-            _write({"t": round(time.time(), 4), "m": round(time.monotonic(), 4),
+-                    "fin": [request.request_id, request.num_prompt_tokens, request.num_computed_tokens,
+-                            request.num_output_tokens, _cached(request), request.num_preemptions,
+-                            _status(request), _blocks(sched, request.request_id)]}, force=True)
++            _write(
++                {
++                    "t": round(time.time(), 4),
++                    "m": round(time.monotonic(), 4),
++                    "fin": [
++                        request.request_id,
++                        request.num_prompt_tokens,
++                        request.num_computed_tokens,
++                        request.num_output_tokens,
++                        _cached(request),
++                        request.num_preemptions,
++                        _status(request),
++                        _blocks(sched, request.request_id),
++                    ],
++                },
++                force=True,
++            )
+         except Exception as e:  # noqa: BLE001 - the debug log must never break the scheduler
+             _error(e)
+         return orig(request, *args, **kwargs)
+@@ -100,12 +159,35 @@ def log_step(sched, scheduler_output) -> None:
+         pool = sched.kv_cache_manager.block_pool
+         nsched = getattr(scheduler_output, "num_scheduled_tokens", None) or {}
+         _contract(next(iter(sched.requests.values())))
+-        rows = [[rid, r.num_prompt_tokens, r.num_computed_tokens, r.num_output_tokens, _cached(r),
+-                 r.num_preemptions, len(spec.get(rid, ())), _status(r), _blocks(sched, rid), int(nsched.get(rid, 0))]
+-                for rid, r in sched.requests.items()]
+-        _write({"t": round(time.time(), 4), "m": round(time.monotonic(), 4), "step": _state["step"],
+-                "total": pool.num_gpu_blocks, "free": pool.get_num_free_blocks(),
+-                "running": len(sched.running), "waiting": len(sched.waiting),
+-                "tot": int(getattr(scheduler_output, "total_num_scheduled_tokens", 0) or 0), "reqs": rows})
++        rows = [
++            [
++                rid,
++                r.num_prompt_tokens,
++                r.num_computed_tokens,
++                r.num_output_tokens,
++                _cached(r),
++                r.num_preemptions,
++                len(spec.get(rid, ())),
++                _status(r),
++                _blocks(sched, rid),
++                int(nsched.get(rid, 0)),
++            ]
++            for rid, r in sched.requests.items()
++        ]
++        _write(
++            {
++                "t": round(time.time(), 4),
++                "m": round(time.monotonic(), 4),
++                "step": _state["step"],
++                "total": pool.num_gpu_blocks,
++                "free": pool.get_num_free_blocks(),
++                "running": len(sched.running),
++                "waiting": len(sched.waiting),
++                "tot": int(
++                    getattr(scheduler_output, "total_num_scheduled_tokens", 0) or 0
++                ),
++                "reqs": rows,
++            }
++        )
+     except Exception as e:  # noqa: BLE001
+         _error(e)
+diff --git a/vllm/v1/ple_offload/test_fault.py b/vllm/v1/ple_offload/test_fault.py
+index 3546a1f089..9ae74f7205 100644
+--- a/vllm/v1/ple_offload/test_fault.py
++++ b/vllm/v1/ple_offload/test_fault.py
+@@ -2,8 +2,12 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """Compatibility exports for the top-level test-only fault singleton."""
+ 
++from vllm_ple_test_fault import (
++    _FAULT as _FAULT,
++)
+ from vllm_ple_test_fault import (  # noqa: F401
+     FaultSpec as FaultSpec,
+-    _FAULT as _FAULT,
++)
++from vllm_ple_test_fault import (
+     _parse_fault_spec as _parse_fault_spec,
+ )
+diff --git a/vllm/v1/worker/guard_telemetry.py b/vllm/v1/worker/guard_telemetry.py
+index e95653e54e..adca93049f 100644
+--- a/vllm/v1/worker/guard_telemetry.py
++++ b/vllm/v1/worker/guard_telemetry.py
+@@ -174,9 +174,7 @@ SITE_NAMES = {
+ _MODE = os.environ.get("VLLM_E2_GUARD_MODE", "off").strip().lower()
+ if _MODE not in ("raise", "warn", "off"):
+     # fail closed: a set-but-broken gate must not silently disarm the instrument
+-    raise ValueError(
+-        f"VLLM_E2_GUARD_MODE must be raise|warn|off, got {_MODE!r}"
+-    )
++    raise ValueError(f"VLLM_E2_GUARD_MODE must be raise|warn|off, got {_MODE!r}")
+ 
+ 
+ def _parse_interval(text: str) -> float:
+@@ -241,7 +239,7 @@ class NonBlockingReader:
+     """
+ 
+     def __init__(self) -> None:
+-        self._streams: dict[torch.device, "torch.cuda.Stream"] = {}
++        self._streams: dict[torch.device, torch.cuda.Stream] = {}
+         # key -> [device_tensor, pinned_host_tensor | None, event | None, inflight]
+         self._jobs: dict[object, list] = {}
+         self._lock = threading.Lock()
+@@ -266,7 +264,9 @@ class NonBlockingReader:
+             if dev not in self._streams:
+                 with torch.cuda.device(dev):
+                     self._streams[dev] = torch.cuda.Stream(device=dev)
+-            host = torch.empty(tensor.shape, dtype=tensor.dtype, device="cpu", pin_memory=True)
++            host = torch.empty(
++                tensor.shape, dtype=tensor.dtype, device="cpu", pin_memory=True
++            )
+             with torch.cuda.device(dev):
+                 event = torch.cuda.Event()
+             self._jobs[key] = [tensor, host, event, False]
+@@ -333,7 +333,8 @@ class NonBlockingReader:
+ 
+ 
+ _nb_reader = NonBlockingReader()
+-# device -> the copy in which a count increase was first seen (reported on the next tick)
++# device -> the copy in which a count increase was first seen
++# (reported on the next tick)
+ _confirm_pending: dict[torch.device, list] = {}
+ 
+ # Sites that arm the pending raise even under VLLM_E2_GUARD_MODE=warn. warn is
+@@ -442,12 +443,11 @@ def start_reader() -> None:
+     if _reader_started or _MODE == "off":
+         return
+     _reader_started = True
+-    threading.Thread(
+-        target=_reader, name="bounds-guard-reader", daemon=True
+-    ).start()
++    threading.Thread(target=_reader, name="bounds-guard-reader", daemon=True).start()
+     logger.info(
+         "bounds-guard reader started (mode=%s, interval=%.3gs).",
+-        _MODE, _INTERVAL,
++        _MODE,
++        _INTERVAL,
+     )
+ 
+ 
+@@ -531,7 +531,11 @@ def _poll_once() -> None:
+             # by which time the maxima of that hit are written). The fatal
+             # decision is count-based either way; only its report waits a tick.
+             pend = _confirm_pending.get(device)
+-            rising = [site for site, (n, _r, _v) in enumerate(rows) if n > _seen.get((device, site), 0)]
++            rising = [
++                site
++                for site, (n, _r, _v) in enumerate(rows)
++                if n > _seen.get((device, site), 0)
++            ]
+             if pend is None:
+                 if rising:
+                     _confirm_pending[device] = rows
+@@ -644,21 +648,18 @@ def drain(*, raise_on_fatal: bool = False) -> dict[str, list[int]]:
+         _report_rows(device, rows)
+         for site, (n_masked, _r, _v) in enumerate(rows):
+             if n_masked and (_MODE == "raise" or site in _ALWAYS_FATAL_SITES):
+-                fatal.append(
+-                    f"{SITE_NAMES.get(site, site)} on {device}: {n_masked}"
+-                )
++                fatal.append(f"{SITE_NAMES.get(site, site)} on {device}: {n_masked}")
+     snap = snapshot()
+     if fatal:
+         logger.error(
+             "bounds-guard FINAL DRAIN: fatal-site hits %s (snapshot %s)",
+-            fatal, snap,
++            fatal,
++            snap,
+         )
+         if raise_on_fatal:
+             raise RuntimeError(f"bounds-guard FINAL DRAIN: fatal-site hits {fatal}")
+     else:
+-        logger.info(
+-            "bounds-guard FINAL DRAIN: no fatal-site hits (snapshot %s)", snap
+-        )
++        logger.info("bounds-guard FINAL DRAIN: no fatal-site hits (snapshot %s)", snap)
+     return snap
+ 
+ 
+diff --git a/vllm/v1/worker/mamba_utils.py b/vllm/v1/worker/mamba_utils.py
+index a6972f1cde..eeeadaea0e 100644
+--- a/vllm/v1/worker/mamba_utils.py
++++ b/vllm/v1/worker/mamba_utils.py
+@@ -832,7 +832,7 @@ def postprocess_mamba_fused_kernel(
+     if src_block_idx == dest_block_idx and accept_token_bias == 0:
+         return
+ 
+-    if BT_ROW_IS_REQ:
++    if BT_ROW_IS_REQ:  # noqa: SIM108 -- a ternary would drop this comment
+         # Persistent per-req-slot table: the row is the request's own slot, so
+         # it stays correct however many steps separate the gather from this
+         # launch (the PP-deferred post-process is enqueued at the top of
+diff --git a/vllm_ple_test_fault/__init__.py b/vllm_ple_test_fault/__init__.py
+index e8fe835ad3..41830e02c4 100644
+--- a/vllm_ple_test_fault/__init__.py
++++ b/vllm_ple_test_fault/__init__.py
+@@ -145,16 +145,12 @@ class FaultSpec:
+                 if bytes_sent is not None or frame_size is None:
+                     return False
+                 suffix = (
+-                    f" bytes_written={int(bytes_written)}"
+-                    f" frame_size={int(frame_size)}"
++                    f" bytes_written={int(bytes_written)} frame_size={int(frame_size)}"
+                 )
+             elif bytes_sent is not None:
+                 if frame_size is None:
+                     return False
+-                suffix = (
+-                    f" bytes_sent={int(bytes_sent)}"
+-                    f" frame_size={int(frame_size)}"
+-                )
++                suffix = f" bytes_sent={int(bytes_sent)} frame_size={int(frame_size)}"
+             elif frame_size is not None:
+                 return False
+             message = (
+@@ -306,7 +302,9 @@ def _parse_fault_spec(value: str | None) -> FaultSpec | None:
+     if value is None:
+         return None
+     if not value or value != value.strip():
+-        raise ValueError(f"{_ENV_NAME}: spec must be non-empty with no outer whitespace")
++        raise ValueError(
++            f"{_ENV_NAME}: spec must be non-empty with no outer whitespace"
++        )
+ 
+     fields: dict[str, str] = {}
+     for item in value.split(","):
+@@ -355,8 +353,7 @@ def _parse_fault_spec(value: str | None) -> FaultSpec | None:
+ 
+     if role in {"offload", "bootstrap"} and not has_any_rank:
+         raise ValueError(
+-            f"{_ENV_NAME}: {role} cut {cut!r} requires rank=any; "
+-            "it has no TP/PP rank"
++            f"{_ENV_NAME}: {role} cut {cut!r} requires rank=any; it has no TP/PP rank"
+         )
+     if role == "gpu":
+         if pp_rank is not None and pp_rank != 0:

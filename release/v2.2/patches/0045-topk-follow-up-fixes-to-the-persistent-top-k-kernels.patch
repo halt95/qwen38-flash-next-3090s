@@ -1,0 +1,1079 @@
+From 563c15942a39a5f56d994451174a4ab80dbf425b Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Wed, 23 Sep 2026 08:35:50 -0400
+Subject: [PATCH 45/58] topk: follow-up fixes to the persistent top-k kernels
+
+- Counter enum declared above the decode template (two-phase lookup).
+- Emission-fault flag set atomically.
+- Close the legacy large tie loop with a block barrier (inherited).
+- Large-path fault injectors registered as hashed passthroughs.
+- The tensor-free counter-slots op registered for CompositeExplicitAutograd.
+- Tie measurements recorded only on rows neither fault verdict failed.
+- Tests scoped to the properties the build promises.
+---
+ csrc/libtorch_stable/persistent_topk.cuh | 199 +++++++----
+ csrc/libtorch_stable/topk.cu             |  41 ++-
+ csrc/libtorch_stable/torch_bindings.cpp  |   8 +-
+ tests/kernels/test_top_k_per_row.py      | 403 +++++++++++++++++++++--
+ tests/test_envs.py                       |  46 ++-
+ vllm/envs.py                             |  37 +++
+ 6 files changed, 642 insertions(+), 92 deletions(-)
+
+diff --git a/csrc/libtorch_stable/persistent_topk.cuh b/csrc/libtorch_stable/persistent_topk.cuh
+index f8ce8597f5..85d217f9be 100644
+--- a/csrc/libtorch_stable/persistent_topk.cuh
++++ b/csrc/libtorch_stable/persistent_topk.cuh
+@@ -189,6 +189,87 @@ struct PersistentTopKParams {
+   // constant like the two switches.  Setting it also suppresses __trap(), because
+   // the point of injecting is to observe the trap-off row-failure policy.
+   int fault_inject_cta;
++  // Which fault the injector forces in that CTA.
++  //   false (MERLIN_TOPK_LARGE_FAULT_KIND unset or `pre`): the PRE-EMISSION
++  //     predicate `my_keep > local_eq`, caught at X3.  Emission is skipped
++  //     entirely on that row, so this kind cannot reach the X4 code at all.
++  //   true (`emit`): the EMISSION-BOUND slot check inside the placement loop,
++  //     caught at X4.  This is the only way to exercise `suffix_sum[6]`, and
++  //     it exercises it the way the hardware would: every emitting thread of
++  //     the named CTA discovers an invalid slot at once, which is exactly the
++  //     concurrency the atomic exists for.
++  // Resolved once per process on the host, so it is a launch constant.
++  bool fault_inject_emit;
++};
++
++// ============================================================================
++// Device-global exact-path counters -- DECLARED HERE, ABOVE EVERY USER.
++//
++// This enum used to live beside the medium-path restart,
++// ~200 lines BELOW the decode template that increments
++// `kCtrDecodeOverflow`.  `counters` is a plain `unsigned long long*`
++// parameter, so that enumerator is a NON-DEPENDENT name: two-phase lookup
++// resolves it when the template is DEFINED, not when it is instantiated,
++// and the Linux build rejected the tree with
++//   persistent_topk.cuh(442): identifier "kCtrDecodeOverflow" is undefined.
++// An offline `nvcc -cubin` on a non-Linux host does NOT reproduce that on its own: nvcc
++// can drive cicc in Microsoft mode (`--ms_c++17 --microsoft_version=`), and that mode
++// defers non-dependent lookup to instantiation, where the enum is already
++// visible.  `-Xcudafe --dep_name` restores strict two-phase lookup and the
++// offline harness then reproduces the Linux diagnostic verbatim.
++//
++// The fix is the declaration ORDER, not a literal: every increment still
++// names its enumerator, so a slot renumbering stays a one-line edit here.
++// ============================================================================
++
++// Device-global counters.  Plain device atomics on a process-lifetime buffer:
++// no host sync and no host-visible allocation on the launch path, so this is
++// safe to record inside a cudagraph capture and on every replay.  Read from
++// Python with `torch.ops._C.persistent_topk_exact_counters`.
++//
++// The counters are `unsigned long long`, not `unsigned int`,
++// and the reader tensor is int64.  A u32 counter copied into a SIGNED int32
++// tensor goes negative, then wraps: at 65,536 columns with k=512 an all-equal
++// row drops 65,024 ties, so slot 6 crosses the signed boundary after 33,027
++// rows and wraps after 66,053, and a delta taken across that boundary is a
++// wrong number that looks like a measurement.  `atomicAdd(unsigned long long*)`
++// is native on sm_86, so the width costs nothing on the increment path.
++//
++// SLOT MAP (the tie-determinism + large-path integration, 11 slots).  The tie change numbered its decode
++// counter AROUND the large-path block rather than after the medium-path one, so the merged layout is
++// the union of the two branches with nothing renumbered and no external probe
++// silently re-reading a row count as a switch -- the failure a merged layout
++// must avoid.
++//
++//   [0] medium rows      [1] medium overflow   [2] medium exact fallback
++//   [3] medium exact fault
++//   [4]-[7]  large path (rows_large, ties_cut, ties_dropped, faults_large)
++//   [8] MERLIN_TOPK_EXACT_MEDIUM   [9] MERLIN_TOPK_DET_LARGE
++//   [10] decode overflow
++//
++// Slots 8-9 are written by the HOST after the device copy; the device never
++// touches them, and they are slots INSIDE the array, not two elements appended
++// after it.  A stale five- or ten-element reader buffer is rejected outright by
++// the length check in the reader op, which is the fail-loud direction.
++enum TopKExactCounter : int {
++  kCtrMediumRows = 0,           // denominator: medium-path rows entered
++  kCtrMediumOverflow = 1,       // rows where a 4,096-slot guard would drop
++  kCtrMediumExactFallback = 2,  // rows that took the exact restart
++  kCtrMediumExactFault = 3,     // exact restart could not complete
++  // Large path (multi-CTA radix_topk, seq_len > RADIX_THRESHOLD).
++  // Slots 4-7 are only ever touched by the deterministic emission, so they
++  // stay 0 in the MERLIN_TOPK_DET_LARGE=0 control arm: `[9] == 1 && [4] == 0`
++  // while large rows are known to have run means the host-side capacity gate
++  // (4 * ctas_per_group <= RADIX) turned the switch off for that launch.
++  kCtrLargeDetRows = 4,       // large rows emitted deterministically
++  kCtrLargeTiesCut = 5,       // rows where the pivot-equal group was cut
++  kCtrLargeTiesDropped = 6,   // pivot-equal elements discarded by those cuts
++  kCtrLargeFault = 7,         // large-path invariant violation
++  kSlotSwitchMedium = 8,        // host-written flag, NOT a device counter
++  kSlotSwitchLarge = 9,         // host-written flag, NOT a device counter
++  kCtrDecodeOverflow = 10,      // decode rows whose buffered-candidate count
++                                // exceeded DBUF before deterministic ranking
++  kNumTopKExactCounters = 11,   // total slots: device buffer AND reader output
+ };
+ 
+ // ============================================================================
+@@ -604,56 +685,6 @@ __device__ __noinline__ bool histogram_2048_topk(
+   #define MERLIN_TOPK_EXACT_TRAP 1
+ #endif
+ 
+-// Device-global counters.  Plain device atomics on a process-lifetime buffer:
+-// no host sync and no host-visible allocation on the launch path, so this is
+-// safe to record inside a cudagraph capture and on every replay.  Read from
+-// Python with `torch.ops._C.persistent_topk_exact_counters`.
+-//
+-// The counters are `unsigned long long`, not `unsigned int`,
+-// and the reader tensor is int64.  A u32 counter copied into a SIGNED int32
+-// tensor goes negative, then wraps: at 65,536 columns with k=512 an all-equal
+-// row drops 65,024 ties, so slot 6 crosses the signed boundary after 33,027
+-// rows and wraps after 66,053, and a delta taken across that boundary is a
+-// wrong number that looks like a measurement.  `atomicAdd(unsigned long long*)`
+-// is native on sm_86, so the width costs nothing on the increment path.
+-//
+-// SLOT MAP (the tie-determinism + large-path integration, 11 slots).  The tie change numbered its decode
+-// counter AROUND the large-path block rather than after the medium-path one, so the merged layout is
+-// the union of the two branches with nothing renumbered and no external probe
+-// silently re-reading a row count as a switch -- the failure a merged layout
+-// must avoid.
+-//
+-//   [0] medium rows      [1] medium overflow   [2] medium exact fallback
+-//   [3] medium exact fault
+-//   [4]-[7]  large path (rows_large, ties_cut, ties_dropped, faults_large)
+-//   [8] MERLIN_TOPK_EXACT_MEDIUM   [9] MERLIN_TOPK_DET_LARGE
+-//   [10] decode overflow
+-//
+-// Slots 8-9 are written by the HOST after the device copy; the device never
+-// touches them, and they are slots INSIDE the array, not two elements appended
+-// after it.  A stale five- or ten-element reader buffer is rejected outright by
+-// the length check in the reader op, which is the fail-loud direction.
+-enum TopKExactCounter : int {
+-  kCtrMediumRows = 0,           // denominator: medium-path rows entered
+-  kCtrMediumOverflow = 1,       // rows where a 4,096-slot guard would drop
+-  kCtrMediumExactFallback = 2,  // rows that took the exact restart
+-  kCtrMediumExactFault = 3,     // exact restart could not complete
+-  // Large path (multi-CTA radix_topk, seq_len > RADIX_THRESHOLD).
+-  // Slots 4-7 are only ever touched by the deterministic emission, so they
+-  // stay 0 in the MERLIN_TOPK_DET_LARGE=0 control arm: `[9] == 1 && [4] == 0`
+-  // while large rows are known to have run means the host-side capacity gate
+-  // (4 * ctas_per_group <= RADIX) turned the switch off for that launch.
+-  kCtrLargeDetRows = 4,       // large rows emitted deterministically
+-  kCtrLargeTiesCut = 5,       // rows where the pivot-equal group was cut
+-  kCtrLargeTiesDropped = 6,   // pivot-equal elements discarded by those cuts
+-  kCtrLargeFault = 7,         // large-path invariant violation
+-  kSlotSwitchMedium = 8,        // host-written flag, NOT a device counter
+-  kSlotSwitchLarge = 9,         // host-written flag, NOT a device counter
+-  kCtrDecodeOverflow = 10,      // decode rows whose buffered-candidate count
+-                                // exceeded DBUF before deterministic ranking
+-  kNumTopKExactCounters = 11,   // total slots: device buffer AND reader output
+-};
+-
+ // Exact, bounded-memory re-selection for a single medium-path row.
+ //
+ // `scores` is already offset to the row.  Every radix round rescans the whole
+@@ -1419,7 +1450,8 @@ __device__ __noinline__ void radix_emit_deterministic(
+     uint32_t* local_histogram, uint32_t* suffix_sum, uint32_t* shared_ordered,
+     RadixRowState* state, uint32_t cta_in_group, uint32_t ctas_per_group,
+     int& barrier_phase, uint32_t radix_iter, uint32_t tx,
+-    unsigned long long* counters, int fault_inject_cta, bool tie_recent) {
++    unsigned long long* counters, int fault_inject_cta,
++    bool fault_inject_emit, bool tie_recent) {
+   constexpr uint32_t kWarpsPerBlock = kThreadsPerBlock / 32u;
+   // Staging for the published per-CTA counts.  The host gates the switch on
+   // 4 * ctas_per_group <= RADIX, so these regions never collide.
+@@ -1585,7 +1617,7 @@ __device__ __noinline__ void radix_emit_deterministic(
+     // Test-only: force the CTA-LOCAL predicate in one named CTA, so a fault
+     // that originates outside CTA 0 can be observed.  Off (-1) in production;
+     // the host resolves it once per process, so it is a launch constant.
+-    if (fault_inject_cta >= 0 &&
++    if (fault_inject_cta >= 0 && !fault_inject_emit &&
+         static_cast<int>(cta_in_group) == fault_inject_cta) {
+       my_keep_checked = local_eq + 1u;
+     }
+@@ -1622,22 +1654,22 @@ __device__ __noinline__ void radix_emit_deterministic(
+   barrier_phase++;
+   __syncthreads();
+ 
++  // Tie measurement staged in thread 0's register; recorded only after BOTH
++  // verdicts (X3 here, X4 after emission) have cleared the row. Recording it
++  // here, behind X3 alone, counted tie cuts for rows an emission-bound fault
++  // later failed closed (reference host, FAULT_KIND=emit: ties_cut +8 on 8
++  // all -1 rows).
++  uint32_t staged_ties_dropped = 0u;
+   if (tx == 0) {
+     uint32_t row_fault = 0u;
+     for (uint32_t c = 0; c < ctas_per_group; ++c) {
+       row_fault |= cta_counts[kFaultStage + c];
+     }
+     suffix_sum[5] = row_fault;
++    staged_ties_dropped = suffix_sum[8];
+ 
+     if (counters != nullptr && cta_in_group == 0u) {
+       atomicAdd(&counters[kCtrLargeDetRows], 1ull);
+-      // Only meaningful on a healthy row: on a faulted one the tie arithmetic
+-      // is what is under suspicion, so do not record it as a measurement.
+-      if (row_fault == 0u && suffix_sum[8] > 0u) {
+-        atomicAdd(&counters[kCtrLargeTiesCut], 1ull);
+-        atomicAdd(&counters[kCtrLargeTiesDropped],
+-                  static_cast<unsigned long long>(suffix_sum[8]));
+-      }
+     }
+   }
+   __syncthreads();
+@@ -1648,6 +1680,17 @@ __device__ __noinline__ void radix_emit_deterministic(
+   const uint32_t keep_width = suffix_sum[9];
+   const uint32_t row_fault = suffix_sum[5];
+ 
++  // TEST ONLY: force the emission-bound violation in one
++  // named CTA.  Block-uniform (both operands are launch constants and
++  // `cta_in_group` is block-uniform), so it changes no control flow the whole
++  // block does not take together.  It deliberately fires for EVERY emitting
++  // thread of that CTA rather than one: the defect under repair is a
++  // concurrent write to `suffix_sum[6]`, and a single-writer injection would
++  // pass with the broken code.
++  const bool force_emit_fault =
++      fault_inject_emit && fault_inject_cta >= 0 &&
++      static_cast<int>(cta_in_group) == fault_inject_cta;
++
+   // ---- emission: rank by index, no atomics -------------------------------
+   if (row_fault == 0u) {
+     // Scratch for the tile scan.  The staged per-CTA counts above are dead by
+@@ -1724,7 +1767,7 @@ __device__ __noinline__ void radix_emit_deterministic(
+             (eq_rank > cut_rank) ? (eq_rank - cut_rank) : 0u;
+         if (kept_eq_before > keep_width) kept_eq_before = keep_width;
+         const uint32_t slot = gt_base + eq_keep_base + gt_rank + kept_eq_before;
+-        if (slot < static_cast<uint32_t>(TopK)) {
++        if (slot < static_cast<uint32_t>(TopK) && !force_emit_fault) {
+           row_output[slot] = static_cast<int32_t>(my_chunk_start + i);
+         } else {
+           // An out-of-range slot used to bump a counter and
+@@ -1732,7 +1775,16 @@ __device__ __noinline__ void radix_emit_deterministic(
+           // promised all-`-1` row.  It is now recorded as a row failure and
+           // goes through the SAME policy as the pre-emission faults below: no
+           // store here, and the row is filled with -1 after the group agrees.
+-          suffix_sum[6] = 1u;
++          //
++          // ATOMIC, not a plain store.  Every thread whose
++          // slot is out of range reaches this line, and an invariant failure
++          // is precisely the situation in which several of them do at once --
++          // so the plain `suffix_sum[6] = 1u` was a concurrent non-atomic
++          // write inside the mechanism that exists to detect the failure.  It
++          // is a shared-memory word and the flag is monotonic, so `atomicOr`
++          // is the whole fix; the healthy path never executes it.  The medium
++          // restart already uses atomicOr for the same job.
++          atomicOr(&suffix_sum[6], 1u);
+         }
+       }
+ 
+@@ -1765,6 +1817,14 @@ __device__ __noinline__ void radix_emit_deterministic(
+       emit_fault |= cta_counts[kEmitStage + c];
+     }
+     suffix_sum[7] = emit_fault;
++    // Only meaningful on a healthy row: on a faulted one the tie arithmetic
++    // is what is under suspicion, so do not record it as a measurement.
++    if (counters != nullptr && cta_in_group == 0u && row_fault == 0u &&
++        emit_fault == 0u && staged_ties_dropped > 0u) {
++      atomicAdd(&counters[kCtrLargeTiesCut], 1ull);
++      atomicAdd(&counters[kCtrLargeTiesDropped],
++                static_cast<unsigned long long>(staged_ties_dropped));
++    }
+   }
+   __syncthreads();
+ 
+@@ -1814,7 +1874,7 @@ __device__ void radix_topk(const float* __restrict__ row_input,
+                            uint32_t ctas_per_group, int& barrier_phase,
+                            uint32_t radix_iter, uint32_t tx, bool det_large,
+                            unsigned long long* counters, int fault_inject_cta,
+-                           bool tie_recent) {
++                           bool fault_inject_emit, bool tie_recent) {
+   const uint32_t my_chunk_end = (my_chunk_start + chunk_size < seq_len)
+                                     ? my_chunk_start + chunk_size
+                                     : seq_len;
+@@ -1975,7 +2035,7 @@ __device__ void radix_topk(const float* __restrict__ row_input,
+         row_output, ordered_pivot, shared_scalars[1], my_chunk_start,
+         actual_chunk_size, local_histogram, suffix_sum, shared_ordered, state,
+         cta_in_group, ctas_per_group, barrier_phase, radix_iter, tx, counters,
+-        fault_inject_cta, tie_recent);
++        fault_inject_cta, fault_inject_emit, tie_recent);
+     return;
+   }
+ 
+@@ -2029,6 +2089,18 @@ __device__ void radix_topk(const float* __restrict__ row_input,
+       }
+     }
+   }
++  // BASELINE repair (inherited from v2.0.1): the tie loop
++  // above reads shared_ordered, and the next row this CTA processes -- a
++  // large row's Stage-1 chunk load, or a decode/medium row reusing the same
++  // dynamic shared memory -- writes it before its first barrier. Without a
++  // closing barrier a fast warp can overwrite entries a slow warp is still
++  // comparing against the pivot, changing tie MEMBERSHIP, not only order.
++  // Every thread of the block reaches this point (the loop bound is
++  // block-uniform and there is no early return in the legacy tail), so the
++  // barrier is uniform. Applies to both comparison arms: the legacy path is
++  // the MERLIN_TOPK_DET_LARGE=0 control, so the control now carries this
++  // repair too, like the histogram-publication barrier (an earlier commit).
++  __syncthreads();
+ }
+ 
+ // ============================================================================
+@@ -2142,6 +2214,7 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 2)
+         local_histogram, suffix_sum, shared_scalars, shared_ordered, state,
+         cta_in_group, ctas_per_group, barrier_phase, radix_iter, tx,
+         params.det_large, params.exact_counters, params.fault_inject_cta,
++        params.fault_inject_emit,
+         effective_tie_recent(params.det_ties, params.tie_recent));
+     radix_iter++;
+   }
+diff --git a/csrc/libtorch_stable/topk.cu b/csrc/libtorch_stable/topk.cu
+index 2d2c81dc07..56b0af4cf8 100644
+--- a/csrc/libtorch_stable/topk.cu
++++ b/csrc/libtorch_stable/topk.cu
+@@ -6,6 +6,7 @@
+ #include <atomic>
+ #include <cstdio>
+ #include <cstdlib>
++#include <cstring>
+ #include <mutex>
+ 
+ #include "ops.h"
+@@ -131,6 +132,31 @@ int large_fault_inject_cta() {
+   return cta;
+ }
+ 
++// ---------------------------------------------------------------------------
++// MERLIN_TOPK_LARGE_FAULT_KIND.  TEST ONLY, companion to
++// the variable above; ignored unless MERLIN_TOPK_LARGE_FAULT_INJECT names a
++// CTA.
++//
++//   unset / "pre" (default)  force the PRE-EMISSION predicate, caught at X3.
++//   "emit"                   force the EMISSION-BOUND slot check, caught at X4.
++//
++// The two are mutually exclusive by construction: a pre-emission fault makes
++// `row_fault` nonzero, the emission block is skipped wholesale, and the X4
++// code -- including `suffix_sum[6]`, the word whose concurrent non-atomic
++// write this change is about -- is never reached.  The shipped injector could
++// therefore only ever exercise the arm that was already correct, which is why
++// the X4 arm had never been exercised.  Resolved once per process like
++// every other switch here, so it is a launch constant a cudagraph bakes in.
++// ---------------------------------------------------------------------------
++bool large_fault_inject_emit() {
++  static const bool emit = [] {
++    const char* raw = std::getenv("MERLIN_TOPK_LARGE_FAULT_KIND");
++    if (raw == nullptr || raw[0] == '\0') return false;
++    return std::strncmp(raw, "emit", 5) == 0;
++  }();
++  return emit;
++}
++
+ // ---------------------------------------------------------------------------
+ // Say the effective tie policy out loud, once.
+ //
+@@ -495,6 +521,7 @@ void launch_persistent_topk(const torch::stable::Tensor& logits,
+         4u * ctas_per_group <= static_cast<uint32_t>(P::RADIX);
+     params.det_large = det_large_enabled() && det_large_fits;
+     params.fault_inject_cta = large_fault_inject_cta();
++    params.fault_inject_emit = large_fault_inject_emit();
+     if (det_large_enabled() && !det_large_fits) {
+       static std::atomic<bool> det_large_warned{false};
+       if (!det_large_warned.exchange(true)) {
+@@ -510,11 +537,15 @@ void launch_persistent_topk(const torch::stable::Tensor& logits,
+       static std::atomic<bool> inject_warned{false};
+       if (!inject_warned.exchange(true)) {
+         std::fprintf(stderr,
+-                     "[vllm] MERLIN_TOPK_LARGE_FAULT_INJECT=%d is set: the "
+-                     "large path FORCES a fault in that CTA of every "
+-                     "deterministic large row and returns an all -1 row. This "
+-                     "is a test mode and must not be set in production.\n",
+-                     params.fault_inject_cta);
++                     "[vllm] MERLIN_TOPK_LARGE_FAULT_INJECT=%d kind=%s is "
++                     "set: the large path FORCES a %s fault in that CTA of "
++                     "every deterministic large row and returns an all -1 row. "
++                     "This is a test mode and must not be set in "
++                     "production.\n",
++                     params.fault_inject_cta,
++                     params.fault_inject_emit ? "emit" : "pre",
++                     params.fault_inject_emit ? "emission-bound (X4)"
++                                              : "pre-emission (X3)");
+       }
+     }
+     params.det_ties = det_ties_enabled();
+diff --git a/csrc/libtorch_stable/torch_bindings.cpp b/csrc/libtorch_stable/torch_bindings.cpp
+index 53f4577b0d..3b23bc1cd2 100644
+--- a/csrc/libtorch_stable/torch_bindings.cpp
++++ b/csrc/libtorch_stable/torch_bindings.cpp
+@@ -867,8 +867,6 @@ STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
+   ops.impl("persistent_topk", TORCH_BOX(&persistent_topk));
+   ops.impl("persistent_topk_exact_counters",
+            TORCH_BOX(&persistent_topk_exact_counters));
+-  ops.impl("persistent_topk_exact_counters_slots",
+-           TORCH_BOX(&persistent_topk_exact_counters_slots));
+ #ifdef VLLM_ENABLE_COOPERATIVE_TOPK
+   ops.impl("cooperative_topk", TORCH_BOX(&cooperative_topk));
+ #endif
+@@ -945,6 +943,12 @@ STABLE_TORCH_LIBRARY_IMPL(_C, CompositeExplicitAutograd, ops) {
+   ops.impl("cutlass_scaled_mm_supports_fp4",
+            TORCH_BOX(&cutlass_scaled_mm_supports_fp4));
+ #endif
++  // Tensor-free: the counter layout the BUILD carries. Registered here, not
++  // in the CUDA block -- with no tensor argument there is no dispatch key, so
++  // a CUDA-only registration can never be called (reference host:
++  // NotImplementedError "no fallback function is registered").
++  ops.impl("persistent_topk_exact_counters_slots",
++           TORCH_BOX(&persistent_topk_exact_counters_slots));
+ }
+ 
+ // Cache ops
+diff --git a/tests/kernels/test_top_k_per_row.py b/tests/kernels/test_top_k_per_row.py
+index fa6ee84f0b..2b45b3ba48 100644
+--- a/tests/kernels/test_top_k_per_row.py
++++ b/tests/kernels/test_top_k_per_row.py
+@@ -2423,11 +2423,15 @@ LARGEDET_KEPT = LARGEDET_TOP_K - LARGEDET_ABOVE  # 312 of the 700 survive
+ LARGEDET_DROPPED = LARGEDET_TIE - LARGEDET_KEPT  # 388 are cut
+ 
+ 
+-def _build_largedet_tie_row(num_rows: int) -> tuple[torch.Tensor, torch.Tensor]:
++def _build_largedet_tie_row(
++    num_rows: int, tie_recent: bool | None = None
++) -> tuple[torch.Tensor, torch.Tensor]:
+     """Identical rows with a deliberate multi-CTA tie at the cutoff.
+ 
+     Returns (logits, expected_indices) where expected_indices is the ascending
+-    int64 index list the deterministic kernel must return for every row.
++    int64 index list the deterministic kernel must return for every row, in the
++    tie direction this launch actually runs (an earlier oracle hard-coded
++    most-recent-wins).
+     """
+     gen = torch.Generator(device="cpu").manual_seed(19)
+     perm = torch.randperm(LARGEDET_SEQ_LEN, generator=gen, device="cpu")
+@@ -2445,7 +2449,10 @@ def _build_largedet_tie_row(num_rows: int) -> tuple[torch.Tensor, torch.Tensor]:
+ 
+     logits = row.to("cuda").unsqueeze(0).repeat(num_rows, 1).contiguous()
+ 
+-    kept_tie = torch.sort(tie_idx).values[-LARGEDET_KEPT:]
++    if tie_recent is None:
++        tie_recent = _largedet_effective_tie_recent()
++    sorted_tie = torch.sort(tie_idx).values
++    kept_tie = sorted_tie[-LARGEDET_KEPT:] if tie_recent else sorted_tie[:LARGEDET_KEPT]
+     expected = torch.sort(torch.cat([above_idx, kept_tie])).values.to(torch.int64)
+     assert expected.numel() == LARGEDET_TOP_K
+     return logits, expected
+@@ -2488,7 +2495,7 @@ def _largedet_counters_or_skip(require_on: bool) -> list[int]:
+ @pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
+ @torch.inference_mode()
+ def test_persistent_topk_large_tie_keeps_highest_indices() -> None:
+-    """Multi-CTA tie at the cutoff: most-recent-wins, ascending, reproducible."""
++    """Multi-CTA tie at the cutoff: the effective direction, ascending, reproducible."""
+     torch.set_default_device("cuda:0")
+     num_rows = 8  # <= 32 keeps the dispatch on persistent_topk
+ 
+@@ -2530,9 +2537,12 @@ def test_persistent_topk_large_tie_keeps_highest_indices() -> None:
+         )
+ 
+         # 3. The set is the analytic one: everything above the pivot, plus the
+-        #    312 HIGHEST-indexed of the 700 pivot-equal elements.
++        #    312 highest- or lowest-indexed of the 700 pivot-equal elements,
++        #    whichever the effective direction says.
+         assert torch.equal(got.cpu(), expected), (
+-            f"row {row}: selected set is not most-recent-wins at the cutoff"
++            f"row {row}: selected set is not the "
++            f"{'most-recent' if _largedet_effective_tie_recent() else 'oldest'}"
++            "-wins set at the cutoff"
+         )
+ 
+         # 4. The weaker check torch.topk can make: same value multiset.
+@@ -2638,6 +2648,12 @@ def test_persistent_topk_large_fault_in_nonzero_cta_fails_closed() -> None:
+             "pass; run this test in its own process with the variable set to a "
+             "NONZERO CTA index."
+         )
++    if os.getenv("MERLIN_TOPK_LARGE_FAULT_KIND", "pre").strip() == "emit":
++        pytest.skip(
++            "this is the PRE-emission (X3) fault test; the process has "
++            "MERLIN_TOPK_LARGE_FAULT_KIND=emit, which the emission-bound test "
++            "covers. Run this one in a process with KIND unset or 'pre'."
++        )
+     assert int(inject) > 0, (
+         "this test exists to prove a fault originating outside CTA 0 fails the "
+         f"row closed; MERLIN_TOPK_LARGE_FAULT_INJECT={inject} is CTA 0"
+@@ -2677,6 +2693,96 @@ def test_persistent_topk_large_fault_in_nonzero_cta_fails_closed() -> None:
+     )
+ 
+ 
++@pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
++@torch.inference_mode()
++def test_persistent_topk_large_emission_fault_fails_closed() -> None:
++    """The EMISSION-BOUND (X4) fault arm, from CTA 0 and from a nonzero CTA.
++
++    `suffix_sum[6]` -- the per-CTA emission-violation flag --
++    was written with a plain `suffix_sum[6] = 1u`. Every thread whose computed
++    slot is out of range reaches that line, and an invariant failure is exactly
++    the situation in which many of them do at once, so the mechanism that
++    exists to DETECT the failure contained a concurrent non-atomic write of its
++    own. It is now `atomicOr(&suffix_sum[6], 1u)`.
++
++    The shipped injector could not reach this code at all. It forces the
++    PRE-EMISSION predicate, which makes `row_fault` nonzero; the whole emission
++    block is then skipped and `suffix_sum[6]` is never touched. So the X4 arm
++    had never been exercised, and the existing all -1 result proved only the
++    X3 arm. `MERLIN_TOPK_LARGE_FAULT_KIND=emit` selects the emission-bound
++    predicate instead, and forces it for every emitting thread of the named
++    CTA -- a single-writer injection would pass against the broken code and so
++    would measure nothing.
++
++    Both values of the CTA index are in scope here, unlike the X3 cell: CTA 0
++    is the CTA that performs the -1 fill, so "the fill happens even when the
++    discovering CTA is the filling CTA" and "…even when it is not" are two
++    different claims. Run this in its own process, once per CTA index -- the
++    injector is a function-local static baked in at the first launch:
++
++        MERLIN_TOPK_DET_LARGE=1 MERLIN_TOPK_LARGE_FAULT_INJECT=0 \
++            MERLIN_TOPK_LARGE_FAULT_KIND=emit pytest -k large_emission_fault
++        MERLIN_TOPK_DET_LARGE=1 MERLIN_TOPK_LARGE_FAULT_INJECT=1 \
++            MERLIN_TOPK_LARGE_FAULT_KIND=emit pytest -k large_emission_fault
++
++    Injection suppresses __trap(), so this is the trap-off arm of the policy.
++    The trap-on arm kills the CUDA context by construction and stays in a disposable
++    process (test_isolated_diag_trap_on_kills_only_the_child), not here.
++    """
++    torch.set_default_device("cuda:0")
++    num_rows = 8
++
++    inject = os.getenv("MERLIN_TOPK_LARGE_FAULT_INJECT")
++    kind = (os.getenv("MERLIN_TOPK_LARGE_FAULT_KIND") or "").strip()
++    if inject is None or inject.strip() in ("", "-1") or kind != "emit":
++        pytest.skip(
++            "QUALIFICATION FAILURE if seen on the branch build with the fault "
++            "cells unrun: the emission-bound arm needs "
++            "MERLIN_TOPK_LARGE_FAULT_INJECT=<cta> AND "
++            "MERLIN_TOPK_LARGE_FAULT_KIND=emit. Without the kind the injector "
++            "forces the PRE-emission fault, which skips the emission block "
++            "entirely and cannot exercise suffix_sum[6]. A skip is not a pass."
++        )
++    assert int(inject) >= 0
++
++    before = _largedet_counters_or_skip(require_on=True)
++
++    logits, _ = _build_largedet_tie_row(num_rows)
++    out = _run_largedet_row(logits)
++    after = _read_exact_counters()
++
++    # 1. The whole row is -1. The X4 arm's specific hazard is a PARTIAL row:
++    #    the CTAs that did not fault have already stored real indices by the
++    #    time the violation is discovered, so "contains -1" would pass on the
++    #    defect. The fill must overwrite every slot.
++    assert int(out.min()) == -1 and int(out.max()) == -1, (
++        "an emission-bound fault did not fill the row with -1: "
++        f"min={int(out.min())} max={int(out.max())}; "
++        f"{int((out != -1).sum())} of {out.numel()} slots survived"
++    )
++
++    # 2. EXACTLY one fault per row. Not one per CTA and -- the reason the
++    #    injector fires in every emitting thread -- not one per out-of-range
++    #    element.
++    delta = after[_SLOT_LARGE_FAULT] - before[_SLOT_LARGE_FAULT]
++    assert delta == num_rows, (
++        "the large-path fault counter did not increment exactly once per "
++        f"failed row: {delta} of {num_rows}"
++    )
++
++    # 3. The rows were still entered, and no tie measurement was recorded off
++    #    a faulted row.
++    assert after[_SLOT_LARGE_ROWS] - before[_SLOT_LARGE_ROWS] == num_rows, (
++        "faulted rows must still be counted as large-path rows"
++    )
++    assert after[_SLOT_LARGE_TIES_CUT] - before[_SLOT_LARGE_TIES_CUT] == 0, (
++        "a faulted row recorded a tie-cut measurement"
++    )
++    assert after[_SLOT_LARGE_TIES_DROPPED] - before[_SLOT_LARGE_TIES_DROPPED] == 0, (
++        "a faulted row recorded dropped-tie counts"
++    )
++
++
+ # ---------------------------------------------------------------------------
+ # Large-path determinism -- expanded coverage (more shapes and
+ # adversarial distributions).
+@@ -2707,27 +2813,120 @@ def test_persistent_topk_large_fault_in_nonzero_cta_fails_closed() -> None:
+ LARGEDET_RADIX_THRESHOLD = 32768  # persistent_topk.cuh: above this, the large path
+ 
+ 
+-def _largedet_reference(values: torch.Tensor, top_k: int) -> torch.Tensor:
++# ---------------------------------------------------------------------------
++# The EFFECTIVE policy, read from the same place the kernel
++# reads it.
++#
++# Every switch in topk.cu is a function-local static filled from std::getenv on
++# the first launch, so the environment this process started with IS the policy
++# the kernel applies -- provided nothing mutates os.environ after a top-k
++# kernel has run. Do not monkeypatch these inside a session; run each arm in
++# its own process, exactly as the fault cells do.
++# ---------------------------------------------------------------------------
++def _largedet_env_on(name: str, default: bool) -> bool:
++    raw = os.getenv(name)
++    if raw is None or raw.strip() == "":
++        return default
++    try:
++        return int(raw) != 0
++    except ValueError:
++        return default
++
++
++def _largedet_effective_tie_recent() -> bool:
++    """`effective_tie_recent(det_ties, tie_recent)` = det_ties ? tie_recent : true.
++
++    With MERLIN_TIE_DET=0 (the shipped default) the buffered paths keep their
++    racy atomic rule, which has no direction, and every deterministic emission
++    -- including the large path -- uses most-recent-wins.
++    """
++    if not _largedet_env_on("MERLIN_TIE_DET", False):
++        return True
++    return _largedet_env_on("MERLIN_TIE_RECENT", False)
++
++
++def _buffered_order_is_canonical() -> bool:
++    """Do the DECODE and MEDIUM paths promise a deterministic SELECTED SET?
++
++    Only with MERLIN_TIE_DET=1, and only the set: TIE_DET makes cutoff-tie
++    MEMBERSHIP deterministic, but the buffered paths still place every
++    selected element by atomicAdd arrival, so the RAW output order stays
++    launch-dependent. Canonical order is MERLIN_QSA_SORT's job (a Python-side
++    sort in qsa_indexer), not the kernel's -- the root-cause analysis split the
++    two mechanisms exactly this way. On the reference host, asserting raw equality
++    here failed on 3 short rows in both tie directions while values,
++    membership and tie policy all passed. Callers compare sorted indices.
++    The LARGE path is separate: it is canonical in raw order whenever
++    MERLIN_TOPK_DET_LARGE is on.
++    """
++    return _largedet_env_on("MERLIN_TIE_DET", False)
++
++
++def _largedet_reference_impl(
++    values: torch.Tensor, top_k: int, tie_recent: bool | None = None
++) -> torch.Tensor:
+     """The deterministic large path's own rule, as ascending int64 indices.
+ 
+-    Everything strictly above the k-th largest value, plus the HIGHEST-indexed
+-    of the elements equal to it (most-recent-wins). Computed on CPU float32.
+-    float32 equality is exactly the kernel's ordered-uint32 equality, because
+-    the transform is monotonic and injective, so this reference is exact.
++    Everything strictly above the k-th largest value, plus -- in the direction
++    the launch actually runs -- the HIGHEST-indexed (most-recent-wins) or the
++    LOWEST-indexed (oldest-wins) of the elements equal to it. Computed on CPU
++    float32; float32 equality is exactly the kernel's ordered-uint32 equality,
++    because the transform is monotonic and injective, so this is exact.
++
++    This oracle used to hard-code most-recent-wins, so a
++    CORRECT oldest-wins run (MERLIN_TIE_DET=1 MERLIN_TIE_RECENT=0) failed every
++    distribution cell, and the oldest-wins behaviour the integration added had
++    no oracle at all. `tie_recent=None` resolves it from the environment the
++    kernel resolves it from; pass an explicit value only to test the oracle.
+     """
+     assert values.dtype == torch.float32 and values.dim() == 1
++    if tie_recent is None:
++        tie_recent = _largedet_effective_tie_recent()
+     pivot = torch.sort(values, descending=True).values[top_k - 1]
+     above = (values > pivot).nonzero(as_tuple=False).flatten()
+     equal = (values == pivot).nonzero(as_tuple=False).flatten()
+     need = top_k - int(above.numel())
+     assert need >= 0, "more elements above the pivot than k; reference is wrong"
+-    kept = equal[equal.numel() - need :] if need > 0 else equal[:0]
++    if need == 0:
++        kept = equal[:0]
++    elif tie_recent:
++        kept = equal[equal.numel() - need :]
++    else:
++        kept = equal[:need]
+     expected = torch.sort(torch.cat([above, kept])).values.to(torch.int64)
+     assert expected.numel() == top_k
+     return expected
+ 
+ 
+-def _largedet_distribution(kind: str, seq_len: int, top_k: int, seed: int) -> torch.Tensor:
++def _assert_valid_topk_membership(
++    values: torch.Tensor, got: torch.Tensor, top_k: int, where: str
++) -> None:
++    """Policy-CORRECT membership, for rows whose tie choice is not canonical.
++
++    Where the output order is not promised, the set still is,
++    up to the choice WITHIN the pivot-equal group. Asserted: exactly `top_k`
++    distinct in-range indices; every selected value >= the pivot; and every
++    element strictly above the pivot selected. That leaves free exactly the one
++    degree of freedom the buffered paths have with MERLIN_TIE_DET=0, and
++    nothing else.
++    """
++    assert got.numel() == top_k, f"{where}: {got.numel()} indices, want {top_k}"
++    assert int(got.min()) >= 0 and int(got.max()) < values.numel(), (
++        f"{where}: index out of range"
++    )
++    assert got.unique().numel() == top_k, f"{where}: duplicate index"
++    pivot = torch.sort(values, descending=True).values[top_k - 1]
++    assert bool((values[got] >= pivot).all()), (
++        f"{where}: a selected element is below the k-th largest value"
++    )
++    above = (values > pivot).nonzero(as_tuple=False).flatten()
++    missing = int((~torch.isin(above, got)).sum())
++    assert missing == 0, (
++        f"{where}: {missing} elements strictly above the pivot were not selected"
++    )
++
++
++def _largedet_distribution_impl(kind: str, seq_len: int, top_k: int, seed: int) -> torch.Tensor:
+     """One CPU float32 row. All values are positive, so no -0.0/+0.0 hazard."""
+     gen = torch.Generator(device="cpu").manual_seed(seed)
+ 
+@@ -2778,6 +2977,24 @@ def _largedet_distribution(kind: str, seq_len: int, top_k: int, seed: int) -> to
+     raise ValueError(f"unknown large-path distribution: {kind}")
+ 
+ 
++def _largedet_reference(*args, **kwargs) -> torch.Tensor:
++    """CPU reference, whatever the global default device is.
++
++    Earlier tests in this file call torch.set_default_device("cuda:0") and
++    never reset it, so factory calls inside the helpers would otherwise land
++    on the GPU and fail the torch.equal against a .cpu() kernel output
++    (seen on the reference host) -- a harness failure that would read as a kernel one.
++    """
++    with torch.device("cpu"):
++        return _largedet_reference_impl(*args, **kwargs).cpu()
++
++
++def _largedet_distribution(*args, **kwargs) -> torch.Tensor:
++    """CPU fixture row, whatever the global default device is (see above)."""
++    with torch.device("cpu"):
++        return _largedet_distribution_impl(*args, **kwargs).cpu()
++
++
+ def _largedet_launch(logits: torch.Tensor, lengths: torch.Tensor, top_k: int):
+     indices = torch.empty((logits.shape[0], top_k), dtype=torch.int32, device="cuda")
+     _run_topk_backend(
+@@ -2840,7 +3057,9 @@ def test_persistent_topk_large_distributions(
+         )
+         assert got.unique().numel() == top_k, f"{kind} row {row}: duplicate index"
+         assert torch.equal(got.cpu(), expected), (
+-            f"{kind} row {row}: selected set is not the most-recent-wins set"
++            f"{kind} row {row}: selected set is not the "
++            f"{'most-recent' if _largedet_effective_tie_recent() else 'oldest'}"
++            "-wins set"
+         )
+         assert torch.equal(logits[row][got].sort().values, ref_values), (
+             f"{kind} row {row}: selected values are not torch.topk's values"
+@@ -2862,6 +3081,18 @@ def test_persistent_topk_large_ragged_mixed_paths(top_k: int) -> None:
+     across interleaved traffic. Large rows get the exact set assertion; short
+     rows only get the value-multiset check, because their tie policy belongs to
+     the decode/medium paths, not to this branch.
++
++    The raw `torch.equal(first, second)` over the WHOLE
++    tensor is gone. The decode and medium rows in this launch emit by atomicAdd
++    arrival order unless MERLIN_TIE_DET is on, so a legitimate buffered-order
++    difference on a short row used to fail a test presented as large-path
++    qualification -- a misattribution, and on the other side a flake. Raw
++    equality is now asserted per row: unconditionally on the large rows, whose
++    canonical ascending order DET_LARGE promises, and on the short rows only
++    when TIE_DET makes that promise for them too. Where it is not promised, the
++    short rows are still held to the value multiset and to policy-correct
++    membership (a valid top-k SET: no duplicates, in range, every selected
++    value >= the pivot and every strictly-greater element selected).
+     """
+     torch.set_default_device("cuda:0")
+     lengths_list = [
+@@ -2895,6 +3126,7 @@ def test_persistent_topk_large_ragged_mixed_paths(top_k: int) -> None:
+     )
+     assert mid[_SLOT_LARGE_FAULT] - before[_SLOT_LARGE_FAULT] == 0
+ 
++    canonical_short = _buffered_order_is_canonical()
+     for row, length in enumerate(lengths_list):
+         got = first[row].to(torch.int64)
+         prefix = cpu_row[:length]
+@@ -2903,14 +3135,29 @@ def test_persistent_topk_large_ragged_mixed_paths(top_k: int) -> None:
+         assert torch.equal(got_values, ref_values), (
+             f"row {row} (length {length}): values are not torch.topk's values"
+         )
++        _assert_valid_topk_membership(prefix, got.cpu(), top_k, f"row {row}")
+         if length > LARGEDET_RADIX_THRESHOLD:
++            assert bool((got[1:] - got[:-1] > 0).all()), (
++                f"row {row} (length {length}): large-path output is not "
++                "ascending in index"
++            )
+             assert torch.equal(got.cpu(), _largedet_reference(prefix, top_k)), (
+-                f"row {row} (length {length}): not the most-recent-wins set"
++                f"row {row} (length {length}): not the "
++                f"{'most-recent' if _largedet_effective_tie_recent() else 'oldest'}"
++                "-wins set"
++            )
++            assert torch.equal(first[row], second[row]), (
++                f"row {row} (length {length}): the LARGE path returned a "
++                "different index tensor on an identical relaunch"
++            )
++        elif canonical_short:
++            assert torch.equal(
++                first[row].sort().values, second[row].sort().values
++            ), (
++                f"row {row} (length {length}): MERLIN_TIE_DET=1 promises a "
++                "deterministic selected set, but two identical launches "
++                "selected different indices"
+             )
+-
+-    assert torch.equal(first, second), (
+-        "two identical ragged launches returned different index tensors"
+-    )
+ 
+ 
+ @pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
+@@ -2965,3 +3212,121 @@ def test_persistent_topk_large_slot_residue_reuse() -> None:
+     assert torch.equal(first, second), (
+         "two identical launches over reused histogram slots differed"
+     )
++
++
++# Large-path reuse geometry, computed for the reference 3090 and asserted before use.
++#
++# topk.cu: ctas_per_group = ceil(stride / max_chunk_elements); at >8 rows and
++# 262,144 columns the chunk budget gives ~24,824 elements, so
++# ctas_per_group = 11. On a 3090 (82 SMs; occupancy 1 for a 1,024-thread CTA at
++# this shared-memory size) the cooperative headroom rule leaves
++# max_resident_ctas = 81, hence num_groups = min(81 // 11, num_rows) = 7.
++#
++# persistent_topk.cuh assigns rows `row_idx = group_id + iter * num_groups`, so
++# with num_groups = 7 the ITERATION index of a row is `row_idx // 7` and its
++# GROUP is `row_idx % 7`. Laying the classes out in blocks of 7 therefore gives
++# EVERY group the same five-iteration sequence, and the sequence is the one
++# the coverage needs.
++LARGEDET_REUSE_GROUPS = 7
++LARGEDET_REUSE_SMS = 82  # RTX 3090; the geometry above is derived from this
++LARGEDET_REUSE_LARGE_LEN = 262144
++LARGEDET_REUSE_CLASSES = ["large", "decode", "medium", "large", "large"]
++LARGEDET_REUSE_LENGTHS = {"large": LARGEDET_REUSE_LARGE_LEN, "decode": 2048, "medium": 12288}
++
++
++@pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
++@torch.inference_mode()
++def test_persistent_topk_large_within_group_mixed_reuse() -> None:
++    """One group, in order: large, decode, medium, large, large.
++
++    The eight-row mixed test gives each group only ONE row on
++    this lane, so it shows that a ragged launch returns correct rows -- not
++    that a group which handled a short row BETWEEN two large ones still reuses
++    `RadixRowState::histogram[radix_iter % 3]` correctly. Those are different
++    claims. `radix_iter` only advances on large rows, so the third large row
++    here lands on the slot the first one used, with a decode row and a medium
++    row having run through the same group in between; that is the geometry the
++    X1 publication barrier and the slot-residue argument are actually about.
++
++    Three large rows per group, not two, so all three histogram residues are
++    covered, and the short rows sit between them rather than after them.
++
++    The geometry is asserted, not hoped for: if the device is not the 82-SM
++    3090 the constants above were derived for, the test SKIPS rather than
++    quietly degrading to one large row per group and reporting a pass.
++    """
++    torch.set_default_device("cuda:0")
++
++    sms = torch.cuda.get_device_properties(0).multi_processor_count
++    if sms != LARGEDET_REUSE_SMS:
++        pytest.skip(
++            f"this cell's group geometry is derived for a {LARGEDET_REUSE_SMS}-SM "
++            f"RTX 3090; this device has {sms} SMs, so num_groups would not be "
++            f"{LARGEDET_REUSE_GROUPS} and the within-group interleaving would not "
++            "be established. Re-derive the constants before claiming this "
++            "coverage on other hardware -- a skip is not a pass."
++        )
++
++    classes = [c for c in LARGEDET_REUSE_CLASSES for _ in range(LARGEDET_REUSE_GROUPS)]
++    lengths_list = [LARGEDET_REUSE_LENGTHS[c] for c in classes]
++    num_rows = len(lengths_list)
++    seq_len = LARGEDET_REUSE_LARGE_LEN
++    top_k = 512
++    num_large = sum(1 for n in lengths_list if n > LARGEDET_RADIX_THRESHOLD)
++    assert num_large == 3 * LARGEDET_REUSE_GROUPS
++
++    before = _largedet_counters_or_skip(require_on=True)
++
++    cpu_row = _largedet_distribution("cross_cta_ties", seq_len, top_k, seed=1907)
++    logits = cpu_row.to("cuda").unsqueeze(0).repeat(num_rows, 1).contiguous()
++    lengths = torch.tensor(lengths_list, dtype=torch.int32, device="cuda")
++
++    first = _largedet_launch(logits, lengths, top_k).clone()
++    mid = _read_exact_counters()
++    second = _largedet_launch(logits, lengths, top_k)
++
++    assert mid[_SLOT_LARGE_ROWS] - before[_SLOT_LARGE_ROWS] == num_large, (
++        "the large path ran on the wrong number of rows: "
++        f"{mid[_SLOT_LARGE_ROWS] - before[_SLOT_LARGE_ROWS]} of {num_large}"
++    )
++    assert mid[_SLOT_LARGE_FAULT] - before[_SLOT_LARGE_FAULT] == 0, (
++        "a large-path invariant fired across the interleaved reuse"
++    )
++
++    canonical_short = _buffered_order_is_canonical()
++    expected_large = _largedet_reference(cpu_row, top_k)
++
++    for row, length in enumerate(lengths_list):
++        got = first[row].to(torch.int64)
++        prefix = cpu_row[:length]
++        ref_values = torch.topk(prefix, top_k).values.sort().values
++        assert torch.equal(prefix[got.cpu()].sort().values, ref_values), (
++            f"row {row} (length {length}, iter {row // LARGEDET_REUSE_GROUPS}, "
++            f"group {row % LARGEDET_REUSE_GROUPS}): values are not torch.topk's"
++        )
++        _assert_valid_topk_membership(
++            prefix, got.cpu(), top_k,
++            f"row {row} (length {length})",
++        )
++        if length > LARGEDET_RADIX_THRESHOLD:
++            assert bool((got[1:] - got[:-1] > 0).all()), (
++                f"row {row} (iter {row // LARGEDET_REUSE_GROUPS}): large-path "
++                "output is not ascending in index"
++            )
++            assert torch.equal(got.cpu(), expected_large), (
++                f"row {row} (iter {row // LARGEDET_REUSE_GROUPS}, group "
++                f"{row % LARGEDET_REUSE_GROUPS}): the selected set changed across "
++                "histogram-slot reuse with short rows interleaved"
++            )
++            assert torch.equal(first[row], second[row]), (
++                f"row {row}: the LARGE path was not reproducible across the "
++                "interleaved reuse"
++            )
++        elif canonical_short:
++            assert torch.equal(
++                first[row].sort().values, second[row].sort().values
++            ), (
++                f"row {row} (length {length}): MERLIN_TIE_DET=1 promises a "
++                "deterministic selected set, but two identical launches "
++                "selected different indices"
++            )
+diff --git a/tests/test_envs.py b/tests/test_envs.py
+index 4e8513ed4e..11700fa7c0 100644
+--- a/tests/test_envs.py
++++ b/tests/test_envs.py
+@@ -675,6 +675,19 @@ _TIEDET_KERNEL_SWITCHES = [
+     ("MERLIN_TOPK_DET_LARGE", "1", "1"),
+ ]
+ 
++# The large-path fault injectors. TEST-ONLY knobs, but
++# both are capture-baked -- the values become kernel launch arguments and a
++# cudagraph captured with the injector armed returns an all -1 row on every
++# replay, with nothing re-reading the environment to notice it was unset since.
++# So they are registered and hashed on the same conservative rule, and are kept
++# in their own table because they are not switches: unset means "no injection",
++# and a default-off assertion on them would be testing the absence of a test
++# mode rather than a shipped behaviour.
++_LARGEDET_FAULT_INJECTORS = [
++    ("MERLIN_TOPK_LARGE_FAULT_INJECT", "1", "1"),
++    ("MERLIN_TOPK_LARGE_FAULT_KIND", "emit", "emit"),
++]
++
+ # Named in the envs.py fenced block, deliberately NOT registered.
+ _TIEDET_UNAUDITED = ["MERLIN_PIN_BSM"]
+ 
+@@ -721,7 +734,8 @@ def _envs_source() -> str:
+ 
+ 
+ @pytest.mark.parametrize(
+-    ("name", "value", "expected"), _TIEDET_HASHED + _TIEDET_KERNEL_SWITCHES
++    ("name", "value", "expected"),
++    _TIEDET_HASHED + _TIEDET_KERNEL_SWITCHES + _LARGEDET_FAULT_INJECTORS,
+ )
+ def test_tiedet_toggle_is_a_cache_factor(
+     name: str, value: str, expected, monkeypatch: pytest.MonkeyPatch
+@@ -760,7 +774,8 @@ def test_tiedet_toggle_defaults_off(
+ 
+ @pytest.mark.parametrize(
+     "name",
+-    [n for n, _, _ in _TIEDET_HASHED + _TIEDET_KERNEL_SWITCHES] + _TIEDET_UNAUDITED,
++    [n for n, _, _ in _TIEDET_HASHED + _TIEDET_KERNEL_SWITCHES + _LARGEDET_FAULT_INJECTORS]
++    + _TIEDET_UNAUDITED,
+ )
+ def test_unaudited_host_side_knob_stays_listed_until_it_is_classified(name: str):
+     """The fenced block in envs.py is a gate, not a note.
+@@ -792,6 +807,31 @@ def test_unaudited_host_side_knob_stays_listed_until_it_is_classified(name: str)
+         )
+ 
+ 
++@pytest.mark.parametrize(("name", "value", "expected"), _LARGEDET_FAULT_INJECTORS)
++def test_largedet_fault_injector_changes_the_cache_key(
++    name: str, value: str, expected, monkeypatch: pytest.MonkeyPatch
++):
++    """Arming an injector must move the compile factors, not just appear in them.
++
++    MERLIN_TOPK_LARGE_FAULT_INJECT was once unregistered and
++    capture-baked: a cudagraph captured with it armed keeps returning all -1
++    rows on replay whatever the environment says afterwards. Registration is
++    only worth something if the hashed value FOLLOWS the environment, so assert
++    both worlds -- unset reads None and absent-from-armed, armed reads the raw
++    string -- rather than membership alone, which a dead getter would satisfy.
++    """
++    monkeypatch.delenv(name, raising=False)
++    assert _fresh_env_value(name) is None
++    off = envs.compile_factors()
++    monkeypatch.setenv(name, value)
++    assert _fresh_env_value(name) == expected
++    on = envs.compile_factors()
++    assert off[name] != on[name], (
++        f"{name} is registered but its hashed value does not follow the "
++        "environment, so an injected build and a clean build share a cache key"
++    )
++
++
+ def test_unaudited_gate_discriminates_both_worlds():
+     """Control for the gate above: it must be able to FAIL.
+ 
+@@ -860,7 +900,7 @@ def test_tiedet_toggles_are_not_ignored_factors():
+     ignored_factors would keep every test green while dropping it from the
+     cache key."""
+     monkeypatch_free_factors = envs.compile_factors()
+-    for name, _, _ in _TIEDET_HASHED + _TIEDET_KERNEL_SWITCHES:
++    for name, _, _ in _TIEDET_HASHED + _TIEDET_KERNEL_SWITCHES + _LARGEDET_FAULT_INJECTORS:
+         assert name in environment_variables, name
+         assert name in monkeypatch_free_factors, name
+     for name in _TIEDET_UNAUDITED:
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 960d92ba4f..b604b39395 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -563,6 +563,35 @@ if TYPE_CHECKING:
+     # bool that would imply this tree can act on it.
+     MERLIN_TOPK_DET_LARGE: str | None = None
+     #
++    # The large-path FAULT INJECTORS. TEST
++    # ONLY, and registered for exactly the same reason as the switches above,
++    # not because anything should set them in production:
++    #
++    #   * both are resolved once per process by a std::getenv in topk.cu
++    #     (large_fault_inject_cta(), large_fault_inject_emit()) and the
++    #     resolved values reach the GPU as kernel launch arguments, so a
++    #     cudagraph BAKES THEM IN. An injected build and a clean build differ
++    #     in the captured graph while sharing a cache key -- which is the
++    #     failure mode: a graph captured under injection returns an all -1 row
++    #     for every deterministic large row, and on replay nothing re-reads the
++    #     environment to notice the variable has since been unset. FAULT_INJECT
++    #     was once "unregistered and capture-baked"; hashing
++    #     them is what stops a cached artifact crossing between the arms.
++    #   * compile_factors() is a deny-list, so a name it does not know cannot
++    #     be hashed at all. Neither is in ignored_factors.
++    #
++    # Raw passthroughs, like the switches: the C++ getters are the single
++    # source of truth (INJECT parses with atoi and treats <0 and unset alike;
++    # KIND compares against the literal "emit"). Do not parse them here.
++    #
++    # Which CTA of the group has its fault predicate forced; unset / negative
++    # is off, and setting it also suppresses __trap().
++    MERLIN_TOPK_LARGE_FAULT_INJECT: str | None = None
++    # Which fault: unset / "pre" forces the pre-emission predicate caught at
++    # X3, "emit" forces the emission-bound slot check caught at X4. Ignored
++    # unless MERLIN_TOPK_LARGE_FAULT_INJECT names a CTA.
++    MERLIN_TOPK_LARGE_FAULT_KIND: str | None = None
++    #
+     # NOT REGISTERED, deliberately: MERLIN_TOPK_EXACT_TRAP. It is a
+     # preprocessor define consumed by `#ifndef` in persistent_topk.cuh at
+     # BUILD time (-D), not a process environment variable -- nothing in the
+@@ -2566,6 +2595,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     # MERLIN_TOPK_EXACT_MEDIUM is registered once, earlier in this dict.
+     "MERLIN_TOPK_EXACT_DECODE": lambda: os.getenv("MERLIN_TOPK_EXACT_DECODE", None),
+     "MERLIN_TOPK_DET_LARGE": lambda: os.getenv("MERLIN_TOPK_DET_LARGE", None),
++    # Large-path fault injectors. TEST ONLY, hashed for
++    # the reason in the declaration block: both are capture-baked.
++    "MERLIN_TOPK_LARGE_FAULT_INJECT": lambda: os.getenv(
++        "MERLIN_TOPK_LARGE_FAULT_INJECT", None
++    ),
++    "MERLIN_TOPK_LARGE_FAULT_KIND": lambda: os.getenv(
++        "MERLIN_TOPK_LARGE_FAULT_KIND", None
++    ),
+ }
+ 
+ 

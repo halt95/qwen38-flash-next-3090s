@@ -1,0 +1,343 @@
+From 3f54a3fa196c231332056e8440c4d3673bde7f61 Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Wed, 23 Sep 2026 08:31:06 -0400
+Subject: [PATCH 40/58] topk: Python reader for the exact-restart counters
+
+Reads persistent_topk_exact_counters into {slot: value}, logs one line on a
+cadence, and degrades to a one-time warning when the op is absent.
+---
+ tests/kernels/test_top_k_per_row.py           |  60 +++++++
+ vllm/envs.py                                  |  12 ++
+ .../qwen4_exp/nvidia/ops/topk_counters.py     | 167 ++++++++++++++++++
+ vllm/v1/worker/gpu/model_runner.py            |  13 ++
+ 4 files changed, 252 insertions(+)
+ create mode 100644 vllm/models/qwen4_exp/nvidia/ops/topk_counters.py
+
+diff --git a/tests/kernels/test_top_k_per_row.py b/tests/kernels/test_top_k_per_row.py
+index 70332b81b0..b0564e89bf 100644
+--- a/tests/kernels/test_top_k_per_row.py
++++ b/tests/kernels/test_top_k_per_row.py
+@@ -1,11 +1,13 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
++import re
+ 
+ import numpy as np
+ import pytest
+ import torch
+ 
++import vllm.envs as envs
+ from vllm.platforms import current_platform
+ from vllm.utils.torch_utils import set_random_seed
+ 
+@@ -2090,3 +2092,61 @@ def test_persistent_topk_exact_counters_rejects_unsafe_output() -> None:
+ 
+     with pytest.raises(Exception):
+         op(ok, 1, 0)  # reset without sync is not a complete handoff
++
++
++@pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
++@torch.inference_mode()
++def test_topk_exact_counters_reader_log_line(monkeypatch) -> None:
++    """The Python reader must produce the exact line the smoke greps.
++
++    Runs the op path directly -- no engine, no model -- so a failure here is
++    the reader's, not a serving regression. Asserting the format with a regex
++    is the point: the smoke keys on these field names, and a reader that
++    prints something else is as good as no reader at all.
++    """
++    from vllm.models.qwen4_exp.nvidia.ops import topk_counters
++
++    torch.set_default_device("cuda:0")
++    direct = _read_exact_counters()
++    if direct is None:
++        pytest.skip(
++            "QUALIFICATION FAILURE if seen on the branch build: no "
++            "persistent_topk_exact_counters op. A skip is not a pass."
++        )
++
++    monkeypatch.setenv("MERLIN_TOPK_EXACT_COUNTERS_LOG", "1")
++    monkeypatch.setenv("MERLIN_TOPK_COUNTER_SLOTS", str(_EXACT_COUNTER_SLOTS))
++    assert envs.MERLIN_TOPK_EXACT_COUNTERS_LOG == 1
++
++    counters = topk_counters.read()
++    assert list(counters) == [
++        "rows",
++        "overflow",
++        "fallbacks",
++        "faults",
++        "switch",
++    ], f"unexpected slot names: {list(counters)}"
++    assert counters == dict(zip(counters, direct, strict=True)), (
++        "the reader disagrees with a direct op call"
++    )
++
++    line = topk_counters.log_line("PP0_TP0")
++    assert re.fullmatch(
++        r"topk-exact-counters rank=PP0_TP0 rows=\d+ overflow=\d+ "
++        r"fallbacks=\d+ faults=\d+ switch=\d+",
++        line,
++    ), f"log line does not match the documented format: {line!r}"
++
++    # The cadence gate must also be able to emit -- a reader that never fires
++    # from maybe_log() is the same defect one level up.
++    topk_counters._last_log_monotonic = 0.0
++    expected = line.replace("PP0_TP0", topk_counters.rank_tag())
++    assert topk_counters.maybe_log() == expected
++    # ... and must then stay silent until the period elapses.
++    assert topk_counters.maybe_log() == ""
++
++    # Unknown slot counts must degrade to positional names, never mislabel.
++    assert topk_counters.slot_names(7) == tuple(f"slot{i}" for i in range(7))
++    if getattr(torch.ops._C, "persistent_topk_exact_counters_slots", None) is None:
++        monkeypatch.setenv("MERLIN_TOPK_COUNTER_SLOTS", "7")
++        assert topk_counters.slot_count() == 7
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 35047dd469..5923dc5d90 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -506,6 +506,7 @@ if TYPE_CHECKING:
+     VLLM_GPU_NIC_PCIE_MAPPING: str = ""
+     VLLM_NIC_SELECTION_VARS: str = ""
+     VLLM_ENABLE_HPC_OPS: bool = False
++    MERLIN_TOPK_EXACT_COUNTERS_LOG: int = 0
+ 
+ 
+ def get_default_cache_root():
+@@ -2459,6 +2460,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     "VLLM_E2_MAMBA_SLOT_OWNERSHIP": lambda: _e2_diagnostic_mode(
+         "VLLM_E2_MAMBA_SLOT_OWNERSHIP"
+     ),
++    # Seconds between `topk-exact-counters` lines from each GPU worker
++    # (0, the default, disables the reader entirely). The line reports the
++    # medium-path exact-restart counters; see
++    # vllm/models/qwen4_exp/nvidia/ops/topk_counters.py.
++    "MERLIN_TOPK_EXACT_COUNTERS_LOG": lambda: int(
++        os.getenv("MERLIN_TOPK_EXACT_COUNTERS_LOG", "0")
++    ),
+ }
+ 
+ 
+@@ -2683,6 +2691,10 @@ def compile_factors() -> dict[str, object]:
+         # configuration factor and is hashed conservatively.
+         "VLLM_E2_PLE_FLAG_CHECK",
+         "VLLM_E2_MAMBA_SLOT_OWNERSHIP",
++        # Logging cadence for an already-compiled kernel's counters: it gates a
++        # host-side timer and a snapshot op, and is read by no compiled code, so
++        # hashing it would invalidate every compile cache for a log interval.
++        "MERLIN_TOPK_EXACT_COUNTERS_LOG",
+         # ------------------------------------------------------------------
+     }
+ 
+diff --git a/vllm/models/qwen4_exp/nvidia/ops/topk_counters.py b/vllm/models/qwen4_exp/nvidia/ops/topk_counters.py
+new file mode 100644
+index 0000000000..02c1720f11
+--- /dev/null
++++ b/vllm/models/qwen4_exp/nvidia/ops/topk_counters.py
+@@ -0,0 +1,167 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Python reader for the medium-path exact-restart top-k counters.
++
++The counters themselves are device-global uint32s owned by
++`csrc/libtorch_stable/topk.cu`; `torch.ops._C.persistent_topk_exact_counters`
++snapshots them into an int32 CUDA tensor. Without this module nothing in a
++running engine ever calls that op, so the instrument records into a buffer no
++one reads -- which measures nothing.
++
++SLOT LAYOUT is build-dependent, so nothing here hard-codes five. `slot_count()`
++asks the build first (a `..._slots` op, should a later build expose one) and
++otherwise reads `MERLIN_TOPK_COUNTER_SLOTS` (default 5); names come from a
++table keyed by that length:
++
++  5  rows overflow fallbacks faults switch
++  10  rows overflow fallbacks faults rows_large ties_cut ties_dropped
++             faults_large switch switch_large
++
++An unknown length degrades to `slot<i>` names rather than mislabelling.
++
++HOW THE SMOKE READS IT. Set `MERLIN_TOPK_EXACT_COUNTERS_LOG=<seconds>` on the
++engine; each GPU worker then emits, at most that often and once more at
++shutdown, one line into the ordinary engine log:
++
++    topk-exact-counters rank=PP0_TP1 rows=... overflow=... fallbacks=...
++    faults=... switch=...
++
++Counts are cumulative per worker process, so the smoke takes the LATEST line
++per rank -- `grep topk-exact-counters <engine log> | ...` keyed on the `rank=`
++field -- and reads `faults` as the pass/fail number (it must stay 0) with
++`rows` as the denominator. Earlier lines are only useful as a rate.
++
++COST. `read()` passes `sync=1`, i.e. a full device synchronize, because a
++stream-ordered snapshot can miss increments from work in flight on another
++stream. That is acceptable ONLY because the cadence is coarse (>= 30 s in
++practice): the time check happens before the op call, so a step that is not
++due for a log touches nothing but `time.monotonic()`. The read is also refused
++inside a cudagraph capture -- the op allocates and synchronizes, which would
++abort the capture.
++"""
++
++import os
++import time
++
++import torch
++
++import vllm.envs as envs
++from vllm.logger import init_logger
++
++logger = init_logger(__name__)
++
++_OP_NAME = "persistent_topk_exact_counters"
++
++_MEDIUM_NAMES = ("rows", "overflow", "fallbacks", "faults", "switch")
++_LARGEDET_NAMES = (
++    "rows",
++    "overflow",
++    "fallbacks",
++    "faults",
++    "rows_large",
++    "ties_cut",
++    "ties_dropped",
++    "faults_large",
++    "switch",
++    "switch_large",
++)
++_SLOT_NAMES: dict[int, tuple[str, ...]] = {5: _MEDIUM_NAMES, 10: _LARGEDET_NAMES}
++
++# The medium-path line contract. Any further name is appended after these, in slot
++# order, so a 10-slot build still starts with exactly the medium-path line.
++_LINE_ORDER = _MEDIUM_NAMES
++
++_warned_absent = False
++_warned_failed = False
++_last_log_monotonic = 0.0
++
++
++def _get_op(name: str):
++    try:
++        return getattr(torch.ops._C, name, None)
++    except (AttributeError, RuntimeError):
++        return None
++
++
++def slot_count() -> int:
++    """How many int32 slots this build's counter array carries."""
++    query = _get_op(_OP_NAME + "_slots")
++    if query is not None:
++        return int(query())
++    return int(os.getenv("MERLIN_TOPK_COUNTER_SLOTS", "5"))
++
++
++def slot_names(count: int) -> tuple[str, ...]:
++    names = _SLOT_NAMES.get(count)
++    return names if names is not None else tuple(f"slot{i}" for i in range(count))
++
++
++def read(reset: bool = False, sync: bool = True) -> dict[str, int]:
++    """Snapshot the counters as {slot name: value}; {} when unreadable."""
++    global _warned_absent
++    op = _get_op(_OP_NAME)
++    if op is None:
++        if not _warned_absent:
++            _warned_absent = True
++            logger.warning(
++                "torch.ops._C.%s is not in this build; the top-k exact-restart "
++                "counters cannot be read.",
++                _OP_NAME,
++            )
++        return {}
++    if reset and not sync:
++        raise ValueError("reset requires sync: zeroing races in-flight atomics")
++    if not (torch.cuda.is_available() and torch.cuda.is_initialized()):
++        return {}
++    if torch.cuda.is_current_stream_capturing():
++        # The op allocates and synchronizes; calling it here aborts the capture.
++        return {}
++    count = slot_count()
++    device = torch.device("cuda", torch.cuda.current_device())
++    out = torch.zeros(count, dtype=torch.int32, device=device)
++    op(out, 1 if reset else 0, 1 if sync else 0)
++    return dict(zip(slot_names(count), out.tolist(), strict=True))
++
++
++def rank_tag() -> str:
++    from vllm.distributed.parallel_state import get_pp_group, get_tp_group
++
++    try:
++        return f"PP{get_pp_group().rank_in_group}_TP{get_tp_group().rank_in_group}"
++    except Exception:
++        # Pre-init or single-process: say so rather than claim rank 0.
++        return "PP?_TP?"
++
++
++def log_line(tag: str) -> str:
++    """The one-line form the smoke greps; "" when the counters are unreadable."""
++    counters = read()
++    if not counters:
++        return ""
++    order = [name for name in _LINE_ORDER if name in counters]
++    order += [name for name in counters if name not in _LINE_ORDER]
++    fields = " ".join(f"{name}={counters[name]}" for name in order)
++    return f"topk-exact-counters rank={tag} {fields}"
++
++
++def maybe_log(force: bool = False) -> str:
++    """Emit the line if due (or forced). Time check first: when not due this
++    costs one clock read and never touches the device."""
++    global _last_log_monotonic, _warned_failed
++    period = envs.MERLIN_TOPK_EXACT_COUNTERS_LOG
++    if period <= 0:
++        return ""
++    now = time.monotonic()
++    if not force and now - _last_log_monotonic < period:
++        return ""
++    _last_log_monotonic = now
++    try:
++        line = log_line(rank_tag())
++    except Exception as exc:  # never let an instrument break a step or shutdown
++        if not _warned_failed:
++            _warned_failed = True
++            logger.warning("top-k exact-restart counter read failed: %s", exc)
++        return ""
++    if line:
++        logger.info("%s", line)
++    return line
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 67ba37f24d..b5b8a70a18 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -55,6 +55,7 @@ from vllm.model_executor.offloader import (
+     set_offloader,
+ )
+ from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
++from vllm.models.qwen4_exp.nvidia.ops import topk_counters
+ from vllm.multimodal import MULTIMODAL_REGISTRY
+ from vllm.multimodal.encoder_budget import (
+     MultiModalBudget,
+@@ -1784,6 +1785,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             # A Python bool; adds no device sync to the step. Late and
+             # rank-local -- see guard_telemetry.check_pending.
+             guard_telemetry.check_pending()
++            # Post-step read of the top-k exact-restart counters, i.e.
++            # everything the previous steps accumulated. Off unless
++            # MERLIN_TOPK_EXACT_COUNTERS_LOG > 0, and then a clock read on
++            # every step but the one per cadence that is actually due. It sits
++            # here rather than at the tail of sample_tokens because that method
++            # returns early on non-last PP ranks, so a tail hook would silently
++            # never fire on them. Outside any capture: this is the engine
++            # thread between steps (read() re-checks).
++            topk_counters.maybe_log()
+             # Update the request states.
+             self.update_pp_decode_requests()
+             self.finish_requests(scheduler_output)
+@@ -2479,6 +2489,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         """Release GPU tensors (model weights, KV caches, workspace) so that
+         memory is reclaimable when running in the same process."""
+         torch.accelerator.synchronize()
++        # The last window of a run is the one a cadence log always
++        # misses; emit it before the device state goes away.
++        topk_counters.maybe_log(force=True)
+         if self._ple_offload_connector is not None:
+             self._ple_offload_connector.close()
+             self._ple_offload_connector = None

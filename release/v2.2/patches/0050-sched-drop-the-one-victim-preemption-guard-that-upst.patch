@@ -1,0 +1,127 @@
+From e12f417d35c1a0ffb5d70d1d814b8d3540533fbe Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Wed, 23 Sep 2026 10:00:36 -0400
+Subject: [PATCH 50/58] sched: drop the one-victim preemption guard that
+ upstream #49675 made dead
+
+The cascade test now expects zero needless victims.
+---
+ tests/v1/core/test_deferred_block_free.py | 43 +++++++++++++++--------
+ vllm/v1/core/sched/scheduler.py           | 18 ++++------
+ 2 files changed, 36 insertions(+), 25 deletions(-)
+
+diff --git a/tests/v1/core/test_deferred_block_free.py b/tests/v1/core/test_deferred_block_free.py
+index e94161bf84..e5e91a3cbe 100644
+--- a/tests/v1/core/test_deferred_block_free.py
++++ b/tests/v1/core/test_deferred_block_free.py
+@@ -646,13 +646,18 @@ def test_ring_preempt_withholds_the_ring_block_until_the_fence():
+ 
+ 
+ def test_deferred_victim_stops_the_preemption_cascade():
+-    """Under deferred free a preempted victim returns no blocks
+-    until its in-flight step is processed, so the allocation retry must not
+-    keep preempting. Two 48-token requests fill a 6-block pool; the first
+-    request's speculative decode (token 49) needs a 4th block. Expected: exactly ONE
+-    victim (the last running request), the requester stays RUNNING and
+-    unscheduled, and after the in-flight step is processed it gets its block.
+-    Without the fix this preempts both requests in one schedule() call.
++    """Restated for upstream #49675 (v0.30.0): under deferred free
++    a preempted victim returns no blocks until its in-flight step is
++    processed, so preempting it cannot satisfy the allocation. Two 48-token
++    requests fill a 6-block pool; the first request's speculative decode
++    (token 49) needs a 4th block. Contract: ZERO victims while the fence is
++    pending -- both requests stay RUNNING, nothing is deferred, the requester
++    is unscheduled -- and once the in-flight step is processed ordinary
++    preemption resumes with an IMMEDIATE free (the victim's blocks never enter
++    the deferred queue) and the requester gets its block.
++    Without the fix this preempted both requests in one schedule() call; our v2
++    post-hoc guard stopped at exactly one deferred victim; #49675's
++    pre-check (`_request_blocks_can_be_freed(victim)`) makes it zero.
+     """
+     with patch.object(
+         VllmConfig,
+@@ -680,24 +685,34 @@ def test_deferred_victim_stops_the_preemption_cascade():
+     assert pool.get_num_free_blocks() == 0
+ 
+     # step 2 (step 1 in flight): the first request's decode crosses into a
+-    # 4th block -> allocation fails -> the loop preempts the LAST running one.
++    # 4th block -> allocation fails -> the only candidate victim (the LAST
++    # running one) is fenced behind step 1, so nobody is preempted.
+     first, second = scheduler.running[0], scheduler.running[1]
+     out1 = scheduler.schedule()
+-    assert second.status == RequestStatus.PREEMPTED
++    assert not out1.preempted_req_ids, "a fenced victim was preempted"
++    assert second.status == RequestStatus.RUNNING, "a fenced victim was preempted"
+     assert first.status == RequestStatus.RUNNING, "the cascade reached the requester"
+-    assert first in scheduler.running
+-    assert len(scheduler.deferred_frees) == 1
++    assert scheduler.running == [first, second]
++    assert first.num_preemptions == 0 and second.num_preemptions == 0
++    assert not scheduler.deferred_frees
+     assert pool.get_num_free_blocks() == 0
+     assert first.request_id not in out1.num_scheduled_tokens
++    assert out1.total_num_scheduled_tokens == 0
+ 
+-    # step 1's output processed: the victim's blocks drain, the requester
+-    # is scheduled on the next call.
++    # step 1's output processed: the fence has passed, so the retry preempts
++    # the last running request with an immediate free and the requester is
++    # scheduled in the same call.
+     scheduler.update_from_output(out0, _make_model_runner_output(out0))
+     assert not scheduler.deferred_frees
+-    assert pool.get_num_free_blocks() == 3
++    assert pool.get_num_free_blocks() == 0
+     out2 = scheduler.schedule()
++    assert out2.preempted_req_ids == {second.request_id}
++    assert second.status == RequestStatus.PREEMPTED
++    assert second.num_preemptions == 1
++    assert not scheduler.deferred_frees, "a free past the fence was deferred"
+     assert first.request_id in out2.num_scheduled_tokens
+     assert first.status == RequestStatus.RUNNING
++    assert first.num_preemptions == 0
+ 
+ 
+ def _make_pool_with_cached_blocks(num_blocks: int, block_size: int = 16):
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 30704d06b5..1402e8ec3d 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -787,6 +787,13 @@ class Scheduler(SchedulerInterface):
+                         preempted_req = self.running[-1]
+ 
+                     # A deferred free will not help with immediate allocation.
++                    # (Upstream #49675. It subsumes our earlier post-hoc guard,
++                    # which stopped after ONE deferred victim: a victim that
++                    # passes this check is freed immediately by
++                    # _preempt_request, so deferred_frees cannot grow below.
++                    # The requester stays running, unscheduled, and retries
++                    # after the fence drains; with every running request in
++                    # flight (PP / async) that is zero victims, not the batch.)
+                     if not self._request_blocks_can_be_freed(preempted_req):
+                         break
+ 
+@@ -818,7 +825,6 @@ class Scheduler(SchedulerInterface):
+                     else:
+                         preempted_req = self.running.pop()
+ 
+-                    num_deferred_before = len(self.deferred_frees)
+                     self._preempt_request(
+                         preempted_req,
+                         scheduled_timestamp,
+@@ -828,16 +834,6 @@ class Scheduler(SchedulerInterface):
+                     if preempted_req == request:
+                         # No more request to preempt. Cannot schedule this request.
+                         break
+-                    if len(self.deferred_frees) > num_deferred_before:
+-                        # The ring-skip fix: the victim's blocks are fenced
+-                        # behind its in-flight step and return to the pool only
+-                        # when that step's output is processed, so retrying the
+-                        # allocation now cannot succeed on their account and would
+-                        # preempt the next request for nothing -- with every running
+-                        # request in flight (PP / async) the whole batch. Stop at one
+-                        # deferred victim; this request stays running, unscheduled,
+-                        # and retries next step after the drain.
+-                        break
+ 
+             if new_blocks is None:
+                 # Cannot schedule this request.

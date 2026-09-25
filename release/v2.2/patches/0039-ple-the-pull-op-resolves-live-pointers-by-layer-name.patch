@@ -1,0 +1,185 @@
+From 230b29368e663d063982a30a64c9d7379b7474c6 Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Wed, 23 Sep 2026 08:18:03 -0400
+Subject: [PATCH 39/58] ple: the pull op resolves live pointers by layer name
+
+The wait/copy op took host pointers as Python-int arguments, which were baked
+into the AOT compile cache as the tracing process's addresses; the first
+forward after a cache-load boot then failed. The op now carries only
+process-stable values and resolves pointers from a per-process registry.
+---
+ .../ple_offload/test_transport_bounded_io.py  |  2 +-
+ tests/v1/test_ple_pull_compile_profile.py     | 68 +++++++++++++++++++
+ .../layers/ple_offload_layer.py               | 45 ++++++++++--
+ 3 files changed, 107 insertions(+), 8 deletions(-)
+
+diff --git a/tests/v1/ple_offload/test_transport_bounded_io.py b/tests/v1/ple_offload/test_transport_bounded_io.py
+index 748fd46744..5a2aa199e9 100644
+--- a/tests/v1/ple_offload/test_transport_bounded_io.py
++++ b/tests/v1/ple_offload/test_transport_bounded_io.py
+@@ -275,7 +275,7 @@ def test_real_wait_copy_geometry_rejected_before_graph_publication(
+ 
+     def capture_then_publish() -> None:
+         with manager.capture_ple_copy_geometry(desc):
+-            ple_layer_module._ple_offload_wait_copy_impl(
++            ple_layer_module._ple_offload_wait_copy_raw(
+                 gpu_output_buffer,
+                 hidden_states,
+                 1,
+diff --git a/tests/v1/test_ple_pull_compile_profile.py b/tests/v1/test_ple_pull_compile_profile.py
+index d5bf87e307..d5c47a99e2 100644
+--- a/tests/v1/test_ple_pull_compile_profile.py
++++ b/tests/v1/test_ple_pull_compile_profile.py
+@@ -466,3 +466,71 @@ def test_draft_guard_reports_the_draft_architecture() -> None:
+     assert e2_guards._profile(cfg, "draft")[0] == ["Qwen4ExpMTP"]
+     no_spec = SimpleNamespace(**{**vars(cfg), "speculative_config": None})
+     assert e2_guards._profile(no_spec, "draft")[0] == ["Qwen4ExpForConditionalGeneration"]
++
++
++def _import_ple_offload_layer(monkeypatch):
++    """Import the layer module offline without cuda-python: stub only the
++    two names it imports at module load (the tests never reach the driver)."""
++    import sys
++    import types
++
++    try:
++        import cuda.bindings.driver  # noqa: F401
++    except ImportError:
++        cuda = types.ModuleType("cuda")
++        bindings = types.ModuleType("cuda.bindings")
++        driver = types.ModuleType("cuda.bindings.driver")
++        driver.CUstreamWaitValue_flags = types.SimpleNamespace(
++            CU_STREAM_WAIT_VALUE_EQ=types.SimpleNamespace(value=1)
++        )
++        cuda.bindings = bindings
++        bindings.driver = driver
++        for name, mod in (("cuda", cuda), ("cuda.bindings", bindings),
++                          ("cuda.bindings.driver", driver)):
++            monkeypatch.setitem(sys.modules, name, mod)
++    from vllm.model_executor.layers import ple_offload_layer
++
++    return ple_offload_layer
++
++
++def test_wait_copy_op_carries_no_raw_pointers(monkeypatch) -> None:
++    """On the reference host, the first boot that LOADED the AOT compile
++    cache failed cuStreamWaitValue32 with CUDA_ERROR_INVALID_VALUE -- the flag
++    and host pointers were Python-int op arguments, specialised into the saved
++    graph as the previous process's addresses. The op must carry only
++    process-stable values and resolve the live pointers by layer name."""
++    import inspect
++
++    m = _import_ple_offload_layer(monkeypatch)
++
++    params = list(inspect.signature(m._ple_offload_wait_copy_impl).parameters)
++    assert params == ["gpu_output_buffer", "hidden_states", "num_tokens", "layer_name"]
++    fake = list(inspect.signature(m._ple_offload_wait_copy_fake).parameters)
++    assert fake == params
++    for banned in ("flag_ptr", "host_ptr", "row_bytes"):
++        assert banned not in params
++
++
++def test_wait_copy_resolves_live_pointers_by_layer_name(monkeypatch) -> None:
++    from types import SimpleNamespace
++
++    import torch
++
++    m = _import_ple_offload_layer(monkeypatch)
++    seen = {}
++    monkeypatch.setattr(m, "_ple_offload_wait_copy_raw",
++                        lambda buf, hs, flag, host, rb, n, name: seen.update(
++                            flag=flag, host=host, rb=rb, n=n, name=name))
++    layer = SimpleNamespace(_sem=SimpleNamespace(flag_ptr=0x1000),
++                            _host_output_ptr=0x2000, _host_row_bytes=16)
++    monkeypatch.setitem(m._PULL_LAYERS, "L2", layer)
++    buf = torch.empty(4, 4)
++    m._ple_offload_wait_copy_impl(buf, buf, 3, "L2")
++    assert seen == {"flag": 0x1000, "host": 0x2000, "rb": 16, "n": 3, "name": "L2"}
++    layer._sem.flag_ptr = 0x3000  # a new process / re-armed layer: no stale value
++    m._ple_offload_wait_copy_impl(buf, buf, 3, "L2")
++    assert seen["flag"] == 0x3000
++    import pytest
++
++    with pytest.raises(RuntimeError, match="no armed pull layer"):
++        m._ple_offload_wait_copy_impl(buf, buf, 3, "missing")
+diff --git a/vllm/model_executor/layers/ple_offload_layer.py b/vllm/model_executor/layers/ple_offload_layer.py
+index d1f668380b..ff581b205a 100644
+--- a/vllm/model_executor/layers/ple_offload_layer.py
++++ b/vllm/model_executor/layers/ple_offload_layer.py
+@@ -248,11 +248,46 @@ direct_register_custom_op(
+ # and the consumers read device memory as before. The flag is NOT reset here:
+ # ``release_outputs`` resets it after the forward (unchanged semantics), so
+ # capture warm-ups and dummy runs behave exactly as with ``ple_offload_wait``.
+-# Pointers are passed as ints so no CPU tensor enters the compiled graph.
++# No CPU tensor and no raw address enters the compiled graph: the op resolves
++# the live pointers by layer name (see _PULL_LAYERS).
+ # ---------------------------------------------------------------------------
+ 
+ 
++# Fork (found on the reference host): the host flag / host output pointers and
++# the row size are NOT op arguments any more. As Python ints they were
++# specialised into the compiled graph as constants, so a boot that LOADED the
++# AOT compile cache (no Dynamo pass) waited on the previous process's addresses:
++# cuStreamWaitValue32 -> CUDA_ERROR_INVALID_VALUE on the first forward. The op
++# now carries only process-stable values (buffer, token count, layer name) and
++# resolves the live pointers from this registry on every call.
++_PULL_LAYERS: dict[str, "PleOffloadLayer"] = {}
++
++
+ def _ple_offload_wait_copy_impl(
++    gpu_output_buffer: torch.Tensor,
++    hidden_states: torch.Tensor,
++    num_tokens: int,
++    layer_name: str,
++) -> None:
++    """Resolve this process's live pointers for ``layer_name``, then wait+DMA."""
++    layer = _PULL_LAYERS.get(layer_name)
++    if layer is None or layer._host_output_ptr is None:
++        raise RuntimeError(
++            f"PLE wait_copy: no armed pull layer named {layer_name!r} in this "
++            f"process (armed: {sorted(_PULL_LAYERS)})"
++        )
++    _ple_offload_wait_copy_raw(
++        gpu_output_buffer,
++        hidden_states,
++        layer._sem.flag_ptr,
++        layer._host_output_ptr,
++        layer._host_row_bytes,
++        num_tokens,
++        layer_name,
++    )
++
++
++def _ple_offload_wait_copy_raw(
+     gpu_output_buffer: torch.Tensor,
+     hidden_states: torch.Tensor,
+     flag_ptr: int,
+@@ -298,9 +333,6 @@ def _ple_offload_wait_copy_impl(
+ def _ple_offload_wait_copy_fake(
+     gpu_output_buffer: torch.Tensor,
+     hidden_states: torch.Tensor,
+-    flag_ptr: int,
+-    host_ptr: int,
+-    row_bytes: int,
+     num_tokens: int,
+     layer_name: str,
+ ) -> None:
+@@ -395,6 +427,8 @@ class PleOffloadLayer(nn.Module, ABC):
+         self._sem = semaphore
+         self._host_output_ptr = host_output_ptr
+         self._host_row_bytes = int(host_row_bytes)
++        if host_output_ptr is not None:
++            _PULL_LAYERS[self._ple_offload_name] = self
+ 
+     def forward(
+         self,
+@@ -409,9 +443,6 @@ class PleOffloadLayer(nn.Module, ABC):
+                 torch.ops.vllm.ple_offload_wait_copy(
+                     self._gpu_output_buffer,
+                     hidden_states,
+-                    self._sem.flag_ptr,
+-                    self._host_output_ptr,
+-                    self._host_row_bytes,
+                     input_ids.shape[0],
+                     self._ple_offload_name,
+                 )

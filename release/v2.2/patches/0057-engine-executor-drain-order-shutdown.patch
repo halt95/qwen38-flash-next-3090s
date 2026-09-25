@@ -1,0 +1,1962 @@
+From ef47116176cefc7a2ad04952b916585edc71b19d Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 01:36:08 -0400
+Subject: [PATCH 57/58] engine, executor: drain-order shutdown
+
+- EngineCore survives a late SIGTERM during teardown (bounded deferral) so
+  every worker drains its guard telemetry.
+- A worker exits right after its orderly shutdown.
+- A worker failure racing shutdown stays a failure (exit 1).
+- Rank 0 waits for the PLE child's whole thread group, bounded, instead of its
+  reap; drain-aware failure ladder with a bounded grace for survivors whose
+  shutdown already started.
+- tests: the sorted-emit graph arm takes max_len on the host before capture.
+---
+ tests/kernels/merlin_sorted_emit_arm.py       |  16 +-
+ .../test_engine_core_teardown_signal.py       | 194 ++++++++
+ .../test_multiproc_executor_parent_death.py   |   2 +-
+ .../test_multiproc_failed_worker_ladder.py    | 212 ++++++++
+ .../test_multiproc_ple_exit_without_reap.py   | 344 +++++++++++++
+ .../test_multiproc_worker_exit_after_drain.py | 456 ++++++++++++++++++
+ vllm/v1/engine/core.py                        |  98 +++-
+ vllm/v1/executor/multiproc_executor.py        | 226 ++++++++-
+ vllm/v1/ple_offload/worker.py                 | 118 +++++
+ 9 files changed, 1640 insertions(+), 26 deletions(-)
+ create mode 100644 tests/v1/engine/test_engine_core_teardown_signal.py
+ create mode 100644 tests/v1/executor/test_multiproc_failed_worker_ladder.py
+ create mode 100644 tests/v1/executor/test_multiproc_ple_exit_without_reap.py
+ create mode 100644 tests/v1/executor/test_multiproc_worker_exit_after_drain.py
+
+diff --git a/tests/kernels/merlin_sorted_emit_arm.py b/tests/kernels/merlin_sorted_emit_arm.py
+index 700dab1ffb..5141f28cba 100644
+--- a/tests/kernels/merlin_sorted_emit_arm.py
++++ b/tests/kernels/merlin_sorted_emit_arm.py
+@@ -97,8 +97,11 @@ def _inputs(name, k, lengths, kind):
+     return logits, torch.tensor(lengths, dtype=torch.int32), prefill
+ 
+ 
+-def _launch(logits, lengths, out, ws, k):
+-    torch.ops._C.persistent_topk(logits, lengths, out, ws, k, int(lengths.max()))
++def _launch(logits, lengths, out, ws, k, max_len):
++    # max_len is a host int computed BEFORE any graph capture: int(t.max()) on
++    # a CUDA tensor is a D2H sync, which is illegal inside torch.cuda.graph
++    # (cudaErrorStreamCaptureUnsupported).
++    torch.ops._C.persistent_topk(logits, lengths, out, ws, k, max_len)
+ 
+ 
+ def main() -> int:
+@@ -109,9 +112,10 @@ def main() -> int:
+     cells, replays_ok = {}, True
+     for name, k, lengths, kind in CELLS:
+         logits, lens, prefill = _inputs(name, k, lengths, kind)
++        max_len = int(lens.max())  # CPU tensor: no device sync
+         logits, lens = logits.to(dev), lens.to(dev)
+         out = prefill.to(dev).clone()
+-        _launch(logits, lens, out, ws, k)
++        _launch(logits, lens, out, ws, k, max_len)
+         torch.cuda.synchronize()
+         cells[name] = out.cpu().clone()
+         if graph:
+@@ -119,11 +123,11 @@ def main() -> int:
+             g = torch.cuda.CUDAGraph()
+             s = torch.cuda.Stream()
+             s.wait_stream(torch.cuda.current_stream())
+-            with torch.cuda.stream(s):
+-                _launch(logits, lens, static_out, ws, k)  # warm on a side stream
++            with torch.cuda.stream(s):  # warm on a side stream
++                _launch(logits, lens, static_out, ws, k, max_len)
+             torch.cuda.current_stream().wait_stream(s)
+             with torch.cuda.graph(g):
+-                _launch(logits, lens, static_out, ws, k)
++                _launch(logits, lens, static_out, ws, k, max_len)
+             static_out.copy_(prefill.to(dev))
+             g.replay()
+             torch.cuda.synchronize()
+diff --git a/tests/v1/engine/test_engine_core_teardown_signal.py b/tests/v1/engine/test_engine_core_teardown_signal.py
+new file mode 100644
+index 0000000000..94a5255908
+--- /dev/null
++++ b/tests/v1/engine/test_engine_core_teardown_signal.py
+@@ -0,0 +1,194 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""EngineCore must survive a late SIGTERM while it tears down its executor.
++
++Workers carry PR_SET_PDEATHSIG=SIGKILL, so an EngineCore that dies before
++model_executor.shutdown() has reaped them SIGKILLs every worker before its
++bounds-guard FINAL DRAIN runs. Observed on an earlier-build shutdown: the
++process-group SIGTERM started the shutdown, the API server's process manager
++sent a second SIGTERM in the same second, the finally block had already reset
++SIGTERM to SIG_DFL, EngineCore died before "[shutdown] Executor: waiting for
++worker exit", and FINAL DRAIN printed on 2 of 4 ranks.
++
++The test drives the real EngineCoreProc.run_engine_core with a fake engine whose
++shutdown() receives that second SIGTERM mid-teardown. Unfixed code: the child
++dies with -SIGTERM before teardown completes (the failing control).
++"""
++
++import contextlib
++import multiprocessing
++import os
++import signal
++import sys
++import time
++from types import SimpleNamespace
++
++import pytest
++
++pytestmark = pytest.mark.skipif(
++    not sys.platform.startswith("linux"), reason="fork + POSIX signals"
++)
++
++
++def _child_run(conn, mode: str = "once") -> None:
++    import logging
++
++    from vllm.v1.engine import core
++
++    if mode == "once-hang":
++        core._TEARDOWN_SIGNAL_BOUND_S = 1.0
++
++    run_engine_core = core.EngineCoreProc.run_engine_core
++
++    records: list[str] = []
++
++    class _Capture(logging.Handler):
++        def emit(self, record):
++            records.append(record.getMessage())
++
++    core.logger.addHandler(_Capture(level=logging.WARNING))
++
++    class _FakeEngineCore:
++        def __init__(self, *args, **kwargs):
++            import queue
++
++            self.input_queue = queue.Queue()
++            self.shutdown_state = None
++            self.vllm_config = kwargs["vllm_config"]
++
++        def run_busy_loop(self):
++            # As after the first (process-group) SIGTERM: the busy loop exits.
++            raise SystemExit
++
++        def has_work(self):
++            return False
++
++        def shutdown(self):
++            # The process manager's SIGTERM, delivered mid-teardown.
++            conn.send(("teardown-start", None))
++            os.kill(os.getpid(), signal.SIGTERM)
++            if mode == "twice-hang":
++                time.sleep(0.2)
++                conn.send(("second-signal", None))
++                os.kill(os.getpid(), signal.SIGTERM)
++            if mode in ("twice-hang", "once-hang"):
++                time.sleep(3600)  # teardown hangs (e.g. distributed cleanup)
++            time.sleep(0.3)  # the executor waiting for its workers
++            conn.send(("teardown-done", None))
++
++    core.EngineCoreProc = _FakeEngineCore
++    core.maybe_register_config_serialize_by_value = lambda: None
++    core.set_process_title = lambda *a, **k: None
++    core.maybe_init_worker_tracer = lambda *a, **k: None
++    core.decorate_logs = lambda *a, **k: None
++
++    vllm_config = SimpleNamespace(
++        parallel_config=SimpleNamespace(
++            data_parallel_size=1,
++            numa_bind=False,
++            data_parallel_index=0,
++            reconfigure_for_independent_dp_rank=lambda: None,
++        ),
++        kv_transfer_config=None,
++        model_config=SimpleNamespace(is_moe=False),
++        shutdown_timeout=60,
++    )
++    with contextlib.suppress(SystemExit):
++        run_engine_core(vllm_config=vllm_config)
++    conn.send(
++        (
++            "after",
++            {
++                "sigterm_is_default": signal.getsignal(signal.SIGTERM)
++                is signal.SIG_DFL,
++                "sigint_is_default": signal.getsignal(signal.SIGINT) is signal.SIG_DFL,
++                "warnings": records,
++            },
++        )
++    )
++    conn.close()
++
++
++def test_late_sigterm_does_not_kill_engine_core_teardown():
++    ctx = multiprocessing.get_context("fork")
++    parent, child = ctx.Pipe(duplex=False)
++    proc = ctx.Process(target=_child_run, args=(child,))
++    proc.start()
++    child.close()
++    events = {}
++    deadline = time.monotonic() + 60
++    while time.monotonic() < deadline:
++        if not parent.poll(0.1):
++            # after exit, drain whatever was sent before it
++            if not proc.is_alive() and not parent.poll(0):
++                break
++            continue
++        try:
++            name, payload = parent.recv()
++        except EOFError:
++            break
++        events[name] = payload
++        if name == "after":
++            break
++    proc.join(30)
++    assert "teardown-start" in events, f"fake teardown never ran: {events}"
++    assert proc.exitcode != -signal.SIGTERM, (
++        "EngineCore died of the SIGTERM delivered during teardown "
++        "(workers would be SIGKILLed before their FINAL DRAIN)"
++    )
++    assert "teardown-done" in events, f"teardown did not complete: {events}"
++    after = events.get("after")
++    assert after is not None, f"run_engine_core did not return: {events}"
++    assert proc.exitcode == 0, proc.exitcode
++    # default dispositions are restored once teardown is over
++    assert after["sigterm_is_default"] and after["sigint_is_default"], after
++    # fail loud: the deferred signal is logged
++    assert any(
++        "SIGTERM during resource teardown deferred" in m for m in after["warnings"]
++    ), after["warnings"]
++
++
++def _run_hanging_teardown(mode: str, bound_s: float):
++    ctx = multiprocessing.get_context("fork")
++    parent, child = ctx.Pipe(duplex=False)
++    proc = ctx.Process(target=_child_run, args=(child, mode))
++    start = time.monotonic()
++    proc.start()
++    child.close()
++    proc.join(bound_s)
++    elapsed = time.monotonic() - start
++    alive = proc.is_alive()
++    if alive:
++        proc.kill()
++        proc.join(10)
++    events = []
++    while True:
++        try:
++            if not parent.poll(0.2):
++                break
++            events.append(parent.recv()[0])
++        except (EOFError, OSError):
++            break
++    return alive, proc.exitcode, elapsed, events
++
++
++def test_second_late_signal_ends_a_hung_teardown():
++    # The deferral must be bounded. The first late SIGTERM is
++    # deferred (the drain-race fix); a second one while teardown hangs ends
++    # the process by that signal. Unfixed code (every late signal deferred)
++    # stays alive until killed (the failing control).
++    alive, exitcode, elapsed, events = _run_hanging_teardown("twice-hang", 15)
++    assert "teardown-start" in events and "second-signal" in events, events
++    assert not alive, f"hung teardown survived a second SIGTERM ({elapsed:.1f}s)"
++    assert exitcode == -signal.SIGTERM, exitcode
++    assert "teardown-done" not in events, events
++
++
++def test_teardown_watchdog_bounds_a_single_deferred_signal():
++    # One deferred SIGTERM, then teardown hangs: the watchdog ends the process
++    # (exit code 1) once _TEARDOWN_SIGNAL_BOUND_S (1 s here) has passed.
++    alive, exitcode, elapsed, events = _run_hanging_teardown("once-hang", 15)
++    assert "teardown-start" in events, events
++    assert not alive, f"hung teardown outlived the watchdog ({elapsed:.1f}s)"
++    assert exitcode == 1, exitcode
++    assert "teardown-done" not in events, events
+diff --git a/tests/v1/executor/test_multiproc_executor_parent_death.py b/tests/v1/executor/test_multiproc_executor_parent_death.py
+index 111fca6733..2ea275533e 100644
+--- a/tests/v1/executor/test_multiproc_executor_parent_death.py
++++ b/tests/v1/executor/test_multiproc_executor_parent_death.py
+@@ -87,7 +87,7 @@ def _run_fake_worker_main(
+                     time.sleep(3600)
+             raise AssertionError(f"unknown block mode: {block_mode}")
+ 
+-        def shutdown(self):
++        def shutdown(self, *, destroy_distributed: bool = True):
+             pass
+ 
+     executor_module.WorkerProc = FakeWorkerProc
+diff --git a/tests/v1/executor/test_multiproc_failed_worker_ladder.py b/tests/v1/executor/test_multiproc_failed_worker_ladder.py
+new file mode 100644
+index 0000000000..9c591132f4
+--- /dev/null
++++ b/tests/v1/executor/test_multiproc_failed_worker_ladder.py
+@@ -0,0 +1,212 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""After a worker died, parked survivors are killed fast; draining ones are not.
++
++A drain fault-injection run (earlier build): the PLE fault killed rank 0. One
++survivor drained and exited at once. Two ranks sat in a collective with the
++dead rank, inside C code where neither the grace nor the SIGTERM reaches them,
++and the executor ran its full 5 s grace + 4 s SIGTERM wait before SIGKILL.
++Workers were gone 17.6 s after the fault, vs 8.7 s on an earlier build, where the
++engine died on the late SIGTERM and PDEATHSIG killed the survivors at once.
++the drain-order change keeps the engine alive for the drain, so the failure ladder has
++to be short on its own.
++
++A known hazard: a blanket 1 s cap can cut a survivor that is still
++draining. Each worker now publishes a shared byte: 0 = shutdown not started,
++1 = started (FINAL DRAIN in progress), 2 = done. Only workers with no drain
++signal get the 1 s ladder.
++
++A later drain fault-injection run: a survivor whose shutdown had STARTED blocked
++inside it on the dead rank (no FINAL DRAIN line) and got the full orderly
++ladder; workers gone 17.6 s after the fault. Started shutdowns now get a
++bounded 2 s grace on the failure path (every measured FINAL DRAIN < 0.1 s),
++then SIGTERM, then SIGKILL after 1 s.
++"""
++
++import contextlib
++import signal
++import subprocess
++import sys
++import time
++from types import SimpleNamespace
++
++import pytest
++
++pytestmark = [
++    pytest.mark.skip_global_cleanup,
++    pytest.mark.skipif(sys.platform == "win32", reason="POSIX signals"),
++]
++
++# Parked in a collective: ignores SIGTERM, never exits on its own.
++_PARKED = (
++    "import signal, time\n"
++    "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
++    "print('ready', flush=True)\n"
++    "time.sleep(600)\n"
++)
++# Draining: default SIGTERM (would die -15), exits 0 by itself after 1.2 s --
++# 12x the longest FINAL DRAIN measured on the reference host, inside the 2 s failure grace.
++_DRAINING_S = 1.2
++_DRAINING = (
++    "import os, time\n"
++    "print('ready', flush=True)\n"
++    f"time.sleep({_DRAINING_S})\n"
++    "os._exit(0)\n"
++)
++
++
++class _Proc:
++    """The BaseProcess surface _ensure_worker_termination uses."""
++
++    def __init__(self, script):
++        self.popen = subprocess.Popen(
++            [sys.executable, "-c", script], stdout=subprocess.PIPE, text=True
++        )
++        assert self.popen.stdout.readline().strip() == "ready"
++
++    def is_alive(self):
++        return self.popen.poll() is None
++
++    def terminate(self):
++        self.popen.send_signal(signal.SIGTERM)
++
++    def kill(self):
++        self.popen.kill()
++
++
++class _Handle:
++    def __init__(self, script, state):
++        self.proc = _Proc(script)
++        self.death_writer = None
++        self.worker_response_mq = None
++        # None = no state published (older handle): treated as parked.
++        self.shutdown_state = None if state is None else SimpleNamespace(value=state)
++
++
++def _executor(workers, *, failed):
++    from vllm.v1.executor.multiproc_executor import MultiprocExecutor
++
++    executor = object.__new__(MultiprocExecutor)
++    executor.workers = workers
++    executor.is_failed = failed
++    executor.rpc_broadcast_mq = None
++    executor.response_mqs = []
++    return executor
++
++
++def _shutdown(specs, *, failed):
++    workers = [_Handle(script, state) for script, state in specs]
++    try:
++        start = time.monotonic()
++        _executor(workers, failed=failed).shutdown()
++        elapsed = time.monotonic() - start
++        # The ladder's last step sends SIGKILL without waiting for the reap.
++        for w in workers:
++            with contextlib.suppress(subprocess.TimeoutExpired):
++                w.proc.popen.wait(2)
++        codes = [w.proc.popen.returncode for w in workers]
++    finally:
++        for w in workers:
++            if w.proc.is_alive():
++                w.proc.kill()
++            w.proc.popen.wait(10)
++    return elapsed, codes
++
++
++def test_failure_shutdown_kills_parked_survivors_fast():
++    elapsed, codes = _shutdown([(_PARKED, 0), (_PARKED, None)], failed=True)
++    assert all(c is not None for c in codes), codes
++    assert elapsed < 3.0, (
++        f"a failure-triggered shutdown took {elapsed:.1f} s to kill ranks parked "
++        "with the dead rank (the orderly 5 s grace + 4 s SIGTERM ladder)"
++    )
++
++
++def test_failure_shutdown_lets_a_draining_survivor_finish():
++    elapsed, codes = _shutdown([(_DRAINING, 1), (_PARKED, 0)], failed=True)
++    assert codes[0] == 0, (
++        f"the draining survivor was signalled (exit {codes[0]}) instead of "
++        "finishing its FINAL DRAIN"
++    )
++    assert codes[1] is not None
++    # The parked survivor is SIGKILLed at ~2 s; the drainer was never signalled.
++    assert _DRAINING_S - 0.3 <= elapsed < 3.0, elapsed
++
++
++def test_failure_shutdown_ends_a_survivor_stuck_in_its_shutdown():
++    # Started its shutdown (state 1), then blocked on the dead rank: ignores
++    # SIGTERM like a rank inside a device synchronize, never exits by itself.
++    elapsed, codes = _shutdown([(_PARKED, 1), (_PARKED, 0)], failed=True)
++    assert all(c is not None for c in codes), codes
++    assert codes[0] == -signal.SIGKILL, codes
++    assert elapsed < 2.0 + 1.0 + 0.6, (
++        f"a failure-triggered shutdown took {elapsed:.1f} s to end a survivor "
++        "stuck inside its started shutdown (bound: 2 s grace + 1 s SIGTERM wait)"
++    )
++
++
++def test_orderly_shutdown_keeps_its_grace(monkeypatch):
++    monkeypatch.setenv("VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS", "2")
++    elapsed, codes = _shutdown([(_PARKED, 0), (_PARKED, 0)], failed=False)
++    assert all(c is not None for c in codes), codes
++    # Unchanged: the configured grace, then the 4 s SIGTERM wait, then SIGKILL.
++    assert elapsed >= 2.0 + 4.0 - 0.5, elapsed
++
++
++def test_worker_main_publishes_shutdown_started_then_done(monkeypatch):
++    """worker_main marks 1 before WorkerProc.shutdown() (drain) and 2 after."""
++    import multiprocessing
++    import os
++
++    import vllm.v1.executor.multiproc_executor as executor_module
++
++    seen = []
++    state = multiprocessing.RawValue("b", 0)
++
++    class _Inner:
++        def shutdown(self):
++            seen.append(("drain", state.value))
++
++    def fake_init(self, *args, **kwargs):
++        self.rank = 0
++        self.worker = _Inner()
++        self.rpc_broadcast_mq = None
++        self.worker_response_mq = SimpleNamespace(
++            export_handle=lambda: None,
++            wait_until_ready=lambda: None,
++            shutdown=lambda: None,
++        )
++        self.peer_response_handles = []
++
++    def busy_loop(self):
++        seen.append(("busy", state.value))
++        raise ValueError("boom")  # an unexpected failure: full teardown path
++
++    monkeypatch.setattr(executor_module.WorkerProc, "__init__", fake_init)
++    monkeypatch.setattr(executor_module.WorkerProc, "worker_busy_loop", busy_loop)
++    monkeypatch.setattr(executor_module, "destroy_model_parallel", lambda: None)
++    monkeypatch.setattr(
++        executor_module, "destroy_distributed_environment", lambda: None
++    )
++    monkeypatch.setattr(executor_module, "maybe_init_worker_tracer", lambda **k: None)
++    monkeypatch.setattr(executor_module, "set_worker_net_device", lambda *a, **k: None)
++    monkeypatch.setattr(
++        executor_module, "_install_worker_parent_death_signal", lambda pid: None
++    )
++    monkeypatch.setattr(executor_module.signal, "signal", lambda *a, **k: None)
++    ready_reader, ready_writer = multiprocessing.Pipe(duplex=False)
++    executor_module.WorkerProc.worker_main(
++        vllm_config=SimpleNamespace(
++            parallel_config=SimpleNamespace(
++                assigned_physical_gpu_ids=None, numa_bind=False
++            )
++        ),
++        ready_pipe=ready_writer,
++        death_pipe=None,
++        shutdown_state=state,
++        inherited_fds=[],
++        expected_parent_pid=os.getpid(),
++    )
++    ready_reader.close()
++    assert seen == [("busy", 0), ("drain", 1)], seen
++    assert state.value == 2
+diff --git a/tests/v1/executor/test_multiproc_ple_exit_without_reap.py b/tests/v1/executor/test_multiproc_ple_exit_without_reap.py
+new file mode 100644
+index 0000000000..4bab227522
+--- /dev/null
++++ b/tests/v1/executor/test_multiproc_ple_exit_without_reap.py
+@@ -0,0 +1,344 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Rank 0 waits for its PLE offload child to leave userspace, not for its reap.
++
++A drain run on an earlier build: on every F cycle three ranks exited
++right after their FINAL DRAIN, but Worker_PP0_TP0, the rank that owns the PLE
++offload process, sat in Worker.shutdown() -> PleOffloadWorkerHandle.close()
++until the executor's grace ran out (SIGTERM at +5 s, SIGKILL at +9 s). A
++read-only /proc sample showed the cause. The offload child (RSS ~51 GB)
++finished its userspace, and its leader went Z at ~+2.7 s. One thread stayed R
++with PF_EXITING set, in-kernel, freeing the address space, so the child was
++not reapable until ~+8.6 s.
++
++A known hazard: a Z leader alone does not prove the child left
++userspace, because another thread can still run. close() therefore waits for
++every task to be Z/X or PF_EXITING.
++
++Covered here:
++- the predicate itself, on a fake procfs;
++- close() does not wait for the reap once the thread group is in exit (fake
++  procfs over a live, unreaped child); the earlier build waits for the reap and fails this;
++- close() does wait while a non-leader thread still runs userspace (real
++  child whose leader exits alone); the earlier commit fails this;
++- the bound: a child that ignores SIGTERM is SIGKILLed within the bound, and
++  the bound fits inside the executor's grace;
++- the default close() still reaps.
++"""
++
++import contextlib
++import platform
++import signal
++import socket
++import subprocess
++import sys
++import tempfile
++import threading
++import time
++from multiprocessing.connection import Connection
++from pathlib import Path
++
++import pytest
++
++pytestmark = pytest.mark.skip_global_cleanup
++
++linux_only = pytest.mark.skipif(
++    sys.platform != "linux" or platform.machine() not in ("x86_64", "aarch64"),
++    reason="needs Linux /proc and a raw SYS_exit number",
++)
++
++_SYS_EXIT = {"x86_64": 60, "aarch64": 93}.get(platform.machine(), -1)
++
++# On SIGTERM: run the cleanup (unlink + marker, like proc_main's finally), then
++# the leader thread exits alone (raw SYS_exit) while a second thread keeps
++# running userspace for LINGER seconds. mode=ignore: SIGTERM is ignored.
++_STUB_CHILD = r"""
++import ctypes
++import os
++import pathlib
++import signal
++import sys
++import threading
++import time
++
++endpoint, marker, linger_s, sys_exit, mode = sys.argv[1:]
++stop = threading.Event()
++if mode == "ignore":
++    signal.signal(signal.SIGTERM, signal.SIG_IGN)
++else:
++    signal.signal(signal.SIGTERM, lambda _s, _f: stop.set())
++pathlib.Path(endpoint).touch()
++print("ready", flush=True)
++if mode == "ignore":
++    time.sleep(600)
++stop.wait()
++os.unlink(endpoint)
++pathlib.Path(marker).touch()
++
++
++def linger():
++    time.sleep(float(linger_s))  # userspace: NOT in the exit path yet
++    os._exit(0)
++
++
++threading.Thread(target=linger).start()
++ctypes.CDLL(None).syscall(int(sys_exit), 0)
++"""
++
++
++def _stat_line(pid, comm, state, flags):
++    # Field 9 (flags) is the 7th field after the parenthesised comm.
++    return f"{pid} ({comm}) {state} 1 1 1 0 -1 {flags} 0 0 0 0\n"
++
++
++def _fake_task_tree(root: Path, pid: int, tasks):
++    for tid, comm, state, flags in tasks:
++        d = root / str(pid) / "task" / str(tid)
++        d.mkdir(parents=True)
++        (d / "stat").write_text(_stat_line(tid, comm, state, flags))
++
++
++def _start_handle(tmp: Path, linger_s: float, mode: str = "graceful"):
++    from vllm.v1.ple_offload.worker import PleOffloadWorkerHandle
++
++    endpoint = tmp / "ple.sock"
++    marker = tmp / "cleanup.done"
++    proc = subprocess.Popen(
++        [
++            sys.executable,
++            "-c",
++            _STUB_CHILD,
++            str(endpoint),
++            str(marker),
++            str(linger_s),
++            str(_SYS_EXIT),
++            mode,
++        ],
++        stdout=subprocess.PIPE,
++        text=True,
++    )
++    assert proc.stdout.readline().strip() == "ready"
++    # gpu_worker._start_ple_offload_watchdog: a thread blocked in proc.wait()
++    # holds Popen._waitpid_lock for as long as the child is unreapable.
++    watchdog = threading.Thread(target=proc.wait, daemon=True)
++    watchdog.start()
++    parent_death, child_death = socket.socketpair()
++    handle = PleOffloadWorkerHandle(
++        proc=proc,
++        death_writer=Connection(parent_death.detach()),
++        ready_pipe_reader=None,
++        launch_deadline=time.monotonic() + 60,
++        ipc_addr=f"ipc://{endpoint}",
++    )
++    return handle, proc, watchdog, endpoint, marker, child_death
++
++
++def _finish(proc, watchdog, child_end, join_s=15):
++    with contextlib.suppress(ProcessLookupError):
++        if proc.returncode is None:
++            proc.send_signal(signal.SIGKILL)
++    watchdog.join(join_s)
++    child_end.close()
++
++
++@pytest.mark.parametrize(
++    "tasks, expected",
++    [
++        # Observed shape (a shutdown sample): leader Z, one task R with PF_EXITING.
++        ([(1, "python3.13", "Z", 0x40810C), (2, "python3.13", "R", 0x40044C)], True),
++        # Leader Z, a thread still in userspace (no PF_EXITING).
++        ([(1, "python3.13", "Z", 0x40810C), (2, "python3.13", "S", 0x400040)], False),
++        ([(1, "python3.13", "S", 0x400100)], False),
++        ([(1, "odd) comm (x", "X", 0)], True),
++        ([], True),
++    ],
++)
++def test_thread_group_predicate(tmp_path, tasks, expected):
++    from vllm.v1.ple_offload.worker import _child_thread_group_exiting
++
++    pid = 4242
++    if tasks:
++        _fake_task_tree(tmp_path, pid, tasks)
++    else:
++        (tmp_path / str(pid) / "task").mkdir(parents=True)
++    proc = type("P", (), {"pid": pid, "returncode": None})()
++    assert _child_thread_group_exiting(proc, str(tmp_path)) is expected
++
++
++@linux_only
++def test_exit_imminent_close_does_not_wait_for_the_reap(monkeypatch, tmp_path):
++    import vllm.v1.ple_offload.worker as ple_worker
++
++    monkeypatch.setattr(ple_worker, "_PROCESS_EXIT_IMMINENT", True, raising=False)
++    with tempfile.TemporaryDirectory() as d:
++        # A live child that will not exit on SIGTERM stands in for the 51 GB
++        # child: unreapable for as long as the test wants.
++        handle, proc, watchdog, endpoint, marker, child_end = _start_handle(
++            Path(d), 0, mode="ignore"
++        )
++        try:
++            # procfs says: leader Z, the other task R with PF_EXITING.
++            fake = tmp_path / "proc"
++            _fake_task_tree(
++                fake,
++                proc.pid,
++                [(proc.pid, "python3.13", "Z", 0x40810C), (1, "x", "R", 0x40044C)],
++            )
++            monkeypatch.setattr(ple_worker, "_PROC_ROOT", str(fake), raising=False)
++            start = time.monotonic()
++            handle.close()
++            elapsed = time.monotonic() - start
++            assert elapsed < 1.0, (
++                f"close() waited {elapsed:.1f} s for the offload child's reap "
++                "although its thread group was in the kernel exit path; the "
++                "executor's 5 s grace expires first on the reference host"
++            )
++            assert proc.poll() is None, "close() reaped or killed the child"
++            assert handle.death_writer is None
++        finally:
++            _finish(proc, watchdog, child_end)
++
++
++@linux_only
++def test_exit_imminent_close_waits_for_a_userspace_thread(monkeypatch):
++    import vllm.v1.ple_offload.worker as ple_worker
++
++    monkeypatch.setattr(ple_worker, "_PROCESS_EXIT_IMMINENT", True, raising=False)
++    linger_s = 1.5
++    with tempfile.TemporaryDirectory() as d:
++        handle, proc, watchdog, endpoint, marker, child_end = _start_handle(
++            Path(d), linger_s
++        )
++        try:
++            start = time.monotonic()
++            handle.close()
++            elapsed = time.monotonic() - start
++            assert elapsed >= linger_s - 0.2, (
++                f"close() returned after {elapsed:.2f} s, while a child thread "
++                f"was still running userspace ({linger_s} s): a Z leader is "
++                "not the whole thread group"
++            )
++            assert elapsed < linger_s + 1.5, elapsed
++            assert marker.exists(), "child cleanup (proc_main finally) never ran"
++            assert not endpoint.exists()
++        finally:
++            _finish(proc, watchdog, child_end)
++        assert proc.returncode == 0
++
++
++@linux_only
++def test_exit_imminent_wait_is_bounded_inside_the_grace(monkeypatch):
++    import vllm.envs as envs
++    import vllm.v1.ple_offload.worker as ple_worker
++
++    monkeypatch.setattr(ple_worker, "_PROCESS_EXIT_IMMINENT", True, raising=False)
++    bound = ple_worker._EXIT_IMMINENT_CHILD_WAIT_S
++    # Rank 0 must be gone before the executor's grace; leave >= 1 s for the
++    # rest of its shutdown and its own exit.
++    assert bound <= envs.VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS - 1.0
++    with tempfile.TemporaryDirectory() as d:
++        handle, proc, watchdog, endpoint, marker, child_end = _start_handle(
++            Path(d), 0, mode="ignore"
++        )
++        try:
++            start = time.monotonic()
++            handle.close()
++            elapsed = time.monotonic() - start
++            assert bound - 0.1 <= elapsed < bound + 1.0, elapsed
++            watchdog.join(5)
++            assert proc.returncode == -signal.SIGKILL
++        finally:
++            _finish(proc, watchdog, child_end)
++
++
++@linux_only
++def test_default_close_still_reaps(monkeypatch):
++    import vllm.v1.ple_offload.worker as ple_worker
++
++    monkeypatch.setattr(ple_worker, "_PROCESS_EXIT_IMMINENT", False, raising=False)
++    with tempfile.TemporaryDirectory() as d:
++        handle, proc, watchdog, endpoint, marker, child_end = _start_handle(
++            Path(d), 1.0
++        )
++        try:
++            handle.close()
++            # Unchanged full-teardown path: the child is reaped before return.
++            assert proc.returncode is not None
++            assert marker.exists() and not endpoint.exists()
++        finally:
++            _finish(proc, watchdog, child_end)
++
++
++class _FakeInner:
++    def __init__(self):
++        self.calls = 0
++
++    def shutdown(self):
++        self.calls += 1
++
++
++@pytest.mark.parametrize("destroy_distributed", [False, True])
++def test_worker_shutdown_marks_exit_imminent_only_on_the_exit_path(
++    monkeypatch, destroy_distributed
++):
++    import vllm.v1.executor.multiproc_executor as executor_module
++    import vllm.v1.ple_offload.worker as ple_worker
++
++    monkeypatch.setattr(ple_worker, "_PROCESS_EXIT_IMMINENT", False, raising=False)
++    monkeypatch.setattr(executor_module, "destroy_model_parallel", lambda: None)
++    monkeypatch.setattr(
++        executor_module, "destroy_distributed_environment", lambda: None
++    )
++    proc = object.__new__(executor_module.WorkerProc)
++    proc.rpc_broadcast_mq = None
++    proc.worker_response_mq = None
++    proc.worker = _FakeInner()
++    proc.shutdown(destroy_distributed=destroy_distributed)
++    assert proc.worker.calls == 1
++    assert ple_worker._PROCESS_EXIT_IMMINENT is (not destroy_distributed)
++
++
++_FATAL_CHILD = r"""
++import os
++import sys
++import time
++
++import vllm.v1.ple_offload.worker as ple_worker
++from vllm.v1.ple_offload.fatal import ple_fail_closed
++
++
++def forbidden(*args, **kwargs):
++    os.write(1, b"CLOSE-CALLED\n")
++    time.sleep(10)  # what a reap wait would cost
++
++
++ple_worker.PleOffloadWorkerHandle.close = forbidden
++ple_worker.PleOffloadWorkerHandle._close_without_reap = forbidden
++t0 = time.monotonic()
++os.write(1, b"FIRE %.6f\n" % t0)
++try:
++    raise RuntimeError("PLE test fault: exc_after_prepare")
++except RuntimeError as error:
++    ple_fail_closed(where="execute_model", rank=0, layer="l", sequence=9, error=error)
++os.write(1, b"RETURNED\n")
++"""
++
++
++def test_ple_fatal_path_exits_without_closing_or_reaping_the_offload_child():
++    """Drain fault-injection test: rank 0 died ~8.3 s after its PLE fatal line. The fatal path
++    must be a straight os._exit(1): no Worker.shutdown(), no
++    PleOffloadWorkerHandle.close() (terminate + reap wait). The offload child
++    is ended by its own death-pipe monitor when this process exits."""
++    start = time.monotonic()
++    proc = subprocess.run(
++        [sys.executable, "-c", _FATAL_CHILD],
++        capture_output=True,
++        text=True,
++        timeout=120,
++    )
++    assert proc.returncode == 1, (proc.returncode, proc.stdout, proc.stderr[-500:])
++    assert "CLOSE-CALLED" not in proc.stdout
++    assert "RETURNED" not in proc.stdout
++    assert "FIRE " in proc.stdout
++    assert "PLE fatal: where=execute_model" in proc.stderr
++    assert time.monotonic() - start < 60
+diff --git a/tests/v1/executor/test_multiproc_worker_exit_after_drain.py b/tests/v1/executor/test_multiproc_worker_exit_after_drain.py
+new file mode 100644
+index 0000000000..7694a62225
+--- /dev/null
++++ b/tests/v1/executor/test_multiproc_worker_exit_after_drain.py
+@@ -0,0 +1,456 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""A worker whose orderly shutdown has finished must exit, not linger.
++
++A fault-injection run with the drain-order deferred-signal fix: every rank printed
++its bounds-guard FINAL DRAIN within ~1 s of the executor closing the death pipes,
++but then stayed alive past VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS (5 s); the
++executor logged two WARNINGs and SIGKILLed the workers at ~9 s. After
++Worker.shutdown() (drain, instrumentation flushes, PLE cleanup) WorkerProc
++destroys the model-parallel groups, and PyNcclCommunicator.destroy() joins its
++ncclCommAbort thread for up to 5 s per communicator while the CUDA graphs that
++captured NCCL ops are still alive. The executor's SIGTERM is then a no-op (the
++worker's handler raises SystemExit only once and the death-pipe monitor already
++set shutdown_requested), so the ladder runs to SIGKILL.
++
++The fake below reproduces that: destroy_model_parallel blocks _SLOW_DESTROY_S.
++Unfixed code pays it before the process can exit (the failing controls); fixed
++code runs WorkerProc.shutdown(destroy_distributed=False) and exits right after.
++"""
++
++import logging
++import multiprocessing
++import os
++import sys
++import threading
++import time
++from types import SimpleNamespace
++
++import pytest
++
++# CPU-only fakes: no process groups or device memory to clean up afterwards.
++pytestmark = pytest.mark.skip_global_cleanup
++
++_SLOW_DESTROY_S = 6.0  # > the executor's 5 s grace, like the NCCL destroy join
++_EXIT_BOUND_S = 3.0  # reference-host bound: all workers gone <= 3 s after the drain
++
++
++class _FakeMQ:
++    def __init__(self, entered: threading.Event | None = None):
++        self.entered = entered
++        self.stop = threading.Event()
++        self.shutting_down = False
++
++    def export_handle(self):
++        return None
++
++    def wait_until_ready(self):
++        pass
++
++    def shutdown(self):
++        self.shutting_down = True
++        self.stop.set()
++
++    def dequeue(self, indefinite=True):
++        if self.entered is not None:
++            self.entered.set()
++        # shm_broadcast.acquire_read raises RuntimeError("cancelled") once the
++        # death-pipe monitor has called shutdown().
++        self.stop.wait()
++        raise RuntimeError("cancelled")
++
++
++class _FakeInnerWorker:
++    """Stands in for gpu_worker.Worker; shutdown() is where FINAL DRAIN runs."""
++
++    def __init__(self, record):
++        self.record = record
++
++    def shutdown(self):
++        self.record("drain")
++
++
++def _patch_executor(executor_module, record, entered, slow_destroy_s, set_=setattr):
++    real_worker_proc = executor_module.WorkerProc
++
++    def fake_init(self, *args, **kwargs):
++        self.rank = 0
++        self.worker = _FakeInnerWorker(record)
++        self.rpc_broadcast_mq = _FakeMQ(entered)
++        self.worker_response_mq = _FakeMQ()
++        self.peer_response_handles = []
++        self.use_async_scheduling = False
++
++    def slow_destroy_model_parallel():
++        record("destroy_model_parallel")
++        time.sleep(slow_destroy_s)
++
++    set_(real_worker_proc, "__init__", fake_init)
++    set_(executor_module, "destroy_model_parallel", slow_destroy_model_parallel)
++    set_(
++        executor_module,
++        "destroy_distributed_environment",
++        lambda: record("destroy_distributed_environment"),
++    )
++    set_(executor_module, "maybe_init_worker_tracer", lambda **kwargs: None)
++    set_(executor_module, "set_worker_net_device", lambda *args, **kwargs: None)
++
++
++def _fake_config():
++    return SimpleNamespace(
++        parallel_config=SimpleNamespace(
++            assigned_physical_gpu_ids=None,
++            numa_bind=False,
++        )
++    )
++
++
++# ---------------------------------------------------------------------------
++# In-process: the real worker_main / WorkerProc.shutdown, os._exit intercepted.
++# ---------------------------------------------------------------------------
++
++
++class _Exited(BaseException):
++    def __init__(self, code):
++        super().__init__(code)
++        self.code = code
++
++
++def _run_worker_main_in_process(
++    monkeypatch,
++    *,
++    busy_loop_error=None,
++    fail_after_shutdown_request=False,
++    slow_destroy_s=_SLOW_DESTROY_S,
++):
++    import vllm.v1.executor.multiproc_executor as executor_module
++
++    events: list[tuple[str, float]] = []
++
++    def record(name):
++        events.append((name, time.monotonic()))
++
++    entered = threading.Event()
++    _patch_executor(
++        executor_module, record, entered, slow_destroy_s, monkeypatch.setattr
++    )
++    if busy_loop_error is not None:
++
++        def failing_busy_loop(self):
++            if fail_after_shutdown_request:
++                # Idle until the death-pipe monitor has set shutdown_requested
++                # and shut the queues down, then fail for a reason of its own.
++                entered.set()
++                assert self.rpc_broadcast_mq.stop.wait(30)
++            raise busy_loop_error
++
++        monkeypatch.setattr(
++            executor_module.WorkerProc, "worker_busy_loop", failing_busy_loop
++        )
++    # worker_main arms PDEATHSIG and installs SIGTERM/SIGINT handlers; keep
++    # both off the pytest process.
++    monkeypatch.setattr(
++        executor_module, "_install_worker_parent_death_signal", lambda pid: None
++    )
++    monkeypatch.setattr(executor_module.signal, "signal", lambda *a, **k: None)
++    monkeypatch.setattr(logging, "shutdown", lambda *a, **k: None)
++    # The orderly path marks this (pytest) process exit-imminent for the PLE
++    # handle; restore the flag so later PLE close() tests see a live process.
++    ple_worker = sys.modules.get("vllm.v1.ple_offload.worker")
++    if ple_worker is not None:
++        monkeypatch.setattr(
++            ple_worker,
++            "_PROCESS_EXIT_IMMINENT",
++            getattr(ple_worker, "_PROCESS_EXIT_IMMINENT", False),
++            raising=False,
++        )
++
++    def fake_exit(code):
++        record("os._exit")
++        raise _Exited(code)
++
++    monkeypatch.setattr(os, "_exit", fake_exit)
++
++    ctx = multiprocessing.get_context()
++    ready_reader, ready_writer = ctx.Pipe(duplex=False)
++    death_reader, death_writer = ctx.Pipe(duplex=False)
++
++    def close_death_pipe_when_idle():
++        # The executor's shutdown(): close the death pipe once the worker idles.
++        if entered.wait(30):
++            record("death_pipe_closed")
++            death_writer.close()
++
++    closer = threading.Thread(target=close_death_pipe_when_idle, daemon=True)
++    closer.start()
++
++    exit_code = None
++    start = time.monotonic()
++    try:
++        executor_module.WorkerProc.worker_main(
++            vllm_config=_fake_config(),
++            ready_pipe=ready_writer,
++            death_pipe=death_reader,
++            inherited_fds=[],
++            expected_parent_pid=os.getpid(),
++        )
++    except _Exited as exited:
++        exit_code = exited.code
++    except SystemExit as exited:
++        record("SystemExit")
++        exit_code = exited.code
++    finally:
++        entered.set()  # a failing busy loop never dequeues
++        closer.join(5)
++    assert ready_reader.recv()["status"] == "READY"
++    ready_reader.close()
++    return events, exit_code, time.monotonic() - start
++
++
++def test_orderly_shutdown_exits_right_after_drain(monkeypatch):
++    events, exit_code, _ = _run_worker_main_in_process(monkeypatch)
++    names = [name for name, _ in events]
++    assert "drain" in names, f"FINAL DRAIN never ran: {names}"
++    assert exit_code is not None, (
++        "worker_main returned instead of exiting the process after its "
++        f"orderly shutdown (the process would linger in teardown): {names}"
++    )
++    assert exit_code == 0
++    assert "destroy_model_parallel" not in names, (
++        f"the exit-only NCCL destroy ran before the process exit: {names}"
++    )
++    t = dict(events)
++    assert names.index("drain") < names.index("os._exit"), names
++    assert t["os._exit"] - t["drain"] <= _EXIT_BOUND_S, events
++
++
++def test_unexpected_busy_loop_failure_keeps_full_teardown(monkeypatch):
++    # Not an orderly shutdown (no shutdown request): unchanged behaviour --
++    # full WorkerProc.shutdown incl. distributed destroy, then a normal return.
++    events, exit_code, _ = _run_worker_main_in_process(
++        monkeypatch, busy_loop_error=ValueError("boom"), slow_destroy_s=0.0
++    )
++    names = [name for name, _ in events]
++    assert exit_code is None, names
++    assert names.count("drain") == 1, names
++    assert "destroy_model_parallel" in names, names
++    assert "destroy_distributed_environment" in names, names
++
++
++def test_failure_racing_shutdown_is_not_an_orderly_exit(monkeypatch):
++    # A real busy-loop failure that happens while a shutdown
++    # request is pending must not take the orderly exit-0 path. Unfixed code
++    # treats ANY exception as orderly once shutdown_requested is set (the
++    # failing control: exit code 0, no distributed teardown).
++    events, exit_code, _ = _run_worker_main_in_process(
++        monkeypatch,
++        busy_loop_error=ValueError("boom"),
++        fail_after_shutdown_request=True,
++        slow_destroy_s=0.0,
++    )
++    names = [name for name, _ in events]
++    assert "death_pipe_closed" in names, names
++    assert exit_code not in (None, 0), (
++        f"a worker failure that raced the shutdown request exited {exit_code!r} "
++        f"(hidden as a clean exit): {names}"
++    )
++    assert "os._exit" not in names, f"took the orderly exit path: {names}"
++    assert names.count("drain") == 1, names
++    assert "destroy_model_parallel" in names, names
++    assert "destroy_distributed_environment" in names, names
++
++
++def test_busy_loop_raises_shutdown_type_only_for_its_own_cancellation():
++    import vllm.v1.executor.multiproc_executor as executor_module
++
++    proc = executor_module.WorkerProc.__new__(executor_module.WorkerProc)
++    proc.rpc_broadcast_mq = _FakeMQ()
++    proc.rpc_broadcast_mq.shutdown()
++    with pytest.raises(executor_module.WorkerShutdownRequested):
++        proc.worker_busy_loop()
++
++    class _NotShutDownMQ(_FakeMQ):
++        def dequeue(self, indefinite=True):
++            raise RuntimeError("cancelled")  # but nobody shut this queue down
++
++    proc.rpc_broadcast_mq = _NotShutDownMQ()
++    with pytest.raises(RuntimeError) as info:
++        proc.worker_busy_loop()
++    assert not isinstance(info.value, executor_module.WorkerShutdownRequested)
++
++
++# ---------------------------------------------------------------------------
++# Real processes: the executor's own grace/SIGTERM/SIGKILL ladder.
++# ---------------------------------------------------------------------------
++
++
++def _worker_child(ready_pipe, death_pipe, events_pipe, parent_pid):
++    import vllm.v1.executor.multiproc_executor as executor_module
++
++    def record(name):
++        events_pipe.send((name, time.monotonic()))
++
++    _patch_executor(executor_module, record, None, _SLOW_DESTROY_S)
++    executor_module.WorkerProc.worker_main(
++        vllm_config=_fake_config(),
++        ready_pipe=ready_pipe,
++        death_pipe=death_pipe,
++        inherited_fds=[],
++        expected_parent_pid=parent_pid,
++    )
++
++
++def test_executor_reaps_drained_workers_within_grace():
++    import vllm.v1.executor.multiproc_executor as executor_module
++
++    ctx = multiprocessing.get_context("spawn")
++    procs, deaths, readers = [], [], []
++    for _ in range(2):  # two ranks, as the executor sees them
++        ready_reader, ready_writer = ctx.Pipe(duplex=False)
++        death_reader, death_writer = ctx.Pipe(duplex=False)
++        events_reader, events_writer = ctx.Pipe(duplex=False)
++        proc = ctx.Process(
++            target=_worker_child,
++            args=(ready_writer, death_reader, events_writer, os.getpid()),
++            daemon=True,
++        )
++        proc.start()
++        ready_writer.close()
++        death_reader.close()
++        events_writer.close()
++        assert ready_reader.poll(180), "worker child never became READY"
++        assert ready_reader.recv()["status"] == "READY"
++        ready_reader.close()
++        procs.append(proc)
++        deaths.append(death_writer)
++        readers.append(events_reader)
++
++    warnings: list[str] = []
++
++    class _Capture(logging.Handler):
++        def emit(self, record):
++            warnings.append(record.getMessage())
++
++    handler = _Capture(level=logging.WARNING)
++    executor_module.logger.addHandler(handler)
++    try:
++        start = time.monotonic()
++        for death_writer in deaths:  # MultiprocExecutor.shutdown()
++            death_writer.close()
++        executor_module.MultiprocExecutor._ensure_worker_termination(procs)
++        elapsed = time.monotonic() - start
++    finally:
++        executor_module.logger.removeHandler(handler)
++        for proc in procs:
++            if proc.is_alive():
++                proc.kill()
++            proc.join(10)
++
++    for rank, reader in enumerate(readers):
++        names = []
++        # The child has exited: read what it sent until EOF (Windows reports a
++        # closed pipe as BrokenPipeError).
++        while True:
++            try:
++                if not reader.poll(0.5):
++                    break
++                names.append(reader.recv()[0])
++            except (EOFError, OSError):
++                break
++        assert "drain" in names, f"rank {rank} never drained: {names}"
++    assert not warnings, f"executor escalated past the grace period: {warnings}"
++    assert elapsed <= _EXIT_BOUND_S, (
++        f"workers took {elapsed:.1f}s to exit after the death pipes closed"
++    )
++    assert [proc.exitcode for proc in procs] == [0, 0]
++
++
++def _stuck_worker_child(ready_pipe, death_pipe, events_pipe, parent_pid):
++    import vllm.v1.executor.multiproc_executor as executor_module
++
++    def record(name):
++        events_pipe.send((name, time.monotonic()))
++
++    _patch_executor(executor_module, record, None, 0.0)
++
++    def stuck_busy_loop(self):
++        # Never leaves the loop and ignores the queue shutdown (a hung RPC).
++        record("busy")
++        while True:
++            time.sleep(0.05)
++
++    executor_module.WorkerProc.worker_busy_loop = stuck_busy_loop
++    executor_module.WorkerProc.worker_main(
++        vllm_config=_fake_config(),
++        ready_pipe=ready_pipe,
++        death_pipe=death_pipe,
++        inherited_fds=[],
++        expected_parent_pid=parent_pid,
++    )
++
++
++def test_ladder_bounds_a_worker_stuck_in_its_busy_loop(monkeypatch):
++    """Documents (does not change) the bounded ladder.
++
++    A READY worker that never leaves its busy loop after the death pipe
++    closes: the death-pipe monitor has already set shutdown_requested, so the
++    executor's SIGTERM is a no-op in the worker's handler and the ladder ends
++    in SIGKILL -- that rank's FINAL DRAIN does not run. The bound is the
++    property: grace + 4 s, never longer.
++    """
++    import vllm.envs as envs
++    import vllm.v1.executor.multiproc_executor as executor_module
++
++    grace_s = 1
++    monkeypatch.setattr(
++        envs, "VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS", grace_s, raising=False
++    )
++    ctx = multiprocessing.get_context("spawn")
++    ready_reader, ready_writer = ctx.Pipe(duplex=False)
++    death_reader, death_writer = ctx.Pipe(duplex=False)
++    events_reader, events_writer = ctx.Pipe(duplex=False)
++    proc = ctx.Process(
++        target=_stuck_worker_child,
++        args=(ready_writer, death_reader, events_writer, os.getpid()),
++        daemon=True,
++    )
++    proc.start()
++    ready_writer.close()
++    death_reader.close()
++    events_writer.close()
++    assert ready_reader.poll(180), "worker child never became READY"
++    assert ready_reader.recv()["status"] == "READY"
++    ready_reader.close()
++
++    warnings: list[str] = []
++
++    class _Capture(logging.Handler):
++        def emit(self, record):
++            warnings.append(record.getMessage())
++
++    handler = _Capture(level=logging.WARNING)
++    executor_module.logger.addHandler(handler)
++    try:
++        start = time.monotonic()
++        death_writer.close()
++        executor_module.MultiprocExecutor._ensure_worker_termination([proc])
++        elapsed = time.monotonic() - start
++    finally:
++        executor_module.logger.removeHandler(handler)
++        if proc.is_alive():
++            proc.kill()
++        proc.join(10)
++    names = []
++    while True:
++        try:
++            if not events_reader.poll(0.5):
++                break
++            names.append(events_reader.recv()[0])
++        except (EOFError, OSError):
++            break
++    assert "busy" in names, names
++    assert "drain" not in names, names  # the documented gap: SIGKILL, no drain
++    assert any("after grace period" in w for w in warnings), warnings
++    assert any("sending SIGKILL" in w for w in warnings), warnings
++    assert proc.exitcode == -9, proc.exitcode
++    assert elapsed <= grace_s + 4 + 2, f"ladder took {elapsed:.1f}s"
+diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
+index 110f56dcde..72da32ebc5 100644
+--- a/vllm/v1/engine/core.py
++++ b/vllm/v1/engine/core.py
+@@ -4,12 +4,13 @@ import gc
+ import os
+ import queue
+ import signal
++import sys
+ import threading
+ import time
+ from collections import defaultdict, deque
+ from collections.abc import Callable, Generator, Sequence
+ from concurrent.futures import Future
+-from contextlib import ExitStack, contextmanager
++from contextlib import ExitStack, contextmanager, suppress
+ from enum import IntEnum
+ from functools import partial
+ from inspect import isclass, signature
+@@ -102,6 +103,76 @@ HANDSHAKE_TIMEOUT_MINS = 5
+ _R = TypeVar("_R")  # Return type for collective_rpc
+ 
+ 
++# How long EngineCore teardown may run after it deferred a late SIGTERM/SIGINT
++# before the process exits anyway. Covers the whole of engine_core.shutdown(),
++# not only the executor's worker ladder (grace + 4 s): a hang in later teardown
++# (scheduler, distributed cleanup) must not make the process unkillable.
++_TEARDOWN_SIGNAL_BOUND_S = 30.0
++
++
++class _TeardownSignalGuard:
++    """EngineCore teardown: defer ONE late SIGTERM/SIGINT, bounded.
++
++    Dying on the first late signal would SIGKILL every worker
++    (PR_SET_PDEATHSIG) before its shutdown drain; see the finally block of
++    EngineCoreProc.run_engine_core. The deferral is bounded two ways:
++      - a SECOND late signal restores the default disposition and re-delivers
++        itself, so the process dies of it (the maintainer's escalation);
++      - after the first deferred signal a watchdog ends the process with
++        exit code 1 if teardown is still running _TEARDOWN_SIGNAL_BOUND_S later.
++    """
++
++    def __init__(self, bound_s: float | None = None) -> None:
++        self.bound_s = _TEARDOWN_SIGNAL_BOUND_S if bound_s is None else bound_s
++        self.deferred = 0
++        self._done = threading.Event()
++        self._watchdog: threading.Thread | None = None
++
++    def __call__(self, signum, frame) -> None:
++        name = signal.Signals(signum).name
++        if self._done.is_set():
++            return
++        self.deferred += 1
++        if self.deferred == 1:
++            logger.warning(
++                "[shutdown] EngineCore: %s during resource teardown deferred; "
++                "workers finish their shutdown (FINAL DRAIN) first (a second "
++                "signal, or %.0f s of teardown, ends the process)",
++                name,
++                self.bound_s,
++            )
++            self._watchdog = threading.Thread(
++                target=self._expire,
++                daemon=True,
++                name="EngineCoreTeardownWatchdog",
++            )
++            self._watchdog.start()
++            return
++        logger.warning(
++            "[shutdown] EngineCore: second late signal (%s) during resource "
++            "teardown; not deferring again",
++            name,
++        )
++        signal.signal(signum, signal.SIG_DFL)
++        os.kill(os.getpid(), signum)
++
++    def _expire(self) -> None:
++        if self._done.wait(self.bound_s):
++            return
++        logger.error(
++            "[shutdown] EngineCore: resource teardown still running %.0f s "
++            "after a deferred signal; exiting (code 1)",
++            self.bound_s,
++        )
++        for stream in (sys.stdout, sys.stderr):
++            with suppress(Exception):
++                stream.flush()
++        os._exit(1)
++
++    def disarm(self) -> None:
++        self._done.set()
++
++
+ class EngineCore:
+     """Inner loop of vLLM's Engine."""
+ 
+@@ -1371,12 +1442,29 @@ class EngineCoreProc(EngineCore):
+                 engine_core._send_engine_dead()
+             raise e
+         finally:
+-            signal.signal(signal.SIGTERM, signal.SIG_DFL)
+-            signal.signal(signal.SIGINT, signal.SIG_DFL)
++            # Workers carry PR_SET_PDEATHSIG=SIGKILL (fail-closed PLE teardown),
++            # so if this process dies before model_executor.shutdown() has reaped
++            # them, every worker is SIGKILLed mid-shutdown and its bounds-guard
++            # FINAL DRAIN never runs. The API server's process manager sends a
++            # second SIGTERM right after the signal that started this shutdown;
++            # with SIG_DFL here it killed teardown before the executor waited for
++            # the workers. Defer ONE late signal until teardown ends; a second
++            # signal or _TEARDOWN_SIGNAL_BOUND_S of teardown after the deferral
++            # still ends the process (_TeardownSignalGuard), as do the
++            # executor's terminate/kill ladder and the process manager's timeout
++            # (kill_process_tree -> SIGKILL).
++            teardown_guard = _TeardownSignalGuard()
++            signal.signal(signal.SIGTERM, teardown_guard)
++            signal.signal(signal.SIGINT, teardown_guard)
+             if signal_callback is not None:
+                 signal_callback.stop()
+-            if engine_core is not None:
+-                engine_core.shutdown()
++            try:
++                if engine_core is not None:
++                    engine_core.shutdown()
++            finally:
++                signal.signal(signal.SIGTERM, signal.SIG_DFL)
++                signal.signal(signal.SIGINT, signal.SIG_DFL)
++                teardown_guard.disarm()
+             if clean_shutdown:
+                 from vllm.platforms import current_platform
+ 
+diff --git a/vllm/v1/executor/multiproc_executor.py b/vllm/v1/executor/multiproc_executor.py
+index fc744cbd2b..0c5af34707 100644
+--- a/vllm/v1/executor/multiproc_executor.py
++++ b/vllm/v1/executor/multiproc_executor.py
+@@ -114,6 +114,65 @@ def _install_worker_parent_death_signal(expected_parent_pid: int) -> None:
+         os._exit(1)
+ 
+ 
++# Grace and post-SIGTERM wait, after a worker's death, for survivors that never
++# started their shutdown (see MultiprocExecutor._ensure_worker_termination).
++_FAILED_WORKER_WAIT_S = 1.0
++# After a worker's death, the bounded grace for survivors whose shutdown has
++# STARTED (FINAL DRAIN in progress). Every FINAL DRAIN measured on the reference host took
++# < 0.1 s (drain-path tests: the drain line lands within ~0.05 s of the
++# shutdown request); 2 s is 20x that, so a draining rank is not cut
++# (a shorter cap did), while one blocked inside its shutdown on the dead rank is ended.
++_FAILED_DRAIN_GRACE_S = 2.0
++# Per-worker shared byte (WorkerProcHandle.shutdown_state): written by the
++# worker in worker_main's finally, read by the executor's termination ladder.
++_SHUTDOWN_NOT_STARTED = 0
++_SHUTDOWN_STARTED = 1
++_SHUTDOWN_DONE = 2
++
++
++class WorkerShutdownRequested(RuntimeError):
++    """The busy loop's dequeue was cancelled by a shutdown request.
++
++    Raised only by WorkerProc.worker_busy_loop when the RPC broadcast queue
++    reports its own cancellation (shm_broadcast: RuntimeError("cancelled")
++    after MessageQueue.shutdown(), which the death-pipe monitor calls once the
++    parent closes the pipe). worker_main takes the orderly exit path on this
++    type only; any other exception is a failure, even one that races a
++    shutdown request. Subclasses RuntimeError so existing catchers still match.
++    """
++
++
++def _exit_worker_process(exit_code: int) -> None:
++    """End a worker process whose orderly shutdown has already run.
++
++    Called after WorkerProc.shutdown(destroy_distributed=False): the FINAL
++    DRAIN, the instrumentation flushes and the PLE offload / shared-memory
++    cleanup are done. What would remain is process-exit-only teardown --
++    destroying the NCCL communicators (PyNcclCommunicator.destroy joins its
++    ncclCommAbort thread for up to 5 s per communicator while CUDA graphs that
++    captured NCCL ops are still alive) and interpreter finalization (CUDA
++    context, allocator pools). The driver and kernel reclaim all of it at
++    process exit, and without this the executor's 5 s grace expired and the
++    worker was SIGKILLed at ~9 s anyway. Flush the logs,
++    then leave.
++    """
++    logger.info(
++        "[shutdown] WorkerProc: shutdown complete; exiting process (code %d) "
++        "without distributed teardown",
++        exit_code,
++    )
++    try:
++        import logging
++
++        logging.shutdown()
++    except Exception:  # noqa: BLE001 -- the exit must happen regardless
++        pass
++    for stream in (sys.stdout, sys.stderr):
++        with suppress(Exception):
++            stream.flush()
++    os._exit(exit_code)
++
++
+ class FutureWrapper(Future):
+     def __init__(
+         self,
+@@ -491,10 +550,36 @@ class MultiprocExecutor(Executor):
+         return future if non_block else future.result()
+ 
+     @staticmethod
+-    def _ensure_worker_termination(worker_procs: list[BaseProcess]):
++    def _ensure_worker_termination(
++        worker_procs: list[BaseProcess],
++        *,
++        after_failure: bool = False,
++        shutdown_states: list[Any] | None = None,
++    ):
+         """Ensure that all worker processes are terminated. Assumes workers have
+         received termination requests. Waits for processing, then sends
+-        termination and kill signals if needed."""
++        termination and kill signals if needed.
++
++        after_failure: a worker already died. Survivors split in two. Those
++        that never started WorkerProc.shutdown() are parked in a collective
++        with the dead rank (NCCL / gloo, in C, where neither the grace nor a
++        SIGTERM reaches them -- in a fault-injection test two ranks ran the full
++        5 s + 4 s ladder to SIGKILL): they get _FAILED_WORKER_WAIT_S to start
++        their shutdown, then SIGTERM, then SIGKILL after as long again. Those
++        whose shutdown_states entry shows the shutdown started (FINAL DRAIN,
++        flushes) get _FAILED_DRAIN_GRACE_S from the start of the ladder, then
++        SIGTERM, then SIGKILL after _FAILED_WORKER_WAIT_S: a started shutdown
++        can itself block on the dead rank (in a drain fault-injection test one
++        survivor had started its shutdown and never logged its FINAL DRAIN --
++        the drain's device synchronize waits on work paired with the dead
++        rank -- and ran the full orderly ladder, workers gone 17.6 s after the
++        fault). Before the drain-order fix the engine died on the late SIGTERM and
++        PDEATHSIG killed all survivors at once. A worker with no state (None,
++        or no shutdown_states) counts as parked. The orderly ladder (no
++        failure) is unchanged.
++        """
++        grace_s = float(envs.VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS)
++        term_wait_s = 4.0
+ 
+         def wait_for_termination(procs, timeout):
+             if not time:
+@@ -516,9 +601,42 @@ class MultiprocExecutor(Executor):
+             "[shutdown] Executor: waiting for worker exit count=%d",
+             initial_count,
+         )
+-        if wait_for_termination(
+-            active_procs(), timeout=envs.VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS
+-        ):
++        if after_failure and time:
++            start = time.time()
++            states = list(shutdown_states or [None] * len(worker_procs))
++
++            def parked() -> list[BaseProcess]:
++                return [
++                    proc
++                    for proc, state in zip(worker_procs, states)
++                    if proc.is_alive()
++                    and (state is None or state.value == _SHUTDOWN_NOT_STARTED)
++                ]
++
++            if not wait_for_termination(active_procs(), _FAILED_WORKER_WAIT_S):
++                stuck = parked()
++                if stuck:
++                    logger.warning(
++                        "[shutdown] Executor: workers parked after a worker "
++                        "failure (shutdown not started); sending SIGTERM count=%d",
++                        len(stuck),
++                    )
++                    for p in stuck:
++                        p.terminate()
++                    if not wait_for_termination(stuck, _FAILED_WORKER_WAIT_S):
++                        stuck = [p for p in stuck if p.is_alive()]
++                        logger.warning(
++                            "[shutdown] Executor: parked workers still running "
++                            "after SIGTERM; sending SIGKILL count=%d",
++                            len(stuck),
++                        )
++                        for p in stuck:
++                            p.kill()
++            # Workers that started their shutdown get a BOUNDED grace, counted
++            # from the start of this ladder, then SIGTERM, then SIGKILL.
++            grace_s = max(0.0, _FAILED_DRAIN_GRACE_S - (time.time() - start))
++            term_wait_s = _FAILED_WORKER_WAIT_S
++        if wait_for_termination(active_procs(), timeout=grace_s):
+             logger.info_once("[shutdown] Executor: all workers exited gracefully")
+             return
+ 
+@@ -531,7 +649,7 @@ class MultiprocExecutor(Executor):
+         )
+         for p in remaining:
+             p.terminate()
+-        if not wait_for_termination(active_procs(), 4):
++        if not wait_for_termination(active_procs(), term_wait_s):
+             # Send SIGKILL if still running
+             remaining = active_procs()
+             logger.warning(
+@@ -559,7 +677,13 @@ class MultiprocExecutor(Executor):
+                     if w.death_writer is not None:
+                         w.death_writer.close()
+                         w.death_writer = None
+-                self._ensure_worker_termination([w.proc for w in workers])
++                self._ensure_worker_termination(
++                    [w.proc for w in workers],
++                    after_failure=getattr(self, "is_failed", False),
++                    shutdown_states=[
++                        getattr(w, "shutdown_state", None) for w in workers
++                    ],
++                )
+ 
+                 for w in workers:
+                     # Shutdown response queues
+@@ -610,6 +734,7 @@ class UnreadyWorkerProcHandle:
+     rank: int
+     ready_pipe: Connection
+     death_writer: Connection | None = None
++    shutdown_state: Any = None
+ 
+ 
+ @dataclass
+@@ -623,6 +748,8 @@ class WorkerProcHandle:
+     # `peer_worker_response_mqs[i]`
+     peer_worker_response_mqs: list[MessageQueue | None]
+     death_writer: Connection | None = None
++    # Shared byte: _SHUTDOWN_NOT_STARTED / _STARTED / _DONE (worker writes).
++    shutdown_state: Any = None
+ 
+     @classmethod
+     def from_unready_handle(
+@@ -637,6 +764,7 @@ class WorkerProcHandle:
+             worker_response_mq=worker_response_mq,
+             peer_worker_response_mqs=peer_worker_response_mqs,
+             death_writer=unready_handle.death_writer,
++            shutdown_state=unready_handle.shutdown_state,
+         )
+ 
+ 
+@@ -775,6 +903,8 @@ class WorkerProc:
+         ready_reader, ready_writer = context.Pipe(duplex=False)
+         # Death pipe to let child detect parent process exit
+         death_reader, death_writer = context.Pipe(duplex=False)
++        # One shared byte: has this worker started / finished its shutdown?
++        shutdown_state = context.RawValue("b", _SHUTDOWN_NOT_STARTED)
+         if inherited_fds is not None:
+             inherited_fds = inherited_fds.copy()
+             inherited_fds.extend((ready_reader.fileno(), death_writer.fileno()))
+@@ -787,6 +917,7 @@ class WorkerProc:
+             "input_shm_handle": input_shm_handle,
+             "ready_pipe": ready_writer,
+             "death_pipe": death_reader,
++            "shutdown_state": shutdown_state,
+             "shared_worker_lock": shared_worker_lock,
+             "is_driver_worker": is_driver_worker,
+             # Have the worker close parent end of this worker's pipes too
+@@ -811,7 +942,9 @@ class WorkerProc:
+         death_reader.close()
+         # Keep death_writer open in parent - when parent exits,
+         # death_reader in child will get EOFError
+-        return UnreadyWorkerProcHandle(proc, rank, ready_reader, death_writer)
++        return UnreadyWorkerProcHandle(
++            proc, rank, ready_reader, death_writer, shutdown_state
++        )
+ 
+     @staticmethod
+     def wait_for_response_handle_ready(
+@@ -872,7 +1005,14 @@ class WorkerProc:
+ 
+         return cast(list[WorkerProcHandle], ready_proc_handles)
+ 
+-    def shutdown(self):
++    def shutdown(self, *, destroy_distributed: bool = True):
++        if not destroy_distributed:
++            # worker_main os._exits right after this: the PLE offload handle
++            # (rank 0 owns the child) must not wait for the child's reap,
++            # which trails its exit by seconds for a large host table.
++            ple_worker = sys.modules.get("vllm.v1.ple_offload.worker")
++            if ple_worker is not None:
++                ple_worker.mark_process_exit_imminent()
+         if self.rpc_broadcast_mq is not None:
+             self.rpc_broadcast_mq.shutdown()
+         if self.worker_response_mq is not None:
+@@ -880,8 +1020,12 @@ class WorkerProc:
+         self.worker.shutdown()
+         self.rpc_broadcast_mq = None
+         self.worker_response_mq = None
+-        destroy_model_parallel()
+-        destroy_distributed_environment()
++        # worker_main passes False when the process exits right after this
++        # (see _exit_worker_process): the NCCL destroy is exit-only work that
++        # can block for 5 s per communicator.
++        if destroy_distributed:
++            destroy_model_parallel()
++            destroy_distributed_environment()
+ 
+     def monitor_death_pipe(self, death_pipe, shutdown_requested: threading.Event):
+         if death_pipe is None:
+@@ -948,8 +1092,20 @@ class WorkerProc:
+         set_worker_net_device(kwargs.get("local_rank", 0), kwargs["vllm_config"])
+ 
+         worker = None
++        # Set once a READY worker leaves its busy loop because shutdown was
++        # requested (death pipe EOF or SIGTERM/SIGINT): the process then exits
++        # straight after WorkerProc.shutdown (see _exit_worker_process).
++        orderly_shutdown = False
++        # Set when a READY worker's busy loop FAILED while a shutdown request
++        # was pending: full teardown, then exit code 1 (never the exit-0 path).
++        failed_during_shutdown = False
+         ready_writer = kwargs.pop("ready_pipe")
+         death_pipe = kwargs.pop("death_pipe", None)
++        shutdown_state = kwargs.pop("shutdown_state", None)
++
++        def mark_shutdown(value: int) -> None:
++            if shutdown_state is not None:
++                shutdown_state.value = value
+ 
+         # Close inherited pipes from parent (incl. other worker pipes)
+         # Explicitly passing in existing pipes and closing them makes the pipe
+@@ -996,7 +1152,7 @@ class WorkerProc:
+ 
+             worker.worker_busy_loop()
+ 
+-        except Exception:
++        except Exception as e:
+             # NOTE: if an Exception arises in busy_loop, we send
+             # a FAILURE message over the MQ RPC to notify the Executor,
+             # which triggers system shutdown.
+@@ -1004,10 +1160,20 @@ class WorkerProc:
+ 
+             if ready_writer is not None:
+                 logger.exception("WorkerProc failed to start.")
+-            elif shutdown_requested.is_set():
++            elif isinstance(e, WorkerShutdownRequested) and (
++                shutdown_requested.is_set()
++            ):
++                # The busy loop left BECAUSE of the shutdown request (its
++                # dequeue was cancelled), not because something failed.
+                 logger.debug_once(
+                     "[shutdown] WorkerProc: exiting after shutdown request"
+                 )
++                orderly_shutdown = True
++            elif shutdown_requested.is_set():
++                # A real failure that raced a shutdown request: keep it a
++                # failure -- full teardown, then a non-zero exit.
++                logger.exception("WorkerProc failed during shutdown.")
++                failed_during_shutdown = True
+             else:
+                 logger.exception("WorkerProc failed.")
+ 
+@@ -1023,6 +1189,7 @@ class WorkerProc:
+                 logger.debug_once(
+                     "[shutdown] WorkerProc: terminated by shutdown signal"
+                 )
++                orderly_shutdown = ready_writer is None
+             else:
+                 logger.warning("WorkerProc was terminated")
+             # SystemExit must never be ignored
+@@ -1035,7 +1202,26 @@ class WorkerProc:
+                 death_pipe.close()
+             # Clean up once worker exits busy loop
+             if worker is not None:
++                # Tells the executor's ladder this rank is draining, not parked
++                # in a collective (see _ensure_worker_termination).
++                mark_shutdown(_SHUTDOWN_STARTED)
++                if orderly_shutdown:
++                    # Everything that must happen before exit (FINAL DRAIN,
++                    # instrumentation flushes, PLE cleanup) is in
++                    # worker.shutdown(); then exit instead of paying the NCCL
++                    # destroy + finalization past the executor's grace.
++                    exit_code = 0
++                    try:
++                        worker.shutdown(destroy_distributed=False)
++                    except BaseException:
++                        logger.exception("WorkerProc shutdown failed")
++                        exit_code = 1
++                    mark_shutdown(_SHUTDOWN_DONE)
++                    _exit_worker_process(exit_code)
+                 worker.shutdown()
++                mark_shutdown(_SHUTDOWN_DONE)
++                if failed_during_shutdown:
++                    sys.exit(1)
+ 
+     class ResponseStatus(Enum):
+         SUCCESS = auto()
+@@ -1116,8 +1302,20 @@ class WorkerProc:
+     def worker_busy_loop(self):
+         """Main busy loop for Multiprocessing Workers"""
+         assert self.rpc_broadcast_mq is not None
++        mq = self.rpc_broadcast_mq
+         while True:
+-            self._execute_worker_rpc(self.rpc_broadcast_mq.dequeue(indefinite=True))
++            # No local holds the request across the next dequeue: its payload
++            # must be released first (test_multiproc_executor).
++            self._execute_worker_rpc(self._dequeue_worker_rpc(mq))
++
++    @staticmethod
++    def _dequeue_worker_rpc(mq: MessageQueue):
++        try:
++            return mq.dequeue(indefinite=True)
++        except RuntimeError as e:
++            if getattr(mq, "shutting_down", False) and str(e) == "cancelled":
++                raise WorkerShutdownRequested("RPC broadcast queue shut down") from e
++            raise
+ 
+     def _execute_worker_rpc(
+         self,
+diff --git a/vllm/v1/ple_offload/worker.py b/vllm/v1/ple_offload/worker.py
+index 3d294073da..608f3644a5 100644
+--- a/vllm/v1/ple_offload/worker.py
++++ b/vllm/v1/ple_offload/worker.py
+@@ -102,6 +102,86 @@ def _unlink_ipc_socket(ipc_addr: str) -> None:
+         logger.warning("Failed to unlink PLE IPC socket %s: %s", path, error)
+ 
+ 
++# Set once by a GPU worker process whose orderly shutdown is about to end in
++# os._exit (multiproc_executor._exit_worker_process). PleOffloadWorkerHandle
++# then waits for the offload child's whole thread group to be in the kernel's
++# exit path, not for its REAP. In a drain fault-injection test the ~51 GB
++# child's leader went Z at ~+2.7 s, but one thread stayed R -- PF_EXITING set,
++# in-kernel, freeing the address space -- until the reap at ~+8.6 s. Rank 0
++# waiting for that reap ran the executor's grace -> SIGTERM -> SIGKILL ladder on
++# every cycle. A read-only sample of one such shutdown showed
++# the same thing: from Z to reap (6.0 s), the only live task was R with
++# PF_EXITING, the leader's fd table was already closed (0 /dev/nvidia fds,
++# down from 13), and the child was never an nvidia-smi compute app, before or
++# after. It holds no GPU memory (host-mapped pull: no CUDA context). What is
++# left is kernel-side host-memory teardown, and nothing in this process
++# needs to wait for it.
++_PROCESS_EXIT_IMMINENT = False
++# Bound for the child's userspace cleanup (its proc_main finally) on that path;
++# it took ~2.7 s on the reference host. It has to fit inside the executor's 5 s
++# VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS with room for rank 0's own exit. After it,
++# the child is SIGKILLed (userspace ends at once) and not waited for.
++_EXIT_IMMINENT_CHILD_WAIT_S = 3.5
++# procfs mount the predicate reads (tests point it at a fake tree).
++_PROC_ROOT = "/proc"
++# task_struct flag: set by do_exit() -> exit_signals() before exit_mm(); a task
++# carrying it never returns to userspace.
++_PF_EXITING = 0x4
++
++
++def mark_process_exit_imminent() -> None:
++    """This process os._exits right after its shutdown; see close()."""
++    global _PROCESS_EXIT_IMMINENT
++    _PROCESS_EXIT_IMMINENT = True
++
++
++def _task_in_exit(stat: bytes) -> bool:
++    """One /proc/<pid>/task/<tid>/stat: Z/X, or PF_EXITING (kernel exit path)."""
++    # Fields after the parenthesised comm (which may contain spaces/parens):
++    # [0]=state ... [6]=flags (stat field 9).
++    fields = stat[stat.rfind(b")") + 2 :].split()
++    if not fields:
++        return True
++    if fields[0] in (b"Z", b"X"):
++        return True
++    try:
++        return bool(int(fields[6]) & _PF_EXITING)
++    except (IndexError, ValueError):
++        return False
++
++
++def _child_thread_group_exiting(
++    proc: subprocess.Popen, proc_root: str | None = None
++) -> bool:
++    """True once EVERY task of ``proc`` is exited or in the kernel exit path.
++
++    A zombie leader alone is not enough (a thread can still run userspace
++    after the leader exits). Never reaps: the child is unreaped, so its PID
++    cannot be reused and <proc_root>/<pid>/task is its own. Off Linux, only a
++    reaped child counts.
++    """
++    if proc.returncode is not None:
++        return True
++    task_dir = os.path.join(proc_root or _PROC_ROOT, str(proc.pid), "task")
++    try:
++        tids = os.listdir(task_dir)
++    except FileNotFoundError:
++        return True
++    except OSError:
++        return proc.poll() is not None
++    for tid in tids:
++        try:
++            with open(os.path.join(task_dir, tid, "stat"), "rb") as fh:
++                stat = fh.read()
++        except FileNotFoundError:
++            continue  # this task finished exiting between listdir and open
++        except OSError:
++            return False
++        if not _task_in_exit(stat):
++            return False
++    return True
++
++
+ def _publish_fence() -> None:
+     with _PUBLISH_FENCE:
+         pass
+@@ -448,6 +528,9 @@ class PleOffloadWorkerHandle:
+         if self.ready_pipe_reader is not None:
+             self.ready_pipe_reader.close()
+             self.ready_pipe_reader = None
++        if graceful and _PROCESS_EXIT_IMMINENT:
++            self._close_without_reap()
++            return
+         if graceful and self.proc.poll() is None:
+             # Keep parent-death supervision connected while SIGTERM lets
+             # proc_main run its shutdown event and finally cleanup.
+@@ -472,6 +555,41 @@ class PleOffloadWorkerHandle:
+         if self.proc.poll() is not None and self.ipc_addr is not None:
+             _unlink_ipc_socket(self.ipc_addr)
+ 
++    def _close_without_reap(self) -> None:
++        """close() for a parent that os._exits next: wait (bounded) until every
++        child task has left userspace, never for the reap.
++
++        SIGTERM lets proc_main's finally unlink the IPC socket, as in the
++        graceful path; parent-death supervision stays connected meanwhile.
++        Once the child has run exit, the address-space teardown that keeps it
++        unreapable needs nothing from this process: the orphan is reaped by
++        the subreaper/init after this process exits.
++        """
++        if not _child_thread_group_exiting(self.proc):
++            with contextlib.suppress(ProcessLookupError):
++                os.kill(self.proc.pid, signal.SIGTERM)
++            deadline = time.monotonic() + _EXIT_IMMINENT_CHILD_WAIT_S
++            while not _child_thread_group_exiting(self.proc):
++                if time.monotonic() >= deadline:
++                    logger.warning(
++                        "PLE offload process %d still running %.1f s after "
++                        "SIGTERM; killing it without waiting (parent exits)",
++                        self.proc.pid,
++                        _EXIT_IMMINENT_CHILD_WAIT_S,
++                    )
++                    with contextlib.suppress(ProcessLookupError):
++                        os.kill(self.proc.pid, signal.SIGKILL)
++                    break
++                time.sleep(0.01)
++        exited = _child_thread_group_exiting(self.proc)
++        if self.death_writer is not None:
++            self.death_writer.close()
++            self.death_writer = None
++        # Same fallback as close(): the child has run exit, so this exact
++        # PLE-owned address is no longer in use.
++        if exited and self.ipc_addr is not None:
++            _unlink_ipc_socket(self.ipc_addr)
++
+ 
+ def _init_offload_distributed() -> None:
+     """Initialize the single-rank Gloo world required by TP-aware layers."""

@@ -1,0 +1,1098 @@
+From 5d3c205c759adc02cf910abcc532a3fbea555234 Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Tue, 22 Sep 2026 08:37:51 -0400
+Subject: [PATCH 30/58] e2_guards: executable graph-profile and
+ breakable-cudagraph guards
+
+New vllm/v1/e2_guards.py, called from the target and MTP constructors on every
+rank before profiling or capture: the breakable-cudagraph pin is asserted
+(three readings of the switch), a graph profile that cannot execute on v0.30.0
+is refused, and VLLM_E2_EXPECTED_CUDAGRAPH_MODE is checked by name. Tests
+cover the drafter. An inert knob is no longer hashed into the cache key.
+---
+ .../test_ple_fp8_selector_checkpoint.py       | 276 ++++++++++++++++++
+ tests/test_envs.py                            |  15 +-
+ tests/v1/test_e2_guards.py                    | 215 ++++++++++++++
+ vllm/envs.py                                  |  63 +++-
+ vllm/models/qwen4_exp/nvidia/model.py         |   8 +
+ vllm/models/qwen4_exp/nvidia/mtp.py           |   5 +
+ vllm/v1/e2_guards.py                          | 218 ++++++++++++++
+ vllm/v1/ple_offload/test_fault.py             |  13 -
+ vllm/v1/worker/gpu_worker.py                  | 112 -------
+ 9 files changed, 792 insertions(+), 133 deletions(-)
+ create mode 100644 tests/models/qwen4_exp/test_ple_fp8_selector_checkpoint.py
+ create mode 100644 tests/v1/test_e2_guards.py
+ create mode 100644 vllm/v1/e2_guards.py
+ delete mode 100644 vllm/v1/ple_offload/test_fault.py
+
+diff --git a/tests/models/qwen4_exp/test_ple_fp8_selector_checkpoint.py b/tests/models/qwen4_exp/test_ple_fp8_selector_checkpoint.py
+new file mode 100644
+index 0000000000..815a22fc08
+--- /dev/null
++++ b/tests/models/qwen4_exp/test_ple_fp8_selector_checkpoint.py
+@@ -0,0 +1,276 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""The shipped Flash-Next checkpoint must still select the FP8 PLE method on v0.30.0.
++
++Why this file exists (vLLM 0.30 rebase). Our
++fork used to force the FP8 PLE embedding method from a 21-line catch-all branch
++in ``_get_ple_embedding_quant_method``. That function lived in the half of
++``vllm/models/qwen4_exp/nvidia/ple_layer.py`` that upstream #54371 deleted, so
++the branch is gone from the 0.30 base and the environment switch that fed it
++(``VLLM_PLE_FP8_GLOBAL_SCALE``) is now inert.
++
++v0.30.0 selects instead in ``Qwen4ExpPLEEmbeddingMethod.from_quant_config``
++(``ngram_embedding.py:168-208``), which is stricter: it takes the FP8 path from
++``text_config.ple_embedding_dtype == "float8_e4m3fn"`` (``:174-175``), and for a
++quantization config that is neither ``Fp8Config`` nor a ModelOpt variant it
++**raises** ``NotImplementedError`` (``:186-190``). Our checkpoint is
++compressed-tensors, so without that key the model would not build at all.
++
++The first version of this file was rejected for reading a plain dict and
++never exercising the resolution chain, for naming the wrong engine prefix, and
++for conflating a dequantization check with a scale-loading check. This version
++walks the real chain --
++``Qwen4ExpConfig(**config.json)`` (``models/qwen4_exp/config.py:231``)
++-> ``get_hf_text_config()`` (``transformers_utils/config.py:1142``)
++-> ``getattr(text_config, "ple_embedding_dtype")`` as
++``ngram_embedding.py:694-699`` reads it -- and keeps the three questions apart.
++
++Fixture provenance: the published checkpoint's ``config.json``, the
++published v2.0.1 card. Excerpted verbatim for every field the
++selector or the resolver touches; ``config_groups`` keeps one representative
++group and ``ignore`` its first nine entries.
++"""
++
++import pytest
++
++from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (  # noqa: E501
++    CompressedTensorsConfig,
++)
++from vllm.model_executor.layers.quantization.fp8 import Fp8Config
++from vllm.models.qwen4_exp.nvidia.ngram_embedding import (
++    Qwen4ExpPLEEmbeddingMethod,
++    Qwen4ExpPLEFp8EmbeddingMethod,
++    Qwen4ExpPLEUnquantizedEmbeddingMethod,
++)
++
++# ``ple_layer_ids = [2]`` selects the decoder layer whose ``layer_idx + 1`` is 2
++# (``nvidia/model.py:303``), i.e. zero-based layer **1** -- not layer 2. The
++# multimodal entry class wraps the text model under ``language_model``
++# (``nvidia/model.py:1111-1114``); the PLE layer prefix is ``.ple``
++# (``:309-314``), the embedding ``.ple_embedding`` (``ple_layer.py:102``) and
++# the table ``.ngram_embedding`` (``ngram_embedding.py``).
++_PLE_PREFIX_MM = "language_model.model.layers.1.ple.ple_embedding.ngram_embedding"
++_PLE_PREFIX_TEXT = "model.layers.1.ple.ple_embedding.ngram_embedding"
++
++# ---------------------------------------------------------------------------
++# Verbatim excerpt of the shipped checkpoint's config.json.
++# ---------------------------------------------------------------------------
++SHIPPED_CONFIG = {
++    "architectures": ["Qwen4ExpForConditionalGeneration"],
++    "model_type": "qwen4_exp",
++    "image_token_id": 248056,
++    "video_token_id": 248057,
++    "vision_start_token_id": 248053,
++    "vision_end_token_id": 248054,
++    "tie_word_embeddings": False,
++    "text_config": {
++        "model_type": "qwen4_exp_text",
++        # The key the whole selection now hangs on.
++        "ple_embedding_dtype": "float8_e4m3fn",
++        "ple_layer_ids": [2],
++    },
++    "quantization_config": {
++        "quant_method": "compressed-tensors",
++        "format": "pack-quantized",
++        "quantization_status": "compressed",
++        "kv_cache_scheme": None,
++        "sparsity_config": {},
++        "transform_config": {},
++        "config_groups": {
++            "group_0": {
++                "targets": ["Linear"],
++                "weights": {
++                    "num_bits": 4,
++                    "type": "int",
++                    "symmetric": True,
++                    "strategy": "group",
++                    "group_size": 128,
++                    "dynamic": False,
++                    "observer": "minmax",
++                    "observer_kwargs": {},
++                    "actorder": None,
++                    "block_structure": None,
++                },
++            },
++        },
++        # The PLE is EXCLUDED from the quantization config -- which is exactly
++        # why the type-based dispatch cannot see that the table is FP8.
++        "ignore": [
++            "lm_head",
++            "re:.*embed_tokens.*",
++            "re:.*\\.ple\\..*",
++            "re:.*visual\\..*",
++            "re:.*\\.gate$",
++            "re:.*hyper_connection.*",
++            "re:.*indexer.*",
++            "re:.*shared_expert.*",
++            "re:.*\\.self_attn\\..*",
++        ],
++    },
++}
++
++
++def _quant_config() -> CompressedTensorsConfig:
++    import copy
++
++    return CompressedTensorsConfig.from_config(
++        copy.deepcopy(SHIPPED_CONFIG["quantization_config"])
++    )
++
++
++def _resolved_text_config():
++    """Walk the real chain the engine walks, not a dict lookup.
++
++    ``ModelConfig`` stores ``get_hf_text_config(self.hf_config)``
++    (``config/model.py:641``); that calls ``PretrainedConfig.get_text_config()``
++    (``transformers_utils/config.py:1142``); ``Qwen4ExpConfig.__init__`` builds
++    the nested ``Qwen4ExpTextConfig`` from the ``text_config`` dict
++    (``models/qwen4_exp/config.py:231``).
++    """
++    import copy
++
++    from vllm.models.qwen4_exp.config import Qwen4ExpConfig
++    from vllm.transformers_utils.config import get_hf_text_config
++
++    raw = copy.deepcopy(SHIPPED_CONFIG)
++    raw.pop("architectures", None)
++    raw.pop("model_type", None)
++    return get_hf_text_config(Qwen4ExpConfig(**raw))
++
++
++def _embedding_dtype_as_the_engine_reads_it(text_config) -> str | None:
++    """``ngram_embedding.py:694-699`` -> ``getattr(config, "ple_embedding_dtype")``."""
++    return getattr(text_config, "ple_embedding_dtype", None)
++
++
++# --------------------------------------------------------------------------
++# 1. the resolution chain
++# --------------------------------------------------------------------------
++
++
++def test_the_key_survives_the_real_text_config_resolution() -> None:
++    """THE CHAIN: nested dict -> Qwen4ExpConfig -> get_hf_text_config -> getattr."""
++    text_config = _resolved_text_config()
++    assert _embedding_dtype_as_the_engine_reads_it(text_config) == "float8_e4m3fn"
++    assert list(text_config.ple_layer_ids) == [2]
++
++
++def test_a_top_level_only_key_is_lost_on_the_text_path() -> None:
++    """RESIDUAL RISK, made executable.
++
++    A checkpoint copy that carried the key at the top level of a NESTED config
++    would not be seen by ``hf_text_config``, and the same checkpoint would then
++    hit the raise. This is a known caveat of the 0.30 port.
++    It says nothing about a FLAT config, which ``Qwen4ExpConfig`` converts into
++    a text config itself -- do not generalise it.
++    """
++    import copy
++
++    from vllm.models.qwen4_exp.config import Qwen4ExpConfig
++    from vllm.transformers_utils.config import get_hf_text_config
++
++    raw = copy.deepcopy(SHIPPED_CONFIG)
++    raw.pop("architectures", None)
++    raw.pop("model_type", None)
++    raw["ple_embedding_dtype"] = raw["text_config"].pop("ple_embedding_dtype")
++    text_config = get_hf_text_config(Qwen4ExpConfig(**raw))
++    assert _embedding_dtype_as_the_engine_reads_it(text_config) is None
++
++
++# --------------------------------------------------------------------------
++# 2. the selector
++# --------------------------------------------------------------------------
++
++
++@pytest.mark.parametrize("prefix", [_PLE_PREFIX_MM, _PLE_PREFIX_TEXT])
++def test_shipped_checkpoint_selects_the_fp8_ple_method(prefix: str) -> None:
++    """THE PROPERTY: compressed-tensors + the resolved key -> FP8 PLE, no raise.
++
++    Parametrised over both prefixes because the config-key branch precedes every
++    prefix-dependent check; if that ever stops being true, this fails.
++    """
++    method = Qwen4ExpPLEEmbeddingMethod.from_quant_config(
++        _quant_config(),
++        prefix,
++        _embedding_dtype_as_the_engine_reads_it(_resolved_text_config()),
++    )
++    assert isinstance(method, Qwen4ExpPLEFp8EmbeddingMethod)
++
++
++def test_without_the_config_key_the_shipped_checkpoint_raises() -> None:
++    """FAILING CONTROL: the key is load-bearing, not decorative.
++
++    Drop it and the same checkpoint hits ``ngram_embedding.py:186-190``. If this
++    stops raising, upstream has widened the selector and the offline conclusion
++    must be re-read -- it does not mean we are safer.
++    """
++    with pytest.raises(NotImplementedError):
++        Qwen4ExpPLEEmbeddingMethod.from_quant_config(
++            _quant_config(), _PLE_PREFIX_MM, None
++        )
++
++
++def test_the_key_beats_an_otherwise_unquantized_verdict() -> None:
++    """The key short-circuits before the ignore-list check.
++
++    ``re:.*\\.ple\\..*`` puts our PLE in the ignore list. On an ``Fp8Config``
++    that resolves to the *unquantized* method -- shown here as the contrast --
++    so the key must win, or an FP8 table would be read as bf16.
++    """
++    fp8_config = Fp8Config(
++        is_checkpoint_fp8_serialized=True, ignored_layers=[_PLE_PREFIX_MM]
++    )
++    assert isinstance(
++        Qwen4ExpPLEEmbeddingMethod.from_quant_config(fp8_config, _PLE_PREFIX_MM, None),
++        Qwen4ExpPLEUnquantizedEmbeddingMethod,
++    )
++    assert isinstance(
++        Qwen4ExpPLEEmbeddingMethod.from_quant_config(
++            fp8_config, _PLE_PREFIX_MM, "float8_e4m3fn"
++        ),
++        Qwen4ExpPLEFp8EmbeddingMethod,
++    )
++
++
++# --------------------------------------------------------------------------
++# 3. the scale -- a SEPARATE question from selection
++# --------------------------------------------------------------------------
++
++
++def test_fp8_ple_method_rejects_an_unloaded_global_scale() -> None:
++    """Sentinel rejection only. This does NOT prove checkpoint scale LOADING.
++
++    ``create_fp8_scale_parameter`` fills the parameter with the float32 sentinel
++    and the weight loader is expected to overwrite it; proving that the loader
++    does so needs a checkpoint shard, which belongs to a reference-host loader test,
++    not here.
++    """
++    import torch
++    from torch import nn
++
++    method = Qwen4ExpPLEFp8EmbeddingMethod()
++    unloaded = nn.Module()
++    unloaded.weight_scale = nn.Parameter(
++        torch.full((1,), torch.finfo(torch.float32).min, dtype=torch.float32),
++        requires_grad=False,
++    )
++    with pytest.raises(ValueError, match="missing its global scale"):
++        method.process_weights_after_loading(unloaded)
++
++
++def test_fp8_ple_dequantization_applies_the_scale() -> None:
++    """Dequantization arithmetic only, with a hand-set scale. Not loading."""
++    import torch
++    from torch import nn
++
++    method = Qwen4ExpPLEFp8EmbeddingMethod()
++    loaded = nn.Module()
++    loaded.weight_scale = nn.Parameter(
++        torch.tensor([0.25], dtype=torch.float32), requires_grad=False
++    )
++    method.process_weights_after_loading(loaded)  # must not raise
++
++    embeddings = torch.tensor([[1.0, 2.0]], dtype=torch.float32)
++    torch.testing.assert_close(
++        method.dequantize(loaded, embeddings, torch.float32), embeddings * 0.25
++    )
+diff --git a/tests/test_envs.py b/tests/test_envs.py
+index 3e65518db7..920229d8f0 100644
+--- a/tests/test_envs.py
++++ b/tests/test_envs.py
+@@ -610,7 +610,6 @@ class TestVllmMaxNSequences:
+ 
+ _FORK_HASHED = [
+     ("VLLM_HOST_EMBED_TABLE", "1", True),
+-    ("VLLM_PLE_FP8_GLOBAL_SCALE", "1", True),
+     ("VLLM_QSA_KV_CLIP_COUNT", "7", "7"),
+     ("VLLM_QSA_KV_COLLECT", "/var/tmp/qsa-absmax", "/var/tmp/qsa-absmax"),
+     # Capture-configuration factor read in C++ (topk.cu exact_medium_enabled);
+@@ -622,6 +621,10 @@ _FORK_IGNORED = [
+     ("VLLM_QSA_KV_SCALES", "/var/tmp/scales.json", "/var/tmp/scales.json"),
+     # "WARN" also checks the .strip().lower() mirror of the read site.
+     ("VLLM_E2_GUARD_MODE", " WARN ", "warn"),
++    ("VLLM_E2_ALLOW_BREAKABLE", "1", True),
++    ("VLLM_E2_EXPECTED_CUDAGRAPH_MODE", " FULL ", "FULL"),
++    # INERT: no read site on the 0.30 base, so not a cache factor.
++    ("VLLM_PLE_FP8_GLOBAL_SCALE", "1", True),
+     ("VLLM_E2_GUARD_INTERVAL", "0.25", "0.25"),
+     ("VLLM_E2_MEMSTATS", "2", "2"),
+     ("VLLM_E2_MEMSTATS_DIR", "/var/tmp/memstats", "/var/tmp/memstats"),
+@@ -695,7 +698,15 @@ def test_unaudited_host_side_knob_stays_listed_until_it_is_classified(name: str)
+     exists to prevent, so it fails here.
+     """
+     source = Path(envs.__file__).read_text(encoding="utf-8")
+-    listed = name in source
++    # Scan ONLY the delimited block. Scanning the whole file can never pass
++    # once a knob is legitimately registered, because the registry entry
++    # contains the knob's own name -- the gate would block the very act it
++    # exists to sequence.
++    start = source.index("# --8<-- [start:fork-unaudited-knobs]")
++    end = source.index("# --8<-- [end:fork-unaudited-knobs]")
++    assert start < end, "the unaudited-knob block markers are inverted"
++    block = source[start:end]
++    listed = name in block
+     if name in environment_variables:
+         assert not listed, (
+             f"{name} is registered but still named in the envs.py TODO block: "
+diff --git a/tests/v1/test_e2_guards.py b/tests/v1/test_e2_guards.py
+new file mode 100644
+index 0000000000..a3b683988d
+--- /dev/null
++++ b/tests/v1/test_e2_guards.py
+@@ -0,0 +1,215 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Focused cases for the fork's startup graph-profile guard.
++
++An earlier version was rejected for accepting values upstream
++treats as off, rejecting valid ``CompilationMode.NONE`` boots, swallowing read
++errors, and missing the drafter. Each of those is a case below.
++
++These use a plain stand-in config rather than a real ``VllmConfig``: the guard
++reads exactly three attributes, and building a real config needs a checkpoint.
++"""
++
++from types import SimpleNamespace
++
++import pytest
++
++from vllm.config import CompilationMode, CUDAGraphMode
++from vllm.v1 import e2_guards
++from vllm.v1.e2_guards import (
++    ALLOW_BREAKABLE_ENV,
++    BREAKABLE_ENV,
++    EXPECTED_MODE_ENV,
++    assert_graph_profile_is_executable,
++    breakable_resolved,
++)
++
++
++def _config(
++    mode: CompilationMode = CompilationMode.NONE,
++    cudagraph_mode: CUDAGraphMode = CUDAGraphMode.FULL,
++    architectures: tuple[str, ...] = ("Qwen4ExpForCausalLM",),
++):
++    return SimpleNamespace(
++        model_config=SimpleNamespace(architectures=list(architectures)),
++        compilation_config=SimpleNamespace(mode=mode, cudagraph_mode=cudagraph_mode),
++    )
++
++
++@pytest.fixture(autouse=True)
++def _clean_env(monkeypatch):
++    for name in (BREAKABLE_ENV, ALLOW_BREAKABLE_ENV, EXPECTED_MODE_ENV):
++        monkeypatch.delenv(name, raising=False)
++    # Keep the envs accessor from dominating the raw reading in these cases.
++    monkeypatch.setattr(e2_guards, "breakable_resolved", breakable_resolved)
++
++
++# --------------------------------------------------------------- the parser
++
++
++@pytest.mark.parametrize("raw", ["0", "2", "true", "True", "FALSE", "", "01"])
++def test_only_the_exact_string_one_is_on(monkeypatch, raw: str) -> None:
++    """Match envs.py:937 exactly. A stricter parser is a FALSE REJECTION."""
++    monkeypatch.setenv(BREAKABLE_ENV, raw)
++    monkeypatch.setattr(
++        "vllm.envs.VLLM_USE_BREAKABLE_CUDAGRAPH", False, raising=False
++    )
++    assert breakable_resolved() is False
++
++
++def test_the_raw_reading_wins_when_envs_is_stale(monkeypatch) -> None:
++    """_maybe_enable_breakable_cudagraph mutates os.environ after envs caches."""
++    monkeypatch.setenv(BREAKABLE_ENV, "1")
++    monkeypatch.setattr(
++        "vllm.envs.VLLM_USE_BREAKABLE_CUDAGRAPH", False, raising=False
++    )
++    assert breakable_resolved() is True
++
++
++def test_the_envs_reading_wins_when_the_raw_value_is_absent(monkeypatch) -> None:
++    monkeypatch.delenv(BREAKABLE_ENV, raising=False)
++    monkeypatch.setattr(
++        "vllm.envs.VLLM_USE_BREAKABLE_CUDAGRAPH", True, raising=False
++    )
++    assert breakable_resolved() is True
++
++
++# ------------------------------------------------------------- the rejections
++
++
++def test_an_unpinned_launch_fails(monkeypatch) -> None:
++    """Absence is the state the upstream auto-enable feeds on."""
++    with pytest.raises(RuntimeError, match="is not set"):
++        assert_graph_profile_is_executable(_config())
++
++
++def test_breakable_on_fails(monkeypatch) -> None:
++    monkeypatch.setenv(BREAKABLE_ENV, "1")
++    with pytest.raises(RuntimeError, match="resolved ON"):
++        assert_graph_profile_is_executable(_config())
++
++
++def test_piecewise_with_vllm_compile_and_breakable_off_fails(monkeypatch) -> None:
++    """The BLOCKER: upstream accepts this at config time and dies at capture."""
++    monkeypatch.setenv(BREAKABLE_ENV, "0")
++    with pytest.raises(RuntimeError, match="cudagraph_utils.py:605"):
++        assert_graph_profile_is_executable(
++            _config(
++                mode=CompilationMode.VLLM_COMPILE,
++                cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
++            )
++        )
++
++
++def test_expected_mode_mismatch_fails(monkeypatch) -> None:
++    monkeypatch.setenv(BREAKABLE_ENV, "0")
++    monkeypatch.setenv(EXPECTED_MODE_ENV, "FULL_DECODE_ONLY")
++    with pytest.raises(RuntimeError, match="EXPECTED_CUDAGRAPH_MODE"):
++        assert_graph_profile_is_executable(_config(cudagraph_mode=CUDAGraphMode.FULL))
++
++
++# ------------------------------------------------------------- the permissions
++
++
++def test_compilation_none_with_full_graphs_is_permitted(monkeypatch) -> None:
++    """FALSE REJECTION control.
++
++    On v0.30.0's NVIDIA Qwen4Exp path NONE is a normal resolved state -- #55272
++    removed the compile wrappers -- so treating NONE as evidence of the
++    auto-enable, which the first version of this guard did, rejects the one
++    profile that is actually executable.
++    """
++    monkeypatch.setenv(BREAKABLE_ENV, "0")
++    assert_graph_profile_is_executable(
++        _config(mode=CompilationMode.NONE, cudagraph_mode=CUDAGraphMode.FULL)
++    )
++
++
++def test_none_plus_full_decode_only_is_permitted(monkeypatch) -> None:
++    monkeypatch.setenv(BREAKABLE_ENV, "0")
++    assert_graph_profile_is_executable(
++        _config(
++            mode=CompilationMode.NONE, cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY
++        )
++    )
++
++
++def test_eager_is_permitted(monkeypatch) -> None:
++    monkeypatch.setenv(BREAKABLE_ENV, "0")
++    assert_graph_profile_is_executable(
++        _config(mode=CompilationMode.NONE, cudagraph_mode=CUDAGraphMode.NONE)
++    )
++
++
++def test_expected_mode_match_passes(monkeypatch) -> None:
++    monkeypatch.setenv(BREAKABLE_ENV, "0")
++    monkeypatch.setenv(EXPECTED_MODE_ENV, "FULL")
++    assert_graph_profile_is_executable(_config(cudagraph_mode=CUDAGraphMode.FULL))
++
++
++# ------------------------------------------------------------ fail-closed paths
++
++
++def test_a_missing_compilation_config_fails(monkeypatch) -> None:
++    monkeypatch.setenv(BREAKABLE_ENV, "0")
++    cfg = SimpleNamespace(
++        model_config=SimpleNamespace(architectures=["Qwen4ExpForCausalLM"]),
++        compilation_config=None,
++    )
++    with pytest.raises(RuntimeError, match="no compilation_config"):
++        assert_graph_profile_is_executable(cfg)
++
++
++def test_a_missing_model_config_fails(monkeypatch) -> None:
++    monkeypatch.setenv(BREAKABLE_ENV, "0")
++    cfg = SimpleNamespace(model_config=None, compilation_config=SimpleNamespace())
++    with pytest.raises(RuntimeError, match="no model_config"):
++        assert_graph_profile_is_executable(cfg)
++
++
++def test_an_unreadable_switch_fails_rather_than_reporting_off(monkeypatch) -> None:
++    """A guard that cannot read its own input must not answer False."""
++    monkeypatch.delenv(BREAKABLE_ENV, raising=False)
++
++    class _Boom:
++        def __getattr__(self, name):
++            raise RuntimeError("envs unavailable")
++
++    monkeypatch.setitem(__import__("sys").modules, "vllm.envs", _Boom())
++    with pytest.raises(RuntimeError):
++        breakable_resolved()
++
++
++# ------------------------------------------------------------------ the opt-out
++
++
++def test_the_opt_out_is_loud_and_skips_the_checks(monkeypatch, caplog) -> None:
++    monkeypatch.setenv(ALLOW_BREAKABLE_ENV, "1")
++    monkeypatch.setenv(BREAKABLE_ENV, "1")
++    with caplog.at_level("WARNING"):
++        assert_graph_profile_is_executable(
++            _config(
++                mode=CompilationMode.VLLM_COMPILE,
++                cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
++            )
++        )
++    assert ALLOW_BREAKABLE_ENV in caplog.text
++    # The opt-out log line must say it is not a promotion (production) boot.
++    assert "promotion" in caplog.text.lower()
++
++
++# -------------------------------------------------------------- the draft role
++
++
++def test_the_draft_role_is_checked_independently(monkeypatch) -> None:
++    """Qwen4ExpMTP builds Qwen4ExpMultiTokenPredictor, not CausalLM."""
++    monkeypatch.setenv(BREAKABLE_ENV, "0")
++    with pytest.raises(RuntimeError, match=r"e2-guard\[draft\]"):
++        assert_graph_profile_is_executable(
++            _config(
++                mode=CompilationMode.VLLM_COMPILE,
++                cudagraph_mode=CUDAGraphMode.PIECEWISE,
++                architectures=("Qwen4ExpMTP",),
++            ),
++            role="draft",
++        )
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 588ca59107..734a95cd0a 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -333,11 +333,29 @@ if TYPE_CHECKING:
+     # hashed anyway: a spurious cache miss costs a recompile, a missed one costs
+     # a wrong graph.
+     #
+-    # COMPILE/CAPTURE FACTORS (hashed):
+-    # AOT: yes. CAPTURE: yes. PLE table is FP8-with-global-scale ->
+-    # Qwen4ExpPLEFp8EmbeddingMethod instead of the checkpoint's method:
+-    # different weight dtype and a different embedding forward.
++    # *** INERT ON THE 0.30 BASE. ***
++    # NO READ SITE, and therefore NOT HASHED -- moved out of the compile
++    # factors into ignored_factors below. Its only reader was the 21-line
++    # catch-all branch in _get_ple_embedding_quant_method, which lived in the
++    # half of models/qwen4_exp/nvidia/ple_layer.py that #54371 deleted. With no
++    # reader it cannot change an artifact, so hashing it would only invalidate
++    # caches for nothing; and on this uncompiled NVIDIA path (#55272) there may
++    # be no AOT artifact to key at all. It gives NO capture protection either.
++    # v0.30.0 selects the FP8 PLE method from the CONFIG KEY
++    # text_config.ple_embedding_dtype == "float8_e4m3fn"
++    # (ngram_embedding.py:174-175) -- see
++    # tests/models/qwen4_exp/test_ple_fp8_selector_checkpoint.py.
++    # Setting this on the 0.30 base does NOTHING, and NOTHING WARNS: validate_environ
++    # (envs.py, below) warns only about names that are NOT registered, and this
++    # comment lives in a TYPE_CHECKING block that never runs. It is kept
++    # registered so a later PLE transport change can reland its reader and
++    # reclassify it, or delete it. DO NOT assume it works.
++    # When its reader returns: AOT yes, CAPTURE yes -- the FP8-with-global-scale
++    # table selects Qwen4ExpPLEFp8EmbeddingMethod over the checkpoint's method,
++    # a different weight dtype and a different embedding forward.
+     VLLM_PLE_FP8_GLOBAL_SCALE: bool = False
++    #
++    # COMPILE/CAPTURE FACTORS (hashed):
+     # CAPTURE: yes, established -- clip counting allocates persistent per-layer
+     # int64 counters and its increment ops are CAPTURED into the cudagraph (see
+     # the graph-safety note in models/qwen4_exp/nvidia/qsa.py); unset, those ops
+@@ -398,16 +416,34 @@ if TYPE_CHECKING:
+     # cross-change knob table). Each mirrors its read site's
+     # parse; if a read site changes, the entry here must be reconciled.
+     # (Both read sites below are now live.)
++    # *** INERT ON THE 0.30 BASE: NO READ SITE. ***
++    # Its reader is the slot-ownership assertion code (an earlier commit), which edits
++    # vllm/v1/ple_offload/connector.py -- a module that does not exist on
++    # v0.30.0. Setting this on the 0.30 base does NOTHING, and NOTHING WARNS
++    # (validate_environ only reports UNregistered names). Already an ignored
++    # factor, correctly. Kept registered so the contract is recorded; it
++    # becomes live again only together with the pull transport
++    # (the PLE transport choice).
+     # AOT: no. CAPTURE: no -- strictly host-side and outside capture.
+     # off|warn|raise (1 = warn), normalised by _e2_diagnostic_mode like the
+     # rest of the family. The mamba ownership check moved this gate off a plain
+     # boolean; reconciled here.
+-    # Read site returns with the deferred PLE transport.
+     VLLM_E2_PLE_FLAG_CHECK: str = "off"
+     # AOT: no. CAPTURE: no -- strictly host-side. off|warn|raise (1 = warn).
+     # the mamba slot-ownership check, v1/worker/mamba_utils.py:74.
+     VLLM_E2_MAMBA_SLOT_OWNERSHIP: str = "off"
++    # Opt-out for the fork startup guards in vllm/v1/e2_guards.py, read at
++    # Qwen4ExpForCausalLM construction. AOT: no. CAPTURE: no -- it changes
++    # nothing itself; it only permits a boot whose identity IS different
++    # (VLLM_USE_BREAKABLE_CUDAGRAPH, which upstream already registers and
++    # hashes). Ignored factor for exactly that reason.
++    VLLM_E2_ALLOW_BREAKABLE: bool = False
++    # Expected RESOLVED cudagraph mode by name, asserted by the same guard when
++    # set (e.g. "FULL", "FULL_DECODE_ONLY"). AOT: no. CAPTURE: no -- it asserts
++    # an identity, it does not choose one. Ignored factor.
++    VLLM_E2_EXPECTED_CUDAGRAPH_MODE: str = ""
+     #
++    # --8<-- [start:fork-unaudited-knobs]
+     # --- TODO: knobs that are NOT in this tree at all ----------
+     # The tie-determinism toggles and the BSM pin live in a separate
+     # patch stack, not in v2.0.1 and not in this tree:
+@@ -428,8 +464,11 @@ if TYPE_CHECKING:
+     # identities from its actual read site, hash it unless exclusion is proven,
+     # and delete it from this block. tests/test_envs.py holds a test that fails
+     # if a name is registered while still listed here, so the classification
+-    # cannot be skipped silently.
++    # cannot be skipped silently. That test reads ONLY the delimited block
++    # below/above -- scanning the whole file could never pass, because a
++    # registry entry necessarily contains its own name.
+     # ----------------------------------------------------------------------
++    # --8<-- [end:fork-unaudited-knobs]
+     VLLM_LOG_MODEL_INSPECTION: bool = False
+     VLLM_DEBUG_MFU_METRICS: bool = False
+     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
+@@ -2209,6 +2248,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     # Capture-configuration factor, read in C++; raw passthrough on purpose.
+     "MERLIN_TOPK_EXACT_MEDIUM": lambda: os.getenv("MERLIN_TOPK_EXACT_MEDIUM", None),
+     # Runtime only; all of the following are in compile_factors.ignored_factors.
++    "VLLM_E2_ALLOW_BREAKABLE": lambda: os.getenv("VLLM_E2_ALLOW_BREAKABLE", "") == "1",
++    "VLLM_E2_EXPECTED_CUDAGRAPH_MODE": lambda: os.getenv(
++        "VLLM_E2_EXPECTED_CUDAGRAPH_MODE", ""
++    ).strip(),
+     "VLLM_QSA_KV_SCALES": lambda: os.getenv("VLLM_QSA_KV_SCALES", "").strip(),
+     "VLLM_E2_GUARD_MODE": lambda: (
+         os.getenv("VLLM_E2_GUARD_MODE", "off").strip().lower()
+@@ -2592,6 +2635,14 @@ def compile_factors() -> dict[str, object]:
+         "VLLM_PLE_TEST_FAULT",
+         "VLLM_PLE_TEST_FAULT_GATE",
+         "VLLM_PLE_TEST_FAULT_LOG",
++        # Fork startup guard: the opt-out permits a different identity and the
++        # expected-mode pin asserts one; neither IS one.
++        "VLLM_E2_ALLOW_BREAKABLE",
++        "VLLM_E2_EXPECTED_CUDAGRAPH_MODE",
++        # INERT on the 0.30 base: no read site, so it cannot change any artifact.
++        # Hashing it would invalidate caches for no behavioural change. Restore
++        # it to the compile factors in the same commit that relands its reader.
++        "VLLM_PLE_FP8_GLOBAL_SCALE",
+         # Diagnostic knobs, both strictly host-side and outside capture, so
+         # neither AOT nor capture identity depends on them. Hashing
+         # them would invalidate every compile cache the moment a diagnostic
+diff --git a/vllm/models/qwen4_exp/nvidia/model.py b/vllm/models/qwen4_exp/nvidia/model.py
+index 816a4e231c..8c292687de 100644
+--- a/vllm/models/qwen4_exp/nvidia/model.py
++++ b/vllm/models/qwen4_exp/nvidia/model.py
+@@ -78,6 +78,7 @@ from vllm.transformers_utils.configs.qwen4_exp import (
+     Qwen4ExpTextConfig,
+ )
+ from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
++from vllm.v1.e2_guards import assert_graph_profile_is_executable
+ from vllm.v1.kv_cache_interface import MambaSpec
+ 
+ from ..config import Qwen4ExpConfig
+@@ -786,6 +787,13 @@ class Qwen4ExpForCausalLM(
+ 
+     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+         super().__init__()
++        # V0.30.0 auto-enables breakable cudagraphs
++        # for this architecture when VLLM_USE_BREAKABLE_CUDAGRAPH is unset, and
++        # VLLM_COMPILE + a PIECEWISE mode dies at capture because #55272 left no
++        # compiled submodule. Fail here rather than let a reference-host run qualify an
++        # identity nobody chose. Qwen4ExpForConditionalGeneration constructs
++        # this class; Qwen4ExpMTP does not, and guards itself.
++        assert_graph_profile_is_executable(vllm_config, role="target")
+         config: Qwen4ExpTextConfig = vllm_config.model_config.hf_text_config
+         self.vllm_config = vllm_config
+         self.model_config = vllm_config.model_config
+diff --git a/vllm/models/qwen4_exp/nvidia/mtp.py b/vllm/models/qwen4_exp/nvidia/mtp.py
+index 2df3868456..468fc3ab8d 100644
+--- a/vllm/models/qwen4_exp/nvidia/mtp.py
++++ b/vllm/models/qwen4_exp/nvidia/mtp.py
+@@ -49,6 +49,7 @@ from vllm.sequence import IntermediateTensors
+ from vllm.transformers_utils.configs.qwen4_exp import (
+     Qwen4ExpTextConfig,
+ )
++from vllm.v1.e2_guards import assert_graph_profile_is_executable
+ 
+ from .hyperconnection import GatedResidual, HyperConnectionConfig
+ from .low_latency_gemm import enable_qwen4_exp_low_latency_gemm
+@@ -395,6 +396,10 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
+     }
+ 
+     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
++        # The drafter is NOT reached through Qwen4ExpForCausalLM --
++        # this class builds Qwen4ExpMultiTokenPredictor directly, from a config
++        # rebuilt at mtp.py:159 -- so its graph profile is checked here.
++        assert_graph_profile_is_executable(vllm_config, role="draft")
+         config: Qwen4ExpTextConfig = vllm_config.model_config.hf_text_config
+         self.vllm_config = vllm_config
+         cache_config = vllm_config.cache_config
+diff --git a/vllm/v1/e2_guards.py b/vllm/v1/e2_guards.py
+new file mode 100644
+index 0000000000..9971ccd39a
+--- /dev/null
++++ b/vllm/v1/e2_guards.py
+@@ -0,0 +1,218 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Fork startup guards that fail closed on a graph profile we never qualified.
++
++These run at model construction, on every rank, for the target model and for
++the MTP drafter, before profiling or capture. They exist because a *documented*
++launch flag is not a mechanism: the first reference-host run of a rebase will otherwise
++qualify a compile/capture identity nobody chose
++(see below).
++
++What this module does NOT do: choose a graph profile. That is the maintainer's
++call and it is open (the graph-profile choice). What it does is refuse the
++two states that are silently wrong on vLLM v0.30.0 --
++
++  * ``VLLM_USE_BREAKABLE_CUDAGRAPH`` left unset, which lets
++    ``VllmConfig._maybe_enable_breakable_cudagraph`` turn it on for this fork's
++    architectures and force ``CompilationMode.NONE``; and
++  * a PIECEWISE-bearing cudagraph mode combined with ``VLLM_COMPILE`` and
++    breakable-off, which upstream accepts at config time and then rejects at
++    capture, because #55272 removed every ``@support_torch_compile`` wrapper
++    from the NVIDIA Qwen4Exp model and MTP.
++
++-- and to make the resolved profile visible and assertable.
++
++Timing limit, stated honestly: this runs at model construction, i.e. AFTER
++``VllmConfig.__post_init__`` has already called
++``_maybe_enable_breakable_cudagraph`` (``config/vllm.py:1561``) and
++``_normalize_piecewise_cudagraph_mode`` (``:1673``, ``:1844``). It is early
++enough to stop profiling and capture; it cannot un-mutate ``os.environ`` or
++recover the originally requested cudagraph mode. Requiring the pin to be
++*explicitly present* is the part of "validate before auto-enable" that is
++checkable from here: absence is exactly the state the auto-enable feeds on.
++"""
++
++import os
++
++from vllm.logger import init_logger
++
++logger = init_logger(__name__)
++
++BREAKABLE_ENV = "VLLM_USE_BREAKABLE_CUDAGRAPH"
++#: Opt-out for every guard in this module. Recorded in the launch identity and
++#: PROHIBITED in production profiles; a production launch must not set it.
++ALLOW_BREAKABLE_ENV = "VLLM_E2_ALLOW_BREAKABLE"
++#: Optional expected resolved cudagraph mode, by name (e.g. "FULL",
++#: "FULL_DECODE_ONLY"). When set, a mismatch is an error. This is how a launch
++#: profile pins the graph identity once the maintainer has chosen one.
++EXPECTED_MODE_ENV = "VLLM_E2_EXPECTED_CUDAGRAPH_MODE"
++
++#: The architectures vLLM v0.30.0 auto-enables breakable cudagraphs for, out of
++#: ``vllm/config/vllm.py:DEFAULT_BREAKABLE_CUDAGRAPH_ARCHITECTURES``, that are
++#: ours. Recorded so the guard's message can name the upstream mechanism.
++OUR_AUTO_BREAKABLE_ARCHITECTURES = frozenset(
++    {
++        "Qwen4ExpForCausalLM",
++        "Qwen4ExpForConditionalGeneration",
++        "Qwen4ExpMTP",
++    }
++)
++
++
++def _upstream_truth(raw: str | None) -> bool:
++    """Upstream's exact semantics for the breakable switch.
++
++    ``envs.py:937`` is ``os.environ.get(..., "0") == "1"``. Nothing else is on:
++    ``"2"``, ``"true"``, ``"FALSE"`` and ``""`` are all off. Using one parser
++    that matches it is the point -- a stricter local parser would reject boots
++    upstream treats as off, which is a false rejection, not extra safety.
++    """
++    return raw == "1"
++
++
++def breakable_resolved() -> bool:
++    """Whether breakable cudagraphs are on, as the engine will see it.
++
++    Two readings of ONE source, not three independent sources:
++    ``vllm.compilation.breakable_cudagraph.is_breakable_cudagraph_enabled()``
++    is literally ``bool(envs.VLLM_USE_BREAKABLE_CUDAGRAPH)``
++    (``breakable_cudagraph.py:53``), so it adds nothing over the envs read.
++    The envs read is kept beside the raw one because
++    ``_maybe_enable_breakable_cudagraph`` mutates ``os.environ`` at config time
++    while the envs accessor is cached, so the two can legitimately disagree;
++    either saying "on" means on.
++
++    No exception is swallowed. A guard that cannot read its own input must fail
++    the boot, not report False.
++    """
++    if _upstream_truth(os.environ.get(BREAKABLE_ENV)):
++        return True
++    import vllm.envs as envs
++
++    return bool(envs.VLLM_USE_BREAKABLE_CUDAGRAPH)
++
++
++def _profile(vllm_config) -> tuple[list[str], object, object]:
++    """Resolved (architectures, compilation mode, cudagraph mode). Fails closed."""
++    model_config = getattr(vllm_config, "model_config", None)
++    if model_config is None:
++        raise RuntimeError("e2-guard: vllm_config has no model_config to check")
++    compilation_config = getattr(vllm_config, "compilation_config", None)
++    if compilation_config is None:
++        raise RuntimeError("e2-guard: vllm_config has no compilation_config to check")
++    architectures = list(getattr(model_config, "architectures", None) or [])
++    return (
++        architectures,
++        compilation_config.mode,
++        compilation_config.cudagraph_mode,
++    )
++
++
++def assert_graph_profile_is_executable(vllm_config, *, role: str = "target") -> None:
++    """Refuse the two silently-wrong startup states on v0.30.0.
++
++    ``role`` is ``"target"`` or ``"draft"``; both are checked, because
++    ``Qwen4ExpMTP`` builds ``Qwen4ExpMultiTokenPredictor`` rather than
++    ``Qwen4ExpForCausalLM`` (``mtp.py:397``, ``:411``) from a config rebuilt at
++    ``mtp.py:159``, so the drafter's profile can differ from the target's.
++
++    Intentional eager and intentional ``CompilationMode.NONE`` are PERMITTED.
++    On v0.30.0's NVIDIA Qwen4Exp path ``NONE`` is a normal resolved state, not
++    evidence of the auto-enable: #55272 removed the compile wrappers, so
++    ``_normalize_piecewise_cudagraph_mode`` legitimately lands there.
++    """
++    from vllm.config import CompilationMode
++    architectures, mode, cudagraph_mode = _profile(vllm_config)
++
++    if os.environ.get(ALLOW_BREAKABLE_ENV, "") == "1":
++        logger.warning(
++            "e2-guard[%s]: %s=1 -- guards disabled by request. architectures=%s "
++            "breakable=%s compilation_mode=%s cudagraph_mode=%s. This boot is "
++            "NOT a promotion-grade boot; a production launch must not set this flag.",
++            role,
++            ALLOW_BREAKABLE_ENV,
++            architectures,
++            os.environ.get(BREAKABLE_ENV),
++            mode,
++            cudagraph_mode,
++        )
++        return
++
++    # 1. The pin must be explicit. Absence is the state _maybe_enable_breakable_
++    #    cudagraph feeds on (config/vllm.py:758: "not in os.environ").
++    if BREAKABLE_ENV not in os.environ:
++        raise RuntimeError(
++            f"e2-guard[{role}]: {BREAKABLE_ENV} is not set. vLLM v0.30.0 lists "
++            f"{sorted(OUR_AUTO_BREAKABLE_ARCHITECTURES)} in "
++            "DEFAULT_BREAKABLE_CUDAGRAPH_ARCHITECTURES and turns the switch on "
++            "by itself when it is unset (vllm/config/vllm.py:756-774), forcing "
++            "CompilationMode.NONE with it. Pin it in the launcher: "
++            f"export {BREAKABLE_ENV}=0 (or =1 deliberately), or set "
++            f"{ALLOW_BREAKABLE_ENV}=1 to take an unpinned boot on purpose."
++        )
++
++    breakable = breakable_resolved()
++
++    # 2. Breakable on is an identity this fork has never qualified.
++    if breakable:
++        raise RuntimeError(
++            f"e2-guard[{role}]: {BREAKABLE_ENV} resolved ON for "
++            f"{architectures or '<unknown architecture>'} "
++            f"(compilation_mode={mode}, cudagraph_mode={cudagraph_mode}). That "
++            "is not the identity the v2.0.1 results were measured on. Export "
++            f"{BREAKABLE_ENV}=0, or set {ALLOW_BREAKABLE_ENV}=1 to take it "
++            "deliberately."
++        )
++
++    # 3. PIECEWISE with breakable off needs a torch-compiled submodule, and
++    #    #55272 removed every @support_torch_compile wrapper from
++    #    vllm/models/qwen4_exp/nvidia/*. Upstream only rewrites the mode when
++    #    compilation mode is NOT VLLM_COMPILE
++    #    (config/vllm.py:1010-1030), so VLLM_COMPILE + PIECEWISE + breakable-off
++    #    survives config time and then dies at
++    #    gpu/cudagraph_utils.py:605 in the middle of capture. Fail here instead,
++    #    with the candidates named.
++    if (
++        cudagraph_mode.requires_piecewise_compilation()
++        and mode is CompilationMode.VLLM_COMPILE
++    ):
++        raise RuntimeError(
++            f"e2-guard[{role}]: cudagraph_mode={cudagraph_mode} needs piecewise "
++            "capture, compilation mode is VLLM_COMPILE and breakable cudagraphs "
++            "are off -- but vLLM PR #55272 removed every @support_torch_compile "
++            "wrapper from vllm/models/qwen4_exp/nvidia/, so "
++            "has_compiled_submodule() is False and capture will raise at "
++            "vllm/v1/worker/gpu/cudagraph_utils.py:605. Executable candidates: "
++            "(a) breakable off + -O0/CompilationMode.NONE, which normalises "
++            "FULL_AND_PIECEWISE to FULL_DECODE_ONLY (changed prefill "
++            "behaviour -- must be qualified); (b) breakable off + an explicit "
++            "cudagraph_mode=FULL or NONE; (c) breakable PIECEWISE, i.e. "
++            f"{BREAKABLE_ENV}=1, which is a different identity. See "
++            "the graph-profile choice."
++        )
++
++    # 4. Optional exact pin of the resolved mode, for a launch profile.
++    expected = os.environ.get(EXPECTED_MODE_ENV, "").strip()
++    if expected:
++        actual = getattr(cudagraph_mode, "name", str(cudagraph_mode))
++        if actual != expected:
++            raise RuntimeError(
++                f"e2-guard[{role}]: resolved cudagraph_mode={actual} but "
++                f"{EXPECTED_MODE_ENV}={expected}. The launch profile and the "
++                "engine disagree about the graph identity."
++            )
++
++    logger.info(
++        "e2-guard[%s]: architectures=%s breakable=OFF compilation_mode=%s "
++        "cudagraph_mode=%s expected=%s. Recorded, not certified -- this guard "
++        "checks startup states, not that the profile was qualified.",
++        role,
++        architectures,
++        mode,
++        cudagraph_mode,
++        expected or "<unset>",
++    )
++
++
++#: Back-compatible name for the earlier call sites.
++assert_breakable_cudagraph_pinned = assert_graph_profile_is_executable
+diff --git a/vllm/v1/ple_offload/test_fault.py b/vllm/v1/ple_offload/test_fault.py
+deleted file mode 100644
+index 9ae74f7205..0000000000
+--- a/vllm/v1/ple_offload/test_fault.py
++++ /dev/null
+@@ -1,13 +0,0 @@
+-# SPDX-License-Identifier: Apache-2.0
+-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-"""Compatibility exports for the top-level test-only fault singleton."""
+-
+-from vllm_ple_test_fault import (
+-    _FAULT as _FAULT,
+-)
+-from vllm_ple_test_fault import (  # noqa: F401
+-    FaultSpec as FaultSpec,
+-)
+-from vllm_ple_test_fault import (
+-    _parse_fault_spec as _parse_fault_spec,
+-)
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index 949f29965f..09f91f9473 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -231,118 +231,6 @@ class Worker(WorkerBase):
+         # Resolved lazily on first sleep/wake; persists worker-process state.
+         self._sleep_mode_backend: SleepModeBackend | None = None
+ 
+-    def _has_ple_layers(self) -> bool:
+-        """Return whether this model configuration constructs PLE layers."""
+-        if not envs.VLLM_PLE_CPU_OFFLOAD:
+-            return False
+-        text_config = self.model_config.hf_text_config
+-        ple_layer_ids = getattr(text_config, "ple_layer_ids", None)
+-        if not ple_layer_ids:
+-            return False
+-        # PP (vllm#54709, carried from the earlier overlay): only the pipeline rank
+-        # that owns a PLE layer takes part in the offload (rank 0 with the
+-        # default partition). Other ranks build PPMissingLayer there and must
+-        # skip the connector entirely.
+-        pp_size = self.parallel_config.pipeline_parallel_size
+-        if pp_size > 1:
+-            from vllm.distributed.utils import get_pp_indices
+-
+-            tp_size = self.parallel_config.tensor_parallel_size
+-            pp_rank = (self.rank // tp_size) % pp_size
+-            start, end = get_pp_indices(
+-                int(text_config.num_hidden_layers), pp_rank, pp_size
+-            )
+-            return any(start <= int(i) - 1 < end for i in ple_layer_ids)
+-        return True
+-
+-    def _validate_ple_offload_config(self) -> None:
+-        """Reject unsupported PLE offload execution modes."""
+-        parallel_config = self.parallel_config
+-        unsupported = []
+-        if not self.use_v2_model_runner:
+-            unsupported.append("model runner V1")
+-        if not current_platform.is_cuda():
+-            unsupported.append(f"device={current_platform.device_type}")
+-        if parallel_config.nnodes != 1:
+-            unsupported.append(f"nnodes={parallel_config.nnodes}")
+-        if parallel_config.data_parallel_backend != "mp":
+-            unsupported.append(f"DP backend={parallel_config.data_parallel_backend}")
+-        if (
+-            parallel_config.data_parallel_size_local
+-            != parallel_config.data_parallel_size
+-        ):
+-            unsupported.append(
+-                "non-local DP "
+-                f"({parallel_config.data_parallel_size_local}/"
+-                f"{parallel_config.data_parallel_size} local ranks)"
+-            )
+-        # PP allowed (vllm#54709): PLE layers must live on pipeline rank 0
+-        # (enforced placement-based in models/config.py); num_workers stays
+-        # dp_size * tp_size = the ranks of the owning stage.
+-        if parallel_config.prefill_context_parallel_size != 1:
+-            unsupported.append(f"PCP={parallel_config.prefill_context_parallel_size}")
+-        if parallel_config.decode_context_parallel_size != 1:
+-            unsupported.append(f"DCP={parallel_config.decode_context_parallel_size}")
+-        if parallel_config.use_ubatching:
+-            unsupported.append("ubatching/DBO")
+-        if self.model_config.architecture not in {
+-            "Qwen4ExpForCausalLM",
+-            "Qwen4ExpForConditionalGeneration",
+-        }:
+-            unsupported.append("architecture")
+-        if self.vllm_config.weight_transfer_config is not None:
+-            unsupported.append("weight transfer")
+-
+-        if unsupported:
+-            raise ValueError(
+-                "VLLM_PLE_CPU_OFFLOAD does not support the requested "
+-                "configuration. Unsupported settings: "
+-                f"{', '.join(unsupported)}"
+-            )
+-
+-    def spawn_ple_offload(self) -> None:
+-        """Spawn one node-local PLE CPU worker from DP0/TP0."""
+-        if (
+-            not self._ple_offload_enabled
+-            or self.rank != 0
+-            or self.parallel_config.data_parallel_rank != 0
+-        ):
+-            return
+-
+-        from vllm.v1.ple_offload.worker import PleOffloadWorker
+-
+-        ipc_addr = self.parallel_config._ple_offload_ipc_path
+-        if not ipc_addr:
+-            raise RuntimeError("PLE offload IPC address was not initialized")
+-        dp_size = self.parallel_config.data_parallel_size
+-        tp_size = self.parallel_config.tensor_parallel_size
+-        num_workers = dp_size * tp_size
+-        logger.info(
+-            "PleOffload: spawning worker "
+-            "(rank=%d, local_rank=%d, dp_size=%d, tp_size=%d, "
+-            "num_workers=%d, ipc_addr=%s).",
+-            self.rank,
+-            self.local_rank,
+-            dp_size,
+-            tp_size,
+-            num_workers,
+-            ipc_addr,
+-        )
+-        self._ple_offload_worker_handle = PleOffloadWorker.make_process(
+-            self.vllm_config,
+-            num_workers,
+-            ipc_addr,
+-        )
+-
+-    def wait_ple_offload_ready(self) -> None:
+-        """Wait until weights and every TP registration are ready."""
+-        if self._ple_offload_worker_handle is None:
+-            return
+-
+-        from vllm.v1.ple_offload.worker import PleOffloadWorker
+-
+-        PleOffloadWorker.wait_for_ready(self._ple_offload_worker_handle)
+-
+     @property
+     def sleep_mode_backend(self) -> "SleepModeBackend":
+         if self._sleep_mode_backend is None:

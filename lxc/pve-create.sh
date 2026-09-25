@@ -1,14 +1,19 @@
 #!/usr/bin/env bash
-# Create a Proxmox VE LXC container for Flash-Next v2.0.1, modelled on the reference host: a PRIVILEGED Debian 13
+# Create a Proxmox VE LXC container for Flash-Next v2.2.0, modelled on the reference host: a PRIVILEGED Debian 13
 # container with the four cards passed through as devices. Run ON THE PROXMOX HOST as root:
 #
 #   CTID=201 MODELS=/tank/models CACHE=/tank/flash-next-cache lxc/pve-create.sh
 #
-# Then: pct start $CTID; pct push $CTID lxc/provision.sh /root/provision.sh; pct exec $CTID -- bash /root/provision.sh
+# Then: pct start $CTID; pct push $CTID lxc/provision.sh /root/provision.sh;
+#       pct exec $CTID -- env NVIDIA_RUN=/models/NVIDIA-Linux-x86_64-<host version>.run bash /root/provision.sh
+#
+# Needs Proxmox VE 8.1 or later (`pct set --devN` device passthrough) and a PVE whose appliance index lists the
+# debian-13-standard template.
 #
 # Variables: CTID (required), TEMPLATE (debian-13-standard, downloaded if absent), STORAGE (rootfs storage, local-lvm),
-# ROOTFS_GB (32), CORES (12), MEMORY_MB (98304 = 96 GB, the qualified allocation: the ~48 GiB FP8 n-gram table and ~4.2 GiB of
-# embedding tables are pinned in host RAM; measured resident floor ~69 GiB, the rest is reclaimable page cache),
+# ROOTFS_GB (32), CORES (12), MEMORY_MB (98304 = 96 GB, the qualified allocation: host RAM holds the ~48 GiB FP8 n-gram
+# table (ordinary memory) and ~4.2 GiB of pinned embedding tables; measured resident floor ~69 GiB, the rest is
+# reclaimable page cache),
 # BRIDGE (vmbr0), MODELS (host directory holding Qwen3.8-Flash-Next-W4A16-Merlin/; mounted at /models),
 # CACHE (host directory for the compile cache; mounted at /cache), NVIDIA_DEVS (the /dev/nvidia* nodes to pass).
 # The NVIDIA kernel module runs on the host; only its userspace goes inside (provision.sh).
@@ -23,7 +28,7 @@ CORES="${CORES:-12}"; MEMORY_MB="${MEMORY_MB:-98304}"; BRIDGE="${BRIDGE:-vmbr0}"
 # have not qualified. Set UNPRIVILEGED=1 only if you intend to do that yourself.
 UNPRIVILEGED="${UNPRIVILEGED:-0}"
 MODELS="${MODELS:?set MODELS to the host directory that contains Qwen3.8-Flash-Next-W4A16-Merlin/}"
-CACHE="${CACHE:-/var/lib/flash-next-cache}"; mkdir -p "$CACHE"
+CACHE="${CACHE:-/var/lib/flash-next-cache}"
 NVIDIA_DEVS="${NVIDIA_DEVS:-/dev/nvidia0 /dev/nvidia1 /dev/nvidia2 /dev/nvidia3 /dev/nvidiactl /dev/nvidia-uvm /dev/nvidia-uvm-tools}"
 # The device nodes must already exist ON THE HOST: the kernel module stays there and only its userspace goes inside
 # the container. `nvidia-modprobe -u -c0` creates /dev/nvidia0 and nvidiactl but NOT the uvm nodes; running
@@ -37,9 +42,11 @@ for d in $NVIDIA_DEVS; do [ -e "$d" ] || {
   echo "  If the cards are bound to vfio-pci for a VM, unbind them from vfio-pci first."
   echo "  To survive host reboots, drive this from a Proxmox pre-start hookscript (README, LXC section)."
   exit 1; }; done
-tpl="$(pveam list local | awk -v t="$TEMPLATE" '$1 ~ t {print $1; exit}')"
+mkdir -p "$CACHE"
+# (|| true: under pipefail awk's early exit can fail the pipeline; an empty result is handled below)
+tpl="$(pveam list local | awk -v t="$TEMPLATE" '$1 ~ t {print $1; exit}' || true)"
 if [ -z "$tpl" ]; then
-  name="$(pveam available --section system | awk -v t="$TEMPLATE" '$2 ~ t {print $2; exit}')"
+  name="$(pveam available --section system | awk -v t="$TEMPLATE" '$2 ~ t {print $2; exit}' || true)"
   [ -n "$name" ] || { echo "no $TEMPLATE template available (pveam available)"; exit 1; }
   pveam download local "$name"; tpl="local:vztmpl/$name"
 fi

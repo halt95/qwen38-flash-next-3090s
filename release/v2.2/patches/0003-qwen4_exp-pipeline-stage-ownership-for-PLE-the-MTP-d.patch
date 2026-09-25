@@ -1,0 +1,291 @@
+From c0a30ae373dbc68521fdc2b508def60245ddcceb Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Tue, 22 Sep 2026 04:11:27 -0400
+Subject: [PATCH 03/58] qwen4_exp: pipeline-stage ownership for PLE, the MTP
+ drafter and the vision tower
+
+Each pipeline stage builds only the parts it owns: PLE when every PLE layer
+lives on stage 0, MTP under PP (port of vLLM PR #46994 minus its ROCm MLA file
+and tests) with the drafter on the last stage, and the vision tower on the
+first stage only.
+---
+ vllm/model_executor/models/config.py        |  21 +++-
+ vllm/models/qwen4_exp/nvidia/model.py       |  41 +++++--
+ vllm/models/qwen4_exp/nvidia/model_state.py |   8 +-
+ vllm/models/qwen4_exp/nvidia/mtp.py         |   6 +-
+ vllm/v1/worker/gpu_worker.py                | 112 ++++++++++++++++++++
+ 5 files changed, 170 insertions(+), 18 deletions(-)
+
+diff --git a/vllm/model_executor/models/config.py b/vllm/model_executor/models/config.py
+index bbbe98bc8d..5c55412ee0 100644
+--- a/vllm/model_executor/models/config.py
++++ b/vllm/model_executor/models/config.py
+@@ -876,12 +876,25 @@ class Qwen4ExpForConditionalGenerationConfig(Qwen3_5ForConditionalGenerationConf
+             )
+         # Checked again in Qwen4ExpModelState; rejecting it here keeps the
+         # engine from loading weights first.
++        # vllm#54709: PLE only needs raw input_ids on the rank that owns a PLE
++        # layer. Allow PP>1 as long as every PLE layer lives on pipeline rank 0.
+         if text_config.ple_layer_ids and parallel_config.pipeline_parallel_size > 1:
+-            raise NotImplementedError(
+-                "Qwen4Exp N-gram PLE embedding requires pipeline_parallel_size=1 "
+-                "because non-first pipeline ranks do not receive the raw input_ids "
+-                "it needs. Please run with PP=1."
++            from vllm.distributed.utils import get_pp_indices
++
++            rank0_start, rank0_end = get_pp_indices(
++                int(text_config.num_hidden_layers),
++                0,
++                parallel_config.pipeline_parallel_size,
+             )
++            ple_idx = [int(i) - 1 for i in text_config.ple_layer_ids]
++            if min(ple_idx) < rank0_start or max(ple_idx) >= rank0_end:
++                raise NotImplementedError(
++                    "Qwen4Exp N-gram PLE embedding requires every PLE layer to "
++                    f"live on pipeline rank 0 (layers {rank0_start}.."
++                    f"{rank0_end - 1}), but PLE layers are at {ple_idx}. Give "
++                    "rank 0 more layers via VLLM_PP_LAYER_PARTITION, or run "
++                    "with PP=1."
++                )
+         multimodal_config = vllm_config.model_config.multimodal_config
+         if multimodal_config is not None and multimodal_config.language_model_only:
+             _strip_qwen4_exp_mrope(vllm_config.model_config)
+diff --git a/vllm/models/qwen4_exp/nvidia/model.py b/vllm/models/qwen4_exp/nvidia/model.py
+index 3f884cd1f4..7ac0ccb5a3 100644
+--- a/vllm/models/qwen4_exp/nvidia/model.py
++++ b/vllm/models/qwen4_exp/nvidia/model.py
+@@ -58,6 +58,7 @@ from vllm.model_executor.models.qwen3_vl import (
+ )
+ from vllm.model_executor.models.utils import (
+     AutoWeightsLoader,
++    PPMissingLayer,
+     StageMissingLayer,
+     WeightsMapper,
+     _merge_multimodal_embeddings,
+@@ -774,11 +775,16 @@ class Qwen4ExpForCausalLM(
+         self.model = Qwen4ExpModel(
+             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
+         )
+-        self.lm_head = ParallelLMHead(
+-            config.vocab_size,
+-            config.hidden_size,
+-            prefix=maybe_prefix(prefix, "lm_head"),
+-        )
++        # PP ownership: logits are computed on the
++        # last stage only; earlier stages carried an unused 0.59 GiB head.
++        if get_pp_group().is_last_rank:
++            self.lm_head = ParallelLMHead(
++                config.vocab_size,
++                config.hidden_size,
++                prefix=maybe_prefix(prefix, "lm_head"),
++            )
++        else:
++            self.lm_head = PPMissingLayer()
+         self.logits_processor = LogitsProcessor(config.vocab_size)
+         self.make_empty_intermediate_tensors = (
+             self.model.make_empty_intermediate_tensors
+@@ -1011,6 +1017,14 @@ class Qwen4ExpForConditionalGeneration(
+         self.model_config = vllm_config.model_config
+         self.multimodal_config = multimodal_config
+         self.language_model_only = multimodal_config.language_model_only
++        # PP ownership: the encoder cache and the image
++        # embeddings exist on the first pipeline stage only; later stages
++        # carried an unused vision tower (~0.42 GiB per GPU at TP2). Absence
++        # on a later stage is an ownership decision, not language_model_only:
++        # the multimodal configuration stays global.
++        self._owns_vision_tower = (
++            not self.language_model_only and get_pp_group().is_first_rank
++        )
+         if self.language_model_only:
+             self.use_data_parallel = False
+             self.is_multimodal_pruning_enabled = False
+@@ -1019,6 +1033,12 @@ class Qwen4ExpForConditionalGeneration(
+             self._tokenizer = None
+             self.visual = StageMissingLayer("vision_tower")
+             self._tower_model_names = []
++        elif not self._owns_vision_tower:
++            self.use_data_parallel = multimodal_config.mm_encoder_tp_mode == "data"
++            self._init_video_pruning(multimodal_config)
++            self._tokenizer = cached_tokenizer_from_config(vllm_config.model_config)
++            self.visual = StageMissingLayer("vision_tower")
++            self._tower_model_names = []
+         else:
+             self.use_data_parallel = multimodal_config.mm_encoder_tp_mode == "data"
+             self._init_video_pruning(multimodal_config)
+@@ -1064,7 +1084,16 @@ class Qwen4ExpForConditionalGeneration(
+         self.make_empty_intermediate_tensors = (
+             self.language_model.make_empty_intermediate_tensors
+         )
+-        if not get_pp_group().is_first_rank and self.use_deepstack:
++        # Deepstack levels are injected into the first len(indexes) decoder
++        # layers on the first stage and are not forwarded through PP; keep the
++        # boundary assertion independent of use_deepstack (False on stages
++        # without a tower) so a future checkpoint with deepstack cannot be
++        # split across the boundary silently.
++        if (
++            not get_pp_group().is_first_rank
++            and not self.language_model_only
++            and bool(config.vision_config.deepstack_visual_indexes)
++        ):
+             assert self.language_model.model.start_layer >= len(
+                 config.vision_config.deepstack_visual_indexes
+             ), (
+diff --git a/vllm/models/qwen4_exp/nvidia/model_state.py b/vllm/models/qwen4_exp/nvidia/model_state.py
+index 246168509b..092fef7b39 100644
+--- a/vllm/models/qwen4_exp/nvidia/model_state.py
++++ b/vllm/models/qwen4_exp/nvidia/model_state.py
+@@ -32,13 +32,7 @@ class Qwen4ExpModelState(MambaHybridModelState):
+             self.ngram_eos_token_id = 0
+             return
+ 
+-        if vllm_config.parallel_config.pipeline_parallel_size > 1:
+-            raise RuntimeError(
+-                "N-gram PLE embedding currently requires "
+-                "pipeline_parallel_size=1 because non-first pipeline ranks do "
+-                "not receive the raw input_ids required by PLE. Please run "
+-                "with PP=1."
+-            )
++        # vllm#54709: PP gate moved to config.py (placement-based).
+ 
+         self.ngram_context_len = int(config.ngram_size) - 1
+         if self.ngram_context_len <= 0:
+diff --git a/vllm/models/qwen4_exp/nvidia/mtp.py b/vllm/models/qwen4_exp/nvidia/mtp.py
+index d12b851d68..5dc0fc42b5 100644
+--- a/vllm/models/qwen4_exp/nvidia/mtp.py
++++ b/vllm/models/qwen4_exp/nvidia/mtp.py
+@@ -290,7 +290,11 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
+         hidden_size = self.hidden_size
+         prev_block_output: torch.Tensor | None = None
+ 
+-        if get_pp_group().is_first_rank:
++        # Branch on the inputs, not the rank (vllm PR #46994's rule, applied
++        # there to Qwen3_5MTP / DeepSeek MTP): the drafter is built entirely on
++        # the LAST pipeline stage, where is_first_rank is False, and it always
++        # starts from the target's hidden state + token ids it embeds itself.
++        if intermediate_tensors is None:
+             assert hidden_states is not None
+             if inputs_embeds is None:
+                 assert input_ids is not None
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index f0901350d9..eead9c9321 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -231,6 +231,118 @@ class Worker(WorkerBase):
+         # Resolved lazily on first sleep/wake; persists worker-process state.
+         self._sleep_mode_backend: SleepModeBackend | None = None
+ 
++    def _has_ple_layers(self) -> bool:
++        """Return whether this model configuration constructs PLE layers."""
++        if not envs.VLLM_PLE_CPU_OFFLOAD:
++            return False
++        text_config = self.model_config.hf_text_config
++        ple_layer_ids = getattr(text_config, "ple_layer_ids", None)
++        if not ple_layer_ids:
++            return False
++        # PP (vllm#54709, carried from the earlier overlay): only the pipeline rank
++        # that owns a PLE layer takes part in the offload (rank 0 with the
++        # default partition). Other ranks build PPMissingLayer there and must
++        # skip the connector entirely.
++        pp_size = self.parallel_config.pipeline_parallel_size
++        if pp_size > 1:
++            from vllm.distributed.utils import get_pp_indices
++
++            tp_size = self.parallel_config.tensor_parallel_size
++            pp_rank = (self.rank // tp_size) % pp_size
++            start, end = get_pp_indices(
++                int(text_config.num_hidden_layers), pp_rank, pp_size
++            )
++            return any(start <= int(i) - 1 < end for i in ple_layer_ids)
++        return True
++
++    def _validate_ple_offload_config(self) -> None:
++        """Reject unsupported PLE offload execution modes."""
++        parallel_config = self.parallel_config
++        unsupported = []
++        if not self.use_v2_model_runner:
++            unsupported.append("model runner V1")
++        if not current_platform.is_cuda():
++            unsupported.append(f"device={current_platform.device_type}")
++        if parallel_config.nnodes != 1:
++            unsupported.append(f"nnodes={parallel_config.nnodes}")
++        if parallel_config.data_parallel_backend != "mp":
++            unsupported.append(f"DP backend={parallel_config.data_parallel_backend}")
++        if (
++            parallel_config.data_parallel_size_local
++            != parallel_config.data_parallel_size
++        ):
++            unsupported.append(
++                "non-local DP "
++                f"({parallel_config.data_parallel_size_local}/"
++                f"{parallel_config.data_parallel_size} local ranks)"
++            )
++        # PP allowed (vllm#54709): PLE layers must live on pipeline rank 0
++        # (enforced placement-based in models/config.py); num_workers stays
++        # dp_size * tp_size = the ranks of the owning stage.
++        if parallel_config.prefill_context_parallel_size != 1:
++            unsupported.append(f"PCP={parallel_config.prefill_context_parallel_size}")
++        if parallel_config.decode_context_parallel_size != 1:
++            unsupported.append(f"DCP={parallel_config.decode_context_parallel_size}")
++        if parallel_config.use_ubatching:
++            unsupported.append("ubatching/DBO")
++        if self.model_config.architecture not in {
++            "Qwen4ExpForCausalLM",
++            "Qwen4ExpForConditionalGeneration",
++        }:
++            unsupported.append("architecture")
++        if self.vllm_config.weight_transfer_config is not None:
++            unsupported.append("weight transfer")
++
++        if unsupported:
++            raise ValueError(
++                "VLLM_PLE_CPU_OFFLOAD does not support the requested "
++                "configuration. Unsupported settings: "
++                f"{', '.join(unsupported)}"
++            )
++
++    def spawn_ple_offload(self) -> None:
++        """Spawn one node-local PLE CPU worker from DP0/TP0."""
++        if (
++            not self._ple_offload_enabled
++            or self.rank != 0
++            or self.parallel_config.data_parallel_rank != 0
++        ):
++            return
++
++        from vllm.v1.ple_offload.worker import PleOffloadWorker
++
++        ipc_addr = self.parallel_config._ple_offload_ipc_path
++        if not ipc_addr:
++            raise RuntimeError("PLE offload IPC address was not initialized")
++        dp_size = self.parallel_config.data_parallel_size
++        tp_size = self.parallel_config.tensor_parallel_size
++        num_workers = dp_size * tp_size
++        logger.info(
++            "PleOffload: spawning worker "
++            "(rank=%d, local_rank=%d, dp_size=%d, tp_size=%d, "
++            "num_workers=%d, ipc_addr=%s).",
++            self.rank,
++            self.local_rank,
++            dp_size,
++            tp_size,
++            num_workers,
++            ipc_addr,
++        )
++        self._ple_offload_worker_handle = PleOffloadWorker.make_process(
++            self.vllm_config,
++            num_workers,
++            ipc_addr,
++        )
++
++    def wait_ple_offload_ready(self) -> None:
++        """Wait until weights and every TP registration are ready."""
++        if self._ple_offload_worker_handle is None:
++            return
++
++        from vllm.v1.ple_offload.worker import PleOffloadWorker
++
++        PleOffloadWorker.wait_for_ready(self._ple_offload_worker_handle)
++
+     @property
+     def sleep_mode_backend(self) -> "SleepModeBackend":
+         if self._sleep_mode_backend is None:

@@ -1,0 +1,1355 @@
+From a06731a0679b7a791021d0e3f09c54497b1b9c59 Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Wed, 23 Sep 2026 08:41:02 -0400
+Subject: [PATCH 47/58] worker: e2-identity and rank-tagged e2-toggles startup
+ lines
+
+Each worker logs its launch identity and, after warm-up and capture, one
+e2-toggles line with the effective toggle state read back from the C++
+extensions through two new tensor-free query ops. Both extensions must be
+rebuilt.
+---
+ .../moe/marlin_moe_wna16/ops.cu               |  31 +-
+ csrc/libtorch_stable/ops.h                    |   4 +
+ csrc/libtorch_stable/topk.cu                  |  89 +++-
+ csrc/libtorch_stable/torch_bindings.cpp       |   5 +
+ tests/test_merlin_e2_toggles.py               | 420 +++++++++++++++++
+ vllm/v1/worker/e2_identity.py                 | 148 ++++++
+ vllm/v1/worker/e2_toggles.py                  | 444 ++++++++++++++++++
+ vllm/v1/worker/gpu/model_runner.py            |   7 +-
+ vllm/v1/worker/gpu_worker.py                  |  13 +
+ 9 files changed, 1154 insertions(+), 7 deletions(-)
+ create mode 100644 tests/test_merlin_e2_toggles.py
+ create mode 100644 vllm/v1/worker/e2_identity.py
+ create mode 100644 vllm/v1/worker/e2_toggles.py
+
+diff --git a/csrc/libtorch_stable/moe/marlin_moe_wna16/ops.cu b/csrc/libtorch_stable/moe/marlin_moe_wna16/ops.cu
+index 2c6ad7666a..0a6f5de67d 100644
+--- a/csrc/libtorch_stable/moe/marlin_moe_wna16/ops.cu
++++ b/csrc/libtorch_stable/moe/marlin_moe_wna16/ops.cu
+@@ -33,6 +33,7 @@
+ #include <torch/headeronly/util/Exception.h>
+ 
+ #include "libtorch_stable/torch_utils.h"
++#include <atomic>
+ #include <cstdlib>
+ 
+ namespace {
+@@ -53,14 +54,31 @@ namespace {
+ // This std::getenv is the SINGLE source of truth. vllm/envs.py carries a raw
+ // passthrough entry for validate_environ and the compile-factor hash only;
+ // nothing in Python may parse this name a second time.
++//
++// The initialiser also
++// publishes the value it cached into g_cached_full_k (-1 = not initialised
++// yet; nothing else writes it), and marlin_moe_full_k_state() below only
++// LOADS it -- asking never fills the cache. Host code only.
+ // -------------------------------------------------------------------------
++std::atomic<int> g_cached_full_k{-1};
++
+ bool merlin_full_k() {
+   static const bool enabled = [] {
+     const char* raw = std::getenv("MERLIN_FULL_K");
+-    return (raw != nullptr && raw[0] != '\0') ? (std::atoi(raw) != 0) : false;
++    const bool value =
++        (raw != nullptr && raw[0] != '\0') ? (std::atoi(raw) != 0) : false;
++    g_cached_full_k.store(value ? 1 : 0, std::memory_order_release);
++    return value;
+   }();
+   return enabled;
+ }
++
++// MERLIN_FULL_K as this process cached it: -1 = not initialised yet (no Marlin
++// MoE launch has happened in this process), 0 = off, 1 = on. Tensor-free, no
++// CUDA call.
++int64_t marlin_moe_full_k_state() {
++  return static_cast<int64_t>(g_cached_full_k.load(std::memory_order_acquire));
++}
+ }  // namespace
+ 
+ #define STATIC_ASSERT_SCALAR_TYPE_VALID(scalar_t)               \
+@@ -736,3 +754,14 @@ torch::stable::Tensor moe_wna16_marlin_gemm(
+ STABLE_TORCH_LIBRARY_IMPL(_moe_C, CUDA, m) {
+   m.impl("moe_wna16_marlin_gemm", TORCH_BOX(&moe_wna16_marlin_gemm));
+ }
++
++// v2.2 -- defined and registered in this TU so the query exists exactly when
++// the static it reads does. Tensor-free, so CompositeExplicitAutograd (a CUDA
++// registration could never be dispatched to without a tensor argument).
++STABLE_TORCH_LIBRARY_FRAGMENT(_moe_C, m) {
++  m.def("marlin_moe_full_k_state() -> int");
++}
++
++STABLE_TORCH_LIBRARY_IMPL(_moe_C, CompositeExplicitAutograd, m) {
++  m.impl("marlin_moe_full_k_state", TORCH_BOX(&marlin_moe_full_k_state));
++}
+diff --git a/csrc/libtorch_stable/ops.h b/csrc/libtorch_stable/ops.h
+index 11568011f2..32d0673e7e 100644
+--- a/csrc/libtorch_stable/ops.h
++++ b/csrc/libtorch_stable/ops.h
+@@ -482,6 +482,10 @@ void persistent_topk_exact_counters(torch::stable::Tensor& out, int64_t reset,
+ // reader never has to guess it from an environment variable.
+ int64_t persistent_topk_exact_counters_slots();
+ 
++// The persistent_topk switches as this
++// process cached them, packed; see topk.cu for the layout.
++int64_t persistent_topk_toggle_state();
++
+ #ifdef VLLM_ENABLE_COOPERATIVE_TOPK
+ void cooperative_topk(const torch::stable::Tensor& logits,
+                       const torch::stable::Tensor& lengths,
+diff --git a/csrc/libtorch_stable/topk.cu b/csrc/libtorch_stable/topk.cu
+index b52a34b08c..3c90c259e2 100644
+--- a/csrc/libtorch_stable/topk.cu
++++ b/csrc/libtorch_stable/topk.cu
+@@ -43,6 +43,29 @@ namespace {
+ // This std::getenv is the SINGLE source of truth; vllm/envs.py carries a raw
+ // passthrough for validate_environ and the compile-factor hash only.
+ // -------------------------------------------------------------------------
++// -------------------------------------------------------------------------
++// A READ-ONLY MIRROR of the
++// switches as this process CACHED them, for persistent_topk_toggle_state().
++//
++// Each switch below is a function-local static filled once by its lambda. The
++// lambda now also stores the value it cached into the matching atomic here
++// (publish_cached), and nothing else ever writes these atomics, so a mirror
++// either says "not initialised yet" (-1) or holds exactly the cached value.
++// The query only LOADS them: it never calls a getter, so asking cannot fill a
++// cache from an environment that differs from the one the kernel saw. The
++// parse expressions are unchanged; this is host code only.
++// -------------------------------------------------------------------------
++std::atomic<int> g_cached_tie_recent{-1};
++std::atomic<int> g_cached_tie_det{-1};
++std::atomic<int> g_cached_exact_medium{-1};
++std::atomic<int> g_cached_det_large{-1};
++std::atomic<int> g_cached_exact_decode{-1};
++
++bool publish_cached(std::atomic<int>& mirror, bool value) {
++  mirror.store(value ? 1 : 0, std::memory_order_release);
++  return value;
++}
++
+ // MERLIN_TIE_RECENT -- the DIRECTION of the deterministic tie-break above.
+ // Measured at 12k tokens on the reference host: oldest-wins costs -7.9 % decode,
+ // most-recent-wins is +1.5 %. Both deterministic. Also the direction
+@@ -52,7 +75,9 @@ namespace {
+ bool tie_recent_enabled() {
+   static const bool enabled = [] {
+     const char* raw = std::getenv("MERLIN_TIE_RECENT");
+-    return (raw != nullptr && raw[0] != '\0') ? (std::atoi(raw) != 0) : false;
++    return publish_cached(
++        g_cached_tie_recent,
++        (raw != nullptr && raw[0] != '\0') ? (std::atoi(raw) != 0) : false);
+   }();
+   return enabled;
+ }
+@@ -60,7 +85,9 @@ bool tie_recent_enabled() {
+ bool det_ties_enabled() {
+   static const bool enabled = [] {
+     const char* raw = std::getenv("MERLIN_TIE_DET");
+-    return (raw != nullptr && raw[0] != '\0') ? (std::atoi(raw) != 0) : false;
++    return publish_cached(
++        g_cached_tie_det,
++        (raw != nullptr && raw[0] != '\0') ? (std::atoi(raw) != 0) : false);
+   }();
+   return enabled;
+ }
+@@ -68,7 +95,9 @@ bool det_ties_enabled() {
+ bool exact_medium_enabled() {
+   static const bool enabled = [] {
+     const char* raw = std::getenv("MERLIN_TOPK_EXACT_MEDIUM");
+-    return (raw == nullptr || raw[0] == '\0') ? true : (std::atoi(raw) != 0);
++    return publish_cached(
++        g_cached_exact_medium,
++        (raw == nullptr || raw[0] == '\0') ? true : (std::atoi(raw) != 0));
+   }();
+   return enabled;
+ }
+@@ -86,7 +115,9 @@ bool exact_medium_enabled() {
+ bool det_large_enabled() {
+   static const bool enabled = [] {
+     const char* raw = std::getenv("MERLIN_TOPK_DET_LARGE");
+-    return (raw == nullptr || raw[0] == '\0') ? true : (std::atoi(raw) != 0);
++    return publish_cached(
++        g_cached_det_large,
++        (raw == nullptr || raw[0] == '\0') ? true : (std::atoi(raw) != 0));
+   }();
+   return enabled;
+ }
+@@ -103,7 +134,9 @@ bool det_large_enabled() {
+ bool exact_decode_enabled() {
+   static const bool enabled = [] {
+     const char* raw = std::getenv("MERLIN_TOPK_EXACT_DECODE");
+-    return (raw != nullptr && raw[0] != '\0') ? (std::atoi(raw) != 0) : false;
++    return publish_cached(
++        g_cached_exact_decode,
++        (raw != nullptr && raw[0] != '\0') ? (std::atoi(raw) != 0) : false);
+   }();
+   return enabled;
+ }
+@@ -871,3 +904,49 @@ int64_t persistent_topk_exact_counters_slots() {
+   return 0;
+ #endif
+ }
++
++// The persistent_topk
++// switches AS THIS PROCESS CACHED THEM -- the values every launch of this
++// process uses -- read from the mirrors above. Tensor-free, no CUDA call, no
++// allocation, never initialises a cache (see publish_cached), so it is safe
++// from anywhere and asking changes nothing.
++//
++// Packed into one int64 so the op needs no tensor and no dispatch key.
++// 2 bits per field, field i at bits [2i, 2i+1]: 0 = off, 1 = on,
++// 2 = the static has not been initialised in this process yet.
++//   field 0  MERLIN_TIE_DET                       (det_ties_enabled)
++//   field 1  MERLIN_TIE_RECENT as parsed          (tie_recent_enabled)
++//   field 2  effective direction, 1 = most-recent (effective_tie_recent)
++//   field 3  MERLIN_TOPK_EXACT_MEDIUM             (exact_medium_enabled)
++//   field 4  MERLIN_TOPK_EXACT_DECODE             (exact_decode_enabled)
++//   field 5  MERLIN_TOPK_DET_LARGE                (det_large_enabled)
++// bits [48, 55] = field count (6), bits [56, 62] = layout version (1). A
++// reader must check both and refuse any other layout rather than guess.
++int64_t persistent_topk_toggle_state() {
++#ifndef USE_ROCM
++  const auto field = [](int cached) -> int64_t {
++    return cached < 0 ? 2 : (cached != 0 ? 1 : 0);
++  };
++  const int det = g_cached_tie_det.load(std::memory_order_acquire);
++  const int recent = g_cached_tie_recent.load(std::memory_order_acquire);
++  // The kernel's own rule, from the kernel's own header, on the cached values.
++  const int effective =
++      (det < 0 || recent < 0)
++          ? -1
++          : (vllm::persistent::effective_tie_recent(det != 0, recent != 0)
++                 ? 1
++                 : 0);
++  int64_t state = 0;
++  state |= field(det) << 0;
++  state |= field(recent) << 2;
++  state |= field(effective) << 4;
++  state |= field(g_cached_exact_medium.load(std::memory_order_acquire)) << 6;
++  state |= field(g_cached_exact_decode.load(std::memory_order_acquire)) << 8;
++  state |= field(g_cached_det_large.load(std::memory_order_acquire)) << 10;
++  state |= int64_t{6} << 48;
++  state |= int64_t{1} << 56;
++  return state;
++#else
++  return 0;  // layout version 0: no persistent_topk on ROCm
++#endif
++}
+diff --git a/csrc/libtorch_stable/torch_bindings.cpp b/csrc/libtorch_stable/torch_bindings.cpp
+index 3b23bc1cd2..2ecc945184 100644
+--- a/csrc/libtorch_stable/torch_bindings.cpp
++++ b/csrc/libtorch_stable/torch_bindings.cpp
+@@ -591,6 +591,8 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
+   ops.def(
+       "persistent_topk_exact_counters(Tensor! out, int reset, int sync) -> ()");
+   ops.def("persistent_topk_exact_counters_slots() -> int");
++  // v2.2 -- the switches as this process cached them (topk.cu for the layout).
++  ops.def("persistent_topk_toggle_state() -> int");
+ 
+ #ifdef VLLM_ENABLE_COOPERATIVE_TOPK
+   ops.def(
+@@ -949,6 +951,9 @@ STABLE_TORCH_LIBRARY_IMPL(_C, CompositeExplicitAutograd, ops) {
+   // NotImplementedError "no fallback function is registered").
+   ops.impl("persistent_topk_exact_counters_slots",
+            TORCH_BOX(&persistent_topk_exact_counters_slots));
++  // Tensor-free for the same reason as the slot count above.
++  ops.impl("persistent_topk_toggle_state",
++           TORCH_BOX(&persistent_topk_toggle_state));
+ }
+ 
+ // Cache ops
+diff --git a/tests/test_merlin_e2_toggles.py b/tests/test_merlin_e2_toggles.py
+new file mode 100644
+index 0000000000..3cd3c1f80e
+--- /dev/null
++++ b/tests/test_merlin_e2_toggles.py
+@@ -0,0 +1,420 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""CPU tests for vllm/v1/worker/e2_toggles.py.
++
++Parsing parity with the C++ (glibc atoi) and Python (int()) readers including
++odd spellings; the effective map for the toggles-ON and knob-absent boots;
++once-only emission; emission with the counter log OFF; deferral while a C++
++static is uninitialised; the n-a paths; and a line the smoke can tokenise.
++
++    pytest --noconftest tests/test_merlin_e2_toggles.py
++"""
++
++import ctypes
++import ctypes.util
++import logging
++import os
++import sys
++
++import pytest
++
++from vllm.v1.worker import e2_toggles as t
++
++
++# ------------------------------------------------------------ atoi parity ----
++ATOI_CASES = [
++    (b"1", 1),
++    (b"0", 0),
++    (b"00", 0),
++    (b"01", 1),
++    (b"true", 0),  # FULL_K=true reads as OFF (the release note's warning)
++    (b"yes", 0),
++    (b"on", 0),
++    (b" 1", 1),
++    (b"\t\n\v\f\r1", 1),
++    (b"+1", 1),
++    (b"-1", -1),
++    (b"-0", 0),
++    (b"+ 1", 0),  # sign then space: no digits
++    (b"1abc", 1),
++    (b"1 ", 1),
++    (b"0x1", 0),
++    (b"1.9", 1),
++    (b"2147483647", 2147483647),
++    (b"2147483648", -2147483648),  # (int) keeps the low 32 bits
++    (b"4294967296", 0),  # 2^32 -> 0: set but reads OFF
++    (b"4294967297", 1),
++    (b"99999999999999999999", -1),  # strtol clamps to LONG_MAX -> low 32 = -1
++    (b"-99999999999999999999", 0),  # LONG_MIN -> low 32 = 0
++    (b"\xc2\xa01", 0),  # NBSP is not C-locale whitespace
++    (b"\xef\xbc\x91", 0),  # fullwidth digit one: not a C digit
++    (b"", 0),
++]
++
++
++@pytest.mark.parametrize("raw,want", ATOI_CASES)
++def test_c_atoi_table(raw, want):
++    assert t.c_atoi(raw) == want
++
++
++def _glibc():
++    if not sys.platform.startswith("linux"):
++        return None
++    name = ctypes.util.find_library("c")
++    if not name:
++        return None
++    libc = ctypes.CDLL(name)
++    gnu = getattr(libc, "gnu_get_libc_version", None)
++    if gnu is None:
++        return None
++    libc.atoi.restype = ctypes.c_int
++    libc.atoi.argtypes = [ctypes.c_char_p]
++    return libc
++
++
++@pytest.mark.skipif(_glibc() is None, reason="parity against the real atoi needs glibc")
++@pytest.mark.parametrize("raw,want", ATOI_CASES)
++def test_c_atoi_matches_glibc(raw, want):
++    assert t.c_atoi(raw) == _glibc().atoi(raw)
++
++
++@pytest.mark.parametrize(
++    "raw,unset_value,want",
++    [
++        (None, False, False),
++        (b"", False, False),  # empty = unset for the default-OFF getters
++        (None, True, True),
++        (b"", True, True),  # EXACT_MEDIUM= / DET_LARGE= keep the default ON
++        (b"0", True, False),
++        (b"1", False, True),
++        (b"true", False, False),
++        (b"true", True, False),  # a non-numeric value turns a default-ON switch OFF
++        (b"4294967296", False, False),
++        (b"-1", False, True),
++    ],
++)
++def test_cxx_switch(raw, unset_value, want):
++    assert t.cxx_switch(raw, unset_value) is want
++
++
++@pytest.mark.parametrize(
++    "raw,want",
++    [
++        (None, "0"),
++        ("0", "0"),
++        ("1", "1"),
++        ("2", "1"),
++        (" 1 ", "1"),
++        ("+1", "1"),
++        ("-0", "0"),
++        ("1_0", "1"),
++        ("１", "1"),  # Python int() accepts non-ASCII digits
++        ("true", "invalid"),  # envs.py raises: the engine would not boot
++        ("", "invalid"),
++        ("0x1", "invalid"),
++    ],
++)
++def test_qsa_sort_value(raw, want):
++    assert t.qsa_sort_value(raw) == want
++
++
++def test_qsa_sort_value_matches_envs_reader(monkeypatch):
++    """The mirror IS the reader: same int() call as vllm/envs.py:2372."""
++    import vllm.envs as envs
++
++    for raw in ("0", "1", " 1 ", "1_0", "１", "-0"):
++        monkeypatch.setenv("MERLIN_QSA_SORT", raw)
++        assert t.qsa_sort_value(raw) == ("1" if envs.MERLIN_QSA_SORT else "0")
++    for raw in ("true", ""):
++        monkeypatch.setenv("MERLIN_QSA_SORT", raw)
++        with pytest.raises(ValueError):
++            _ = envs.MERLIN_QSA_SORT
++        assert t.qsa_sort_value(raw) == "invalid"
++
++
++def test_effective_tie_recent():
++    assert t.effective_tie_recent(False, False) is True
++    assert t.effective_tie_recent(False, True) is True
++    assert t.effective_tie_recent(True, False) is False
++    assert t.effective_tie_recent(True, True) is True
++
++
++# ------------------------------------------------------- effective maps ----
++def _env(values):
++    def cxx(name):
++        v = values.get(name)
++        return None if v is None else v.encode()
++
++    return cxx, values.get
++
++
++ON = {
++    "MERLIN_FULL_K": "1",
++    "MERLIN_QSA_SORT": "1",
++    "MERLIN_TIE_DET": "1",
++    "MERLIN_TIE_RECENT": "1",
++}
++ON_MAP = {
++    "full_k": "1",
++    "qsa_sort": "1",
++    "tie_det": "1",
++    "tie_recent": "1",
++    "tie_recent_effective": "1",
++    "exact_medium": "1",
++    "exact_decode": "0",
++    "det_large": "1",
++}
++ABSENT_MAP = {
++    "full_k": "0",
++    "qsa_sort": "0",
++    "tie_det": "0",
++    "tie_recent": "0",
++    "tie_recent_effective": "1",
++    "exact_medium": "1",
++    "exact_decode": "0",
++    "det_large": "1",
++}
++
++
++def test_effective_map_toggles_on():
++    raw, eff = t.environ_view(*_env(ON))
++    assert eff == ON_MAP
++    assert raw["MERLIN_TOPK_EXACT_MEDIUM"] == "unset"
++    assert raw["MERLIN_FULL_K"] == "1"
++
++
++def test_effective_map_knob_absent():
++    raw, eff = t.environ_view(*_env({}))
++    assert eff == ABSENT_MAP
++    assert set(raw.values()) == {"unset"}
++
++
++def test_effective_map_odd_spellings():
++    _, eff = t.environ_view(
++        *_env(
++            {
++                "MERLIN_FULL_K": "true",  # C++ atoi -> OFF
++                "MERLIN_TIE_DET": " 1",
++                "MERLIN_TIE_RECENT": "0",
++                "MERLIN_TOPK_EXACT_MEDIUM": "",  # empty -> default ON
++                "MERLIN_TOPK_DET_LARGE": "off",  # atoi("off") == 0 -> OFF
++                "MERLIN_QSA_SORT": "true",
++            }
++        )
++    )
++    assert eff["full_k"] == "0"
++    assert eff["tie_det"] == "1"
++    assert eff["tie_recent_effective"] == "0"  # TIE_DET=1 TIE_RECENT=0 = oldest-wins
++    assert eff["exact_medium"] == "1"
++    assert eff["det_large"] == "0"
++    assert eff["qsa_sort"] == "invalid"
++
++
++def test_encode_raw():
++    assert t.encode_raw(None) == "unset"
++    assert t.encode_raw(b"1") == "1"
++    assert t.encode_raw(b"") == '""'
++    assert t.encode_raw(b"unset") == '"unset"'
++    assert t.encode_raw(b"1 2") == '"1\\x202"'
++    assert t.encode_raw(b'a"b') == '"a\\x22b"'
++    for v in (b"", b" x ", b"\xff", b"a\tb"):
++        assert " " not in t.encode_raw(v)
++
++
++# ----------------------------------------------------------- cpp decode ----
++def _pack(fields, version=1, count=6):
++    state = 0
++    for i, f in enumerate(fields):
++        state |= f << (2 * i)
++    return state | (count << 48) | (version << 56)
++
++
++def test_decode_topk_state():
++    assert t.decode_topk_state(_pack([1, 1, 1, 1, 0, 1])) == {
++        "tie_det": "1",
++        "tie_recent": "1",
++        "tie_recent_effective": "1",
++        "exact_medium": "1",
++        "exact_decode": "0",
++        "det_large": "1",
++    }
++    assert t.decode_topk_state(_pack([2, 2, 2, 1, 2, 2]))["tie_det"] == "uninit"
++    assert t.decode_topk_state(_pack([3, 0, 0, 0, 0, 0]))["tie_det"] == "invalid"
++    assert isinstance(t.decode_topk_state(_pack([0] * 6, version=2)), str)
++    assert isinstance(t.decode_topk_state(_pack([0] * 6, count=5)), str)
++    assert isinstance(t.decode_topk_state(0), str)  # ROCm build: version 0
++
++
++def test_decode_full_k_state():
++    assert [t.decode_full_k_state(v) for v in (-1, 0, 1, 7)] == [
++        "uninit",
++        "0",
++        "1",
++        "invalid",
++    ]
++
++
++# ------------------------------------------------------------- emission ----
++CPP_ON = {k: ON_MAP[k] for k in t.CPP_ORDER}
++
++
++class _Capture(logging.Handler):
++    def __init__(self):
++        super().__init__()
++        self.lines = []
++
++    def emit(self, record):
++        self.lines.append(record.getMessage())
++
++
++@pytest.fixture
++def capture():
++    t._reset_for_tests()
++    handler = _Capture()
++    t.logger.addHandler(handler)
++    old = t.logger.level
++    t.logger.setLevel(logging.INFO)
++    yield handler
++    t.logger.removeHandler(handler)
++    t.logger.setLevel(old)
++    t._reset_for_tests()
++
++
++def _kw(cpp=CPP_ON, env=None, device=None, qsa="1", tag="PP1_TP0"):
++    return dict(
++        tag_fn=lambda: tag,
++        getenv_fn=lambda: (_env(ON if env is None else env)[0], "libc-getenv"),
++        cpp_fn=lambda: cpp,
++        device_fn=lambda: device or {"switch": "1", "switch_large": "1"},
++        qsa_fn=lambda: qsa,
++    )
++
++
++def parse(line):
++    """How the startup smoke tokenises the line (sections; key=value tokens)."""
++    tokens = line.split()
++    assert tokens[0].startswith("e2-toggles[") and tokens[0].endswith("]:")
++    out, section = {"tag": tokens[0][len("e2-toggles[") : -2]}, "raw"
++    for tok in tokens[1:]:
++        if tok.endswith(":"):
++            section = tok[:-1]
++            continue
++        key, sep, value = tok.partition("=")
++        out.setdefault(section, {})[key if sep else tok] = value if sep else ""
++    return out
++
++
++def test_emits_once_per_process(capture, monkeypatch):
++    for k, v in ON.items():
++        monkeypatch.setenv(k, v)
++    line = t.arm(**_kw())
++    assert line and capture.lines == [line]
++    assert t.maybe_emit(**_kw()) == ""
++    assert t.maybe_emit(force=True, **_kw()) == ""
++    assert t.arm(**_kw()) == ""
++    assert len([m for m in capture.lines if m.startswith("e2-toggles[")]) == 1
++
++
++def test_not_before_arm(capture):
++    assert t.maybe_emit(**_kw()) == ""
++    assert capture.lines == []
++
++
++def test_fires_with_counter_log_off(capture, monkeypatch):
++    for k, v in ON.items():
++        monkeypatch.setenv(k, v)
++    for value in (None, "0"):
++        t._reset_for_tests()
++        if value is None:
++            monkeypatch.delenv("MERLIN_TOPK_EXACT_COUNTERS_LOG", raising=False)
++        else:
++            monkeypatch.setenv("MERLIN_TOPK_EXACT_COUNTERS_LOG", value)
++        assert t.arm(**_kw()).startswith("e2-toggles[PP1_TP0]: pid=")
++
++
++def test_line_contents_toggles_on(capture, monkeypatch):
++    for k, v in ON.items():
++        monkeypatch.setenv(k, v)
++    p = parse(t.arm(**_kw()))
++    assert p["tag"] == "PP1_TP0"
++    assert p["raw"]["pid"] == str(os.getpid())
++    assert p["raw"]["MERLIN_FULL_K"] == "1"
++    assert p["raw"]["MERLIN_TOPK_DET_LARGE"] == "unset"
++    eff = dict(p["effective"])
++    assert eff.pop("source") == "libc-getenv"
++    assert eff == ON_MAP
++    cpp = dict(p["cpp-cache"])
++    assert cpp.pop("source") == "cpp-cache"
++    assert cpp == CPP_ON
++    assert p["python"] == {"qsa_sort": "1", "source": "qsa_indexer._QSA_SORT"}
++    assert p["device"] == {
++        "switch": "1",
++        "switch_large": "1",
++        "source": "counter-slots-8-9",
++    }
++
++
++def test_line_knob_absent(capture, monkeypatch):
++    for k in t.RAW_ORDER:
++        monkeypatch.delenv(k, raising=False)
++    cpp = {k: ABSENT_MAP[k] for k in t.CPP_ORDER}
++    p = parse(t.arm(**_kw(cpp=cpp, env={}, qsa="0")))
++    eff = dict(p["effective"])
++    eff.pop("source")
++    assert eff == ABSENT_MAP
++
++
++def test_cpp_op_absent_is_n_a_and_emits_at_once(capture, monkeypatch):
++    for k, v in ON.items():
++        monkeypatch.setenv(k, v)
++    line = t.arm(**_kw(cpp="op-absent:_C.persistent_topk_toggle_state"))
++    p = parse(line)
++    assert p["cpp-cache"] == {
++        "n-a": "",
++        "reason": "op-absent:_C.persistent_topk_toggle_state",
++    }
++
++
++def test_defers_while_a_static_is_uninit(capture, monkeypatch):
++    for k, v in ON.items():
++        monkeypatch.setenv(k, v)
++    pending = dict(CPP_ON, full_k="uninit")
++    assert t.arm(**_kw(cpp=pending)) == ""
++    assert t.maybe_emit(**_kw(cpp=pending)) == ""
++    notes = [m for m in capture.lines if m.startswith("e2-toggles deferred on PP1_TP0")]
++    assert len(notes) == 1 and "full_k" in notes[0]
++    assert not any(m.startswith("e2-toggles[") for m in capture.lines)
++    line = t.maybe_emit(**_kw())  # the next step: every static filled
++    assert parse(line)["cpp-cache"]["full_k"] == "1"
++
++
++def test_forced_at_shutdown_while_uninit(capture, monkeypatch):
++    for k, v in ON.items():
++        monkeypatch.setenv(k, v)
++    pending = dict(CPP_ON, full_k="uninit")
++    t.arm(**_kw(cpp=pending))
++    line = t.maybe_emit(force=True, **_kw(cpp=pending))
++    assert parse(line)["cpp-cache"]["full_k"] == "uninit"
++
++
++def test_never_raises(capture):
++    def boom():
++        raise RuntimeError("no groups")
++
++    kw = _kw()
++    kw["cpp_fn"] = boom
++    assert t.arm(**kw) == ""
++    assert capture.lines
++    assert capture.lines[-1].startswith("e2-toggles[PP1_TP0]: unavailable")
++    assert t.maybe_emit(**_kw()) == ""  # an unavailable line is still the one line
++
++
++def test_default_sources_do_not_raise_on_cpu(monkeypatch):
++    """The real cpp/device/qsa probes on a CPU build: n-a, never an exception."""
++    assert isinstance(t.cpp_cache(), (str, dict))
++    assert set(t.device_switches()) == {"switch", "switch_large"}
++    assert t.qsa_sort_live() in ("0", "1", "n-a")
++    read, source = t._libc_getenv()
++    assert source in ("libc-getenv", "os-environ")
++    monkeypatch.setenv("MERLIN_TIE_DET", "7")
++    assert read("MERLIN_TIE_DET") == b"7"
+diff --git a/vllm/v1/worker/e2_identity.py b/vllm/v1/worker/e2_identity.py
+new file mode 100644
+index 0000000000..e457b09d74
+--- /dev/null
++++ b/vllm/v1/worker/e2_identity.py
+@@ -0,0 +1,148 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Per-rank launch-identity log line (log-only; changes no behaviour).
++
++After model loading -- and after the PLE offload placeholders are armed -- every
++GPU worker rank logs one line per model role it holds::
++
++    e2-identity[PP<p>_TP<t>]: ple_backend=<class>@<transport> ple_method=<class>
++    ple_weight_dtype=<dtype> breakable=<ON|OFF> compile_mode=<mode>
++    cudagraph_mode=<mode> role=<target|draft>
++
++(one line in the log). ``role=draft`` is logged only where a draft model is
++loaded (the last PP stage). Every value is read from the live objects:
++
++* ``ple_backend``: the class of each PLE layer's ``ple_embedding`` module, and
++  the transport that serves its rows on this rank, read from the placeholder's
++  armed state -- ``host-mapped-pull`` (``_is_cpu_offloaded`` with a host output
++  pointer), ``ipc-push`` (offloaded, no host pointer) or ``local:<device>`` (the
++  rank owns the table).
++* ``ple_method``: the embedding's live ``quant_method``, or, on an offloaded
++  placeholder, the ``_offload_quant_method`` the rank dequantizes with.
++* ``ple_weight_dtype``: the table's dtype where the rank owns it; on an
++  offloaded placeholder, the dtype of the armed transfer buffer, into which the
++  offload process copies the table's rows unchanged
++  (``get_offload_output_dtype``).
++* ``breakable``: ``is_breakable_cudagraph_enabled()``, the switch the capture
++  path itself reads.
++* ``compile_mode`` / ``cudagraph_mode``: the role's ``CompilationConfig``
++  (config level, i.e. before KV-cache-time capture-mode resolution).
++
++A role with no PLE layer reports ``none`` for the three PLE fields; several
++distinct values on one rank are joined with ``,``.
++"""
++
++from typing import Any
++
++from torch import nn
++
++from vllm.logger import init_logger
++
++logger = init_logger(__name__)
++
++_NONE = "none"
++
++
++def _join(values: set[str]) -> str:
++    return ",".join(sorted(values)) if values else _NONE
++
++
++def _enum_name(value: Any) -> str:
++    if value is None:
++        return _NONE
++    return str(getattr(value, "name", value))
++
++
++def _ple_embeddings(model: nn.Module | None) -> list[nn.Module]:
++    """The ``ple_embedding`` module of every PLE layer in ``model``."""
++    if model is None:
++        return []
++    found = []
++    for module in model.modules():
++        embedding = module.__dict__.get("_modules", {}).get("ple_embedding")
++        if isinstance(embedding, nn.Module):
++            found.append(embedding)
++    return found
++
++
++def _transport(embedding: nn.Module) -> str:
++    if getattr(embedding, "_is_cpu_offloaded", False):
++        if getattr(embedding, "_host_output_ptr", None) is not None:
++            return "host-mapped-pull"
++        return "ipc-push"
++    weight = getattr(getattr(embedding, "ngram_embedding", None), "weight", None)
++    if weight is not None:
++        return f"local:{weight.device.type}"
++    return "local:unknown"
++
++
++def _method(embedding: nn.Module) -> str:
++    table = getattr(embedding, "ngram_embedding", None)
++    method = getattr(table, "quant_method", None)
++    if method is None:
++        method = getattr(embedding, "_offload_quant_method", None)
++    return type(method).__name__ if method is not None else _NONE
++
++
++def _weight_dtype(embedding: nn.Module) -> str:
++    weight = getattr(getattr(embedding, "ngram_embedding", None), "weight", None)
++    if weight is not None:
++        return str(weight.dtype)
++    if getattr(embedding, "_is_cpu_offloaded", False):
++        buffer = getattr(embedding, "_gpu_output_buffer", None)
++        if buffer is not None:
++            return str(buffer.dtype)
++    return "unknown"
++
++
++def _rank_tag() -> str:
++    from vllm.distributed.parallel_state import get_pp_group, get_tp_group
++
++    return f"PP{get_pp_group().rank_in_group}_TP{get_tp_group().rank_in_group}"
++
++
++def _draft(model_runner: Any) -> tuple[nn.Module | None, Any]:
++    """The loaded draft model and its config (V2 speculator or V1 drafter)."""
++    for name in ("speculator", "drafter"):
++        holder = getattr(model_runner, name, None)
++        model = getattr(holder, "model", None)
++        if isinstance(model, nn.Module):
++            return model, getattr(holder, "vllm_config", None)
++    return None, None
++
++
++def identity_line(
++    tag: str, model: nn.Module | None, vllm_config: Any, role: str
++) -> str:
++    from vllm.compilation.breakable_cudagraph import is_breakable_cudagraph_enabled
++
++    embeddings = _ple_embeddings(model)
++    backends = {f"{type(e).__name__}@{_transport(e)}" for e in embeddings}
++    compilation = getattr(vllm_config, "compilation_config", None)
++    return (
++        f"e2-identity[{tag}]: "
++        f"ple_backend={_join(backends)} "
++        f"ple_method={_join({_method(e) for e in embeddings})} "
++        f"ple_weight_dtype={_join({_weight_dtype(e) for e in embeddings})} "
++        f"breakable={'ON' if is_breakable_cudagraph_enabled() else 'OFF'} "
++        f"compile_mode={_enum_name(getattr(compilation, 'mode', None))} "
++        f"cudagraph_mode={_enum_name(getattr(compilation, 'cudagraph_mode', None))} "
++        f"role={role}"
++    )
++
++
++def log_launch_identity(model_runner: Any, vllm_config: Any) -> None:
++    """Log the identity line(s) for this rank. Never raises."""
++    tag = "PP?_TP?"
++    try:
++        tag = _rank_tag()
++        roles = [("target", model_runner.get_model(), vllm_config)]
++        draft_model, draft_config = _draft(model_runner)
++        if draft_model is not None:
++            roles.append(("draft", draft_model, draft_config or vllm_config))
++        for role, model, config in roles:
++            logger.info("%s", identity_line(tag, model, config, role))
++    except Exception as error:  # log-only: identity must never break a boot
++        logger.warning(
++            "e2-identity[%s]: unavailable (%s: %s)", tag, type(error).__name__, error
++        )
+diff --git a/vllm/v1/worker/e2_toggles.py b/vllm/v1/worker/e2_toggles.py
+new file mode 100644
+index 0000000000..0ae7ad2afc
+--- /dev/null
++++ b/vllm/v1/worker/e2_toggles.py
+@@ -0,0 +1,444 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Per-rank determinism-toggle line (log-only; changes no behaviour).
++
++Why this exists: the effective state of the
++four determinism toggles and the three persistent_topk switches must be
++attributable to a RANK and a PID. The kernel's own stderr line
++(``[merlin] persistent_topk tie policy: ...``, topk.cu report_tie_policy_once)
++is printed once per process with no tag, and FULL_K / QSA_SORT have no log
++producer at all. Every GPU worker therefore logs exactly one line::
++
++    e2-toggles[PP<p>_TP<t>]: pid=<pid> MERLIN_FULL_K=<raw> MERLIN_QSA_SORT=<raw>
++    MERLIN_TIE_DET=<raw> MERLIN_TIE_RECENT=<raw> MERLIN_TOPK_EXACT_MEDIUM=<raw>
++    MERLIN_TOPK_EXACT_DECODE=<raw> MERLIN_TOPK_DET_LARGE=<raw>
++    effective: full_k=<0|1> qsa_sort=<0|1|invalid> tie_det=<0|1> tie_recent=<0|1>
++    tie_recent_effective=<0|1> exact_medium=<0|1> exact_decode=<0|1>
++    det_large=<0|1> source=<libc-getenv|os-environ>
++    cpp-cache: <full_k=... tie_det=... tie_recent=... tie_recent_effective=...
++    exact_medium=... exact_decode=... det_large=... source=cpp-cache
++    | n-a reason=<why>>
++    python: qsa_sort=<0|1|n-a> source=qsa_indexer._QSA_SORT
++    device: switch=<0|1|n-a> switch_large=<0|1|n-a> source=counter-slots-8-9
++
++(one line in the log). ``<raw>`` is ``unset``, a plain token, or a double-quoted
++string with every byte outside ``[!-~]`` (and ``"`` / ``\\``) hex-escaped, so
++the line always splits on whitespace.
++
++WHAT EACH SECTION IS
++* ``effective:`` -- the environment at emission time, parsed with the SAME
++  rules the readers use (C++ ``std::getenv`` + ``std::atoi != 0`` for the six
++  C++ names, ``bool(int(...))`` for QSA_SORT; file:line of each below). The
++  C++ names are read through libc ``getenv`` -- the ``environ`` that
++  ``std::getenv`` reads -- not ``os.environ``, which can diverge from it after
++  an ``os.putenv``. A MIRROR of the parse, not the kernel's state. It exists
++  to report the rule; nothing may branch on it (vllm/envs.py "NOT A PYTHON
++  READ SITE" still holds: this module decides nothing).
++* ``cpp-cache:`` -- the kernel's switches as the C++ statics cached them, from
++  ``torch.ops._C.persistent_topk_toggle_state`` and
++  ``torch.ops._moe_C.marlin_moe_full_k_state`` (query ops that only LOAD a
++  mirror the static initialisers publish; they never fill a cache). ``n-a``
++  with a reason on a build without those ops -- the extensions this release
++  was first cut against (earlier v2.2 builds, not published) have none.
++* ``python:`` -- ``qsa_indexer._QSA_SORT``, the module constant the QSA sort
++  actually branches on (looked up in ``sys.modules``, never imported here;
++  ``n-a`` if the module was never loaded in this process).
++* ``device:`` -- counter slots [8]/[9], which the counter op fills from the
++  C++ ``exact_medium_enabled()`` / ``det_large_enabled()`` statics
++  (topk.cu persistent_topk_exact_counters).
++
++WHEN. Once per worker, after ``compile_or_warm_up_model`` has run the MRV2
++kernel warmup and cudagraph capture (``arm()``), i.e. after this process's
++first persistent_topk and Marlin MoE launches -- NOT at the counter reader's
++first read: an integration boot logged its first counter line BEFORE
++the first tie-policy line in the engine log, because the
++first ``maybe_log`` runs at the head of the warmup's first execute step, before
++that step's forward. When the cpp-cache ops exist and a static is still
++uninitialised at ``arm()``, the line is deferred to the head of the first
++execute step where every static is filled, and forced out at shutdown
++otherwise (with ``uninit`` values, which the smoke FAILs). It does not depend on
++``MERLIN_TOPK_EXACT_COUNTERS_LOG``: it fires with the counter log off.
++
++WHAT THIS DOES NOT PROVE. Without the cpp-cache ops the C++ state is inferred,
++not read: for FULL_K, TIE_DET, TIE_RECENT and EXACT_DECODE the line is the
++environment at emission time run through the C++ parser's rules, and the only
++C++-derived evidence is ``device:`` (EXACT_MEDIUM and DET_LARGE) plus the
++untagged stderr policy line. The residual gap is an environment mutated
++between the kernel's first ``getenv`` and this read. Nothing in this tree does
++that (by grep of csrc/): no ``setenv``/``putenv``/``unsetenv`` under csrc/, and
++the only runtime ``os.environ.update`` calls in vllm/ are the RunAI streamer's
++fixed ``RUNAI_STREAMER_*`` keys (model_executor/model_loader/
++runai_streamer_loader.py:73) and the Ray executor's ``override_env_vars``
++(v1/executor/ray_utils.py:180), which the multiproc executor never calls. With the
++cpp-cache ops that gap closes for every C++ name. Even then the line proves the
++CONFIGURATION each rank ran, not that a switch changed any output: that is the
++job of an output-equality run (identical sends -> one distinct output).
++"""
++
++from __future__ import annotations
++
++import os
++import sys
++from collections.abc import Callable
++
++from vllm.logger import init_logger
++
++logger = init_logger(__name__)
++
++# (environment name, effective key, value when unset or empty) -- the C++
++# readers, each `static const bool enabled = [] { ... }();` once per process:
++#   MERLIN_FULL_K            csrc/libtorch_stable/moe/marlin_moe_wna16/ops.cu:57-63
++#   MERLIN_TIE_DET           csrc/libtorch_stable/topk.cu:60-66
++#   MERLIN_TIE_RECENT        csrc/libtorch_stable/topk.cu:52-58
++#   MERLIN_TOPK_EXACT_MEDIUM csrc/libtorch_stable/topk.cu:68-74   (unset -> ON)
++#   MERLIN_TOPK_EXACT_DECODE csrc/libtorch_stable/topk.cu:103-109
++#   MERLIN_TOPK_DET_LARGE    csrc/libtorch_stable/topk.cu:86-92   (unset -> ON)
++CXX_SWITCHES: tuple[tuple[str, str, bool], ...] = (
++    ("MERLIN_FULL_K", "full_k", False),
++    ("MERLIN_TIE_DET", "tie_det", False),
++    ("MERLIN_TIE_RECENT", "tie_recent", False),
++    ("MERLIN_TOPK_EXACT_MEDIUM", "exact_medium", True),
++    ("MERLIN_TOPK_EXACT_DECODE", "exact_decode", False),
++    ("MERLIN_TOPK_DET_LARGE", "det_large", True),
++)
++QSA_SORT_NAME = "MERLIN_QSA_SORT"
++RAW_ORDER = (
++    "MERLIN_FULL_K",
++    "MERLIN_QSA_SORT",
++    "MERLIN_TIE_DET",
++    "MERLIN_TIE_RECENT",
++    "MERLIN_TOPK_EXACT_MEDIUM",
++    "MERLIN_TOPK_EXACT_DECODE",
++    "MERLIN_TOPK_DET_LARGE",
++)
++EFFECTIVE_ORDER = (
++    "full_k",
++    "qsa_sort",
++    "tie_det",
++    "tie_recent",
++    "tie_recent_effective",
++    "exact_medium",
++    "exact_decode",
++    "det_large",
++)
++CPP_ORDER = tuple(k for k in EFFECTIVE_ORDER if k != "qsa_sort")
++
++_QSA_MODULE = "vllm.models.qwen4_exp.nvidia.ops.qsa_indexer"
++_C_SPACE = b" \t\n\v\f\r"  # isspace() in the "C" locale
++_LONG_MIN, _LONG_MAX = -(2**63), 2**63 - 1  # LP64 long, the reference host's glibc
++
++
++# --------------------------------------------------------------- parsers ----
++def c_atoi(raw: bytes) -> int:
++    """glibc ``atoi``: ``(int) strtol(raw, NULL, 10)`` (glibc stdlib/atoi.c).
++
++    Leading C-locale whitespace, one optional sign, then decimal digits up to
++    the first non-digit; no digits -> 0. ``strtol`` clamps to the ``long``
++    range and the ``(int)`` conversion keeps the low 32 bits (GCC's documented
++    modulo behaviour). So ``"true"`` -> 0, ``"1abc"`` -> 1, ``"0x1"`` -> 0,
++    ``" +1"`` -> 1, ``"+ 1"`` -> 0 and ``"4294967296"`` -> 0.
++    """
++    i, n = 0, len(raw)
++    while i < n and raw[i] in _C_SPACE:
++        i += 1
++    negative = False
++    if i < n and raw[i] in b"+-":
++        negative = raw[i] == ord("-")
++        i += 1
++    value, digits = 0, 0
++    while i < n and 0x30 <= raw[i] <= 0x39:
++        value = value * 10 + (raw[i] - 0x30)
++        digits += 1
++        i += 1
++    if digits == 0:
++        return 0
++    if negative:
++        value = -value
++    value = max(_LONG_MIN, min(_LONG_MAX, value))
++    value &= 0xFFFFFFFF
++    return value - (1 << 32) if value >= (1 << 31) else value
++
++
++def cxx_switch(raw: bytes | None, unset_value: bool) -> bool:
++    """The C++ getter body, both shapes:
++    default OFF  ``(raw != nullptr && raw[0] != '\\0') ? (atoi(raw) != 0) : false``
++    default ON   ``(raw == nullptr || raw[0] == '\\0') ? true : (atoi(raw) != 0)``
++    An environment value cannot contain NUL, so "empty" is exactly
++    ``raw[0] == '\\0'``."""
++    if raw is None or raw == b"":
++        return unset_value
++    return c_atoi(raw) != 0
++
++
++def qsa_sort_value(raw: str | None) -> str:
++    """vllm/envs.py:2372 ``bool(int(os.getenv("MERLIN_QSA_SORT", "0")))``,
++    read once at import by qsa_indexer.py:51 (``_QSA_SORT``). ``int()`` raises
++    on ``"true"`` and on ``""`` -- that engine would not have booted -- which is
++    reported as ``invalid`` rather than guessed. Python's own ``int`` is used,
++    so whitespace, ``+``/``-``, ``1_0`` and non-ASCII digits parse exactly as
++    the reader parses them."""
++    try:
++        return "1" if bool(int("0" if raw is None else raw)) else "0"
++    except ValueError:
++        return "invalid"
++
++
++def effective_tie_recent(det_ties: bool, tie_recent: bool) -> bool:
++    """csrc/libtorch_stable/persistent_topk.cuh:65-68: ``det_ties ? tie_recent
++    : true`` -- with TIE_DET off the restart paths keep most-recent-wins."""
++    return tie_recent if det_ties else True
++
++
++# --------------------------------------------------------------- sources ----
++def _libc_getenv() -> tuple[Callable[[str], bytes | None], str]:
++    """libc ``getenv``: the ``environ`` the C++ ``std::getenv`` calls read.
++
++    Falls back to ``os.environb`` / ``os.environ`` -- and says so in the line's
++    ``source=`` -- where there is no C library to ask (an offline run off Linux).
++    """
++    try:
++        import ctypes
++
++        getenv = ctypes.CDLL(None).getenv
++        getenv.restype = ctypes.c_char_p
++        getenv.argtypes = [ctypes.c_char_p]
++
++        def read(name: str) -> bytes | None:
++            return getenv(name.encode("ascii"))
++
++        return read, "libc-getenv"
++    except (OSError, AttributeError, TypeError):
++        pass
++    environb = getattr(os, "environb", None)
++    if environb is not None:
++        return (lambda name: environb.get(name.encode("ascii"))), "os-environ"
++
++    def read_environ(name: str) -> bytes | None:
++        value = os.environ.get(name)
++        return None if value is None else value.encode("utf-8", "surrogateescape")
++
++    return read_environ, "os-environ"
++
++
++def _printable(b: int) -> bool:
++    return 0x21 <= b <= 0x7E and b not in b'"\\'
++
++
++def encode_raw(raw: bytes | None) -> str:
++    """``unset``, a plain token, or a quoted, hex-escaped string -- never a
++    space, so the line splits on whitespace. The literal value ``unset`` is
++    quoted so it cannot pass for an absent variable."""
++    if raw is None:
++        return "unset"
++    if raw and raw != b"unset" and all(_printable(b) for b in raw):
++        return raw.decode("ascii")
++    return '"' + "".join(chr(b) if _printable(b) else f"\\x{b:02x}" for b in raw) + '"'
++
++
++def environ_view(
++    cxx_getenv: Callable[[str], bytes | None],
++    py_getenv: Callable[[str], str | None],
++) -> tuple[dict[str, str], dict[str, str]]:
++    """(raw value by name, effective map) from one read of the environment."""
++    raw: dict[str, str] = {}
++    flags: dict[str, bool] = {}
++    for name, key, unset_value in CXX_SWITCHES:
++        value = cxx_getenv(name)
++        raw[name] = encode_raw(value)
++        flags[key] = cxx_switch(value, unset_value)
++    qsa_raw = py_getenv(QSA_SORT_NAME)
++    raw[QSA_SORT_NAME] = encode_raw(
++        None if qsa_raw is None else qsa_raw.encode("utf-8", "surrogateescape")
++    )
++    eff = {key: "1" if flags[key] else "0" for key in flags}
++    eff["qsa_sort"] = qsa_sort_value(qsa_raw)
++    eff["tie_recent_effective"] = (
++        "1" if effective_tie_recent(flags["tie_det"], flags["tie_recent"]) else "0"
++    )
++    return raw, {key: eff[key] for key in EFFECTIVE_ORDER}
++
++
++_TOPK_STATE_FIELDS = (
++    "tie_det",
++    "tie_recent",
++    "tie_recent_effective",
++    "exact_medium",
++    "exact_decode",
++    "det_large",
++)
++
++
++def decode_topk_state(state: int) -> dict[str, str] | str:
++    """Unpack ``persistent_topk_toggle_state()``: 2 bits per field (0 off,
++    1 on, 2 not initialised), field count at bits 48-55 (6), layout version at
++    bits 56-62 (1). Any other layout is refused with a reason string."""
++    version, count = (state >> 56) & 0x7F, (state >> 48) & 0xFF
++    if version != 1 or count != len(_TOPK_STATE_FIELDS):
++        return f"unknown-layout-v{version}-{count}-fields"
++    names = {0: "0", 1: "1", 2: "uninit"}
++    return {
++        key: names.get((state >> (2 * i)) & 3, "invalid")
++        for i, key in enumerate(_TOPK_STATE_FIELDS)
++    }
++
++
++def decode_full_k_state(state: int) -> str:
++    """``marlin_moe_full_k_state()``: -1 not initialised, 0 off, 1 on."""
++    return {-1: "uninit", 0: "0", 1: "1"}.get(int(state), "invalid")
++
++
++def _op(namespace: str, name: str):
++    try:
++        import torch
++
++        return getattr(getattr(torch.ops, namespace), name, None)
++    except (AttributeError, RuntimeError, ImportError):
++        return None
++
++
++def cpp_cache() -> dict[str, str] | str:
++    """The C++ cached switches, or a reason string when the build cannot say."""
++    topk_op = _op("_C", "persistent_topk_toggle_state")
++    full_k_op = _op("_moe_C", "marlin_moe_full_k_state")
++    missing = [
++        name
++        for name, op in (
++            ("_C.persistent_topk_toggle_state", topk_op),
++            ("_moe_C.marlin_moe_full_k_state", full_k_op),
++        )
++        if op is None
++    ]
++    if missing:
++        return "op-absent:" + ",".join(missing)
++    decoded = decode_topk_state(int(topk_op()))
++    if isinstance(decoded, str):
++        return decoded
++    out = dict(decoded, full_k=decode_full_k_state(int(full_k_op())))
++    return {key: out[key] for key in CPP_ORDER}
++
++
++def qsa_sort_live() -> str:
++    module = sys.modules.get(_QSA_MODULE)
++    if module is None or not hasattr(module, "_QSA_SORT"):
++        return "n-a"
++    return "1" if bool(module._QSA_SORT) else "0"
++
++
++def device_switches() -> dict[str, str]:
++    """Counter slots [8]/[9] (switch / switch_large). One synchronizing read
++    (topk_counters.read refuses inside a capture), so it is only called from
++    arm() and the head of an execute step."""
++    try:
++        from vllm.models.qwen4_exp.nvidia.ops import topk_counters
++
++        counters = topk_counters.read()
++    except Exception:
++        counters = {}
++    return {
++        key: str(counters[key]) if key in counters else "n-a"
++        for key in ("switch", "switch_large")
++    }
++
++
++# ------------------------------------------------------------------ line ----
++def toggles_line(
++    tag: str,
++    pid: int,
++    raw: dict[str, str],
++    effective: dict[str, str],
++    env_source: str,
++    cpp: dict[str, str] | str,
++    qsa_live: str,
++    device: dict[str, str],
++) -> str:
++    parts = [f"e2-toggles[{tag}]: pid={pid}"]
++    parts += [f"{name}={raw[name]}" for name in RAW_ORDER]
++    parts.append("effective:")
++    parts += [f"{key}={effective[key]}" for key in EFFECTIVE_ORDER]
++    parts.append(f"source={env_source}")
++    parts.append("cpp-cache:")
++    if isinstance(cpp, str):
++        parts += ["n-a", f"reason={cpp}"]
++    else:
++        parts += [f"{key}={cpp[key]}" for key in CPP_ORDER]
++        parts.append("source=cpp-cache")
++    parts += ["python:", f"qsa_sort={qsa_live}", "source=qsa_indexer._QSA_SORT"]
++    parts.append("device:")
++    parts += [f"{key}={device[key]}" for key in ("switch", "switch_large")]
++    parts.append("source=counter-slots-8-9")
++    return " ".join(parts)
++
++
++def _rank_tag() -> str:
++    from vllm.distributed.parallel_state import get_pp_group, get_tp_group
++
++    return f"PP{get_pp_group().rank_in_group}_TP{get_tp_group().rank_in_group}"
++
++
++# ----------------------------------------------------------------- state ----
++_armed = False
++_emitted = False
++_deferral_noted = False
++
++
++def _reset_for_tests() -> None:
++    global _armed, _emitted, _deferral_noted
++    _armed = _emitted = _deferral_noted = False
++
++
++def arm(**kwargs) -> str:
++    """Once per worker, at the end of compile_or_warm_up_model (warmup and
++    capture done): emit now, unless a C++ static is still uninitialised."""
++    global _armed
++    _armed = True
++    return maybe_emit(**kwargs)
++
++
++def maybe_emit(
++    force: bool = False,
++    *,
++    tag_fn: Callable[[], str] = _rank_tag,
++    getenv_fn: Callable[[], tuple[Callable[[str], bytes | None], str]] = _libc_getenv,
++    cpp_fn: Callable[[], dict[str, str] | str] = cpp_cache,
++    device_fn: Callable[[], dict[str, str]] = device_switches,
++    qsa_fn: Callable[[], str] = qsa_sort_live,
++) -> str:
++    """Emit the line at most once per process. One bool check when already
++    emitted or not yet armed, so it can sit at the head of every execute step.
++    Never raises. Returns the line when this call emitted it, else ""."""
++    global _emitted, _deferral_noted
++    if _emitted or not _armed:
++        return ""
++    tag = "PP?_TP?"
++    try:
++        tag = tag_fn()
++        cpp = cpp_fn()
++        pending = (
++            sorted(k for k, v in cpp.items() if v == "uninit")
++            if isinstance(cpp, dict)
++            else []
++        )
++        if pending and not force:
++            if not _deferral_noted:
++                _deferral_noted = True
++                # Deliberately not 'e2-toggles[': the smoke counts those.
++                logger.info(
++                    "e2-toggles deferred on %s: C++ cache not initialised for %s",
++                    tag,
++                    ",".join(pending),
++                )
++            return ""
++        cxx_getenv, env_source = getenv_fn()
++        raw, effective = environ_view(cxx_getenv, os.environ.get)
++        line = toggles_line(
++            tag, os.getpid(), raw, effective, env_source, cpp, qsa_fn(), device_fn()
++        )
++        _emitted = True
++        logger.info("%s", line)
++        return line
++    except Exception as error:  # log-only: must never break a boot or a step
++        _emitted = True
++        logger.warning(
++            "e2-toggles[%s]: unavailable (%s: %s)", tag, type(error).__name__, error
++        )
++        return ""
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index b5b8a70a18..f37f7419ad 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -88,7 +88,7 @@ from vllm.v1.watermarking.spec_decode import (
+     create_speculative_target_watermarker,
+     speculative_target_watermark_key,
+ )
+-from vllm.v1.worker import guard_telemetry
++from vllm.v1.worker import e2_toggles, guard_telemetry
+ from vllm.v1.worker.block_table import get_block_table_width
+ from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
+ from vllm.v1.worker.gpu import pcp_manager as pcp
+@@ -1794,6 +1794,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             # never fire on them. Outside any capture: this is the engine
+             # thread between steps (read() re-checks).
+             topk_counters.maybe_log()
++            # v2.2: the e2-toggles line if arm() had to defer it (a C++ static
++            # still uninitialised). One bool check once it has been emitted.
++            e2_toggles.maybe_emit()
+             # Update the request states.
+             self.update_pp_decode_requests()
+             self.finish_requests(scheduler_output)
+@@ -2492,6 +2495,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         # The last window of a run is the one a cadence log always
+         # misses; emit it before the device state goes away.
+         topk_counters.maybe_log(force=True)
++        # v2.2: a still-deferred e2-toggles line goes out now, 'uninit' and all.
++        e2_toggles.maybe_emit(force=True)
+         if self._ple_offload_connector is not None:
+             self._ple_offload_connector.close()
+             self._ple_offload_connector = None
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index 847837d77d..4edfb76d32 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -673,6 +673,12 @@ class Worker(WorkerBase):
+             model_runner = cast("GPUModelRunnerV2", self.model_runner)
+             model_runner._setup_ple_offload(self.parallel_config._ple_offload_ipc_path)
+ 
++        # Log-only: this rank's PLE / capture identity for target and drafter,
++        # read after the offload placeholders are armed (v1/worker/e2_identity.py).
++        from vllm.v1.worker.e2_identity import log_launch_identity
++
++        log_launch_identity(self.model_runner, self.vllm_config)
++
+         if has_ec_transfer():
+             get_ec_transfer().start_worker_services()
+ 
+@@ -986,6 +992,13 @@ class Worker(WorkerBase):
+             with self._get_cudagraph_capture_context():
+                 cuda_graph_memory_bytes = self.model_runner.capture_model()
+ 
++        # Log-only: this rank's determinism toggles, once, now that the warmup
++        # and capture above have launched persistent_topk and Marlin MoE, so
++        # their C++ statics are filled (v1/worker/e2_toggles.py). Never raises.
++        from vllm.v1.worker import e2_toggles
++
++        e2_toggles.arm()
++
+         # Compare actual vs estimated CUDA graph memory (if we did profiling)
+         if (
+             hasattr(self, "cudagraph_memory_estimate")

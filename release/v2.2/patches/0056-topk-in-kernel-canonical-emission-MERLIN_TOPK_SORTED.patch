@@ -1,0 +1,2023 @@
+From 3bb9f2aed8bf86eb9d94f71a7334f974f6b8f89c Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Wed, 23 Sep 2026 18:59:25 -0400
+Subject: [PATCH 56/58] topk: in-kernel canonical emission
+ (MERLIN_TOPK_SORTED_EMIT)
+
+Emits the selected indices in canonical ascending order inside the kernel so
+the Python QSA sort can be skipped. Output-equivalent to the Python sort;
+reference model, property tests and GPU arms included. Default off in this
+commit.
+---
+ csrc/libtorch_stable/persistent_topk.cuh      | 227 ++++-
+ csrc/libtorch_stable/topk.cu                  |  72 +-
+ tests/kernels/merlin_sorted_emit_arm.py       | 152 +++
+ tests/kernels/test_merlin_topk_sorted_emit.py | 904 ++++++++++++++++++
+ tests/test_envs.py                            |  10 +-
+ tests/test_merlin_e2_toggles.py               |  47 +-
+ vllm/envs.py                                  |  26 +
+ .../qwen4_exp/nvidia/ops/qsa_indexer.py       |  82 +-
+ vllm/v1/worker/e2_toggles.py                  |  68 +-
+ 9 files changed, 1552 insertions(+), 36 deletions(-)
+ create mode 100644 tests/kernels/merlin_sorted_emit_arm.py
+ create mode 100644 tests/kernels/test_merlin_topk_sorted_emit.py
+
+diff --git a/csrc/libtorch_stable/persistent_topk.cuh b/csrc/libtorch_stable/persistent_topk.cuh
+index 749d2d9ac3..0b1b8b5a59 100644
+--- a/csrc/libtorch_stable/persistent_topk.cuh
++++ b/csrc/libtorch_stable/persistent_topk.cuh
+@@ -200,6 +200,17 @@ struct PersistentTopKParams {
+   //     concurrency the atomic exists for.
+   // Resolved once per process on the host, so it is a launch constant.
+   bool fault_inject_emit;
++  // MERLIN_TOPK_SORTED_EMIT: every row leaves
++  // the kernel in the canonical order MERLIN_QSA_SORT used to impose in
++  // Python -- ascending index, padding last as -1 -- so the Python sort can be
++  // dropped.  Paths that already emit that order by construction (trivial,
++  // medium-path restart, deterministic large path) are untouched; the paths that
++  // place by atomic arrival (decode-buffered, medium-buffered, the legacy
++  // large tail) re-emit their OWN selected set through sorted_emit_row().
++  // Selection is never re-derived, so the selected set cannot change.
++  // Resolved once per process on the host, so it is a launch constant a
++  // cudagraph bakes in.  Default OFF.
++  bool sorted_emit;
+ };
+ 
+ // ============================================================================
+@@ -272,6 +283,149 @@ enum TopKExactCounter : int {
+   kNumTopKExactCounters = 11,   // total slots: device buffer AND reader output
+ };
+ 
++// ============================================================================
++// MERLIN_TOPK_SORTED_EMIT -- in-kernel ascending emission of a row's OWN
++// selected set.  Declared here, above every caller (decode/medium dispatch,
++// the legacy large tail, and the standalone fallback kernel), for the
++// two-phase-lookup reason given above the counter enum.
++//
++// CONTRACT.  On return, row[0, TopK) is byte-identical to what
++// `_qsa_canonicalise` (vllm/models/qwen4_exp/nvidia/ops/qsa_indexer.py) makes
++// of the row it was handed:
++//
++//     tmp = where(row < 0, INT32_MAX, row); tmp = sort(tmp)
++//     row = where(tmp == INT32_MAX, -1, tmp)
++//
++// i.e. the non-negative entries ascending, then -1 for every negative entry
++// (and, to the byte, for any entry equal to INT32_MAX -- the Python spelling
++// maps those to -1 too).  It is a function of the MULTISET of values in the
++// row and nothing else, so it cannot change which blocks were selected: the
++// selection is whatever the path already wrote, including a truncated or
++// racy one.
++//
++// WHAT WAS TAKEN FROM UPSTREAM #55122 (head b2312b2de7, det_select_row, the
++// emission half).  The placement idea: a per-index membership flag, a
++// BlockScan exclusive prefix over it with BLOCKED ownership (each thread owns
++// consecutive indices, so scan order is index order), and a store straight to
++// the ascending position -- no atomics on the placement path.  WHAT IS NOT
++// TAKEN: #55122 re-derives membership with a full-row radix rescan and its
++// own lowest-index tie rule, and canonicalises -0.0 to +0.0.  Adopting either
++// would change the selected set against production (most-recent-wins,
++// +0.0 > -0.0), so membership here comes from the path's own emission
++// instead: a 32,768-bit shared bitmap, one word per thread.  Thread tx owns
++// indices [32 tx, 32 tx + 32); its exclusive prefix of popcounts is the
++// ascending position of its first set bit.
++//
++// FAST PATH.  Every non-negative entry is < 32,768 (= RADIX_THRESHOLD, so every
++// single-CTA path qualifies) and no entry repeats.  Cost: one smem word
++// cleared and at most TopK/1024 global loads per thread, TopK shared
++// atomicOr's with no two on the same bit, one 1,024-wide BlockScan, TopK
++// global stores, four block barriers.  No global atomics.
++//
++// FALLBACK.  An out-of-range value or a duplicate (bitmap atomicOr returns the
++// bit already set) cannot be expressed as a bitmap, so the row is ranked
++// instead: rank(i) = #{j : key_j < key_i} + #{j < i : key_j == key_i}, a stable
++// counting sort that equals torch.sort on ANY int32 multiset.  O(TopK^2 / 1024)
++// shared reads per thread; reached only by the legacy large tail (indices past
++// 32,768, control arm only) and by rows whose unfilled slots hold stale
++// values (buffered overflow with its exact repair switched off).
++//
++// SHARED MEMORY.  Aliases the dynamic window from byte 0.  The caller's shared
++// state is dead on entry -- the leading barrier makes sure no thread is still
++// reading it -- and the trailing barrier keeps the next row's loader off this
++// row's bitmap.  Size is static_asserted against kSmemMedium, the floor every
++// persistent_topk launch allocates.
++// ============================================================================
++constexpr uint32_t kSortedEmitBitmapWords = static_cast<uint32_t>(kThreadsPerBlock);
++constexpr uint32_t kSortedEmitBitmapBits = 32u * kSortedEmitBitmapWords;
++static_assert(kSortedEmitBitmapWords == 1024u,
++              "one bitmap word per thread: the scan below is one item per thread");
++static_assert(RADIX_THRESHOLD <= kSortedEmitBitmapBits,
++              "every single-CTA path's indices must fit the fast-path bitmap");
++
++template <int TopK>
++struct SortedEmitSmem {
++  typename cub::BlockScan<uint32_t, kThreadsPerBlock>::TempStorage scan;
++  uint32_t bitmap[kSortedEmitBitmapWords];
++  int32_t vals[TopK];
++  uint32_t fallback;
++};
++
++template <int TopK>
++__host__ __device__ constexpr size_t sorted_emit_smem_bytes() {
++  return (sizeof(SortedEmitSmem<TopK>) + 15) & ~size_t(15);
++}
++
++template <int TopK>
++__device__ __noinline__ void sorted_emit_row(int32_t* __restrict__ row) {
++  static_assert(sorted_emit_smem_bytes<TopK>() <= kSmemMedium,
++                "sorted emission must fit the smallest persistent_topk window");
++  static_assert(alignof(SortedEmitSmem<TopK>) <= 16,
++                "SortedEmitSmem over-aligned for the dynamic window");
++  using BlockScan = cub::BlockScan<uint32_t, kThreadsPerBlock>;
++  extern __shared__ __align__(16) char sorted_emit_smem[];
++  auto* s = reinterpret_cast<SortedEmitSmem<TopK>*>(sorted_emit_smem);
++  const uint32_t tx = threadIdx.x;
++
++  // E0: every emission store of the path is issued and no thread still reads
++  // the path's shared state (block-scope ordering of the global stores too).
++  __syncthreads();
++  s->bitmap[tx] = 0u;
++  if (tx == 0) s->fallback = 0u;
++  __syncthreads();
++
++  // E1: membership.  Reads of `row` all happen before E2; writes all after.
++  for (uint32_t i = tx; i < static_cast<uint32_t>(TopK); i += kThreadsPerBlock) {
++    const int32_t v = row[i];
++    s->vals[i] = v;
++    if (v >= 0) {
++      const uint32_t u = static_cast<uint32_t>(v);
++      if (u < kSortedEmitBitmapBits) {
++        const uint32_t bit = 1u << (u & 31u);
++        if ((atomicOr(&s->bitmap[u >> 5], bit) & bit) != 0u) {
++          atomicOr(&s->fallback, 1u);  // duplicate value
++        }
++      } else {
++        atomicOr(&s->fallback, 1u);  // beyond the bitmap
++      }
++    }
++  }
++  __syncthreads();  // E2
++
++  if (s->fallback == 0u) {  // block-uniform: written only before E2
++    uint32_t word = s->bitmap[tx];
++    uint32_t pos = 0u;
++    uint32_t total = 0u;
++    BlockScan(s->scan).ExclusiveSum(static_cast<uint32_t>(__popc(word)), pos,
++                                    total);
++    while (word != 0u) {
++      const uint32_t b = static_cast<uint32_t>(__ffs(word) - 1);
++      row[pos++] = static_cast<int32_t>((tx << 5) | b);
++      word &= word - 1u;
++    }
++    for (uint32_t i = total + tx; i < static_cast<uint32_t>(TopK);
++         i += kThreadsPerBlock) {
++      row[i] = -1;
++    }
++  } else {
++    constexpr int32_t kBig = 0x7FFFFFFF;
++    for (uint32_t i = tx; i < static_cast<uint32_t>(TopK);
++         i += kThreadsPerBlock) {
++      const int32_t vi = s->vals[i];
++      const int32_t ki = vi < 0 ? kBig : vi;
++      uint32_t rank = 0u;
++      for (uint32_t j = 0; j < static_cast<uint32_t>(TopK); ++j) {
++        const int32_t vj = s->vals[j];
++        const int32_t kj = vj < 0 ? kBig : vj;
++        rank += (kj < ki || (kj == ki && j < i)) ? 1u : 0u;
++      }
++      row[rank] = (ki == kBig) ? -1 : ki;
++    }
++  }
++  // E3: the next row (or the next path in this row) reuses the window.
++  __syncthreads();
++}
++
+ // ============================================================================
+ // Decode path: 2048-bin histogram for short sequences (seq_len <= 8192)
+ // Uses 11-bit half-precision bins for fine granularity.
+@@ -1081,8 +1235,13 @@ __device__ __noinline__ void medium_exact_restart(
+ // by: DarkSharpness
+ // which at the same time is an optimized topk kernel copied from tilelang
+ // kernel
++//
++// Returns TRUE when the row was handed to medium_exact_restart(), whose
++// emission is already ascending (MERLIN_TOPK_SORTED_EMIT skips those rows);
++// FALSE when the buffered path placed the row by atomic arrival.  The return
++// value is block-uniform (every return below is taken by the whole block).
+ template <int TopK>
+-__device__ __noinline__ void histogram_256_topk(
++__device__ __noinline__ bool histogram_256_topk(
+     const float* __restrict__ logits, int* __restrict__ output_indices,
+     int logits_offset, int seq_len, bool exact_medium,
+     unsigned long long* __restrict__ counters, bool det_ties,
+@@ -1181,7 +1340,7 @@ __device__ __noinline__ void histogram_256_topk(
+       }
+     }
+     __syncthreads();
+-    return;
++    return false;
+   }
+ 
+   // Past the early return the threshold bin WILL be collected, so the M1
+@@ -1262,7 +1421,7 @@ __device__ __noinline__ void histogram_256_topk(
+         medium_exact_restart<TopK>(logits + logits_offset, output_indices,
+                                    static_cast<uint32_t>(seq_len), counters,
+                                    effective_tie_recent(det_ties, tie_recent));
+-        return;
++        return true;
+       }
+       __syncthreads();
+     }
+@@ -1361,6 +1520,7 @@ __device__ __noinline__ void histogram_256_topk(
+     }
+     __syncthreads();
+   }
++  return false;
+ }
+ 
+ // ============================================================================
+@@ -1949,7 +2109,8 @@ __device__ void radix_topk(const float* __restrict__ row_input,
+                            uint32_t ctas_per_group, int& barrier_phase,
+                            uint32_t radix_iter, uint32_t tx, bool det_large,
+                            unsigned long long* counters, int fault_inject_cta,
+-                           bool fault_inject_emit, bool tie_recent) {
++                           bool fault_inject_emit, bool tie_recent,
++                           bool sorted_emit) {
+   const uint32_t my_chunk_end = (my_chunk_start + chunk_size < seq_len)
+                                     ? my_chunk_start + chunk_size
+                                     : seq_len;
+@@ -2186,6 +2347,30 @@ __device__ void radix_topk(const float* __restrict__ row_input,
+   // the MERLIN_TOPK_DET_LARGE=0 control, so the control now carries this
+   // repair too, like the histogram-publication barrier (an earlier commit).
+   __syncthreads();
++
++  // MERLIN_TOPK_SORTED_EMIT on the legacy tail (MERLIN_TOPK_DET_LARGE=0, or
++  // the host's staging-capacity gate): the row was written by EVERY CTA of the
++  // group, by arrival order, so CTA 0 may only re-emit it after all of them
++  // have finished.  One more inter-CTA barrier -- the same red_release /
++  // wait_ge pair as every other barrier here, taken by every CTA of the group
++  // because `sorted_emit` is a launch constant, so barrier_phase stays
++  // group-uniform.  The closing __syncthreads() just above orders each CTA's
++  // stores before its thread 0's release fence.  Indices here run past
++  // 32,768, so sorted_emit_row() takes its counting-sort fallback: this is the
++  // control arm, never the production large path (which is the deterministic one and is
++  // already ascending).
++  if (sorted_emit) {
++    if (tx == 0) {
++      red_release(&state->arrival_counter, 1);
++    }
++    wait_ge(&state->arrival_counter,
++            (barrier_phase + 1) * static_cast<int>(ctas_per_group), tx);
++    barrier_phase++;
++    __syncthreads();
++    if (cta_in_group == 0) {
++      sorted_emit_row<TopK>(row_output);
++    }
++  }
+ }
+ 
+ // ============================================================================
+@@ -2280,15 +2465,25 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 2)
+               row_input, row_output, seq_len, params.det_ties,
+               params.tie_recent, params.exact_counters, params.exact_decode);
+           if (decode_needs_exact) {
++            // Already ascending (restart emission): no sorted re-emission.
+             medium_exact_restart<TopK>(
+                 row_input, row_output, seq_len, params.exact_counters,
+                 effective_tie_recent(params.det_ties, params.tie_recent));
++          } else if (params.sorted_emit) {
++            // Decode-buffered placement is by atomic arrival.
++            sorted_emit_row<TopK>(row_output);
+           }
+         } else {
+-          histogram_256_topk<TopK>(row_input, row_output, 0, seq_len,
+-                                   params.exact_medium, params.exact_counters,
+-                                   params.det_ties, params.tie_recent);
++          const bool restarted = histogram_256_topk<TopK>(
++              row_input, row_output, 0, seq_len, params.exact_medium,
++              params.exact_counters, params.det_ties, params.tie_recent);
++          if (!restarted && params.sorted_emit) {
++            // Medium-buffered placement is by atomic arrival.
++            sorted_emit_row<TopK>(row_output);
++          }
+         }
++        // The trivial branch above writes [0, seq_len) then -1 in index
++        // order, which is already the canonical order.
+       }
+       continue;
+     }
+@@ -2300,11 +2495,27 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 2)
+         cta_in_group, ctas_per_group, barrier_phase, radix_iter, tx,
+         params.det_large, params.exact_counters, params.fault_inject_cta,
+         params.fault_inject_emit,
+-        effective_tie_recent(params.det_ties, params.tie_recent));
++        effective_tie_recent(params.det_ties, params.tie_recent),
++        params.sorted_emit);
+     radix_iter++;
+   }
+ }
+ 
++// MERLIN_TOPK_SORTED_EMIT for the two host-side fallbacks that bypass
++// persistent_topk_kernel (FilteredTopK, needs >= 128 KiB opt-in smem, and
++// top_k_per_row_decode, needs a cooperative launch that does not fit).  Both
++// are unreachable on a 3090 at the shapes Flash-Next serves (the fallbacks
++// never dispatch there), but with the knob on the Python sort is gone, so the op's
++// contract -- canonical order on EVERY dispatch -- is kept here rather than
++// assumed.  One block per row, launched on the same stream right after the
++// fallback, so it is stream-ordered after the fallback's stores.
++template <int TopK>
++__global__ void __launch_bounds__(kThreadsPerBlock)
++    sorted_emit_rows_kernel(int32_t* __restrict__ output, uint32_t num_rows) {
++  if (blockIdx.x >= num_rows) return;
++  sorted_emit_row<TopK>(output + static_cast<size_t>(blockIdx.x) * TopK);
++}
++
+ }  // namespace persistent
+ 
+ // ============================================================================
+diff --git a/csrc/libtorch_stable/topk.cu b/csrc/libtorch_stable/topk.cu
+index 3c90c259e2..060f7a60ea 100644
+--- a/csrc/libtorch_stable/topk.cu
++++ b/csrc/libtorch_stable/topk.cu
+@@ -60,6 +60,7 @@ std::atomic<int> g_cached_tie_det{-1};
+ std::atomic<int> g_cached_exact_medium{-1};
+ std::atomic<int> g_cached_det_large{-1};
+ std::atomic<int> g_cached_exact_decode{-1};
++std::atomic<int> g_cached_sorted_emit{-1};
+ 
+ bool publish_cached(std::atomic<int>& mirror, bool value) {
+   mirror.store(value ? 1 : 0, std::memory_order_release);
+@@ -141,6 +142,30 @@ bool exact_decode_enabled() {
+   return enabled;
+ }
+ 
++// ---------------------------------------------------------------------------
++// MERLIN_TOPK_SORTED_EMIT: every persistent_topk
++// row leaves the op in the canonical order the Python MERLIN_QSA_SORT imposes
++// (ascending index, padding last as -1), so qsa_indexer.py can drop that sort.
++// See sorted_emit_row() in persistent_topk.cuh for the contract; the selected
++// SET is never touched.  Resolved once per process like every switch here, so
++// it is a launch constant a cudagraph bakes in.  Default OFF: the maintainer
++// promotes after reference-host qualification.
++//
++// This std::getenv is the single source of truth.  Python does not parse the
++// variable to decide anything: qsa_indexer.py asks THIS cache, through
++// persistent_topk_toggle_state() field 6, after its first launch -- so the
++// Python sort is skipped only when the kernel that ran says it sorted.
++// ---------------------------------------------------------------------------
++bool sorted_emit_enabled() {
++  static const bool enabled = [] {
++    const char* raw = std::getenv("MERLIN_TOPK_SORTED_EMIT");
++    return publish_cached(
++        g_cached_sorted_emit,
++        (raw != nullptr && raw[0] != '\0') ? (std::atoi(raw) != 0) : false);
++  }();
++  return enabled;
++}
++
+ // ---------------------------------------------------------------------------
+ // MERLIN_TOPK_LARGE_FAULT_INJECT.  TEST ONLY.
+ //
+@@ -219,16 +244,21 @@ void report_tie_policy_once() {
+         stderr,
+         "[merlin] persistent_topk tie policy: MERLIN_TIE_DET=%d "
+         "MERLIN_TIE_RECENT=%d MERLIN_TOPK_EXACT_MEDIUM=%d "
+-        "MERLIN_TOPK_EXACT_DECODE=%d MERLIN_TOPK_DET_LARGE=%d -> "
++        "MERLIN_TOPK_EXACT_DECODE=%d MERLIN_TOPK_DET_LARGE=%d "
++        "MERLIN_TOPK_SORTED_EMIT=%d -> "
+         "decode-buffered=%s decode-restart=%s medium-buffered=%s "
+-        "medium-restart=%s large=%s\n",
++        "medium-restart=%s large=%s emission=%s\n",
+         det ? 1 : 0, tie_recent_enabled() ? 1 : 0,
+         exact_medium_enabled() ? 1 : 0, exact_decode_enabled() ? 1 : 0,
+-        det_large_enabled() ? 1 : 0, det ? dir : "atomic-arrival",
++        det_large_enabled() ? 1 : 0, sorted_emit_enabled() ? 1 : 0,
++        det ? dir : "atomic-arrival",
+         exact_decode_enabled() ? dir : "n/a (detect-only; counter [10])",
+         det ? dir : "atomic-arrival",
+         exact_medium_enabled() ? dir : "n/a (exact restart disabled)",
+-        det_large_enabled() ? dir : "atomic-arrival (non-deterministic)");
++        det_large_enabled() ? dir : "atomic-arrival (non-deterministic)",
++        sorted_emit_enabled()
++            ? "ascending-in-kernel (Python QSA sort skipped)"
++            : "arrival-order on buffered paths (Python QSA sort decides)");
+     return true;
+   }();
+   (void)reported;
+@@ -393,6 +423,19 @@ void launch_persistent_topk(const torch::stable::Tensor& logits,
+     max_smem_per_block = device_prop->sharedMemPerBlockOptin;
+   }
+ 
++  // MERLIN_TOPK_SORTED_EMIT on the two fallbacks that bypass
++  // persistent_topk_kernel: re-emit every row ascending on the same stream.
++  // A plain launch with a fixed configuration, so it is capture-safe.
++  const auto sorted_emit_fallback_rows = [&]() {
++    if (!sorted_emit_enabled()) return;
++    report_tie_policy_once();
++    P::sorted_emit_rows_kernel<TopK>
++        <<<static_cast<unsigned>(num_rows), P::kThreadsPerBlock,
++           P::sorted_emit_smem_bytes<TopK>(), stream>>>(
++            output.mutable_data_ptr<int32_t>(),
++            static_cast<uint32_t>(num_rows));
++  };
++
+   if (num_rows > 32 && max_smem_per_block >= 128 * 1024) {
+     cudaError_t status =
+         vllm::FilteredTopKRaggedTransform<float, int32_t, TopK>(
+@@ -401,6 +444,7 @@ void launch_persistent_topk(const torch::stable::Tensor& logits,
+             static_cast<uint32_t>(TopK), static_cast<uint32_t>(stride), stream);
+     STD_TORCH_CHECK(status == cudaSuccess,
+                     "FilteredTopK failed: ", cudaGetErrorString(status));
++    sorted_emit_fallback_rows();
+   } else {
+     STD_TORCH_CHECK(workspace.is_cuda(), "workspace must be CUDA tensor");
+     STD_TORCH_CHECK(
+@@ -497,6 +541,10 @@ void launch_persistent_topk(const torch::stable::Tensor& logits,
+         const int64_t next_n = lengths.dim() == 2 ? lengths.size(1) : 1;
+         top_k_per_row_decode(logits, next_n, lengths, output, num_rows,
+                              logits.stride(0), logits.stride(1), TopK);
++        sorted_emit_fallback_rows();
++        const cudaError_t fb_err = cudaGetLastError();
++        STD_TORCH_CHECK(fb_err == cudaSuccess, "sorted emission failed: ",
++                        cudaGetErrorString(fb_err));
+         return;
+       }
+       cudaError_t status =
+@@ -508,6 +556,10 @@ void launch_persistent_topk(const torch::stable::Tensor& logits,
+               static_cast<uint32_t>(stride), stream);
+       STD_TORCH_CHECK(status == cudaSuccess, "FilteredTopK fallback failed: ",
+                       cudaGetErrorString(status));
++      sorted_emit_fallback_rows();
++      const cudaError_t fb_err = cudaGetLastError();
++      STD_TORCH_CHECK(fb_err == cudaSuccess, "sorted emission failed: ",
++                      cudaGetErrorString(fb_err));
+       return;
+     }
+ 
+@@ -606,6 +658,7 @@ void launch_persistent_topk(const torch::stable::Tensor& logits,
+     params.det_ties = det_ties_enabled();
+     params.tie_recent = tie_recent_enabled();
+     params.exact_decode = exact_decode_enabled();
++    params.sorted_emit = sorted_emit_enabled();
+     report_tie_policy_once();
+ #if MERLIN_TOPK_DIAG_ANY
+     report_diag_build_once();
+@@ -920,8 +973,12 @@ int64_t persistent_topk_exact_counters_slots() {
+ //   field 3  MERLIN_TOPK_EXACT_MEDIUM             (exact_medium_enabled)
+ //   field 4  MERLIN_TOPK_EXACT_DECODE             (exact_decode_enabled)
+ //   field 5  MERLIN_TOPK_DET_LARGE                (det_large_enabled)
+-// bits [48, 55] = field count (6), bits [56, 62] = layout version (1). A
++//   field 6  MERLIN_TOPK_SORTED_EMIT              (sorted_emit_enabled)
++// bits [48, 55] = field count (7), bits [56, 62] = layout version (2). A
+ // reader must check both and refuse any other layout rather than guess.
++// Layout 2 = layout 1 plus field 6; fields 0-5 are unchanged, so
++// a reader that knows both can decode either.  Field 6 is what
++// qsa_indexer.py reads to decide whether its Python sort may be skipped.
+ int64_t persistent_topk_toggle_state() {
+ #ifndef USE_ROCM
+   const auto field = [](int cached) -> int64_t {
+@@ -943,8 +1000,9 @@ int64_t persistent_topk_toggle_state() {
+   state |= field(g_cached_exact_medium.load(std::memory_order_acquire)) << 6;
+   state |= field(g_cached_exact_decode.load(std::memory_order_acquire)) << 8;
+   state |= field(g_cached_det_large.load(std::memory_order_acquire)) << 10;
+-  state |= int64_t{6} << 48;
+-  state |= int64_t{1} << 56;
++  state |= field(g_cached_sorted_emit.load(std::memory_order_acquire)) << 12;
++  state |= int64_t{7} << 48;
++  state |= int64_t{2} << 56;
+   return state;
+ #else
+   return 0;  // layout version 0: no persistent_topk on ROCm
+diff --git a/tests/kernels/merlin_sorted_emit_arm.py b/tests/kernels/merlin_sorted_emit_arm.py
+new file mode 100644
+index 0000000000..700dab1ffb
+--- /dev/null
++++ b/tests/kernels/merlin_sorted_emit_arm.py
+@@ -0,0 +1,152 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""One ARM of the MERLIN_TOPK_SORTED_EMIT GPU equivalence test (GPU only).
++
++Not a test module: test_merlin_topk_sorted_emit.py runs this file in a fresh
++subprocess per arm, because every persistent_topk switch is a C++ static
++resolved once per process. The caller sets the MERLIN_* environment.
++
++    python merlin_sorted_emit_arm.py OUT.pt [--graph]
++
++Writes {"cells": {name: int32 [rows, k] CPU tensor}, "meta": {...}} with the
++RAW kernel output (no Python sort), the exact counters after the run and the
++toggle_state fields. Inputs are seeded and generated on the CPU, so every arm
++sees the same bytes. The output buffer is PRE-FILLED with a fixed pattern
++before each launch, so a slot a path leaves unwritten (overflow without its
++repair) holds the same stale bytes in every arm.
++
++Cell names starting with `racy_` have a launch-order-dependent SET in the
++production arm (decode overflow with MERLIN_TOPK_EXACT_DECODE=0), so the
++cross-arm equality skips them; the canonical-order check still covers them.
++"""
++
++import sys
++import zlib
++
++import torch
++
++import vllm._custom_ops  # noqa: F401  (loads vllm._C)
++from vllm.v1.worker.e2_toggles import decode_topk_state
++
++WORKSPACE = 1024 * 1024
++
++
++def _row(kind: str, n: int, gen: torch.Generator) -> torch.Tensor:
++    if kind == "ties":
++        levels = torch.tensor([0.0, 0.0, 0.0, 0.5, 1.0, 2.0])
++        return levels[torch.randint(0, 6, (n,), generator=gen)]
++    if kind == "allequal":
++        return torch.full((n,), 1.25)
++    if kind == "signedzero":
++        x = torch.where(
++            torch.rand(n, generator=gen) < 0.5, torch.tensor(0.0), torch.tensor(-0.0)
++        )
++        hot = torch.rand(n, generator=gen) < 0.02
++        x[hot] = torch.rand(int(hot.sum()), generator=gen) + 1.0
++        return x
++    if kind == "neginf":
++        x = torch.randn(n, generator=gen)
++        x[torch.rand(n, generator=gen) < 0.7] = float("-inf")
++        return x
++    if kind == "distinct":
++        return torch.randperm(n, generator=gen).float() * 1e-3
++    if kind == "onebin":
++        return 1.0 + torch.rand(n, generator=gen) * 0.01
++    raise ValueError(kind)
++
++
++# (name, k, row lengths, kind). Lengths are in BLOCKS; 32,768 / 32,769 are the
++# 131,072 / 131,076-token medium/large boundary at compress 4.
++CELLS = [
++    ("trivial_300", 512, [300] * 4, "ties"),
++    ("trivial_512", 512, [512] * 4, "ties"),
++    ("decode_600_ties", 512, [600] * 4, "ties"),
++    ("decode_1024_ties", 512, [1024] * 4, "ties"),  # 4K tokens
++    ("decode_4096_signedzero", 512, [4096] * 4, "signedzero"),
++    ("decode_3000_neginf", 512, [3000] * 4, "neginf"),
++    ("racy_decode_8192_allequal", 512, [8192] * 4, "allequal"),
++    ("racy_decodeovf_7000_onebin", 512, [7000] * 4, "onebin"),
++    ("medium_8193_ties", 512, [8193] * 4, "ties"),
++    ("medium_16384_ties", 512, [16384] * 4, "ties"),  # 65K tokens
++    ("medium_12288_onebin", 512, [12288] * 4, "onebin"),  # medium-path restart
++    ("medium_32768_allequal", 512, [32768] * 4, "allequal"),  # 131,072 tokens
++    ("medium_32768_signedzero", 512, [32768] * 4, "signedzero"),
++    ("large_32769_ties", 512, [32769] * 2, "ties"),  # 131,076 tokens
++    ("large_33750_ties", 512, [33750] * 2, "ties"),  # 135K tokens
++    ("large_50000_allequal", 512, [50000] * 2, "allequal"),
++    ("large_65536_signedzero", 512, [65536] * 2, "signedzero"),
++    ("large_40000_distinct", 512, [40000] * 2, "distinct"),
++    ("mixed_batch_ties", 512, [100, 600, 8192, 8193, 32768, 32769, 40000, 512], "ties"),
++    ("k2048_decode_ties", 2048, [6000] * 2, "ties"),
++    ("k2048_medium_allequal", 2048, [20000] * 2, "allequal"),
++    ("k2048_large_ties", 2048, [45000] * 2, "ties"),
++]
++
++
++def _inputs(name, k, lengths, kind):
++    # crc32, not hash(): str hashing is salted per process, and every arm
++    # must see the same bytes.
++    gen = torch.Generator().manual_seed(zlib.crc32(name.encode()))
++    stride = max(lengths)
++    logits = torch.full((len(lengths), stride), float("-inf"))
++    for r, n in enumerate(lengths):
++        logits[r, :n] = _row(kind, n, gen)
++    prefill = torch.stack(
++        [torch.randperm(4 * k, generator=gen)[:k] - k // 2 for _ in lengths]
++    ).to(torch.int32)
++    return logits, torch.tensor(lengths, dtype=torch.int32), prefill
++
++
++def _launch(logits, lengths, out, ws, k):
++    torch.ops._C.persistent_topk(logits, lengths, out, ws, k, int(lengths.max()))
++
++
++def main() -> int:
++    out_path = sys.argv[1]
++    graph = "--graph" in sys.argv[2:]
++    dev = torch.device("cuda")
++    ws = torch.empty(WORKSPACE, dtype=torch.uint8, device=dev)
++    cells, replays_ok = {}, True
++    for name, k, lengths, kind in CELLS:
++        logits, lens, prefill = _inputs(name, k, lengths, kind)
++        logits, lens = logits.to(dev), lens.to(dev)
++        out = prefill.to(dev).clone()
++        _launch(logits, lens, out, ws, k)
++        torch.cuda.synchronize()
++        cells[name] = out.cpu().clone()
++        if graph:
++            static_out = prefill.to(dev).clone()
++            g = torch.cuda.CUDAGraph()
++            s = torch.cuda.Stream()
++            s.wait_stream(torch.cuda.current_stream())
++            with torch.cuda.stream(s):
++                _launch(logits, lens, static_out, ws, k)  # warm on a side stream
++            torch.cuda.current_stream().wait_stream(s)
++            with torch.cuda.graph(g):
++                _launch(logits, lens, static_out, ws, k)
++            static_out.copy_(prefill.to(dev))
++            g.replay()
++            torch.cuda.synchronize()
++            if not name.startswith("racy_"):
++                replays_ok &= torch.equal(static_out.cpu(), cells[name])
++    counters = torch.zeros(
++        torch.ops._C.persistent_topk_exact_counters_slots(),
++        dtype=torch.int64,
++        device=dev,
++    )
++    torch.ops._C.persistent_topk_exact_counters(counters, 0, 1)
++    toggles = decode_topk_state(int(torch.ops._C.persistent_topk_toggle_state()))
++    meta = {
++        "counters": counters.cpu().tolist(),
++        "toggle_sorted_emit": toggles["sorted_emit"]
++        if isinstance(toggles, dict)
++        else toggles,
++        "toggles": str(toggles),
++        "graph_replays_match_eager": bool(replays_ok),
++    }
++    torch.save({"cells": cells, "meta": meta}, out_path)
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/tests/kernels/test_merlin_topk_sorted_emit.py b/tests/kernels/test_merlin_topk_sorted_emit.py
+new file mode 100644
+index 0000000000..1876fae43c
+--- /dev/null
++++ b/tests/kernels/test_merlin_topk_sorted_emit.py
+@@ -0,0 +1,904 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""MERLIN_TOPK_SORTED_EMIT: in-kernel canonical emission.
++
++The claim under test: with the knob on, every row persistent_topk returns is
++BYTE-IDENTICAL to what the knob-off kernel returns after the Python
++MERLIN_QSA_SORT (`qsa_indexer._canonical`: ascending, padding last as -1), on
++every path the tree dispatches -- trivial, decode (buffered and exact restart),
++medium (buffered and exact restart), large (deterministic and the legacy
++tail) and the host fallbacks -- with the SAME selected set, so production
++outputs cannot change.
++
++Two halves:
++
++CPU (runnable offline, no GPU):
++  * a reference model of each path's selection + tie rule + emission LAYOUT
++    (the arrival-order layouts are modelled as seeded permutations; the
++    ascending layouts -- trivial, restart, large deterministic -- are ports of the kernel's
++    own slot arithmetic, including the host's chunking);
++  * a port of sorted_emit_row() (bitmap words, popcount exclusive scan, bit
++    walk, -1 fill, counting-sort fallback);
++  * property tests: sorted_emit_row(emission) == _canonical(emission)
++    byte-for-byte on random rows with heavy ties, +-0.0, -inf, and lengths
++    across 512/513, 8192/8193, 32,768/32,769 (131,072/131,076 tokens), for
++    the paths the kernel re-emits; native emission == _canonical(native) for
++    the paths it skips; and every path's set == the exact top-k under the
++    effective tie rule;
++  * pathological rows (duplicates, stale, out-of-range, INT32_MAX, odd
++    negatives) through the fallback;
++  * FAILING CONTROLS: a canonicaliser without duplicate detection, without the
++    -1 fill, the identity (sort skipped), and a flipped tie rule each FAIL the
++    same checks -- so the checks can fail;
++  * the Python gate: kernel_sorted_emit() reads toggle_state field 6, latches,
++    refuses layout 1, never latches `uninit`; _topk skips the sort only then.
++
++GPU (reference host; written here, run on a GPU host): the knob is a
++process-lifetime C++ static, so each arm is a SUBPROCESS
++(`merlin_sorted_emit_arm.py`). Knob-on raw output must equal knob-off output
++after `_canonical`, cell by cell, as int32 bytes; the failing controls (knob
++off without the sort, and the tie rule flipped) must DIFFER.
++
++    pytest --noconftest tests/kernels/test_merlin_topk_sorted_emit.py
++"""
++
++from __future__ import annotations
++
++import json
++import os
++import subprocess
++import sys
++from pathlib import Path
++
++import numpy as np
++import pytest
++import torch
++
++qsa_indexer = pytest.importorskip(
++    "vllm.models.qwen4_exp.nvidia.ops.qsa_indexer",
++    reason="qsa_indexer needs triton (the reference-host venv has it; offline runs use the shim)",
++)
++
++INT32_MAX = 0x7FFFFFFF
++
++# Kernel constants (csrc/libtorch_stable/persistent_topk.cuh).
++RADIX_THRESHOLD = 32768
++HIST2048_THRESHOLD = 8192
++MAX_BUFFERED_ITEMS = 4096
++DBUF = (8192 - 8 - 2 * (256 + 128)) // 2  # 3708
++BITMAP_WORDS = 1024
++BITMAP_BITS = 32 * BITMAP_WORDS
++K_SMEM_MEDIUM = 35968
++K_FIXED_SMEM_LARGE = ((256 + 256 + 5) * 4 + 15) & ~15
++SMEM_OPTIN_3090 = 101376
++
++
++def canonical(row: np.ndarray) -> np.ndarray:
++    """The REAL Python reference: qsa_indexer._canonical on an int32 row."""
++    t = torch.from_numpy(np.ascontiguousarray(row, dtype=np.int32)).view(1, -1)
++    return qsa_indexer._canonical(t).view(-1).numpy()
++
++
++# ============================================================ keys ==========
++def ordered_key(x: np.ndarray) -> np.ndarray:
++    """convert_to_uint32_v2: +0.0 orders ABOVE -0.0 (we do not adopt #55122's
++    signed-zero canonicalisation)."""
++    bits = np.ascontiguousarray(x, dtype=np.float32).view(np.uint32)
++    neg = (bits & np.uint32(0x80000000)) != 0
++    return np.where(neg, ~bits, bits | np.uint32(0x80000000)).astype(np.uint32)
++
++
++def effective_tie_recent(det_ties: bool, tie_recent: bool) -> bool:
++    return tie_recent if det_ties else True
++
++
++# ======================================================= dispatch ===========
++def path_of(seq_len: int, top_k: int) -> str:
++    if seq_len > RADIX_THRESHOLD:
++        return "large"
++    if seq_len <= top_k:
++        return "trivial"
++    if seq_len <= HIST2048_THRESHOLD:
++        return "decode"
++    return "medium"
++
++
++# ====================================================== reference ===========
++def reference_select(keys: np.ndarray, top_k: int, keep_recent: bool):
++    """Exact top-k by key; among elements EQUAL to the k-th key keep the
++    highest indices (most-recent-wins) or the lowest (oldest-wins).
++    Returns (selected index set as sorted int64, pivot key, #eq kept, #eq)."""
++    n = keys.size
++    assert n >= top_k
++    pivot = np.sort(keys)[::-1][top_k - 1]
++    gt = np.nonzero(keys > pivot)[0]
++    eq = np.nonzero(keys == pivot)[0]
++    need = top_k - gt.size
++    kept_eq = eq[-need:] if keep_recent else eq[:need]
++    return np.sort(np.concatenate([gt, kept_eq])), pivot, need, eq.size
++
++
++# ================================================= path emissions ===========
++def emit_trivial(seq_len: int, top_k: int) -> np.ndarray:
++    """persistent_topk_kernel trivial branch, verbatim."""
++    i = np.arange(top_k)
++    return np.where(i < seq_len, i, -1).astype(np.int32)
++
++
++def emit_buffered(keys, top_k, det_ties, tie_recent, rng, candidates=None):
++    """Decode-/medium-buffered emission LAYOUT: winners by warp arrival
++    (a seeded permutation) in slots [0, TopK - fin); a partially kept pivot
++    group at [TopK - fin + rank] (rank by index in the tie direction when
++    TIE_DET, arrival order otherwise).  `candidates` is the decode path's
++    padded range: n_vec * 4 elements, -inf past seq_len."""
++    if candidates is not None:
++        keys = candidates
++    n = keys.size
++    pivot = np.sort(keys)[::-1][top_k - 1]
++    gt = np.nonzero(keys > pivot)[0]
++    eq = np.nonzero(keys == pivot)[0]
++    need = top_k - gt.size
++    out = np.full(top_k, -7, dtype=np.int64)  # never survives: all slots written
++    if need == eq.size:  # whole pivot group kept: no pass-3 tie cut
++        winners = np.concatenate([gt, eq])
++        out[:] = rng.permutation(winners)
++        return out.astype(np.int32)
++    out[: top_k - need] = rng.permutation(gt)
++    if det_ties:
++        ranked = eq[::-1] if tie_recent else eq  # rank 0 = first kept
++        out[top_k - need :] = ranked[:need]
++    else:  # atomicAdd(&sFIN, -1): first `need` arrivals keep a slot
++        out[top_k - need :] = rng.permutation(eq)[:need]
++    assert n >= top_k
++    return out.astype(np.int32)
++
++
++def emit_restart(keys: np.ndarray, top_k: int, tie_recent: bool) -> np.ndarray:
++    """medium_exact_restart(): four 8-bit radix rounds, the two-round index
++    tie walk, then flag + exclusive prefix over 1,024-wide tiles in index
++    order.  A port of the kernel's arithmetic, not a restatement of the rule."""
++    length = keys.size
++    prefix, remaining, tie_total = 0, top_k, 0
++    masks = [0, 0xFF000000, 0xFFFF0000, 0xFFFFFF00]
++    for rnd in range(4):
++        shift = 24 - 8 * rnd
++        sel = (keys & np.uint32(masks[rnd])) == np.uint32(prefix)
++        hist = np.bincount(
++            (keys[sel] >> np.uint32(shift)) & np.uint32(0xFF), minlength=256
++        )
++        count_above = 0
++        for b in range(255, -1, -1):
++            if count_above + hist[b] >= remaining:
++                remaining -= count_above
++                prefix |= b << shift
++                if rnd == 3:
++                    tie_total = int(hist[b])
++                break
++            count_above += int(hist[b])
++        else:
++            raise AssertionError("no crossing bin")
++    pivot, equal_count = np.uint32(prefix), remaining
++    tie_cut = 0 if tie_recent else 0xFFFFFFFF
++    if tie_total > equal_count:
++        eq_idx = np.nonzero(keys == pivot)[0]
++        need = equal_count
++        hist = np.bincount((eq_idx >> 8) & 0xFF, minlength=256)
++        order = range(255, -1, -1) if tie_recent else range(256)
++        count_above = 0
++        for b in order:
++            if count_above + hist[b] >= need:
++                high, need = b, need - count_above
++                break
++            count_above += int(hist[b])
++        in_high = eq_idx[((eq_idx >> 8) & 0xFF) == high]
++        hist = np.bincount(in_high & 0xFF, minlength=256)
++        count_above = 0
++        for b in order:
++            if count_above + hist[b] >= need:
++                tie_cut = (high << 8) | b
++                break
++            count_above += int(hist[b])
++    out = np.full(top_k, -9, dtype=np.int64)
++    base_rank = 0
++    idx_all = np.arange(length)
++    keep_tie = idx_all >= tie_cut if tie_recent else idx_all <= tie_cut
++    flag = (keys > pivot) | ((keys == pivot) & keep_tie)
++    for base in range(0, -(-length // 1024) * 1024, 1024):
++        f = flag[base : base + 1024]
++        rank = np.cumsum(f) - f  # BlockScan ExclusiveSum
++        for t in np.nonzero(f)[0]:
++            pos = base_rank + rank[t]
++            assert pos < top_k, "restart fault path"
++            out[pos] = base + t
++        base_rank += int(f.sum())
++    assert base_rank == top_k
++    return out.astype(np.int32)
++
++
++def large_geometry(stride: int, num_rows: int) -> tuple[int, int]:
++    """launch_persistent_topk's ctas_per_group / chunk_size, 3090 opt-in."""
++    if num_rows <= 4:
++        eff = min(SMEM_OPTIN_3090, K_SMEM_MEDIUM)
++    elif num_rows <= 8:
++        eff = min(SMEM_OPTIN_3090, 48 * 1024)
++    else:
++        eff = SMEM_OPTIN_3090
++    max_chunk = (eff - K_FIXED_SMEM_LARGE) // 4
++    vec = 4 if stride % 4 == 0 else (2 if stride % 2 == 0 else 1)
++    max_chunk = (max_chunk // vec) * vec
++    max_chunk = max(max_chunk, vec * 1024)
++    ctas = -(-stride // max_chunk)
++    chunk = -(-stride // ctas)
++    chunk = -(-chunk // vec) * vec
++    chunk = min(chunk, max_chunk)
++    return ctas, chunk
++
++
++def emit_large_det(keys, top_k, tie_recent, stride, num_rows) -> np.ndarray:
++    """radix_emit_deterministic(): per-CTA gt/eq counts, the directional CTA
++    walk handing out `equal_needed`, cut_rank/keep_width, and the slot
++    gt_base + eq_keep_base + gt_rank + kept_eq_before."""
++    seq_len = keys.size
++    ctas, chunk = large_geometry(stride, num_rows)
++    assert 4 * ctas <= 256, "host gate would route to the legacy tail"
++    pivot = np.sort(keys)[::-1][top_k - 1]
++    equal_needed = top_k - int((keys > pivot).sum())
++    chunks = [keys[c * chunk : min((c + 1) * chunk, seq_len)] for c in range(ctas)]
++    gt = [int((ch > pivot).sum()) for ch in chunks]
++    eq = [int((ch == pivot).sum()) for ch in chunks]
++    keep = [0] * ctas
++    seen = 0
++    order = range(ctas - 1, -1, -1) if tie_recent else range(ctas)
++    for c in order:
++        want = max(equal_needed - seen, 0)
++        keep[c] = min(want, eq[c])
++        seen += eq[c]
++    out = np.full(top_k, -11, dtype=np.int64)
++    for c, ch in enumerate(chunks):
++        gt_base, eq_keep_base = sum(gt[:c]), sum(keep[:c])
++        cut_rank = (eq[c] - keep[c]) if tie_recent else 0
++        f_gt = (ch > pivot).astype(np.int64)
++        f_eq = (ch == pivot).astype(np.int64)
++        gt_rank = np.cumsum(f_gt) - f_gt  # exclusive, ascending element index
++        eq_rank = np.cumsum(f_eq) - f_eq
++        sel = (f_gt == 1) | (
++            (f_eq == 1) & (eq_rank >= cut_rank) & (eq_rank - cut_rank < keep[c])
++        )
++        kept_before = np.clip(eq_rank - cut_rank, 0, keep[c])
++        slot = gt_base + eq_keep_base + gt_rank + kept_before
++        assert (slot[sel] < top_k).all(), "X4 fault path"
++        out[slot[sel]] = c * chunk + np.nonzero(sel)[0]
++    return out.astype(np.int32)
++
++
++def emit_large_legacy(keys, top_k, rng) -> np.ndarray:
++    """v2.0.1 tail: > pivot by per-CTA arrival, then pivot-equal by global
++    arrival until TopK -- set racy on ties, order racy everywhere."""
++    pivot = np.sort(keys)[::-1][top_k - 1]
++    gt = np.nonzero(keys > pivot)[0]
++    eq = np.nonzero(keys == pivot)[0]
++    need = top_k - gt.size
++    return np.concatenate([rng.permutation(gt), rng.permutation(eq)[:need]]).astype(
++        np.int32
++    )
++
++
++# ================================================ sorted_emit_row() =========
++def sorted_emit_row(
++    row: np.ndarray, *, dup_check=True, fill=True, force_fast=False
++) -> np.ndarray:
++    """Port of persistent_topk.cuh sorted_emit_row(). The keyword switches
++    exist ONLY to build the failing controls."""
++    top_k = row.size
++    vals = row.astype(np.int64)
++    bitmap = [0] * BITMAP_WORDS
++    fallback = False
++    for v in vals:  # E1 (the atomicOr order cannot matter: OR is commutative)
++        if v >= 0:
++            if v < BITMAP_BITS:
++                bit = 1 << (int(v) & 31)
++                if bitmap[int(v) >> 5] & bit and dup_check:
++                    fallback = True
++                bitmap[int(v) >> 5] |= bit
++            elif not force_fast:
++                fallback = True
++    out = row.astype(np.int64).copy()  # slots the kernel does not write keep bytes
++    if not fallback:
++        pops = [bin(w).count("1") for w in bitmap]
++        excl = np.concatenate([[0], np.cumsum(pops)[:-1]])
++        total = int(sum(pops))
++        for tx, w in enumerate(bitmap):  # one bitmap word per thread
++            pos = int(excl[tx])
++            while w:
++                b = (w & -w).bit_length() - 1  # __ffs - 1
++                if pos < top_k:
++                    out[pos] = (tx << 5) | b
++                pos += 1
++                w &= w - 1
++        if fill:
++            out[total:] = -1
++    else:
++        key = np.where(vals < 0, INT32_MAX, vals)
++        idx = np.arange(top_k)
++        less = (key[None, :] < key[:, None]).sum(axis=1)
++        tie_before = (
++            (key[None, :] == key[:, None]) & (idx[None, :] < idx[:, None])
++        ).sum(axis=1)
++        rank = less + tie_before
++        out[rank] = np.where(key == INT32_MAX, -1, key)
++    return out.astype(np.int32)
++
++
++# ================================================== the harness =============
++def make_row(seq_len: int, kind: str, rng: np.random.Generator) -> np.ndarray:
++    if kind == "heavy_ties":  # relu(q.k) sums: many exact zeros, few levels
++        levels = np.array([0.0, 0.0, 0.0, 0.5, 1.0, 2.0], dtype=np.float32)
++        return levels[rng.integers(0, levels.size, seq_len)]
++    if kind == "signed_zero":  # +0.0 / -0.0 at the cutoff
++        x = np.where(rng.random(seq_len) < 0.5, np.float32(0.0), np.float32(-0.0))
++        x = x.astype(np.float32)
++        hot = rng.random(seq_len) < 0.02
++        x[hot] = rng.random(int(hot.sum())).astype(np.float32) + 1.0
++        return x
++    if kind == "neg_inf":  # masked blocks
++        x = rng.standard_normal(seq_len).astype(np.float32)
++        x[rng.random(seq_len) < 0.7] = -np.inf
++        return x
++    if kind == "all_equal":
++        return np.full(seq_len, 1.25, dtype=np.float32)
++    if kind == "distinct":
++        return rng.permutation(seq_len).astype(np.float32) * np.float32(1e-3)
++    if kind == "one_coarse_bin":  # medium / decode overflow class
++        return (1.0 + rng.random(seq_len) * 0.01).astype(np.float32)
++    raise ValueError(kind)
++
++
++def emissions(
++    seq_len,
++    top_k,
++    kind,
++    det_ties,
++    tie_recent,
++    rng,
++    *,
++    num_rows=1,
++    exact_medium=True,
++    exact_decode=False,
++    det_large=True,
++):
++    """(path, native emission, re-emitted by sorted_emit_row?) for one row."""
++    x = make_row(seq_len, kind, rng)
++    keys = ordered_key(x)
++    path = path_of(seq_len, top_k)
++    eff = effective_tie_recent(det_ties, tie_recent)
++    if path == "trivial":
++        return path, x, emit_trivial(seq_len, top_k), False
++    if path == "decode":
++        n_pad = -(-seq_len // 4) * 4
++        cand = ordered_key(
++            np.concatenate([x, np.full(n_pad - seq_len, -np.inf, dtype=np.float32)])
++        )
++        top_bin_pop = _half_bin_population_at_threshold(cand, top_k)
++        if top_bin_pop > DBUF and exact_decode:
++            return "decode-restart", x, emit_restart(keys, top_k, eff), False
++        if top_bin_pop > DBUF:
++            return "decode-overflow", x, None, True  # modelled separately
++        return (
++            path,
++            x,
++            emit_buffered(keys, top_k, det_ties, tie_recent, rng, candidates=cand),
++            True,
++        )
++    if path == "medium":
++        coarse_pop = _coarse_bin_population_at_threshold(keys, x, top_k)
++        if coarse_pop > MAX_BUFFERED_ITEMS and exact_medium:
++            return "medium-restart", x, emit_restart(keys, top_k, eff), False
++        if coarse_pop > MAX_BUFFERED_ITEMS:
++            return "medium-overflow", x, None, True
++        return path, x, emit_buffered(keys, top_k, det_ties, tie_recent, rng), True
++    ctas, _ = large_geometry(seq_len, num_rows)
++    if det_large and 4 * ctas <= 256:
++        return path, x, emit_large_det(keys, top_k, eff, seq_len, num_rows), False
++    return "large-legacy", x, emit_large_legacy(keys, top_k, rng), True
++
++
++def _half_key16(x: np.ndarray) -> np.ndarray:
++    h = x.astype(np.float16).view(np.uint16)
++    return np.where(h & 0x8000, ~h, h | 0x8000).astype(np.uint16)
++
++
++def _half_bin_population_at_threshold(cand_keys: np.ndarray, top_k: int) -> int:
++    x = cand_keys.copy()
++    # back to float for the half bin: invert ordered_key
++    neg = (x & np.uint32(0x80000000)) == 0
++    bits = np.where(neg, ~x, x & np.uint32(0x7FFFFFFF)).astype(np.uint32)
++    f = bits.view(np.float32)
++    b = _half_key16(f) >> 5
++    hist = np.bincount(b, minlength=2048)
++    suf = np.cumsum(hist[::-1])[::-1]
++    thr = int(np.nonzero(suf >= top_k)[0].max())
++    return int(hist[thr]) if suf[thr] - hist[thr] < top_k else 0
++
++
++def _coarse_bin_population_at_threshold(keys, x, top_k) -> int:
++    """histogram_256_topk's M1: threshold = the bin with suffix > TopK and
++    next suffix <= TopK (strict, unlike decode); a next suffix of exactly TopK
++    resolves the row without collecting, so nothing overflows."""
++    b = _half_key16(x) >> 8
++    hist = np.bincount(b, minlength=256)
++    suf = np.cumsum(hist[::-1])[::-1]
++    thr = int(np.nonzero(suf > top_k)[0].max())
++    above = suf[thr] - hist[thr]
++    return int(hist[thr]) if above != top_k else 0
++
++
++def assert_bytes(a: np.ndarray, b: np.ndarray, what: str):
++    a32 = np.ascontiguousarray(a, dtype=np.int32)
++    b32 = np.ascontiguousarray(b, dtype=np.int32)
++    assert a32.tobytes() == b32.tobytes(), what
++
++
++# Lengths in BLOCKS (QSA k=512 blocks, compress 4): 131,072 tokens = 32,768
++# blocks (medium's last), 131,076 = 32,769 (large's first).
++BOUNDARY_LENGTHS = [
++    1,
++    300,
++    511,
++    512,
++    513,
++    700,
++    4096,
++    8191,
++    8192,
++    8193,
++    12000,
++    32767,
++    32768,
++    32769,
++    32770,
++    33750,
++    50000,
++]
++KINDS = [
++    "heavy_ties",
++    "signed_zero",
++    "neg_inf",
++    "all_equal",
++    "distinct",
++    "one_coarse_bin",
++]
++TIE_CONFIGS = [(True, True), (True, False), (False, False)]  # (TIE_DET, RECENT)
++
++
++def _cases(top_k):
++    for seq_len in BOUNDARY_LENGTHS:
++        for kind in KINDS:
++            if seq_len > 8192 and kind in ("distinct",) and seq_len % 3:
++                continue  # keep the grid affordable
++            yield seq_len, kind
++
++
++@pytest.mark.parametrize("top_k", [512, 2048])
++@pytest.mark.parametrize("det_ties,tie_recent", TIE_CONFIGS)
++@pytest.mark.parametrize(
++    "exact_decode,det_large",
++    [(False, True), (True, False)],  # production / the two other arms
++)
++def test_sorted_emission_equals_python_sort_every_path(
++    top_k, det_ties, tie_recent, exact_decode, det_large
++):
++    """THE property: knob-on bytes == knob-off bytes after `_canonical`, and
++    the set is the exact top-k under the effective rule (deterministic
++    configurations) -- on every path at every boundary length."""
++    rng = np.random.default_rng(1000 * top_k + 10 * det_ties + tie_recent)
++    seen_paths = set()
++    for seq_len, kind in _cases(top_k):
++        path, x, native, reemitted = emissions(
++            seq_len,
++            top_k,
++            kind,
++            det_ties,
++            tie_recent,
++            rng,
++            exact_decode=exact_decode,
++            det_large=det_large,
++        )
++        seen_paths.add(path)
++        if native is None:
++            continue  # overflow-without-repair rows: see the stale-slot test
++        knob_off_after_sort = canonical(native)
++        knob_on = sorted_emit_row(native) if reemitted else native
++        assert_bytes(
++            knob_on, knob_off_after_sort, f"{path} len={seq_len} kind={kind} k={top_k}"
++        )
++        # set check against the independent reference
++        if path == "trivial":
++            continue
++        keys = ordered_key(x)
++        if path == "decode":
++            n_pad = -(-seq_len // 4) * 4
++            keys = ordered_key(
++                np.concatenate([x, np.full(n_pad - seq_len, -np.inf, dtype=np.float32)])
++            )
++        racy = (path in ("decode", "medium") and not det_ties) or path == "large-legacy"
++        ref, pivot, need, n_eq = reference_select(
++            keys, top_k, effective_tie_recent(det_ties, tie_recent)
++        )
++        got = np.sort(knob_on.astype(np.int64))
++        if racy and need < n_eq:
++            # racy tie membership: only the value multiset is determined
++            assert np.array_equal(np.sort(keys[got]), np.sort(keys[ref]))
++        else:
++            assert np.array_equal(got, ref), f"{path} len={seq_len} kind={kind}"
++    want = {"trivial", "decode", "medium", "medium-restart"}
++    want |= {"decode-restart", "large-legacy"} if exact_decode else {"large"}
++    assert want <= seen_paths, seen_paths
++
++
++@pytest.mark.parametrize("det_ties,tie_recent", TIE_CONFIGS)
++def test_restart_and_large_det_are_already_canonical(det_ties, tie_recent):
++    """The paths the kernel does NOT re-emit must already be canonical, or the
++    knob would leave them unsorted once the Python sort is gone."""
++    rng = np.random.default_rng(7)
++    eff = effective_tie_recent(det_ties, tie_recent)
++    for seq_len in (513, 8193, 20000, 32768):
++        for kind in ("heavy_ties", "all_equal", "one_coarse_bin", "signed_zero"):
++            keys = ordered_key(make_row(seq_len, kind, rng))
++            out = emit_restart(keys, 512, eff)
++            assert_bytes(out, canonical(out), f"restart {seq_len} {kind}")
++    for seq_len, num_rows in (
++        (32769, 1),
++        (33750, 4),
++        (50000, 8),
++        (65536, 32),
++        (131072, 1),
++    ):
++        for kind in ("heavy_ties", "all_equal", "signed_zero", "distinct"):
++            keys = ordered_key(make_row(seq_len, kind, rng))
++            out = emit_large_det(keys, 512, eff, seq_len, num_rows)
++            assert_bytes(out, canonical(out), f"large {seq_len} {kind}")
++            ref, *_ = reference_select(keys, 512, eff)
++            assert np.array_equal(out.astype(np.int64), ref)
++
++
++def test_mixed_batch_rows_are_independent():
++    """A launch mixes paths row by row; each row's re-emission reads only its
++    own TopK slots."""
++    rng = np.random.default_rng(3)
++    lens = [100, 600, 8192, 8193, 32768, 32769, 40000, 512]
++    rows = []
++    for L in lens:
++        path, x, native, reemit = emissions(
++            L, 512, "heavy_ties", True, True, rng, num_rows=len(lens)
++        )
++        rows.append(sorted_emit_row(native) if reemit else native)
++    batch = np.stack(rows)
++    t = torch.from_numpy(batch.astype(np.int32))
++    assert torch.equal(qsa_indexer._canonical(t), t)
++
++
++# ------------------------------------------------------ pathological rows ----
++@pytest.mark.parametrize("top_k", [512, 1024, 2048])
++def test_pathological_rows_take_the_fallback_and_still_match(top_k):
++    rng = np.random.default_rng(top_k)
++    cases = {
++        "duplicates": rng.integers(0, 64, top_k),
++        "stale_mixed": np.concatenate(
++            [
++                rng.permutation(8192)[: top_k // 2],
++                rng.integers(-5, 40000, top_k - top_k // 2),
++            ]
++        ),
++        "beyond_bitmap": rng.integers(30000, 300000, top_k),
++        "int32_max": np.where(
++            rng.random(top_k) < 0.1, INT32_MAX, rng.permutation(top_k * 4)[:top_k]
++        ),
++        "odd_negatives": np.where(
++            rng.random(top_k) < 0.3,
++            rng.integers(-100, 0, top_k),
++            rng.permutation(top_k * 8)[:top_k],
++        ),
++        "all_padding": np.full(top_k, -1),
++        "int32_min": np.where(
++            rng.random(top_k) < 0.2, -(2**31), rng.permutation(top_k * 2)[:top_k]
++        ),
++        "exact_32768": np.concatenate([[32767, 32768], np.arange(top_k - 2)]),
++    }
++    for name, row in cases.items():
++        row = row.astype(np.int32)
++        rng.shuffle(row)
++        assert_bytes(sorted_emit_row(row), canonical(row), name)
++
++
++@pytest.mark.parametrize("path", ["decode-overflow", "medium-overflow"])
++def test_overflow_without_repair_keeps_stale_bytes_semantics(path):
++    """EXACT_DECODE=0 / EXACT_MEDIUM=0 overflow can leave slots the buffered
++    path never wrote this launch; they hold whatever the output tensor held.
++    The Python sort sorts those stale values too, and so must we."""
++    rng = np.random.default_rng(11)
++    for trial in range(40):
++        written = rng.permutation(8192)[: rng.integers(100, 512)]
++        stale = rng.integers(-3, 70000, 512 - written.size)
++        row = np.concatenate([written, stale]).astype(np.int32)
++        rng.shuffle(row)
++        assert_bytes(sorted_emit_row(row), canonical(row), f"{path} #{trial}")
++
++
++# ------------------------------------------------------- failing controls ----
++def _any_mismatch(fn, rows) -> bool:
++    for row in rows:
++        try:
++            if fn(row).tobytes() != canonical(row).astype(np.int32).tobytes():
++                return True
++        except (IndexError, AssertionError):
++            return True
++    return False
++
++
++def test_failing_control_no_duplicate_detection():
++    rng = np.random.default_rng(5)
++    rows = [rng.integers(0, 64, 512).astype(np.int32) for _ in range(4)]
++    assert _any_mismatch(lambda r: sorted_emit_row(r, dup_check=False), rows)
++    assert not _any_mismatch(sorted_emit_row, rows)
++
++
++def test_failing_control_no_padding_fill():
++    rng = np.random.default_rng(6)
++    rows = [
++        np.where(rng.random(512) < 0.3, -1, rng.permutation(4096)[:512]).astype(
++            np.int32
++        )
++        for _ in range(4)
++    ]
++    assert _any_mismatch(lambda r: sorted_emit_row(r, fill=False), rows)
++    assert not _any_mismatch(sorted_emit_row, rows)
++
++
++def test_failing_control_sort_skipped():
++    """Knob off WITHOUT the Python sort must be caught on buffered paths."""
++    rng = np.random.default_rng(8)
++    rows = []
++    for L in (600, 4096, 8193, 20000):
++        _, _, native, reemit = emissions(L, 512, "heavy_ties", True, True, rng)
++        assert reemit
++        rows.append(native)
++    assert _any_mismatch(lambda r: r, rows)
++
++
++def test_failing_control_out_of_range_forced_fast():
++    rng = np.random.default_rng(9)
++    rows = [rng.integers(30000, 300000, 512).astype(np.int32) for _ in range(3)]
++    assert _any_mismatch(lambda r: sorted_emit_row(r, force_fast=True), rows)
++
++
++def test_failing_control_tie_rule_flipped():
++    """The set check fails if the kernel kept the OTHER end of the tie group
++    (upstream #55122's lowest-index rule) where production keeps the highest."""
++    rng = np.random.default_rng(10)
++    keys = ordered_key(make_row(40000, "all_equal", rng))
++    ours, *_ = reference_select(keys, 512, True)
++    flipped = emit_large_det(keys, 512, False, 40000, 1)
++    assert not np.array_equal(np.sort(flipped.astype(np.int64)), ours)
++    keys = ordered_key(make_row(8193, "all_equal", rng))
++    flipped = emit_restart(keys, 512, False)
++    ours, *_ = reference_select(keys, 512, True)
++    assert not np.array_equal(np.sort(flipped.astype(np.int64)), ours)
++
++
++def test_signed_zero_canonicalisation_would_change_the_set():
++    """Why #55122's +-0.0 change is NOT adopted: with the pivot at zero, +0.0
++    currently outranks -0.0 regardless of index; treating them as a tie hands
++    the choice to the index rule and changes the SET."""
++    # +0.0 at the OLD end, -0.0 at the recent end, the cutoff inside zero.
++    x = np.array([0.0] * 100 + [-0.0] * 600 + [1.0] * 400, dtype=np.float32)
++    ours, *_ = reference_select(ordered_key(x), 512, True)
++    canon = ordered_key(np.where(x == 0, np.float32(0.0), x))  # -0 -> +0
++    theirs, *_ = reference_select(canon, 512, True)
++    assert not np.array_equal(ours, theirs)
++    assert set(range(0, 100)) <= set(ours.tolist())  # all +0.0 kept today
++    assert not set(range(0, 100)) & set(theirs.tolist())  # all lost after
++
++
++# ------------------------------------------------------------ Python gate ----
++def _pack(fields, version, count):
++    s = 0
++    for i, f in enumerate(fields):
++        s |= f << (2 * i)
++    return s | (count << 48) | (version << 56)
++
++
++@pytest.fixture
++def fresh_gate(monkeypatch):
++    monkeypatch.setattr(qsa_indexer, "_kernel_sorted_emit_state", None)
++    yield
++    qsa_indexer._kernel_sorted_emit_state = None
++
++
++class _FakeOps:
++    def __init__(self, state):
++        self.calls = 0
++        self._state = state
++
++    def persistent_topk_toggle_state(self):
++        self.calls += 1
++        return self._state() if callable(self._state) else self._state
++
++
++def _install(monkeypatch, fake):
++    monkeypatch.setattr(torch.ops, "_C", fake, raising=False)
++
++
++def test_gate_reads_field_six_and_latches(fresh_gate, monkeypatch):
++    fake = _FakeOps(_pack([1, 1, 1, 1, 0, 1, 1], 2, 7))
++    _install(monkeypatch, fake)
++    assert qsa_indexer.kernel_sorted_emit() is True
++    assert qsa_indexer.kernel_sorted_emit() is True
++    assert fake.calls == 1  # latched: one host query per process
++
++
++def test_gate_off_and_layout_one(fresh_gate, monkeypatch):
++    _install(monkeypatch, _FakeOps(_pack([1, 1, 1, 1, 0, 1, 0], 2, 7)))
++    assert qsa_indexer.kernel_sorted_emit() is False
++    qsa_indexer._kernel_sorted_emit_state = None
++    _install(monkeypatch, _FakeOps(_pack([1, 1, 1, 1, 0, 1], 1, 6)))
++    assert qsa_indexer.kernel_sorted_emit() is False  # old build: cannot sort
++
++
++def test_gate_does_not_latch_uninit(fresh_gate, monkeypatch):
++    states = iter([_pack([2] * 7, 2, 7), _pack([1, 1, 1, 1, 0, 1, 1], 2, 7)])
++    fake = _FakeOps(lambda: next(states))
++    _install(monkeypatch, fake)
++    assert qsa_indexer.kernel_sorted_emit() is False
++    assert qsa_indexer._kernel_sorted_emit_state is None
++    assert qsa_indexer.kernel_sorted_emit() is True
++
++
++def test_gate_op_absent(fresh_gate, monkeypatch):
++    monkeypatch.setattr(torch.ops, "_C", object(), raising=False)
++    assert qsa_indexer.kernel_sorted_emit() is False
++
++
++class _TopkOps(_FakeOps):
++    """Fake _C: persistent_topk writes a fixed UNSORTED row."""
++
++    def __init__(self, state, row):
++        super().__init__(state)
++        self.row = row
++
++    def persistent_topk(self, logits, lengths, out, ws, k, maxlen):
++        out.copy_(self.row.expand_as(out))
++
++    cooperative_topk = persistent_topk
++
++
++def _run_topk(monkeypatch, state, sort_on, row):
++    fake = _TopkOps(state, row)
++    _install(monkeypatch, fake)
++    monkeypatch.setattr(qsa_indexer, "_QSA_SORT", sort_on)
++    out = torch.empty(2, row.numel(), dtype=torch.int32)
++    qsa_indexer._topk(
++        torch.zeros(2, 64),
++        torch.zeros(2, dtype=torch.int32),
++        4 * row.numel(),
++        4,
++        out,
++        torch.empty(8, dtype=torch.uint8),
++    )
++    return out
++
++
++def test_topk_skips_python_sort_only_when_kernel_says_sorted(fresh_gate, monkeypatch):
++    row = torch.tensor([5, -1, 3, 9, 0, -1, 7, 1], dtype=torch.int32)
++    on = _pack([1, 1, 1, 1, 0, 1, 1], 2, 7)
++    off = _pack([1, 1, 1, 1, 0, 1, 0], 2, 7)
++    # knob on: the kernel's bytes pass through untouched (the sort is skipped)
++    assert torch.equal(_run_topk(monkeypatch, on, True, row)[0], row)
++    qsa_indexer._kernel_sorted_emit_state = None
++    # knob off + QSA_SORT: Python sorts
++    got = _run_topk(monkeypatch, off, True, row)[0]
++    assert torch.equal(got, qsa_indexer._canonical(row.view(1, -1))[0])
++
++
++def test_debug_check_asserts_on_unsorted(monkeypatch):
++    monkeypatch.setattr(qsa_indexer, "_SORTED_EMIT_CHECK", True)
++    ok = torch.tensor([[0, 3, 7, -1, -1]], dtype=torch.int32)
++    qsa_indexer._check_sorted_emission(ok)  # canonical: passes
++    for bad in ([[3, 0, 7, -1, -1]], [[0, 3, -1, 7, -1]], [[0, 3, 7, -2, -1]]):
++        with pytest.raises(RuntimeError):
++            qsa_indexer._check_sorted_emission(torch.tensor(bad, dtype=torch.int32))
++
++
++# ===================================================== GPU only ==============
++_ARM = Path(__file__).with_name("merlin_sorted_emit_arm.py")
++_PROD = {
++    "MERLIN_TIE_DET": "1",
++    "MERLIN_TIE_RECENT": "1",
++    "MERLIN_TOPK_EXACT_MEDIUM": "1",
++    "MERLIN_TOPK_DET_LARGE": "1",
++    "MERLIN_TOPK_EXACT_DECODE": "0",
++}
++
++
++def _run_arm(tmp_path, name, env_over, extra_args=()):
++    out = tmp_path / f"{name}.pt"
++    env = {k: v for k, v in os.environ.items() if not k.startswith("MERLIN_")}
++    env.update(env_over)
++    proc = subprocess.run(
++        [sys.executable, str(_ARM), str(out), *extra_args],
++        env=env,
++        capture_output=True,
++        text=True,
++        timeout=1800,
++    )
++    assert proc.returncode == 0, proc.stdout[-4000:] + proc.stderr[-4000:]
++    return torch.load(out, weights_only=True), proc.stderr
++
++
++needs_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU only")
++
++
++@needs_cuda
++def test_gpu_knob_on_equals_knob_off_plus_python_sort(tmp_path):
++    off, _ = _run_arm(tmp_path, "off", dict(_PROD, MERLIN_TOPK_SORTED_EMIT="0"))
++    on, err = _run_arm(tmp_path, "on", dict(_PROD, MERLIN_TOPK_SORTED_EMIT="1"))
++    assert "MERLIN_TOPK_SORTED_EMIT=1" in err and "ascending-in-kernel" in err
++    assert on["meta"]["toggle_sorted_emit"] == "1"
++    assert off["meta"]["toggle_sorted_emit"] == "0"
++    assert on["meta"]["counters"][3] == 0 and on["meta"]["counters"][7] == 0
++    differs_unsorted = 0
++    for cell, raw_off in off["cells"].items():
++        raw_on = on["cells"][cell]
++        assert torch.equal(raw_on, qsa_indexer._canonical(raw_on)), cell
++        if cell.startswith("racy_"):
++            continue  # launch-order-dependent SET in this arm (see the arm)
++        want = qsa_indexer._canonical(raw_off)
++        assert raw_on.dtype == torch.int32 and want.dtype == torch.int32
++        assert raw_on.numpy().tobytes() == want.numpy().tobytes(), cell
++        differs_unsorted += int(not torch.equal(raw_off, want))
++    # FAILING CONTROL (sort skipped): the knob-off raw bytes are NOT canonical
++    # on the buffered cells, so the equality above is not vacuous.
++    assert differs_unsorted > 0
++
++
++@needs_cuda
++def test_gpu_failing_control_tie_rule_flip(tmp_path):
++    ref, _ = _run_arm(tmp_path, "ref", dict(_PROD, MERLIN_TOPK_SORTED_EMIT="1"))
++    flip, _ = _run_arm(
++        tmp_path,
++        "flip",
++        dict(_PROD, MERLIN_TOPK_SORTED_EMIT="1", MERLIN_TIE_RECENT="0"),
++    )
++    tie_cells = [c for c in ref["cells"] if "tie" in c or "all_equal" in c]
++    assert tie_cells
++    assert any(not torch.equal(ref["cells"][c], flip["cells"][c]) for c in tie_cells)
++
++
++@needs_cuda
++@pytest.mark.parametrize(
++    "arm",
++    [
++        {"MERLIN_TOPK_DET_LARGE": "0"},  # legacy large tail: re-emitted
++        {"MERLIN_TIE_DET": "0"},  # racy buffered ties
++        {"MERLIN_TOPK_EXACT_MEDIUM": "0"},  # medium overflow unrepaired
++        {"MERLIN_TOPK_EXACT_DECODE": "1"},  # decode overflow restarted
++    ],
++)
++def test_gpu_non_production_arms_are_canonical(tmp_path, arm):
++    """Where the SET is racy the two arms may legitimately disagree, so the
++    claim is only: the knob-on row is already canonical."""
++    on, _ = _run_arm(tmp_path, "arm", dict(_PROD, MERLIN_TOPK_SORTED_EMIT="1", **arm))
++    for cell, raw in on["cells"].items():
++        assert torch.equal(raw, qsa_indexer._canonical(raw)), (arm, cell)
++
++
++@needs_cuda
++def test_gpu_cudagraph_replay_knob_on(tmp_path):
++    on, _ = _run_arm(
++        tmp_path,
++        "graph",
++        dict(_PROD, MERLIN_TOPK_SORTED_EMIT="1"),
++        extra_args=("--graph",),
++    )
++    for cell, raw in on["cells"].items():
++        assert torch.equal(raw, qsa_indexer._canonical(raw)), cell
++    assert on["meta"]["graph_replays_match_eager"], json.dumps(on["meta"])[:2000]
+diff --git a/tests/test_envs.py b/tests/test_envs.py
+index 0db9be33b1..9ddb51e877 100644
+--- a/tests/test_envs.py
++++ b/tests/test_envs.py
+@@ -660,13 +660,19 @@ _FORK_IGNORED = [
+ _UNAUDITED_START = "# --8<-- [start:unaudited-host-side-knobs]"
+ _UNAUDITED_END = "# --8<-- [end:unaudited-host-side-knobs]"
+ 
+-# All four are compile/capture factors and must be hashed. Three are raw
+-# passthroughs of a value that C++ parses; MERLIN_QSA_SORT is parsed here.
++# All of these are compile/capture factors and must be hashed. Four are raw
++# passthroughs of a value that C++ parses; MERLIN_QSA_SORT and
++# MERLIN_TOPK_SORTED_EMIT_CHECK are parsed here.
+ _TIEDET_HASHED = [
+     ("MERLIN_FULL_K", "1", "1"),
+     ("MERLIN_TIE_DET", "1", "1"),
+     ("MERLIN_TIE_RECENT", "1", "1"),
+     ("MERLIN_QSA_SORT", "1", True),
++    # In-kernel canonical emission: raw passthrough of the C++
++    # getter (topk.cu sorted_emit_enabled, default OFF), and its Python-parsed
++    # debug check. Both change the captured sequence, so both are hashed.
++    ("MERLIN_TOPK_SORTED_EMIT", "1", "1"),
++    ("MERLIN_TOPK_SORTED_EMIT_CHECK", "1", True),
+ ]
+ 
+ # The persistent_topk kernel switches. Raw passthroughs
+diff --git a/tests/test_merlin_e2_toggles.py b/tests/test_merlin_e2_toggles.py
+index 2ded113f3a..10d465f34b 100644
+--- a/tests/test_merlin_e2_toggles.py
++++ b/tests/test_merlin_e2_toggles.py
+@@ -162,6 +162,7 @@ ON_MAP = {
+     "exact_medium": "1",
+     "exact_decode": "0",
+     "det_large": "1",
++    "sorted_emit": "0",
+ }
+ ABSENT_MAP = {
+     "full_k": "0",
+@@ -172,6 +173,7 @@ ABSENT_MAP = {
+     "exact_medium": "1",
+     "exact_decode": "0",
+     "det_large": "1",
++    "sorted_emit": "0",
+ }
+ 
+ 
+@@ -209,6 +211,17 @@ def test_effective_map_odd_spellings():
+     assert eff["qsa_sort"] == "invalid"
+ 
+ 
++def test_effective_map_sorted_emit():
++    """MERLIN_TOPK_SORTED_EMIT is a default-OFF C++ switch (topk.cu
++    sorted_emit_enabled): atoi rules, empty = unset = OFF."""
++    for raw, want in (("1", "1"), ("0", "0"), ("", "0"), ("true", "0"), (" 1", "1")):
++        raw_map, eff = t.environ_view(*_env(dict(ON, MERLIN_TOPK_SORTED_EMIT=raw)))
++        assert eff["sorted_emit"] == want, raw
++    raw_map, eff = t.environ_view(*_env(ON))
++    assert raw_map["MERLIN_TOPK_SORTED_EMIT"] == "unset"
++    assert eff["sorted_emit"] == "0"
++
++
+ def test_encode_raw():
+     assert t.encode_raw(None) == "unset"
+     assert t.encode_raw(b"1") == "1"
+@@ -229,6 +242,7 @@ def _pack(fields, version=1, count=6):
+ 
+ 
+ def test_decode_topk_state():
++    # Layout 1 (builds before sorted emission): six fields, no sorted emission.
+     assert t.decode_topk_state(_pack([1, 1, 1, 1, 0, 1])) == {
+         "tie_det": "1",
+         "tie_recent": "1",
+@@ -236,7 +250,16 @@ def test_decode_topk_state():
+         "exact_medium": "1",
+         "exact_decode": "0",
+         "det_large": "1",
++        "sorted_emit": "n-a",
+     }
++    # Layout 2: field 6 = MERLIN_TOPK_SORTED_EMIT.
++    v2 = t.decode_topk_state(_pack([1, 1, 1, 1, 0, 1, 1], version=2, count=7))
++    assert v2["sorted_emit"] == "1" and v2["det_large"] == "1"
++    v2 = t.decode_topk_state(_pack([1, 1, 1, 1, 0, 1, 2], version=2, count=7))
++    assert v2["sorted_emit"] == "uninit"
++    assert isinstance(t.decode_topk_state(_pack([0] * 7, version=1, count=7)), str)
++    assert isinstance(t.decode_topk_state(_pack([0] * 8, version=2, count=8)), str)
++    assert isinstance(t.decode_topk_state(_pack([0] * 7, version=3, count=7)), str)
+     assert t.decode_topk_state(_pack([2, 2, 2, 1, 2, 2]))["tie_det"] == "uninit"
+     assert t.decode_topk_state(_pack([3, 0, 0, 0, 0, 0]))["tie_det"] == "invalid"
+     assert isinstance(t.decode_topk_state(_pack([0] * 6, version=2)), str)
+@@ -279,13 +302,14 @@ def capture():
+     t._reset_for_tests()
+ 
+ 
+-def _kw(cpp=CPP_ON, env=None, device=None, qsa="1", tag="PP1_TP0"):
++def _kw(cpp=CPP_ON, env=None, device=None, qsa="1", tag="PP1_TP0", skip="0"):
+     return dict(
+         tag_fn=lambda: tag,
+         getenv_fn=lambda: (_env(ON if env is None else env)[0], "libc-getenv"),
+         cpp_fn=lambda: cpp,
+         device_fn=lambda: device or {"switch": "1", "switch_large": "1"},
+         qsa_fn=lambda: qsa,
++        sorted_skip_fn=lambda: skip,
+     )
+ 
+ 
+@@ -345,7 +369,11 @@ def test_line_contents_toggles_on(capture, monkeypatch):
+     cpp = dict(p["cpp-cache"])
+     assert cpp.pop("source") == "cpp-cache"
+     assert cpp == CPP_ON
+-    assert p["python"] == {"qsa_sort": "1", "source": "qsa_indexer._QSA_SORT"}
++    assert p["python"] == {
++        "qsa_sort": "1",
++        "sorted_emit_skip": "0",
++        "source": "qsa_indexer._QSA_SORT",
++    }
+     assert p["device"] == {
+         "switch": "1",
+         "switch_large": "1",
+@@ -363,6 +391,20 @@ def test_line_knob_absent(capture, monkeypatch):
+     assert eff == ABSENT_MAP
+ 
+ 
++def test_line_sorted_emit_on(capture, monkeypatch):
++    """The knob-on arm the reference host reads: raw, effective, cpp-cache and the
++    Python skip all say sorted emission."""
++    env = dict(ON, MERLIN_TOPK_SORTED_EMIT="1")
++    for k, v in env.items():
++        monkeypatch.setenv(k, v)
++    cpp = dict(CPP_ON, sorted_emit="1")
++    p = parse(t.arm(**_kw(cpp=cpp, env=env, skip="1")))
++    assert p["raw"]["MERLIN_TOPK_SORTED_EMIT"] == "1"
++    assert p["effective"]["sorted_emit"] == "1"
++    assert p["cpp-cache"]["sorted_emit"] == "1"
++    assert p["python"]["sorted_emit_skip"] == "1"
++
++
+ def test_cpp_op_absent_is_n_a_and_emits_at_once(capture, monkeypatch):
+     for k, v in ON.items():
+         monkeypatch.setenv(k, v)
+@@ -413,6 +455,7 @@ def test_default_sources_do_not_raise_on_cpu(monkeypatch):
+     assert isinstance(t.cpp_cache(), (str, dict))
+     assert set(t.device_switches()) == {"switch", "switch_large"}
+     assert t.qsa_sort_live() in ("0", "1", "n-a")
++    assert t.sorted_emit_skip_live() in ("0", "1", "n-a")
+     read, source = t._libc_getenv()
+     assert source in ("libc-getenv", "os-environ")
+     monkeypatch.setenv("MERLIN_TIE_DET", "7")
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 0dca963033..f13f442064 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -597,6 +597,26 @@ if TYPE_CHECKING:
+     # unless MERLIN_TOPK_LARGE_FAULT_INJECT names a CTA.
+     MERLIN_TOPK_LARGE_FAULT_KIND: str | None = None
+     #
++    # MERLIN_TOPK_SORTED_EMIT -- persistent_topk
++    # emits every row in the canonical order MERLIN_QSA_SORT imposes
++    # (ascending index, padding last as -1), and qsa_indexer.py then skips its
++    # Python sort. Same classification as the kernel switches above: resolved
++    # ONCE per process by a std::getenv in csrc/libtorch_stable/topk.cu
++    # (sorted_emit_enabled) -- the single source of truth -- and the resolved
++    # value reaches the GPU as a kernel launch argument AND removes three torch
++    # ops from the captured sequence, so a cudagraph bakes it in. CAPTURE: yes.
++    # AOT: not established for the kernel half; hashed conservatively (a fork
++    # env knob must be a compile factor: an os.environ knob that is not
++    # registered is not in the cache key). Raw passthrough: Python never parses
++    # it to decide anything -- qsa_indexer.py reads the C++ cache through
++    # persistent_topk_toggle_state() field 6. Not in ignored_factors.
++    MERLIN_TOPK_SORTED_EMIT: str | None = None
++    # Debug companion, a REAL Python read site (qsa_indexer._SORTED_EMIT_CHECK,
++    # read once at import): when the kernel sorted, assert on device that the
++    # row equals its canonical form instead of trusting it. Adds ops to the
++    # captured sequence, so it is hashed too. Default off.
++    MERLIN_TOPK_SORTED_EMIT_CHECK: bool = False
++    #
+     # NOT REGISTERED, deliberately: MERLIN_TOPK_EXACT_TRAP. It is a
+     # preprocessor define consumed by `#ifndef` in persistent_topk.cuh at
+     # BUILD time (-D), not a process environment variable -- nothing in the
+@@ -2613,6 +2633,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     "MERLIN_TOPK_LARGE_FAULT_KIND": lambda: os.getenv(
+         "MERLIN_TOPK_LARGE_FAULT_KIND", None
+     ),
++    # In-kernel canonical emission and its debug check; see the
++    # declaration block. Both hashed: both change the captured sequence.
++    "MERLIN_TOPK_SORTED_EMIT": lambda: os.getenv("MERLIN_TOPK_SORTED_EMIT", None),
++    "MERLIN_TOPK_SORTED_EMIT_CHECK": lambda: bool(
++        int(os.getenv("MERLIN_TOPK_SORTED_EMIT_CHECK", "0"))
++    ),
+ }
+ 
+ 
+diff --git a/vllm/models/qwen4_exp/nvidia/ops/qsa_indexer.py b/vllm/models/qwen4_exp/nvidia/ops/qsa_indexer.py
+index 8e5da35a4e..b9e88b0913 100644
+--- a/vllm/models/qwen4_exp/nvidia/ops/qsa_indexer.py
++++ b/vllm/models/qwen4_exp/nvidia/ops/qsa_indexer.py
+@@ -50,17 +50,84 @@ _DECODE_BLOCK_N = 64
+ # ---------------------------------------------------------------------------
+ _QSA_SORT = envs.MERLIN_QSA_SORT
+ 
++# ---------------------------------------------------------------------------
++# MERLIN_TOPK_SORTED_EMIT: persistent_topk emits
++# every row in the canonical order below by itself (sorted_emit_row() in
++# csrc/libtorch_stable/persistent_topk.cuh), so the Python sort is skipped.
++#
++# The decision is NOT a Python parse of the variable. The C++ getter
++# (topk.cu sorted_emit_enabled) is the single source of truth and publishes
++# what it cached into persistent_topk_toggle_state() field 6; that is read
++# once, host-side, right after this process's first persistent_topk launch
++# (the static is filled by then) and latched. So the sort is dropped only when
++# the kernel that actually ran says it sorted; an older build (layout 1, no
++# field 6) or an absent op keeps the Python sort. cooperative_topk (SM90+) has
++# no sorted emission and always keeps the Python sort.
++#
++# MERLIN_TOPK_SORTED_EMIT_CHECK=1 (debug, default off): instead of trusting
++# the kernel, assert on device that the row already equals its canonical form.
++# torch._assert_async is capture-safe (no host sync); a violation is a device
++# assert, i.e. a dead context -- which is the point of a debug check.
++# ---------------------------------------------------------------------------
++_SORTED_EMIT_CHECK = envs.MERLIN_TOPK_SORTED_EMIT_CHECK
++_kernel_sorted_emit_state: bool | None = None  # None: not read yet
+ 
+-def _qsa_canonicalise(block_indices: torch.Tensor) -> None:
+-    """Sort selected block indices ascending, padding last. In place, same shape."""
+-    if not _QSA_SORT:
+-        return
++
++def _canonical(block_indices: torch.Tensor) -> torch.Tensor:
++    """Ascending, padding last as -1 -- THE definition of the canonical order,
++    shared by the Python sort and the debug check (and the reference the
++    kernel's sorted emission is tested against)."""
+     big = torch.iinfo(block_indices.dtype).max
+     tmp = torch.where(
+         block_indices < 0, torch.full_like(block_indices, big), block_indices
+     )
+     tmp = torch.sort(tmp, dim=-1).values
+-    block_indices.copy_(torch.where(tmp == big, torch.full_like(tmp, -1), tmp))
++    return torch.where(tmp == big, torch.full_like(tmp, -1), tmp)
++
++
++def _qsa_canonicalise(block_indices: torch.Tensor) -> None:
++    """Sort selected block indices ascending, padding last. In place, same shape."""
++    if not _QSA_SORT:
++        return
++    block_indices.copy_(_canonical(block_indices))
++
++
++def kernel_sorted_emit() -> bool:
++    """True iff this process's persistent_topk emits canonical order.
++
++    Host-only (a tensor-free query op; no CUDA call), so it is safe inside a
++    capture. Latches once the C++ static is known; an uninitialised static
++    (no launch yet) answers False without latching.
++    """
++    global _kernel_sorted_emit_state
++    if _kernel_sorted_emit_state is not None:
++        return _kernel_sorted_emit_state
++    op = getattr(torch.ops._C, "persistent_topk_toggle_state", None)
++    if op is None:
++        _kernel_sorted_emit_state = False
++        return False
++    from vllm.v1.worker.e2_toggles import decode_topk_state
++
++    decoded = decode_topk_state(int(op()))
++    if isinstance(decoded, str) or "sorted_emit" not in decoded:
++        # Unknown layout, or layout 1 (no field 6): this build cannot sort.
++        _kernel_sorted_emit_state = False
++        return False
++    value = decoded["sorted_emit"]
++    if value == "uninit":
++        return False  # not latched: ask again after a launch
++    _kernel_sorted_emit_state = value == "1"
++    return _kernel_sorted_emit_state
++
++
++def _check_sorted_emission(block_indices: torch.Tensor) -> None:
++    """Debug only: device-side assert that the kernel's row is canonical."""
++    if not _SORTED_EMIT_CHECK:
++        return
++    torch._assert_async(
++        torch.eq(block_indices, _canonical(block_indices)).all(),
++        "MERLIN_TOPK_SORTED_EMIT: persistent_topk row is not in canonical order",
++    )
+ 
+ 
+ @triton.jit
+@@ -605,6 +672,11 @@ def _topk(
+         block_topk,
+         logits.shape[1],
+     )
++    # MERLIN_TOPK_SORTED_EMIT: the kernel already emitted the canonical order,
++    # so the Python sort would be a no-op -- skip it (optionally check it).
++    if not use_cooperative_topk and kernel_sorted_emit():
++        _check_sorted_emission(block_indices)
++        return
+     _qsa_canonicalise(block_indices)
+ 
+ 
+diff --git a/vllm/v1/worker/e2_toggles.py b/vllm/v1/worker/e2_toggles.py
+index 0ae7ad2afc..056a905413 100644
+--- a/vllm/v1/worker/e2_toggles.py
++++ b/vllm/v1/worker/e2_toggles.py
+@@ -12,13 +12,15 @@ producer at all. Every GPU worker therefore logs exactly one line::
+     e2-toggles[PP<p>_TP<t>]: pid=<pid> MERLIN_FULL_K=<raw> MERLIN_QSA_SORT=<raw>
+     MERLIN_TIE_DET=<raw> MERLIN_TIE_RECENT=<raw> MERLIN_TOPK_EXACT_MEDIUM=<raw>
+     MERLIN_TOPK_EXACT_DECODE=<raw> MERLIN_TOPK_DET_LARGE=<raw>
++    MERLIN_TOPK_SORTED_EMIT=<raw>
+     effective: full_k=<0|1> qsa_sort=<0|1|invalid> tie_det=<0|1> tie_recent=<0|1>
+     tie_recent_effective=<0|1> exact_medium=<0|1> exact_decode=<0|1>
+-    det_large=<0|1> source=<libc-getenv|os-environ>
++    det_large=<0|1> sorted_emit=<0|1> source=<libc-getenv|os-environ>
+     cpp-cache: <full_k=... tie_det=... tie_recent=... tie_recent_effective=...
+-    exact_medium=... exact_decode=... det_large=... source=cpp-cache
+-    | n-a reason=<why>>
+-    python: qsa_sort=<0|1|n-a> source=qsa_indexer._QSA_SORT
++    exact_medium=... exact_decode=... det_large=... sorted_emit=...
++    source=cpp-cache | n-a reason=<why>>
++    python: qsa_sort=<0|1|n-a> sorted_emit_skip=<0|1|n-a>
++    source=qsa_indexer._QSA_SORT
+     device: switch=<0|1|n-a> switch_large=<0|1|n-a> source=counter-slots-8-9
+ 
+ (one line in the log). ``<raw>`` is ``unset``, a plain token, or a double-quoted
+@@ -42,7 +44,11 @@ WHAT EACH SECTION IS
+   was first cut against (earlier v2.2 builds, not published) have none.
+ * ``python:`` -- ``qsa_indexer._QSA_SORT``, the module constant the QSA sort
+   actually branches on (looked up in ``sys.modules``, never imported here;
+-  ``n-a`` if the module was never loaded in this process).
++  ``n-a`` if the module was never loaded in this process), and
++  ``sorted_emit_skip`` -- ``qsa_indexer._kernel_sorted_emit_state``, i.e.
++  whether the Python sort is being SKIPPED because the kernel reported
++  MERLIN_TOPK_SORTED_EMIT through ``persistent_topk_toggle_state`` field 6
++  (``n-a`` until the first QSA top-k has run and latched it).
+ * ``device:`` -- counter slots [8]/[9], which the counter op fills from the
+   C++ ``exact_medium_enabled()`` / ``det_large_enabled()`` statics
+   (topk.cu persistent_topk_exact_counters).
+@@ -93,6 +99,7 @@ logger = init_logger(__name__)
+ #   MERLIN_TOPK_EXACT_MEDIUM csrc/libtorch_stable/topk.cu:68-74   (unset -> ON)
+ #   MERLIN_TOPK_EXACT_DECODE csrc/libtorch_stable/topk.cu:103-109
+ #   MERLIN_TOPK_DET_LARGE    csrc/libtorch_stable/topk.cu:86-92   (unset -> ON)
++#   MERLIN_TOPK_SORTED_EMIT  csrc/libtorch_stable/topk.cu sorted_emit_enabled
+ CXX_SWITCHES: tuple[tuple[str, str, bool], ...] = (
+     ("MERLIN_FULL_K", "full_k", False),
+     ("MERLIN_TIE_DET", "tie_det", False),
+@@ -100,6 +107,7 @@ CXX_SWITCHES: tuple[tuple[str, str, bool], ...] = (
+     ("MERLIN_TOPK_EXACT_MEDIUM", "exact_medium", True),
+     ("MERLIN_TOPK_EXACT_DECODE", "exact_decode", False),
+     ("MERLIN_TOPK_DET_LARGE", "det_large", True),
++    ("MERLIN_TOPK_SORTED_EMIT", "sorted_emit", False),
+ )
+ QSA_SORT_NAME = "MERLIN_QSA_SORT"
+ RAW_ORDER = (
+@@ -110,6 +118,7 @@ RAW_ORDER = (
+     "MERLIN_TOPK_EXACT_MEDIUM",
+     "MERLIN_TOPK_EXACT_DECODE",
+     "MERLIN_TOPK_DET_LARGE",
++    "MERLIN_TOPK_SORTED_EMIT",
+ )
+ EFFECTIVE_ORDER = (
+     "full_k",
+@@ -120,6 +129,7 @@ EFFECTIVE_ORDER = (
+     "exact_medium",
+     "exact_decode",
+     "det_large",
++    "sorted_emit",
+ )
+ CPP_ORDER = tuple(k for k in EFFECTIVE_ORDER if k != "qsa_sort")
+ 
+@@ -265,21 +275,29 @@ _TOPK_STATE_FIELDS = (
+     "exact_medium",
+     "exact_decode",
+     "det_large",
++    "sorted_emit",
+ )
++# Known layouts: version -> field count. Layout 2 is layout 1
++# plus field 6 (MERLIN_TOPK_SORTED_EMIT); fields 0-5 are unchanged.
++_TOPK_STATE_LAYOUTS = {1: 6, 2: 7}
+ 
+ 
+ def decode_topk_state(state: int) -> dict[str, str] | str:
+     """Unpack ``persistent_topk_toggle_state()``: 2 bits per field (0 off,
+-    1 on, 2 not initialised), field count at bits 48-55 (6), layout version at
+-    bits 56-62 (1). Any other layout is refused with a reason string."""
++    1 on, 2 not initialised), field count at bits 48-55, layout version at
++    bits 56-62 -- (1, 6) or (2, 7). Any other layout is refused with a reason
++    string. A layout-1 build has no sorted emission, reported as ``n-a``."""
+     version, count = (state >> 56) & 0x7F, (state >> 48) & 0xFF
+-    if version != 1 or count != len(_TOPK_STATE_FIELDS):
++    if _TOPK_STATE_LAYOUTS.get(version) != count:
+         return f"unknown-layout-v{version}-{count}-fields"
+     names = {0: "0", 1: "1", 2: "uninit"}
+-    return {
++    out = {
+         key: names.get((state >> (2 * i)) & 3, "invalid")
+-        for i, key in enumerate(_TOPK_STATE_FIELDS)
++        for i, key in enumerate(_TOPK_STATE_FIELDS[:count])
+     }
++    for key in _TOPK_STATE_FIELDS[count:]:
++        out[key] = "n-a"
++    return out
+ 
+ 
+ def decode_full_k_state(state: int) -> str:
+@@ -324,6 +342,17 @@ def qsa_sort_live() -> str:
+     return "1" if bool(module._QSA_SORT) else "0"
+ 
+ 
++def sorted_emit_skip_live() -> str:
++    """``qsa_indexer._kernel_sorted_emit_state``: 1 = the Python sort is being
++    skipped because the kernel reported sorted emission, 0 = not skipped,
++    ``n-a`` = not latched yet (or the module was never loaded)."""
++    module = sys.modules.get(_QSA_MODULE)
++    state = getattr(module, "_kernel_sorted_emit_state", None) if module else None
++    if state is None:
++        return "n-a"
++    return "1" if state else "0"
++
++
+ def device_switches() -> dict[str, str]:
+     """Counter slots [8]/[9] (switch / switch_large). One synchronizing read
+     (topk_counters.read refuses inside a capture), so it is only called from
+@@ -350,6 +379,7 @@ def toggles_line(
+     cpp: dict[str, str] | str,
+     qsa_live: str,
+     device: dict[str, str],
++    sorted_skip: str = "n-a",
+ ) -> str:
+     parts = [f"e2-toggles[{tag}]: pid={pid}"]
+     parts += [f"{name}={raw[name]}" for name in RAW_ORDER]
+@@ -362,7 +392,12 @@ def toggles_line(
+     else:
+         parts += [f"{key}={cpp[key]}" for key in CPP_ORDER]
+         parts.append("source=cpp-cache")
+-    parts += ["python:", f"qsa_sort={qsa_live}", "source=qsa_indexer._QSA_SORT"]
++    parts += [
++        "python:",
++        f"qsa_sort={qsa_live}",
++        f"sorted_emit_skip={sorted_skip}",
++        "source=qsa_indexer._QSA_SORT",
++    ]
+     parts.append("device:")
+     parts += [f"{key}={device[key]}" for key in ("switch", "switch_large")]
+     parts.append("source=counter-slots-8-9")
+@@ -402,6 +437,7 @@ def maybe_emit(
+     cpp_fn: Callable[[], dict[str, str] | str] = cpp_cache,
+     device_fn: Callable[[], dict[str, str]] = device_switches,
+     qsa_fn: Callable[[], str] = qsa_sort_live,
++    sorted_skip_fn: Callable[[], str] = sorted_emit_skip_live,
+ ) -> str:
+     """Emit the line at most once per process. One bool check when already
+     emitted or not yet armed, so it can sit at the head of every execute step.
+@@ -431,7 +467,15 @@ def maybe_emit(
+         cxx_getenv, env_source = getenv_fn()
+         raw, effective = environ_view(cxx_getenv, os.environ.get)
+         line = toggles_line(
+-            tag, os.getpid(), raw, effective, env_source, cpp, qsa_fn(), device_fn()
++            tag,
++            os.getpid(),
++            raw,
++            effective,
++            env_source,
++            cpp,
++            qsa_fn(),
++            device_fn(),
++            sorted_skip_fn(),
+         )
+         _emitted = True
+         logger.info("%s", line)

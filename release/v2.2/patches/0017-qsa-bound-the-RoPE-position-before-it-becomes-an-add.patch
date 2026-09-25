@@ -1,0 +1,441 @@
+From a4ea95dc5bd0d0fc31999b47f862a0fd7fd8e10f Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Tue, 22 Sep 2026 04:13:09 -0400
+Subject: [PATCH 17/58] qsa: bound the RoPE position before it becomes an
+ address
+
+---
+ .../gpu/test_qsa_rope_position_guard.py       | 301 ++++++++++++++++++
+ .../qwen4_exp/nvidia/ops/qsa_pre_indexer.py   |  76 +++++
+ 2 files changed, 377 insertions(+)
+ create mode 100644 tests/v1/worker/gpu/test_qsa_rope_position_guard.py
+
+diff --git a/tests/v1/worker/gpu/test_qsa_rope_position_guard.py b/tests/v1/worker/gpu/test_qsa_rope_position_guard.py
+new file mode 100644
+index 0000000000..9539aa7761
+--- /dev/null
++++ b/tests/v1/worker/gpu/test_qsa_rope_position_guard.py
+@@ -0,0 +1,301 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Bounds guard 9: the RoPE position must be bounded before it is an address.
++
++An earlier crash-replay harness drove the QSA pre-indexer
++over a re-claimed raw-key ring block and compute-sanitizer reported eleven
++`Invalid __global__ read of size 2 bytes` at `_norm_rope`, roughly 4.6e18 bytes
++out of range. The chain: the cross-chunk pooled group takes its RoPE position
++from the ring row itself (`qsa_pre_indexer.py:305-317`), the ring is excluded
++from zeroing, and `_norm_rope` turns that value straight into a row index into
++the cos/sin table. The masks in `_norm_rope` bound the rotary PAIR, never the
++row.
++
++Two tests, because they answer different questions:
++
++* the CPU one checks the PLUMBING -- that the bound handed to the kernel is the
++  cos/sin table's real row count. A guard with the wrong bound is worse than no
++  guard, and this is the failure mode a CPU suite can actually catch;
++* the GPU one is the POSITIVE CONTROL, and it is the crash-replay case verbatim: fill
++  a re-claimed ring row with bf16 filler, run the kernel, and require that it
++  survives AND that the counter says it masked something. Before this guard the
++  same input produced an illegal address.
++"""
++
++import inspect
++
++import pytest
++import torch
++
++from vllm.models.qwen4_exp.nvidia.ops import qsa_pre_indexer as qpi
++from vllm.v1.worker import guard_telemetry
++
++COMPRESS_RATIO = 4
++HEAD_DIM = 128
++N_HEADS = 4
++STATE_SIZE = 8          # ring capacity
++ROW_WIDTH = 140         # head dim + the int64 position triple in the tail
++MAX_MODEL_LEN = 4096
++NUM_BLOCKS = 8
++
++
++class _Recorder:
++    """Stands in for the Triton kernel and keeps the launch arguments."""
++
++    def __init__(self):
++        self.launches = []
++
++    def __getitem__(self, grid):
++        def launch(*args, **kwargs):
++            self.launches.append((grid, args, kwargs))
++
++        return launch
++
++
++def _inputs(device, num_tokens=4):
++    q = torch.randn(num_tokens, N_HEADS * HEAD_DIM, dtype=torch.bfloat16, device=device)
++    k = torch.randn(num_tokens, HEAD_DIM, dtype=torch.bfloat16, device=device)
++    positions = (
++        torch.arange(num_tokens, dtype=torch.int64, device=device)
++        .unsqueeze(0)
++        .expand(3, -1)
++        .contiguous()
++    )
++    cos_sin = torch.randn(
++        MAX_MODEL_LEN, HEAD_DIM // 2, dtype=torch.bfloat16, device=device
++    )
++    ones = torch.ones(HEAD_DIM, dtype=torch.bfloat16, device=device)
++    q_out = torch.empty(num_tokens, N_HEADS, HEAD_DIM, dtype=torch.bfloat16, device=device)
++    state_cache = torch.zeros(
++        NUM_BLOCKS, STATE_SIZE, 1, ROW_WIDTH, dtype=torch.bfloat16, device=device
++    )
++    state_slots = torch.arange(num_tokens, dtype=torch.int32, device=device)
++    state_table = torch.zeros(1, 1, dtype=torch.int32, device=device)
++    qsl = torch.tensor([0, num_tokens], dtype=torch.int32, device=device)
++    logical = torch.arange(num_tokens, dtype=torch.int32, device=device)
++    comp_cache = torch.zeros(
++        NUM_BLOCKS, 800, 1, HEAD_DIM, dtype=torch.bfloat16, device=device
++    )
++    comp_slots = torch.zeros(num_tokens, dtype=torch.int32, device=device)
++    kwb = torch.zeros(
++        max(num_tokens // COMPRESS_RATIO, 1), 2, dtype=torch.int32, device=device
++    )
++    return dict(
++        q=q, k=k, positions=positions, cos_sin_cache=cos_sin,
++        q_norm_weight=ones, k_norm_weight=ones, eps=1e-6, q_out=q_out,
++        state_cache=state_cache, state_slots=state_slots,
++        state_block_table=state_table, query_start_loc=qsl,
++        logical_positions=logical, compressed_cache=comp_cache,
++        compressed_slots=comp_slots, k_work_metadata=kwb,
++    )
++
++
++def test_launcher_passes_the_real_cos_sin_row_count(monkeypatch):
++    """The bound must be the table's row count, not a constant or a stride.
++
++    A bound that is too large lets the very reads this guard exists to stop
++    through; one that is too small makes the guard fire on correct metadata,
++    which is worse than not having it.
++    """
++    device = torch.device("cpu")
++    # grab the real signature BEFORE the kernel is replaced
++    sig = inspect.signature(qpi._qsa_pre_indexer_kernel.fn)
++    rec = _Recorder()
++    monkeypatch.setattr(qpi, "_qsa_pre_indexer_kernel", rec)
++    kw = _inputs(device)
++    qpi.qsa_pre_indexer(
++        kw.pop("q"), kw.pop("k"), kw.pop("positions"), kw.pop("cos_sin_cache"),
++        kw.pop("q_norm_weight"), kw.pop("k_norm_weight"), kw.pop("eps"),
++        kw.pop("q_out"), kw.pop("state_cache"), kw.pop("state_slots"),
++        kw.pop("state_block_table"), kw.pop("query_start_loc"),
++        kw.pop("logical_positions"), kw.pop("compressed_cache"),
++        kw.pop("compressed_slots"), kw.pop("k_work_metadata"),
++        compress_ratio=COMPRESS_RATIO, mrope_section=(11, 11, 10),
++        rope_pos_offset=HEAD_DIM,
++    )
++
++    assert len(rec.launches) == 1
++    _grid, args, kwargs = rec.launches[0]
++    # Triton launch options are not kernel parameters.
++    kwargs = {k: v for k, v in kwargs.items()
++              if k not in ("num_warps", "num_stages", "num_ctas", "grid")}
++    bound = sig.bind(*args, **kwargs)
++    bound.apply_defaults()
++    assert bound.arguments["cos_sin_rows"] == MAX_MODEL_LEN
++
++    # The rope guard gets its OWN site. A later revision threaded the
++    # pre-indexer's guard_ctr into _norm_rope, so SITE_QSA_ROPE_POS was declared, named
++    # and never written -- it would have read 0 for the life of every run and
++    # been reported as "the rope chain is clean", which is the exact misreading
++    # this series exists to prevent. An earlier version of this test asserted
++    # the wrong pointer and was green BECAUSE the wiring was wrong, so the
++    # assertion is inverted here on purpose: the two counters must DIFFER.
++    rope_ctr = bound.arguments["rope_guard_ctr"]
++    req_ctr = bound.arguments["guard_ctr"]
++    for ctr in (rope_ctr, req_ctr):
++        assert ctr.dtype == torch.int64 and ctr.numel() == 3
++    assert rope_ctr.data_ptr() == guard_telemetry.counter(
++        guard_telemetry.SITE_QSA_ROPE_POS, device
++    ).data_ptr()
++    assert req_ctr.data_ptr() == guard_telemetry.counter(
++        guard_telemetry.SITE_QSA_PRE_INDEXER, device
++    ).data_ptr()
++    assert rope_ctr.data_ptr() != req_ctr.data_ptr()
++
++
++def test_rope_site_aborts_the_stage_even_in_warn_mode():
++    """A clamped rope position is durable damage, not a local wrong answer.
++
++    On the pooled path the wrongly-rotated key is STORED into the compressed
++    cache, so every later step reads it and the ring row that produced it is
++    still there to do it again. warn is the right default for a guard whose
++    masked value dies with the step; it is the wrong default for this one.
++    """
++    assert (
++        guard_telemetry.SITE_QSA_ROPE_POS
++        in guard_telemetry._ALWAYS_FATAL_SITES
++    )
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
++def test_ring_filler_bytes_are_masked_and_counted():
++    """Positive control: the ring-residue crash case, verbatim.
++
++    A re-claimed ring row filled with bf16 0.25 decodes, at the int64 position
++    tail, to roughly 0x3E803E803E803E80. Before guard 9 that value reached
++    cos_sin_ptr + pos * stride and compute-sanitizer reported an invalid read
++    4.6e18 bytes out of range. After it, the launch must complete and the
++    counter must be non-zero.
++
++    A silent counter here means the guard is not on the path -- the same class
++    of failure as a positive control that does not fire, and the reason this
++    test asserts the count rather than only the survival.
++    """
++    device = torch.device("cuda", torch.cuda.current_device())
++    guard_telemetry.prealloc(device)
++    guard_telemetry.reset_for_test()
++
++    kw = _inputs(device)
++    # The victim's bytes: the whole row, tail included. Nothing zeroes the ring.
++    kw["state_cache"][0].fill_(0.25)
++
++    # Drive the CROSS-CHUNK read-back, and prove the drive rather than assume
++    # it. The pooled group reads its position from the ring only when its first
++    # token lies in the PREVIOUS chunk, and the kernel decides that with
++    # (qsa_pre_indexer.py:299-311):
++    #
++    #   chunk_end      = logical[query_end - 1]
++    #   chunk_start    = chunk_end - query_len + 1
++    #   first_boundary = ((chunk_start + CR) // CR) * CR - 1
++    #   first_position = first_boundary - (CR - 1)
++    #   first_in_chunk = first_position >= chunk_start
++    #
++    # A COMPRESS_RATIO-ALIGNED chunk start gives first_position == chunk_start,
++    # i.e. IN chunk, i.e. the ring is never read. An earlier run of this control
++    # with a start of 4 and counted 0, which said nothing about the guard. The
++    # start must be unaligned: 6 gives first_position 4 < chunk_start 6.
++    start = 6
++    assert start % COMPRESS_RATIO != 0, "an aligned chunk start never crosses"
++    kw["logical_positions"] = (
++        torch.arange(start, start + kw["logical_positions"].numel(),
++                     dtype=kw["logical_positions"].dtype, device=device)
++    )
++    chunk_end = start + kw["logical_positions"].numel() - 1
++    chunk_start = chunk_end - kw["logical_positions"].numel() + 1
++    first_boundary = ((chunk_start + COMPRESS_RATIO) // COMPRESS_RATIO) * COMPRESS_RATIO - 1
++    first_position = first_boundary - (COMPRESS_RATIO - 1)
++    assert first_position < chunk_start, (
++        f"first_position {first_position} >= chunk_start {chunk_start}: this "
++        f"input does NOT take the ring read-back, so a zero count below would "
++        f"be meaningless"
++    )
++    # ...and the row the reader picks must be one carrying the filler.
++    assert 0 <= (first_position % STATE_SIZE) < STATE_SIZE
++
++    kw["k_work_metadata"][:, 0] = 0
++    kw["k_work_metadata"][:, 1] = 0
++
++    qpi.qsa_pre_indexer(
++        kw["q"], kw["k"], kw["positions"], kw["cos_sin_cache"],
++        kw["q_norm_weight"], kw["k_norm_weight"], kw["eps"], kw["q_out"],
++        kw["state_cache"], kw["state_slots"], kw["state_block_table"],
++        kw["query_start_loc"], kw["logical_positions"], kw["compressed_cache"],
++        kw["compressed_slots"], kw["k_work_metadata"],
++        compress_ratio=COMPRESS_RATIO, mrope_section=(11, 11, 10),
++        rope_pos_offset=HEAD_DIM,
++    )
++    torch.cuda.synchronize()          # the pre-guard build faults here
++
++    ctr = guard_telemetry.counter(guard_telemetry.SITE_QSA_ROPE_POS, device)
++    n_masked = int(ctr[0].item())
++    assert n_masked > 0, (
++        "the rope-position guard did not fire on the ring filler-bytes case. "
++        "Either the guard is not on this path or the case no longer drives the "
++        "ring read-back -- check before reading any zero counter as clean."
++    )
++    worst = int(ctr[1].item()) - guard_telemetry.GUARD_BIAS
++    assert worst >= MAX_MODEL_LEN or worst < 0, (
++        f"guard fired but recorded an in-range position {worst}"
++    )
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
++@pytest.mark.parametrize("axis,axis_id", [("t", 0), ("h", 1), ("w", 2)])
++@pytest.mark.parametrize("sign", ["mixed", "negative_only"])
++def test_a_single_bad_axis_is_caught_and_named(axis, axis_id, sign):
++    """Any ONE of t/h/w is enough, and the record must name which.
++
++    Under the production mrope section (11, 11, 10) all three components are
++    live row indices -- the IS_MROPE branch masks COLUMNS per axis while the
++    row comes unmasked from pos_rows[axis] -- so a bad pos_w faults exactly as
++    a bad pos_t does. An earlier revision recorded pos_t unconditionally, which for this
++    case would have reported an in-range value next to a non-zero count and
++    sent the reader to the wrong axis.
++
++    The negative case also pins the filler: an all-negative offender must not
++    max to 0 and read back as position 0.
++    """
++    device = torch.device("cuda", torch.cuda.current_device())
++    guard_telemetry.prealloc(device)
++    guard_telemetry.reset_for_test()
++
++    kw = _inputs(device)
++    row = {"t": 0, "h": 1, "w": 2}[axis]
++    kw["positions"] = kw["positions"].clone()
++    if sign == "mixed":
++        kw["positions"][row, 0] = MAX_MODEL_LEN + 7  # out of range, positive
++        kw["positions"][row, 1] = -5                 # out of range, negative
++        expected_worst = MAX_MODEL_LEN + 7
++    else:
++        # NEGATIVE ONLY. Every offender below zero is the case
++        # the tl.where filler decides: with a 0 filler the max would be the
++        # filler itself and slot 1 would read back as position 0 -- an
++        # in-range-looking value next to a non-zero count, which is the negative-value defect
++        # wearing a different hat. -5 must survive to the record.
++        kw["positions"][row, 0] = -5
++        kw["positions"][row, 1] = -9
++        expected_worst = -5
++
++    from vllm.models.qwen4_exp.nvidia.ops.qsa_pre_indexer import qsa_pre_indexer
++
++    qsa_pre_indexer(
++        kw["q"], kw["k"], kw["positions"], kw["cos_sin_cache"],
++        kw["q_norm_weight"], kw["k_norm_weight"], kw["eps"], kw["q_out"],
++        kw["state_cache"], kw["state_slots"], kw["state_block_table"],
++        kw["query_start_loc"], kw["logical_positions"], kw["compressed_cache"],
++        kw["compressed_slots"], kw["k_work_metadata"],
++        compress_ratio=COMPRESS_RATIO, mrope_section=(11, 11, 10),
++        rope_pos_offset=HEAD_DIM,
++    )
++    torch.cuda.synchronize()
++
++    ctr = guard_telemetry.counter(guard_telemetry.SITE_QSA_ROPE_POS, device)
++    assert int(ctr[0].item()) > 0, f"a bad pos_{axis} was not caught"
++    worst = int(ctr[1].item()) - guard_telemetry.GUARD_BIAS
++    got_axis = int(ctr[2].item()) - guard_telemetry.GUARD_BIAS
++    assert worst == expected_worst, (
++        f"recorded {worst}, expected the offending value {expected_worst}"
++    )
++    assert got_axis == axis_id, (
++        f"recorded axis {got_axis}, expected {axis_id} (pos_{axis})"
++    )
+diff --git a/vllm/models/qwen4_exp/nvidia/ops/qsa_pre_indexer.py b/vllm/models/qwen4_exp/nvidia/ops/qsa_pre_indexer.py
+index f682ee90c8..b9a57d5fed 100644
+--- a/vllm/models/qwen4_exp/nvidia/ops/qsa_pre_indexer.py
++++ b/vllm/models/qwen4_exp/nvidia/ops/qsa_pre_indexer.py
+@@ -23,6 +23,8 @@ def _norm_rope(
+     pos_w,
+     cos_sin_ptr,
+     cos_sin_stride,
++    cos_sin_rows,  # bounds-guard instrumentation
++    guard_ctr,  # bounds-guard persistent int64[3], SITE_QSA_ROPE_POS
+     norm_weight_ptr,
+     eps,
+     IS_MROPE: tl.constexpr,
+@@ -30,6 +32,72 @@ def _norm_rope(
+     MROPE_W: tl.constexpr,
+ ):
+     """Apply Gemma RMSNorm and selected-axis NeoX RoPE to register rows."""
++    # Bounds-guard instrumentation (ring-residue crash replay): the position is a
++    # ROW INDEX into the cos/sin table and nothing bounds it. The masks below
++    # bound which rotary PAIR is read, never which row, so
++    # `cos_sin_ptr + pos * cos_sin_stride` is an address formed from an
++    # unchecked value.
++    #
++    # On the pooled cross-chunk path that value is read straight out of a
++    # raw-key RING row (:305-317). The ring is excluded from zeroing
++    # (single_type_kv_cache_manager.py:96-101), so a re-claimed block keeps the
++    # previous occupant's bytes -- and nothing ties the row the reader selects
++    # (`first_position % STATE_SIZE`) to a row any occupant ever committed, so
++    # it can be allocator residue rather than a position at all. A crash replay drove
++    # exactly this and compute-sanitizer reported 11 invalid reads at
++    # +4.6e18 bytes, the filler bytes decoded as an int64.
++    #
++    # This is the ONLY guard in the series that covers that chain: the request guard
++    # bounds the pre-indexer's `request`, which sits upstream of the ring read
++    # and cannot see a bad position.
++    # WHICH AXIS. Under the production mrope section (11, 11, 10)
++    # all three components are live row indices: the IS_MROPE branch masks
++    # COLUMNS per axis while the row comes unmasked from pos_rows[axis], so a
++    # bad pos_h or pos_w faults exactly as a bad pos_t does. Recording pos_t
++    # unconditionally would name the wrong axis and, for a t-clean/h-bad case,
++    # record an in-range value next to a non-zero count.
++    #
++    # The filler under tl.where must be strongly negative, NOT 0: an offender
++    # that is entirely negative (i_t == -1 is the shape that started this
++    # series) would otherwise max to 0 and read back as position 0 -- the
++    # defect re-entering at the one site with a reproduced fault.
++    _FILL: tl.constexpr = -(1 << 62)
++    bad_t = (pos_t < 0) | (pos_t >= cos_sin_rows)
++    if IS_MROPE:
++        bad_h = (pos_h < 0) | (pos_h >= cos_sin_rows)
++        bad_w = (pos_w < 0) | (pos_w >= cos_sin_rows)
++    else:
++        # the non-mrope branch reads only pos_t (:63-66), and with NO mask at
++        # all, which is why this guard clamps rather than masks.
++        # always-false, but correctly shaped and typed for the max below.
++        bad_h = pos_h < pos_h
++        bad_w = pos_w < pos_w
++    guard_bad = bad_t | bad_h | bad_w
++    guard_n = tl.sum(guard_bad.to(tl.int32), axis=0)
++    if guard_n > 0:
++        worst_t = tl.max(tl.where(bad_t, pos_t, _FILL), axis=0).to(tl.int64)
++        worst_h = tl.max(tl.where(bad_h, pos_h, _FILL), axis=0).to(tl.int64)
++        worst_w = tl.max(tl.where(bad_w, pos_w, _FILL), axis=0).to(tl.int64)
++        worst = tl.maximum(worst_t, tl.maximum(worst_h, worst_w))
++        # slot 2 names the axis: 0 = t, 1 = h, 2 = w. Derived from the MASKS
++        # (deliberately), not by comparing the winner's VALUE against each
++        # axis's max. Value comparison mis-attributes whenever two axes share
++        # the worst value -- which is the common case here, because pos_h and
++        # pos_w are frequently equal to pos_t (the non-2D path sets them so,
++        # and a stale ring tail writes the same int64 into all three). Asking
++        # "did this axis have any offender at all", in t/h/w order, cannot.
++        any_t = tl.max(bad_t.to(tl.int32), axis=0) > 0
++        any_h = tl.max(bad_h.to(tl.int32), axis=0) > 0
++        axis = tl.where(any_t, 0, tl.where(any_h, 1, 2))
++        tl.atomic_add(guard_ctr, guard_n.to(tl.int64))
++        tl.atomic_max(guard_ctr + 1, worst + _GUARD_BIAS)
++        tl.atomic_max(guard_ctr + 2, axis.to(tl.int64) + _GUARD_BIAS)
++    # Clamp rather than skip: the rotation is then wrong for these rows, which
++    # is what a masked fault IS. The counter is the result, not the output.
++    pos_t = tl.minimum(tl.maximum(pos_t, 0), cos_sin_rows - 1)
++    pos_h = tl.minimum(tl.maximum(pos_h, 0), cos_sin_rows - 1)
++    pos_w = tl.minimum(tl.maximum(pos_w, 0), cos_sin_rows - 1)
++
+     TILE_T: tl.constexpr = x.shape[0]
+     TILE_H: tl.constexpr = x.shape[1]
+     D: tl.constexpr = x.shape[2]
+@@ -106,6 +174,8 @@ def _qsa_pre_indexer_kernel(
+     pos_stride_axis,
+     pos_stride_token,
+     cos_sin_ptr,
++    cos_sin_rows,  # bounds-guard instrumentation
++    rope_guard_ctr,  # bounds-guard persistent int64[3], SITE_QSA_ROPE_POS
+     q_norm_weight_ptr,
+     k_norm_weight_ptr,
+     eps,
+@@ -189,6 +259,8 @@ def _qsa_pre_indexer_kernel(
+             pos_w,
+             cos_sin_ptr,
+             D // 2,
++            cos_sin_rows,
++            rope_guard_ctr,
+             q_norm_weight_ptr,
+             eps,
+             IS_2D_POSITIONS,
+@@ -348,6 +420,8 @@ def _qsa_pre_indexer_kernel(
+                 pos_w + tl.arange(0, 1),
+                 cos_sin_ptr,
+                 D // 2,
++                cos_sin_rows,
++                rope_guard_ctr,
+                 k_norm_weight_ptr,
+                 eps,
+                 IS_K_MROPE,
+@@ -488,6 +562,8 @@ def qsa_pre_indexer(
+         pos_stride_axis,
+         pos_stride_token,
+         cos_sin_cache,
++        cos_sin_cache.shape[0],
++        guard_telemetry.counter(guard_telemetry.SITE_QSA_ROPE_POS, q.device),
+         q_norm_weight,
+         k_norm_weight,
+         eps,

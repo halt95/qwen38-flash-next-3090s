@@ -1,0 +1,1170 @@
+From ed617e26ecf9d6c45e084409ec0a7a61d748c534 Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Tue, 22 Sep 2026 04:17:29 -0400
+Subject: [PATCH 22/58] topk: exact restart of the medium path on
+ candidate-buffer overflow
+
+When the persistent top-k medium-path candidate buffer overflows, the row is
+restarted exactly instead of being truncated. Capture-safe counters with atomic
+publication and a coherent snapshot record every restart.
+---
+ csrc/libtorch_stable/ops.h               |   4 +
+ csrc/libtorch_stable/persistent_topk.cuh | 461 ++++++++++++++++++++++-
+ csrc/libtorch_stable/topk.cu             | 272 +++++++++++++
+ csrc/libtorch_stable/torch_bindings.cpp  |   6 +
+ tests/kernels/test_top_k_per_row.py      | 263 +++++++++++++
+ 5 files changed, 989 insertions(+), 17 deletions(-)
+
+diff --git a/csrc/libtorch_stable/ops.h b/csrc/libtorch_stable/ops.h
+index e19f49d603..ea81216b65 100644
+--- a/csrc/libtorch_stable/ops.h
++++ b/csrc/libtorch_stable/ops.h
+@@ -474,6 +474,10 @@ void persistent_topk(const torch::stable::Tensor& logits,
+                      torch::stable::Tensor& workspace, int64_t k,
+                      int64_t max_seq_len);
+ 
++// Medium-path exact-restart counters; see topk.cu for the slot layout.
++void persistent_topk_exact_counters(torch::stable::Tensor& out, int64_t reset,
++                                    int64_t sync);
++
+ #ifdef VLLM_ENABLE_COOPERATIVE_TOPK
+ void cooperative_topk(const torch::stable::Tensor& logits,
+                       const torch::stable::Tensor& lengths,
+diff --git a/csrc/libtorch_stable/persistent_topk.cuh b/csrc/libtorch_stable/persistent_topk.cuh
+index 9ae0fd4bcb..8bfb4b9429 100644
+--- a/csrc/libtorch_stable/persistent_topk.cuh
++++ b/csrc/libtorch_stable/persistent_topk.cuh
+@@ -27,7 +27,9 @@ constexpr int RADIX = 256;
+ // which would inflate the kernel's smem footprint and kill occupancy
+ // for the decode/trivial paths).
+ constexpr size_t kMediumHistBytes = 2 * (RADIX + 128) * sizeof(int);  // 3072
+-constexpr size_t kMediumScalarsBytes = 5 * sizeof(int);               // 20
++// 6 scalars, not 5: the medium-path exact restart adds a per-row "overflow already counted" flag.
++// kMediumHeaderSize rounds to 128 B either way, so kSmemMedium is unchanged.
++constexpr size_t kMediumScalarsBytes = 6 * sizeof(int);               // 24
+ constexpr size_t kMediumHeaderSize =
+     (kMediumHistBytes + kMediumScalarsBytes + 127) & ~size_t(127);  // 3200
+ constexpr int MAX_BUFFERED_ITEMS = 4096;
+@@ -138,6 +140,13 @@ struct PersistentTopKParams {
+   uint32_t chunk_size;      // large path: elements per CTA
+   uint32_t ctas_per_group;  // 1=medium, >1=large
+   uint32_t max_seq_len;     // max seq_len across all rows (for early CTA exit)
++  // Medium-path exact top-k restart.  `exact_medium` is the
++  // MERLIN_TOPK_EXACT_MEDIUM switch, resolved once on the host so it is a
++  // launch constant and is baked into a cudagraph at capture.  `exact_counters`
++  // is a process-lifetime device buffer of kNumTopKExactCounters uint32s, or
++  // nullptr; the kernel only ever atomicAdds into it, never reads back.
++  bool exact_medium;
++  unsigned int* exact_counters;
+ };
+ 
+ // ============================================================================
+@@ -411,6 +420,348 @@ __device__ __noinline__ void histogram_2048_topk(
+   }
+ }
+ 
++// ============================================================================
++// Medium-path exact top-k restart
++//
++// The medium path buffers the coarse threshold bin's candidates into a fixed
++// 4,096-slot shared buffer and increments the NEXT-LEVEL histogram *inside*
++// the capacity guard, so a candidate dropped on overflow is invisible to
++// refinement in both the buffer and the histogram.  At 51,481 prompt tokens
++// (~12.9K candidate blocks) that makes the returned set non-exact on 88 % of
++// the rows that overflow, and which candidates survive is decided by atomicAdd
++// arrival order.
++//
++// The repair is the mechanism of vLLM PR #52149 with a different emission
++// rule: detect the overflow, then throw away everything the buffered path did
++// and re-select from scratch (`prefix = 0`, `remaining = TopK`) with a
++// full-row radix rescan.  Because the restart starts from an empty prefix and
++// an undebited `remaining`, the coarse pass's winners are re-counted rather
++// than double-counted -- the "coarse handoff" defect of an earlier revision
++// cannot occur by construction.
++//
++// Where we diverge from #52149: its rescan emits by raw `atomicAdd` arrival
++// order in both the `> pivot` and `== pivot` phases, which is set-exact but
++// order- and tie-membership-nondeterministic.  Sparse attention sums the
++// selected keys in output order, so that would re-introduce exactly the
++// nondeterminism MERLIN_QSA_SORT / MERLIN_TIE_DET / MERLIN_TIE_RECENT exist
++// to remove.  Ours emits in **ascending index order** via a block scan (no
++// atomics anywhere on the placement path) and cuts ties at the k-th value by
++// **most-recent wins** (the highest element indices are kept), matching the
++// rule measured on the reference host (+3.4 % tokens/step at 12K over
++// oldest-wins).
++// ============================================================================
++
++// Abort the kernel when the exact fallback cannot complete, instead of
++// returning a truncated row.  Compile-time so it costs nothing when off; the
++// counters below record the fault either way, so a build with the trap off is
++// still never silently wrong.
++#ifndef MERLIN_TOPK_EXACT_TRAP
++  #define MERLIN_TOPK_EXACT_TRAP 1
++#endif
++
++// Device-global counters.  Plain device atomics on a process-lifetime buffer:
++// no host sync and no host-visible allocation on the launch path, so this is
++// safe to record inside a cudagraph capture and on every replay.  Read from
++// Python with `torch.ops._C.persistent_topk_exact_counters`.
++enum TopKExactCounter : int {
++  kCtrMediumRows = 0,           // denominator: medium-path rows entered
++  kCtrMediumOverflow = 1,       // rows where a 4,096-slot guard would drop
++  kCtrMediumExactFallback = 2,  // rows that took the exact restart
++  kCtrMediumExactFault = 3,     // exact restart could not complete
++  kNumTopKExactCounters = 4,
++};
++
++// Exact, bounded-memory re-selection for a single medium-path row.
++//
++// `scores` is already offset to the row.  Every radix round rescans the whole
++// row, so correctness does not depend on how many values share a coarse bin.
++// Entered only after an overflow has been detected, which is 0.1-0.2 % of
++// medium rows at 38K-51K prompt tokens.
++template <int TopK>
++__device__ __noinline__ void medium_exact_restart(
++    const float* __restrict__ scores, int32_t* __restrict__ output,
++    uint32_t length, unsigned int* __restrict__ counters) {
++  static_assert(kThreadsPerBlock >= RADIX,
++                "the single-thread bin walk assumes RADIX <= blockDim.x");
++
++  using BlockScan = cub::BlockScan<uint32_t, kThreadsPerBlock>;
++
++  struct ExactSmem {
++    uint32_t histogram[RADIX];
++    typename BlockScan::TempStorage scan;
++    uint32_t prefix;      // ordered-uint radix prefix, grows 8 bits per round
++    uint32_t remaining;   // how many of the pivot-equal group must be kept
++    uint32_t tie_total;   // how many elements have key == pivot in total
++    uint32_t tie_cut;     // lowest element index kept among the pivot-equal
++    uint32_t fault;       // set by the walks; block-wide, read after a barrier
++  };
++
++  // The medium path's dynamic smem window is kSmemMedium (35,968 B) and the
++  // buffered state in it is dead the moment we restart, so we overlay it.
++  // Declared with an explicit alignment rather than inheriting the `char`
++  // array's alignment of 1 -- cub::BlockScan::TempStorage needs more.
++  extern __shared__ __align__(16) char medium_exact_smem[];
++  static_assert(alignof(ExactSmem) <= 16, "ExactSmem over-aligned for smem");
++  static_assert(sizeof(ExactSmem) <= kSmemMedium,
++                "exact restart does not fit the medium smem window");
++
++  auto* smem = reinterpret_cast<ExactSmem*>(medium_exact_smem);
++  const uint32_t tx = threadIdx.x;
++
++  if (tx == 0) {
++    smem->prefix = 0;
++    smem->remaining = static_cast<uint32_t>(TopK);
++    smem->tie_total = 0;
++    smem->tie_cut = 0;
++    // The index-space tie walk below is two 8-bit rounds, so it resolves
++    // indices below 65,536.  The medium path serves seq_len <= 32,768, but
++    // fail loudly rather than silently mis-cut if that ever changes.
++    smem->fault = (length > 65536u || length < static_cast<uint32_t>(TopK))
++                      ? 1u
++                      : 0u;
++  }
++  __syncthreads();
++
++  // ---- four 8-bit radix rounds over the full row -------------------------
++#pragma unroll
++  for (uint32_t round = 0; round < 4; ++round) {
++    // An entry fault (bad length) previously still paid four
++    // full-row rescans before anyone looked at the flag.  Block-uniform --
++    // the flag is only ever written before a barrier that precedes this read.
++    if (smem->fault != 0u) break;
++    for (uint32_t bin = tx; bin < RADIX; bin += kThreadsPerBlock) {
++      smem->histogram[bin] = 0;
++    }
++    __syncthreads();
++
++    // Table, not `~0u << (32 - round * 8)`: the round-0 form of that
++    // expression is a 32-bit shift of a 32-bit type, which is undefined even
++    // though the ternary never selects it at runtime, and the loop is fully
++    // unrolled so the compiler does constant-fold the dead branch.
++    constexpr uint32_t kPrefixMask[4] = {0u, 0xFF000000u, 0xFFFF0000u,
++                                         0xFFFFFF00u};
++    const uint32_t shift = 24u - round * 8u;
++    const uint32_t prefix_mask = kPrefixMask[round];
++    const uint32_t prefix = smem->prefix;
++
++    for (uint32_t idx = tx; idx < length; idx += kThreadsPerBlock) {
++      const uint32_t ordered = convert_to_uint32_v2(scores[idx]);
++      if ((ordered & prefix_mask) == prefix) {
++        atomicAdd(&smem->histogram[(ordered >> shift) & 0xFFu], 1u);
++      }
++    }
++    __syncthreads();
++
++    // Single-threaded descending walk.  #52149's wide-radix variant does this
++    // cooperatively and reads `remaining` in every thread before one thread
++    // writes it back with no barrier in between (a lost update on a
++    // non-atomic shared `|=`); one thread owning both the read and the write
++    // removes that class of bug rather than adding the missing barrier.
++    if (tx == 0) {
++      const uint32_t remaining = smem->remaining;
++      uint32_t count_above = 0;
++      bool found = false;
++      for (int bin = RADIX - 1; bin >= 0; --bin) {
++        const uint32_t count = smem->histogram[bin];
++        if (count_above + count >= remaining) {
++          smem->remaining = remaining - count_above;
++          smem->prefix |= static_cast<uint32_t>(bin) << shift;
++          if (round == 3) smem->tie_total = count;
++          found = true;
++          break;
++        }
++        count_above += count;
++      }
++      // No crossing bin means the entry invariant (length >= TopK) is broken.
++      if (!found) atomicOr(&smem->fault, 1u);
++    }
++    __syncthreads();
++  }
++
++  const uint32_t pivot = smem->prefix;
++  const uint32_t equal_count = smem->remaining;
++  const uint32_t tie_total = smem->tie_total;
++
++  // `> pivot` holds exactly TopK - equal_count elements, so the selection is
++  // TopK elements exactly.  equal_count <= tie_total is an invariant of the
++  // walk (count >= remaining - count_above at the crossing bin).
++  if (tx == 0 && (equal_count == 0u || equal_count > tie_total)) {
++    atomicOr(&smem->fault, 1u);
++  }
++  __syncthreads();
++
++  // Note: a fault raised before emission short-circuits ALL
++  // selection work -- no tie walk, no scan, no candidate index ever written
++  // -- so the row goes straight to the -1 fill below.  Previously the scan
++  // ran and could write candidates that the fill then overwrote: correct in
++  // the end, but wasted work on the fault path and harder to debug.  The
++  // condition is block-uniform (shared, read after the barrier above).
++  if (smem->fault == 0u) {
++    // ---- tie cut at the k-th value: most-recent wins --------------------
++    //
++    // Keep the `equal_count` HIGHEST element indices among the pivot-equal
++    // group.  Finding the cut index turns the tie rule into a per-element
++    // predicate, which is what lets the emission below be atomic-free.
++    //
++    // Exact 32-bit ties at the cutoff are rare (19 occurrences across
++    // 12 requests, one element each), so the common case is tie_total ==
++    // equal_count and the whole group is kept with no extra pass.
++    if (tie_total > equal_count) {
++      uint32_t need = equal_count;
++      uint32_t high_byte = 0;
++
++      // Round A: bucket the pivot-equal indices by their high byte.
++      for (uint32_t bin = tx; bin < RADIX; bin += kThreadsPerBlock) {
++        smem->histogram[bin] = 0;
++      }
++      __syncthreads();
++      for (uint32_t idx = tx; idx < length; idx += kThreadsPerBlock) {
++        if (convert_to_uint32_v2(scores[idx]) == pivot) {
++          atomicAdd(&smem->histogram[(idx >> 8) & 0xFFu], 1u);
++        }
++      }
++      __syncthreads();
++      if (tx == 0) {
++        uint32_t count_above = 0;
++        bool found = false;
++        for (int bin = RADIX - 1; bin >= 0; --bin) {
++          const uint32_t count = smem->histogram[bin];
++          if (count_above + count >= need) {
++            smem->tie_cut = static_cast<uint32_t>(bin);  // high byte, for now
++            smem->remaining = need - count_above;        // carried into round B
++            found = true;
++            break;
++          }
++          count_above += count;
++        }
++        if (!found) atomicOr(&smem->fault, 1u);
++      }
++      __syncthreads();
++      high_byte = smem->tie_cut;
++      need = smem->remaining;
++
++      // Round B: within that bucket, bucket by the low byte.  Each (high, low)
++      // pair names one index, so every count here is 0 or 1 and the walk lands
++      // exactly on the need-th largest index.
++      for (uint32_t bin = tx; bin < RADIX; bin += kThreadsPerBlock) {
++        smem->histogram[bin] = 0;
++      }
++      __syncthreads();
++      for (uint32_t idx = tx; idx < length; idx += kThreadsPerBlock) {
++        if (((idx >> 8) & 0xFFu) == high_byte &&
++            convert_to_uint32_v2(scores[idx]) == pivot) {
++          atomicAdd(&smem->histogram[idx & 0xFFu], 1u);
++        }
++      }
++      __syncthreads();
++      if (tx == 0) {
++        uint32_t count_above = 0;
++        bool found = false;
++        for (int bin = RADIX - 1; bin >= 0; --bin) {
++          const uint32_t count = smem->histogram[bin];
++          if (count_above + count >= need) {
++            smem->tie_cut = (high_byte << 8) | static_cast<uint32_t>(bin);
++            found = true;
++            break;
++          }
++          count_above += count;
++        }
++        if (!found) atomicOr(&smem->fault, 1u);
++      }
++      __syncthreads();
++    }
++  }
++
++  // Re-test AFTER the tie walks.  The guard above was
++  // entered before them, so a fault raised at their bin-walk failure sites
++  // used to fall straight through into emission.  No barrier is needed
++  // between the two tests: the tie walks write the flag from tx == 0 and
++  // each is followed by a barrier inside the block above.
++  if (smem->fault == 0u) {
++    const uint32_t tie_cut = smem->tie_cut;
++
++    // ---- emission: ascending index order, no atomics ---------------------
++    //
++    // selected(i) = ordered(i) > pivot || (ordered(i) == pivot && i >= tie_cut)
++    //
++    // is a pure function of the element, so the output slot is a prefix sum
++    // over the row rather than an arrival rank.  Tiles run in ascending base
++    // and within a tile thread `tx` owns `base + tx`, so output[] comes out
++    // strictly ascending in index -- bit-reproducible run to run, and a no-op
++    // for the Python-side MERLIN_QSA_SORT rather than something it corrects.
++    uint32_t base_rank = 0;
++    const uint32_t tiles =
++        (length + kThreadsPerBlock - 1u) / kThreadsPerBlock * kThreadsPerBlock;
++    for (uint32_t base = 0; base < tiles; base += kThreadsPerBlock) {
++      const uint32_t idx = base + tx;
++      uint32_t flag = 0;
++      if (idx < length) {
++        const uint32_t ordered = convert_to_uint32_v2(scores[idx]);
++        flag =
++            (ordered > pivot || (ordered == pivot && idx >= tie_cut)) ? 1u : 0u;
++      }
++      uint32_t rank = 0;
++      uint32_t total = 0;
++      BlockScan(smem->scan).ExclusiveSum(flag, rank, total);
++      if (flag != 0u) {
++        const uint32_t pos = base_rank + rank;
++        // Bounded on both emission phases -- #52149 bounds
++        // `collect_pivot_matches` but not its fused `> pivot` write, so an
++        // invariant break there becomes an out-of-bounds store rather than a
++        // detected fault.
++        if (pos < static_cast<uint32_t>(TopK)) {
++          output[pos] = static_cast<int32_t>(idx);
++        } else {
++          // This is the one fault site with concurrent
++          // writers.  Equal stored values do not make a data race a
++          // protocol, so make it an atomic.  The tx==0 sites below and
++          // above are single-writer and separated by barriers, but they use
++          // the same primitive so the flag has one access discipline.
++          atomicOr(&smem->fault, 1u);
++        }
++      }
++      base_rank += total;
++      __syncthreads();  // BlockScan TempStorage is reused next tile
++    }
++
++    if (tx == 0 && base_rank != static_cast<uint32_t>(TopK)) {
++      atomicOr(&smem->fault, 1u);
++    }
++  }
++  __syncthreads();
++
++  // Consume the decision into a register and barrier again
++  // BEFORE anyone can leave.  The persistent kernel reuses this same dynamic
++  // shared-memory window for the next row -- the large-row loader writes into
++  // it before its first barrier -- so a fast warp returning here while a slow
++  // warp still had to read the shared flag would let the next row's writes
++  // decide this row's fault branch.  "Read after a barrier" is uniform only
++  // until the storage is reused; this closes that window.  After the second
++  // barrier every thread already holds its copy, so no later write can
++  // change any thread's decision, and the branch below is register-uniform.
++  const uint32_t row_fault = smem->fault;
++  __syncthreads();
++
++  // ---- fail loud ---------------------------------------------------------
++  if (row_fault != 0u) {
++    if (tx == 0 && counters != nullptr) {
++      atomicAdd(&counters[kCtrMediumExactFault], 1u);
++    }
++    // -1 is the kernel's own padding value and the consumer rejects it
++    // (`valid = ... & (token >= 0)`), so a faulted row attends nothing and is
++    // visible downstream instead of quietly attending the wrong blocks.
++    for (uint32_t i = tx; i < static_cast<uint32_t>(TopK);
++         i += kThreadsPerBlock) {
++      output[i] = -1;
++    }
++    __threadfence();
++    __syncthreads();
++#if MERLIN_TOPK_EXACT_TRAP
++    __trap();
++#endif
++  }
++}
++
+ // ============================================================================
+ // Medium path: coarse FP16 histogram + 4-pass FP32 radix refinement
+ // For sequences 8K < seq_len <= 64K.
+@@ -424,7 +775,10 @@ __device__ __noinline__ void histogram_2048_topk(
+ template <int TopK>
+ __device__ __noinline__ void histogram_256_topk(
+     const float* __restrict__ logits, int* __restrict__ output_indices,
+-    int logits_offset, int seq_len) {
++    int logits_offset, int seq_len, bool exact_medium,
++    unsigned int* __restrict__ counters) {
++  // No default arguments on purpose: a new call site must state whether it
++  // wants the exact path, rather than silently inheriting the broken one.
+   // All shared state lives in dynamic shared memory to avoid static
+   extern __shared__ char medium_smem[];
+ 
+@@ -435,6 +789,9 @@ __device__ __noinline__ void histogram_256_topk(
+   int& shared_threshold_bin = medium_scalars[1];
+   int* shared_buffered_count = &medium_scalars[2];
+   int& shared_final_k = medium_scalars[4];
++  // One extra scalar so an overflowing row is counted once, not once per
++  // refinement pass.  kMediumScalarsBytes covers it (see the constant).
++  int& shared_overflow_counted = medium_scalars[5];
+   int (*buffered_indices)[MAX_BUFFERED_ITEMS] =
+       reinterpret_cast<int (*)[MAX_BUFFERED_ITEMS]>(medium_smem +
+                                                     kMediumHeaderSize);
+@@ -442,6 +799,11 @@ __device__ __noinline__ void histogram_256_topk(
+   const int thread_id = threadIdx.x;
+   int remaining_k = TopK;
+ 
++  if (thread_id == 0) {
++    shared_overflow_counted = 0;
++    if (counters != nullptr) atomicAdd(&counters[kCtrMediumRows], 1u);
++  }
++
+   if (thread_id < RADIX + 1) {
+     shared_histogram[0][thread_id] = 0;
+   }
+@@ -475,8 +837,25 @@ __device__ __noinline__ void histogram_256_topk(
+   if (thread_id < RADIX && shared_histogram[0][thread_id] > remaining_k &&
+       shared_histogram[0][thread_id + 1] <= remaining_k) {
+     shared_threshold_bin = thread_id;
+-    shared_buffered_count[0] = 0;
++    // Medium-path restart / guard site M1 (was `:512`).  shared_histogram[0] is in suffix-sum
++    // form here -- it is what the predicate just above tests -- so
++    // hist[t] - hist[t+1] is the EXACT population of the threshold bin, which
++    // is exactly what the collection loop below would buffer.  The prediction
++    // is precise, not conservative, so no row pays the exact path unnecessarily
++    // and no overflowing row escapes it.
++    const int threshold_bin_count =
++        shared_histogram[0][thread_id] - shared_histogram[0][thread_id + 1];
++    const bool will_overflow = threshold_bin_count > MAX_BUFFERED_ITEMS;
++    // Sentinel: the refinement loop's entry check reads this and cannot tell
++    // a predicted overflow from a measured one, so both take the same path.
++    shared_buffered_count[0] =
++        (will_overflow && exact_medium) ? MAX_BUFFERED_ITEMS + 1 : 0;
+     shared_output_count = 0;
++    // Flag only -- the counter is incremented past the early return below.
++    // When hist[t+1] == TopK exactly the coarse pass already resolves the row
++    // and the threshold bin is never collected, so a large bin population is
++    // NOT an overflow and must not be counted as one.
++    shared_overflow_counted = will_overflow ? 1 : 0;
+   }
+   __syncthreads();
+ 
+@@ -495,25 +874,51 @@ __device__ __noinline__ void histogram_256_topk(
+     return;
+   }
+ 
++  // Past the early return the threshold bin WILL be collected, so the M1
++  // prediction is now a real overflow event.
++  if (thread_id == 0 && shared_overflow_counted == 1 && counters != nullptr) {
++    atomicAdd(&counters[kCtrMediumOverflow], 1u);
++  }
++
+   __syncthreads();
+   if (thread_id < RADIX + 1) {
+     shared_histogram[0][thread_id] = 0;
+   }
+   __syncthreads();
+ 
+-  for (int idx = thread_id; idx < seq_len; idx += kThreadsPerBlock) {
+-    const float logit_value = logits[idx + logits_offset];
+-    const int bin = convert_to_uint8(logit_value);
+-    if (bin > threshold_bin) {
+-      const int output_pos = atomicAdd(&shared_output_count, 1);
+-      output_indices[output_pos] = idx;
+-    } else if (bin == threshold_bin) {
+-      const int buffer_pos = atomicAdd(&shared_buffered_count[0], 1);
+-      if (__builtin_expect(buffer_pos < MAX_BUFFERED_ITEMS, 1)) {
+-        buffered_indices[0][buffer_pos] = idx;
+-        const uint32_t fp32_bits = convert_to_uint32_v2(logit_value);
+-        const int next_bin = (fp32_bits >> 24) & 0xFF;
+-        atomicAdd(&shared_histogram[0][next_bin], 1);
++  // On a predicted overflow the collection pass is skipped whole --
++  // including its `bin > threshold_bin` emissions.  That matters: the exact
++  // restart rewrites the entire row from slot 0, so anything emitted here
++  // would be double-counted.  Skipping is also why the detector cannot ship
++  // without the restart -- on its own it would emit nothing, which is a
++  // fail-loud half, never a silently-truncated one.
++  //
++  // The entry predicate must be IMMUTABLE.  It used to read
++  // `shared_buffered_count[0]`, which the loop body then increments -- so with
++  // exact_medium = false (the control arm, where the count starts at 0 and a
++  // real overflow pushes it past capacity mid-loop) a late warp could evaluate
++  // the predicate after early warps had driven the count over 4096 and skip
++  // ALL of its elements, including above-threshold winners.  That made `=0` a
++  // new timing-dependent truncation rather than the v2.0.1 baseline.
++  // `shared_overflow_counted` is the M1 prediction, written once before the
++  // barrier above and never touched here; combined with the kernel parameter
++  // it is block-uniform and constant for the whole loop.
++  const bool skip_collection = exact_medium && (shared_overflow_counted == 1);
++  if (__builtin_expect(!skip_collection, 1)) {
++    for (int idx = thread_id; idx < seq_len; idx += kThreadsPerBlock) {
++      const float logit_value = logits[idx + logits_offset];
++      const int bin = convert_to_uint8(logit_value);
++      if (bin > threshold_bin) {
++        const int output_pos = atomicAdd(&shared_output_count, 1);
++        output_indices[output_pos] = idx;
++      } else if (bin == threshold_bin) {
++        const int buffer_pos = atomicAdd(&shared_buffered_count[0], 1);
++        if (__builtin_expect(buffer_pos < MAX_BUFFERED_ITEMS, 1)) {
++          buffered_indices[0][buffer_pos] = idx;
++          const uint32_t fp32_bits = convert_to_uint32_v2(logit_value);
++          const int next_bin = (fp32_bits >> 24) & 0xFF;
++          atomicAdd(&shared_histogram[0][next_bin], 1);
++        }
+       }
+     }
+   }
+@@ -524,6 +929,27 @@ __device__ __noinline__ void histogram_256_topk(
+     const int src_buffer = pass % 2;
+     const int dst_buffer = src_buffer ^ 1;
+     const int raw_buffered = shared_buffered_count[src_buffer];
++    // Medium-path restart / guard site M2 (was `:582`) and the M1 sentinel land here.  The
++    // append's atomicAdd sits OUTSIDE the capacity guard, so raw_buffered
++    // keeps counting past capacity and a post-hoc test is exact.  pass == 3
++    // emits through shared_final_k without buffering, so every buffer filled
++    // at passes 0-2 is read back here: there is no last-pass hole.
++    if (__builtin_expect(raw_buffered > MAX_BUFFERED_ITEMS, 0)) {
++      if (thread_id == 0 && shared_overflow_counted == 0) {
++        shared_overflow_counted = 1;
++        if (counters != nullptr) atomicAdd(&counters[kCtrMediumOverflow], 1u);
++      }
++      if (exact_medium) {
++        if (thread_id == 0 && counters != nullptr) {
++          atomicAdd(&counters[kCtrMediumExactFallback], 1u);
++        }
++        __syncthreads();  // no thread may clobber medium_smem before this
++        medium_exact_restart<TopK>(logits + logits_offset, output_indices,
++                                   static_cast<uint32_t>(seq_len), counters);
++        return;
++      }
++      __syncthreads();
++    }
+     const int num_buffered =
+         (raw_buffered < MAX_BUFFERED_ITEMS) ? raw_buffered : MAX_BUFFERED_ITEMS;
+ 
+@@ -940,7 +1366,8 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 2)
+         } else if (seq_len <= static_cast<uint32_t>(HIST2048_THRESHOLD)) {
+           histogram_2048_topk<TopK>(row_input, row_output, seq_len);
+         } else {
+-          histogram_256_topk<TopK>(row_input, row_output, 0, seq_len);
++          histogram_256_topk<TopK>(row_input, row_output, 0, seq_len,
++                                   params.exact_medium, params.exact_counters);
+         }
+       }
+       continue;
+diff --git a/csrc/libtorch_stable/topk.cu b/csrc/libtorch_stable/topk.cu
+index b3e1a8623f..3419344d32 100644
+--- a/csrc/libtorch_stable/topk.cu
++++ b/csrc/libtorch_stable/topk.cu
+@@ -3,6 +3,9 @@
+ 
+ #include <cuda_runtime.h>
+ #include <algorithm>
++#include <atomic>
++#include <cstdlib>
++#include <mutex>
+ 
+ #include "ops.h"
+ #include "torch_utils.h"
+@@ -14,6 +17,140 @@
+ namespace {
+ 
+ #ifndef USE_ROCM
++
++// ---------------------------------------------------------------------------
++// MERLIN_TOPK_EXACT_MEDIUM switch and its counters.
++//
++// The switch is resolved ONCE per process, not per launch, so it is a launch
++// constant: a cudagraph captures the value that was live at capture time and
++// every replay agrees with it.  Default ON in this release; set
++// MERLIN_TOPK_EXACT_MEDIUM=0 for the A/B control arm, which restores v2.0.1
++// behaviour exactly (the counters still record, so the control arm reports the
++// overflow incidence it is the control for).
++// ---------------------------------------------------------------------------
++bool exact_medium_enabled() {
++  static const bool enabled = [] {
++    const char* raw = std::getenv("MERLIN_TOPK_EXACT_MEDIUM");
++    return (raw == nullptr || raw[0] == '\0') ? true : (std::atoi(raw) != 0);
++  }();
++  return enabled;
++}
++
++// Process-lifetime device counters, one block per device.  The kernel only
++// ever atomicAdds into them, so the launch path needs no host sync and the
++// values accumulate across cudagraph replays.
++//
++// Allocation, however, is NOT capture-safe: cudaMalloc during stream capture
++// is at best not captured and at worst invalidates the capture.  So:
++//   - the allocation only ever happens on a call that is explicitly allowed to
++//     allocate, which is a non-capturing launch or the reader op;
++//   - a call made *during* capture never allocates and never latches a result,
++//     so a capture that happens to be first does not permanently poison the
++//     instrument;
++//   - the launch path fails loudly if it is capturing with no counters, rather
++//     than baking a graph that runs the patched kernel with no instrument at
++//     all.  A silently uninstrumented graph is the failure this is here to
++//     prevent, so the check is deliberately not a warning.
++// Read (and, on the first call, allocate) with
++// torch.ops._C.persistent_topk_exact_counters, which is the explicit
++// pre-capture init path.
++constexpr int kMaxCounterDevices = 16;
++
++enum CounterState : int {
++  kCountersUninit = 0,
++  kCountersReady = 1,
++  kCountersFailed = 2,
++};
++
++// Atomics, not plain globals: the fast path reads these without the mutex, and
++// a second host thread may be publishing them from the slow path.  Release on
++// publish, acquire on read, and the pointer is always published BEFORE the
++// state that advertises it.
++std::atomic<unsigned int*> g_exact_counters[kMaxCounterDevices] = {};
++std::atomic<int> g_exact_counters_state[kMaxCounterDevices] = {};
++std::mutex g_exact_counters_mutex;
++
++// Lookup only.  Never allocates, never blocks, safe from any context.
++unsigned int* get_exact_counters(int device_index) {
++  if (device_index < 0 || device_index >= kMaxCounterDevices) return nullptr;
++  if (g_exact_counters_state[device_index].load(std::memory_order_acquire) !=
++      kCountersReady) {
++    return nullptr;
++  }
++  return g_exact_counters[device_index].load(std::memory_order_acquire);
++}
++
++// Allocate, zero, and publish.  MUST NOT be called on a capturing stream, and
++// should be called in a quiescent lifecycle phase: it allocates and blocks,
++// and neither is safe while any thread in the process is capturing a graph.
++// `stream_is_capturing` only proves the CALLING stream is idle of capture, so
++// the intended entry point is the reader op called explicitly before capture;
++// the non-capturing launch path calls this as a fallback.
++unsigned int* ensure_exact_counters(int device_index, cudaStream_t stream) {
++  if (device_index < 0 || device_index >= kMaxCounterDevices) return nullptr;
++
++  const int state =
++      g_exact_counters_state[device_index].load(std::memory_order_acquire);
++  if (state == kCountersReady) {
++    return g_exact_counters[device_index].load(std::memory_order_acquire);
++  }
++  // A previous attempt failed for real (OOM); do not retry on every launch.
++  // Only a call that was actually allowed to allocate can reach this state, so
++  // a capture-time call never latches it.
++  if (state == kCountersFailed) return nullptr;
++
++  std::lock_guard<std::mutex> lock(g_exact_counters_mutex);
++  // Re-check under the lock; another thread may have published meanwhile.
++  const int locked_state =
++      g_exact_counters_state[device_index].load(std::memory_order_relaxed);
++  if (locked_state != kCountersUninit) {
++    return (locked_state == kCountersReady)
++               ? g_exact_counters[device_index].load(std::memory_order_acquire)
++               : nullptr;
++  }
++
++  constexpr size_t bytes =
++      vllm::persistent::kNumTopKExactCounters * sizeof(unsigned int);
++  unsigned int* ptr = nullptr;
++  if (cudaMalloc(&ptr, bytes) == cudaSuccess && ptr != nullptr) {
++    // Host acquire/release orders the HOST state word; it says
++    // nothing about the device.  cudaMemset on device memory is asynchronous
++    // with respect to the host, so publishing Ready straight after it would
++    // let a first launch -- on this or any other stream -- increment counters
++    // that had not been zeroed yet, or read uninitialised bytes.  Zero on a
++    // known stream and WAIT for it, so initialisation is complete before the
++    // pointer becomes visible to any consumer.
++    if (cudaMemsetAsync(ptr, 0, bytes, stream) != cudaSuccess ||
++        cudaStreamSynchronize(stream) != cudaSuccess) {
++      cudaFree(ptr);
++      ptr = nullptr;
++    }
++  } else {
++    ptr = nullptr;
++  }
++  // A failed allocation leaves the error state set; clear it so the launch's
++  // own cudaGetLastError() gate does not report this as a kernel failure.
++  if (ptr == nullptr) cudaGetLastError();
++
++  g_exact_counters[device_index].store(ptr, std::memory_order_release);
++  g_exact_counters_state[device_index].store(
++      ptr != nullptr ? kCountersReady : kCountersFailed,
++      std::memory_order_release);
++  return ptr;
++}
++
++// True when the stream is mid-capture, in which case nothing on this path may
++// allocate.  A query failure is treated as "capturing": the conservative
++// direction is to refuse to allocate, not to risk invalidating a capture.
++bool stream_is_capturing(cudaStream_t stream) {
++  cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
++  if (cudaStreamIsCapturing(stream, &status) != cudaSuccess) {
++    cudaGetLastError();  // do not leak this into the launch's error gate
++    return true;
++  }
++  return status != cudaStreamCaptureStatusNone;
++}
++
+ template <int TopK>
+ void launch_persistent_topk(const torch::stable::Tensor& logits,
+                             const torch::stable::Tensor& lengths,
+@@ -202,6 +339,30 @@ void launch_persistent_topk(const torch::stable::Tensor& logits,
+         workspace.mutable_data_ptr<uint8_t>());
+     params.ctas_per_group = ctas_per_group;
+     params.max_seq_len = static_cast<uint32_t>(max_seq_len);
++    params.exact_medium = exact_medium_enabled();
++    // Allocate only off the capture path; in the ordinary engine lifecycle the
++    // eager warmup lands here first, long before capture.  The explicit,
++    // quiescent-phase entry point is the reader op.
++    const int device_index = static_cast<int>(logits.get_device_index());
++    params.exact_counters = stream_is_capturing(stream)
++                                ? get_exact_counters(device_index)
++                                : ensure_exact_counters(device_index, stream);
++    // Note: this check is UNCONDITIONAL -- eager as well as
++    // capturing, and in both arms.  Previously only a capturing launch was
++    // rejected, so an eager launch ran with nullptr and the reader then
++    // reported [0,0,0,0,1]: an unavailable instrument encoded as healthy zero
++    // counts, which is the exact failure the counters exist to prevent.
++    // MERLIN_TOPK_EXACT_MEDIUM=0 is NOT an escape: the control arm's whole job
++    // is to report the overflow incidence it is the control for, so it needs
++    // the counters just as much.
++    STD_TORCH_CHECK(
++        params.exact_counters != nullptr,
++        "persistent_topk: the medium-path exact-restart counters are unavailable on "
++        "device ", device_index,
++        " (not initialised before cudagraph capture, or the one-time "
++        "allocation failed). Call "
++        "torch.ops._C.persistent_topk_exact_counters(out, 0, 1) once per "
++        "device in a quiescent phase before capture.");
+ 
+   #define LAUNCH_PERSISTENT(TOPK_VAL, VS)                                     \
+     do {                                                                      \
+@@ -278,3 +439,114 @@ void persistent_topk(const torch::stable::Tensor& logits,
+   STD_TORCH_CHECK(false, "persistent_topk is not supported on ROCm");
+ #endif
+ }
++
++// Read (and, on first call, allocate) the medium-path exact-restart
++// counters.  This is also the explicit pre-capture init path: call it once per
++// device before any cudagraph capture.
++//
++// `out` is an int32 CUDA tensor with at least 5 elements:
++//   [0] medium-path rows entered           (denominator)
++//   [1] rows where a 4,096-slot guard would drop a candidate
++//   [2] rows that took the exact restart   (0 in the control arm)
++//   [3] exact restarts that could not complete (must stay 0)
++//   [4] 1 if MERLIN_TOPK_EXACT_MEDIUM is on, else 0
++//
++// COHERENCY -- stated precisely, because the earlier wording overclaimed.
++// With `sync == 0` the snapshot is ordered ONLY against work already enqueued
++// on the current stream; a kernel running on another stream can land
++// increments it misses.  With `sync != 0` the call synchronizes the device
++// before the copy AND again after the copy/reset have been issued, so on
++// return every increment submitted before the call is included and any reset
++// has COMPLETED.  That is still conditional on the CALLER HOLDING EXCLUSIVE
++// SUBMISSION OWNERSHIP: nothing stops another thread enqueueing work after the
++// leading synchronize, and no claim of unconditional global coherence is made
++// here.  A stronger contract would need an event every later producer waits
++// on; this op deliberately implements the simpler half and says so.
++//
++// `reset != 0` REQUIRES `sync != 0`.  Reset between measurements, never during
++// one.
++//
++// Must not be called during cudagraph capture (it allocates, synchronizes and
++// issues a host-to-device copy).  It IS the explicit, quiescent-phase
++// initialization path: call it once per device before any capture.
++void persistent_topk_exact_counters(torch::stable::Tensor& out, int64_t reset,
++                                    int64_t sync) {
++#ifndef USE_ROCM
++  STD_TORCH_CHECK(out.is_cuda(), "out must be a CUDA tensor");
++  STD_TORCH_CHECK(out.scalar_type() == torch::headeronly::ScalarType::Int,
++                  "out must be int32");
++  // Element count alone is not enough.  A CUDA scalar expanded
++  // to five elements (stride 0) satisfies numel but owns one element's
++  // storage, and the five consecutive raw int32 writes below would run past
++  // it; an ordinary strided view would receive the values in the wrong slots.
++  // Require a contiguous 1-D buffer before taking the pointer.
++  STD_TORCH_CHECK(out.dim() == 1, "out must be 1-D");
++  STD_TORCH_CHECK(out.is_contiguous(),
++                  "out must be contiguous (expanded or strided views would be "
++                  "written out of bounds or into the wrong elements)");
++  STD_TORCH_CHECK(out.numel() >= vllm::persistent::kNumTopKExactCounters + 1,
++                  "out must hold at least ",
++                  vllm::persistent::kNumTopKExactCounters + 1, " elements");
++  STD_TORCH_CHECK(
++      reset == 0 || sync != 0,
++      "persistent_topk_exact_counters: reset requires sync != 0, otherwise the "
++      "zeroing races in-flight kernel atomics and silently drops events");
++
++  const torch::stable::accelerator::DeviceGuard device_guard(
++      out.get_device_index());
++  const cudaStream_t stream = get_current_cuda_stream();
++  STD_TORCH_CHECK(!stream_is_capturing(stream),
++                  "persistent_topk_exact_counters must not be called during "
++                  "cudagraph capture");
++  constexpr size_t bytes =
++      vllm::persistent::kNumTopKExactCounters * sizeof(unsigned int);
++
++  int32_t* dst = out.mutable_data_ptr<int32_t>();
++  unsigned int* src =
++      ensure_exact_counters(static_cast<int>(out.get_device_index()), stream);
++
++  // An unavailable buffer used to be reported as four zeros
++  // plus "enabled", i.e. an instrument failure indistinguishable from "no
++  // medium work and no faults".  Fail instead.
++  STD_TORCH_CHECK(src != nullptr,
++                  "persistent_topk_exact_counters: the counter buffer could "
++                  "not be allocated on this device; the instrument is "
++                  "unavailable and its absence must not read as zero counts");
++
++  if (sync != 0) {
++    // Everything that could still be adding to the block must have retired
++    // before the snapshot (and before a reset) for the numbers to mean
++    // anything across streams.
++    STD_TORCH_CHECK(cudaDeviceSynchronize() == cudaSuccess,
++                    "exact counter synchronize failed");
++  }
++
++  STD_TORCH_CHECK(
++      cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice, stream) ==
++          cudaSuccess,
++      "exact counter read failed");
++  if (reset != 0) {
++    STD_TORCH_CHECK(cudaMemsetAsync(src, 0, bytes, stream) == cudaSuccess,
++                    "exact counter reset failed");
++  }
++
++  // Static storage: the source of an async H2D copy must outlive the copy.
++  static const int32_t enabled = exact_medium_enabled() ? 1 : 0;
++  STD_TORCH_CHECK(
++      cudaMemcpyAsync(dst + vllm::persistent::kNumTopKExactCounters, &enabled,
++                      sizeof(int32_t), cudaMemcpyHostToDevice,
++                      stream) == cudaSuccess,
++      "exact counter flag write failed");
++
++  if (sync != 0) {
++    // The leading synchronize alone left the copy and the reset
++    // merely ENQUEUED, so the caller could return and immediately race the
++    // outstanding reset from another stream.  Complete the handoff before
++    // returning.
++    STD_TORCH_CHECK(cudaDeviceSynchronize() == cudaSuccess,
++                    "exact counter completion synchronize failed");
++  }
++#else
++  STD_TORCH_CHECK(false, "persistent_topk is not supported on ROCm");
++#endif
++}
+diff --git a/csrc/libtorch_stable/torch_bindings.cpp b/csrc/libtorch_stable/torch_bindings.cpp
+index 54548dfd05..44c5f95f8e 100644
+--- a/csrc/libtorch_stable/torch_bindings.cpp
++++ b/csrc/libtorch_stable/torch_bindings.cpp
+@@ -587,6 +587,10 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
+       "persistent_topk(Tensor logits, Tensor lengths, Tensor! output, "
+       "Tensor workspace, int k, int max_seq_len) -> ()");
+ 
++  // Read (and optionally reset) the medium-path exact-restart counters.
++  ops.def(
++      "persistent_topk_exact_counters(Tensor! out, int reset, int sync) -> ()");
++
+ #ifdef VLLM_ENABLE_COOPERATIVE_TOPK
+   ops.def(
+       "cooperative_topk(Tensor logits, Tensor lengths, Tensor! output, "
+@@ -860,6 +864,8 @@ STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
+   ops.impl("top_k_per_row_prefill", TORCH_BOX(&top_k_per_row_prefill));
+   ops.impl("top_k_per_row_decode", TORCH_BOX(&top_k_per_row_decode));
+   ops.impl("persistent_topk", TORCH_BOX(&persistent_topk));
++  ops.impl("persistent_topk_exact_counters",
++           TORCH_BOX(&persistent_topk_exact_counters));
+ #ifdef VLLM_ENABLE_COOPERATIVE_TOPK
+   ops.impl("cooperative_topk", TORCH_BOX(&cooperative_topk));
+ #endif
+diff --git a/tests/kernels/test_top_k_per_row.py b/tests/kernels/test_top_k_per_row.py
+index 591362020e..70332b81b0 100644
+--- a/tests/kernels/test_top_k_per_row.py
++++ b/tests/kernels/test_top_k_per_row.py
+@@ -1827,3 +1827,266 @@ def test_sparse_indexer_topk_backend_resolution() -> None:
+     if not is_sm100:
+         with pytest.raises(RuntimeError, match="SM100a/SM103a"):
+             resolve("deep_select")
++
++
++# ---------------------------------------------------------------------------
++# Medium-path candidate-buffer overflow, exact restart
++#
++# The medium path (8192 < seq_len <= 32768 compressed columns) buffers the
++# coarse threshold bin's candidates into a 4,096-slot shared buffer and
++# increments the next-level histogram inside the capacity guard, so a dropped
++# candidate is invisible to refinement.  A narrow logit distribution collapses
++# far more than 4,096 values into one coarse bin and the returned set stops
++# being a top-k.
++#
++# These tests assert three things, and the third is the one upstream's own
++# regression (vLLM PR #52149) cannot see, because it sorts before comparing:
++#   1. the selected values are exactly torch.topk's,
++#   2. the instrument fired (overflow detected, exact restart taken, no fault)
++#      -- without this a pass proves nothing about the patched path,
++#   3. two runs return bit-identical index tensors, in ascending index order.
++# ---------------------------------------------------------------------------
++
++_EXACT_COUNTER_SLOTS = 5
++
++
++def _read_exact_counters() -> list[int] | None:
++    """Cumulative [rows, overflow, fallbacks, faults, enabled], or None."""
++    op = getattr(torch.ops._C, "persistent_topk_exact_counters", None)
++    if op is None:
++        return None
++    out = torch.zeros(_EXACT_COUNTER_SLOTS, dtype=torch.int32, device="cuda")
++    # sync=1: the counters are device-global but the snapshot is issued on one
++    # stream, so without a device synchronize it can miss increments from work
++    # still in flight elsewhere. The tests compare before/after deltas, so a
++    # stream-ordered read would be a source of flakes, not just imprecision.
++    op(out, 0, 1)
++    return out.cpu().tolist()
++
++
++def _run_medium_overflow_row(
++    num_rows: int, seq_len: int, top_k: int, seed: int
++) -> tuple[torch.Tensor, torch.Tensor]:
++    set_random_seed(seed)
++    # The all-overflow distribution from vLLM issue #51782 / PR #52149: every
++    # value lands in one coarse FP16 bin, so the threshold bin's population is
++    # the whole row and the 4,096-slot buffer cannot hold it.
++    logits = 1.0 + torch.rand(
++        (num_rows, seq_len), dtype=torch.float32, device="cuda"
++    ) * 0.01
++    lengths = torch.full((num_rows,), seq_len, dtype=torch.int32, device="cuda")
++    indices = torch.empty((num_rows, top_k), dtype=torch.int32, device="cuda")
++    _run_topk_backend("persistent_topk", logits, lengths, indices, top_k, seq_len)
++    torch.accelerator.synchronize()
++    return logits, indices
++
++
++@pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
++@pytest.mark.parametrize("top_k", [512, 2048])
++@pytest.mark.parametrize("seq_len", [12288, 32768])
++@torch.inference_mode()
++def test_persistent_topk_medium_overflow_is_exact(top_k: int, seq_len: int) -> None:
++    """> 4,096 candidates in one coarse bin must still return a true top-k."""
++    torch.set_default_device("cuda:0")
++    num_rows = 8  # <= 32 keeps the dispatch on persistent_topk
++
++    before = _read_exact_counters()
++    if before is None:
++        pytest.skip(
++            "QUALIFICATION FAILURE if seen on the branch build: this build has "
++            "no persistent_topk_exact_counters op, so the exact path cannot be "
++            "shown to have run. A skip here does not count as a pass."
++        )
++    if before[4] == 0:
++        pytest.skip(
++            "MERLIN_TOPK_EXACT_MEDIUM=0: control arm. Exactness is not claimed "
++            "here, but a qualification run must also execute the arm with the "
++            "switch on."
++        )
++
++    logits, indices = _run_medium_overflow_row(num_rows, seq_len, top_k, seed=0)
++    after = _read_exact_counters()
++
++    # The instrument must discriminate: a green assertion below is meaningless
++    # unless the overflow actually happened and the exact path actually ran.
++    # EXACT deltas, not lower bounds -- ">= num_rows" would hide duplicate
++    # counting (the per-pass double-count this branch specifically fixes) and
++    # contamination from other CUDA work on the device.
++    assert after[0] - before[0] == num_rows, (
++        f"expected exactly {num_rows} medium rows, saw {after[0] - before[0]}"
++    )
++    assert after[1] - before[1] == num_rows, (
++        f"expected exactly {num_rows} overflow events, saw {after[1] - before[1]}"
++    )
++    assert after[2] - before[2] == num_rows, (
++        f"expected exactly {num_rows} exact fallbacks, saw "
++        f"{after[2] - before[2]}"
++    )
++    assert after[3] == before[3], "the exact fallback reported a fault"
++
++    for row in range(num_rows):
++        reference = torch.topk(logits[row], top_k)
++        got = indices[row].to(torch.int64)
++
++        # Values must match exactly -- not approximately.
++        got_vals = logits[row][got].sort(descending=True).values
++        assert torch.equal(got_vals, reference.values.sort(descending=True).values), (
++            f"row {row}: selected values are not the top-{top_k}"
++        )
++
++        # With float32 samples an exact tie at the cutoff is vanishingly
++        # unlikely; assert set equality only when the boundary is unambiguous,
++        # so the test never passes by accident on a tie.
++        boundary = torch.topk(logits[row], top_k + 1).values
++        if boundary[top_k - 1] != boundary[top_k]:
++            assert set(got.cpu().tolist()) == set(reference.indices.cpu().tolist()), (
++                f"row {row}: selected index set differs from torch.topk"
++            )
++
++        assert len(set(got.cpu().tolist())) == top_k, f"row {row}: duplicate indices"
++
++
++@pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
++@torch.inference_mode()
++def test_persistent_topk_medium_overflow_is_bit_reproducible() -> None:
++    """Two identical launches must return byte-identical index tensors.
++
++    The exact restart emits by a block-scan rank over ascending element index,
++    never by atomicAdd arrival, so the output is reproducible AND sorted.
++    Upstream's rescan is set-exact but arrival-ordered, and sparse attention
++    sums the selected keys in output order -- so order alone forks the hidden
++    state.  This is the assertion that separates the two implementations.
++    """
++    torch.set_default_device("cuda:0")
++    num_rows, seq_len, top_k = 8, 12288, 512
++
++    counters = _read_exact_counters()
++    if counters is None:
++        pytest.skip(
++            "QUALIFICATION FAILURE if seen on the branch build: this build has "
++            "no persistent_topk_exact_counters op, so the exact path cannot be "
++            "shown to have run. A skip here does not count as a pass."
++        )
++    if counters[4] == 0:
++        pytest.skip(
++            "MERLIN_TOPK_EXACT_MEDIUM=0: control arm. Emission order is not "
++            "claimed here; a qualification run must also execute the arm with "
++            "the switch on."
++        )
++
++    _, first = _run_medium_overflow_row(num_rows, seq_len, top_k, seed=0)
++    first = first.clone()
++    _, second = _run_medium_overflow_row(num_rows, seq_len, top_k, seed=0)
++
++    assert torch.equal(first, second), (
++        "two identical launches returned different index tensors"
++    )
++
++    # Ascending index order is the property that makes the Python-side
++    # MERLIN_QSA_SORT a no-op on these rows rather than a correction.
++    diffs = first[:, 1:].to(torch.int64) - first[:, :-1].to(torch.int64)
++    assert bool((diffs > 0).all()), "exact-path output is not ascending in index"
++
++
++@pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
++@torch.inference_mode()
++def test_persistent_topk_medium_overflow_tie_keeps_highest_indices() -> None:
++    """Most-recent-wins at the cutoff, with an analytically known answer.
++
++    Random float32 values essentially never tie at the k-th place, so the
++    exactness tests above never exercise the tie rule at all -- they pass
++    whichever direction it cuts. Here every element of the row carries the
++    SAME value, so:
++
++      * the coarse threshold bin holds the whole row (> 4,096) -> overflow,
++      * `#{key > pivot}` is 0 and the entire selection is the tie group,
++      * `tie_total` (seq_len) far exceeds `equal_count` (top_k), so both
++        index-radix tie rounds actually run,
++      * the cut spans several high-byte index buckets and lands mid-bucket.
++
++    Under most-recent-wins the answer is forced: the top_k HIGHEST indices,
++    emitted ascending. `torch.topk` cannot supply this expectation -- with all
++    values equal its index choice is arbitrary -- so the reference is computed
++    from the rule itself.
++    """
++    torch.set_default_device("cuda:0")
++    num_rows, seq_len, width, top_k = 4, 12345, 12352, 2048
++
++    before = _read_exact_counters()
++    if before is None:
++        pytest.skip(
++            "QUALIFICATION FAILURE if seen on the branch build: no "
++            "persistent_topk_exact_counters op. A skip is not a pass."
++        )
++    if before[4] == 0:
++        pytest.skip(
++            "MERLIN_TOPK_EXACT_MEDIUM=0: control arm, the tie rule is not "
++            "claimed here."
++        )
++
++    logits = torch.full((num_rows, width), 1.5, dtype=torch.float32, device="cuda")
++    lengths = torch.full((num_rows,), seq_len, dtype=torch.int32, device="cuda")
++    indices = torch.empty((num_rows, top_k), dtype=torch.int32, device="cuda")
++    _run_topk_backend("persistent_topk", logits, lengths, indices, top_k, seq_len)
++    torch.accelerator.synchronize()
++
++    after = _read_exact_counters()
++    assert after[1] - before[1] == num_rows, "the row did not overflow as designed"
++    assert after[2] - before[2] == num_rows, "the exact restart did not run"
++    assert after[3] == before[3], "the exact fallback reported a fault"
++
++    # The cut must genuinely exercise both tie rounds, or the test is weaker
++    # than it looks: several high-byte buckets, and not on a bucket boundary.
++    cut = seq_len - top_k
++    assert (cut >> 8) != ((seq_len - 1) >> 8), "tie cut spans only one bucket"
++    assert cut % 256 != 0, "tie cut sits on a bucket boundary"
++
++    expected = torch.arange(cut, seq_len, dtype=torch.int32, device="cuda")
++    for row in range(num_rows):
++        assert torch.equal(indices[row], expected), (
++            f"row {row}: most-recent-wins should select indices "
++            f"[{cut}, {seq_len}) in ascending order; got "
++            f"{indices[row][:4].tolist()}..{indices[row][-4:].tolist()}"
++        )
++
++
++@pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
++@torch.inference_mode()
++def test_persistent_topk_exact_counters_rejects_unsafe_output() -> None:
++    """The counter op writes five raw int32s; it must refuse unusable layouts.
++
++    A CUDA scalar expanded to five elements satisfies a numel check while
++    owning one element of storage, and a strided view would receive the values
++    in the wrong slots. Both must be rejected before the raw pointer is taken.
++    `reset` without `sync` must also be rejected: zeroing while kernels are in
++    flight drops their atomics silently.
++    """
++    torch.set_default_device("cuda:0")
++    op = getattr(torch.ops._C, "persistent_topk_exact_counters", None)
++    if op is None:
++        pytest.skip(
++            "QUALIFICATION FAILURE if seen on the branch build: no "
++            "persistent_topk_exact_counters op. A skip is not a pass."
++        )
++
++    ok = torch.zeros(_EXACT_COUNTER_SLOTS, dtype=torch.int32, device="cuda")
++    op(ok, 0, 1)  # the control: this layout must be accepted
++
++    expanded = torch.zeros(1, dtype=torch.int32, device="cuda").expand(
++        _EXACT_COUNTER_SLOTS
++    )
++    with pytest.raises(Exception):
++        op(expanded, 0, 1)
++
++    strided = torch.zeros(2 * _EXACT_COUNTER_SLOTS, dtype=torch.int32, device="cuda")[
++        ::2
++    ]
++    with pytest.raises(Exception):
++        op(strided, 0, 1)
++
++    too_small = torch.zeros(_EXACT_COUNTER_SLOTS - 1, dtype=torch.int32, device="cuda")
++    with pytest.raises(Exception):
++        op(too_small, 0, 1)
++
++    with pytest.raises(Exception):
++        op(ok, 1, 0)  # reset without sync is not a complete handoff

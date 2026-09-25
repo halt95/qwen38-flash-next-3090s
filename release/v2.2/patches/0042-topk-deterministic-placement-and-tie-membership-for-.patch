@@ -1,0 +1,785 @@
+From 11c3d84e73992ab4ebea1eaf0003c71e2e973c41 Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Wed, 23 Sep 2026 08:31:18 -0400
+Subject: [PATCH 42/58] topk: deterministic placement and tie membership for
+ the large-path radix_topk
+
+Above RADIX_THRESHOLD a row is split across a group of CTAs. The pivot was
+already order-independent; cross-CTA placement, intra-CTA placement and tie
+membership were arrival-order races. They are now deterministic behind
+MERLIN_TOPK_DET_LARGE (default on).
+---
+ csrc/libtorch_stable/persistent_topk.cuh | 326 ++++++++++++++++++++++-
+ csrc/libtorch_stable/topk.cu             |  68 ++++-
+ tests/kernels/test_top_k_per_row.py      | 238 ++++++++++++++++-
+ 3 files changed, 617 insertions(+), 15 deletions(-)
+
+diff --git a/csrc/libtorch_stable/persistent_topk.cuh b/csrc/libtorch_stable/persistent_topk.cuh
+index c5d27d90a9..8dd3f7a36d 100644
+--- a/csrc/libtorch_stable/persistent_topk.cuh
++++ b/csrc/libtorch_stable/persistent_topk.cuh
+@@ -147,6 +147,11 @@ struct PersistentTopKParams {
+   // nullptr; the kernel only ever atomicAdds into it, never reads back.
+   bool exact_medium;
+   unsigned int* exact_counters;
++  // MERLIN_TOPK_DET_LARGE, ANDed on the host with the capacity gate
++  // 2 * ctas_per_group <= RADIX (the per-CTA counts are staged in one 256-slot
++  // RadixRowState histogram row).  Resolved once per process, so it is a
++  // launch constant and a cudagraph captures one value.
++  bool det_large;
+ };
+ 
+ // ============================================================================
+@@ -468,7 +473,16 @@ enum TopKExactCounter : int {
+   kCtrMediumOverflow = 1,       // rows where a 4,096-slot guard would drop
+   kCtrMediumExactFallback = 2,  // rows that took the exact restart
+   kCtrMediumExactFault = 3,     // exact restart could not complete
+-  kNumTopKExactCounters = 4,
++  // Large path (multi-CTA radix_topk, seq_len > RADIX_THRESHOLD).
++  // Slots 4-7 are only ever touched by the deterministic emission, so they
++  // stay 0 in the MERLIN_TOPK_DET_LARGE=0 control arm: `[9] == 1 && [4] == 0`
++  // while large rows are known to have run means the host-side capacity gate
++  // (2 * ctas_per_group <= RADIX) turned the switch off for that launch.
++  kCtrLargeDetRows = 4,       // large rows emitted deterministically
++  kCtrLargeTiesCut = 5,       // rows where the pivot-equal group was cut
++  kCtrLargeTiesDropped = 6,   // pivot-equal elements discarded by those cuts
++  kCtrLargeFault = 7,         // large-path invariant violation
++  kNumTopKExactCounters = 8,
+ };
+ 
+ // Exact, bounded-memory re-selection for a single medium-path row.
+@@ -1074,6 +1088,300 @@ __device__ __forceinline__ void wait_ge(int* ptr, int target_val,
+ // coordinated radix select via global-memory histograms and barriers.
+ // ============================================================================
+ 
++// ============================================================================
++// Deterministic placement and tie membership for the large path
++//
++// `radix_topk`'s pivot is already an exact, order-independent function of the
++// row: every quantity feeding it is an integer histogram add and a
++// single-threaded descending bin walk.  Three things after the
++// pivot are not:
++//
++//   (a) cross-CTA placement   — a CTA's base offset into `row_output` is its
++//       arrival order at `state->output_counter`;
++//   (b) intra-CTA placement   — a slot inside that base is arrival order at a
++//       shared counter;
++//   (c) cross-CTA tie membership — which pivot-equal elements survive the
++//       `pos < TopK` cut is a race across CTAs.
++//
++// (a) and (b) change only the permutation of the selected list, but sparse
++// attention consumes that list as an ordered gather, so a permutation forks
++// the hidden state.  (c) changes the set.  All three are replaced here by a
++// rank derived from (cta_in_group, element index):
++//
++//   * each CTA counts its own `> pivot` and `== pivot` elements out of the
++//     chunk already resident in shared memory (no new global reads);
++//   * the counts are published into `RadixRowState::histogram[radix_iter % 3]`
++//     — the slot round 3 has just finished reading — so the workspace
++//     contract is unchanged;
++//   * every CTA reads all 2*ctas_per_group counts and derives its own base by
++//     an exclusive prefix over `cta_in_group`, in one fixed order, so all
++//     CTAs agree without further communication;
++//   * the tie cut keeps the HIGHEST global indices (most-recent-wins, the
++//     `MERLIN_TIE_RECENT` policy, measured at +3.4 % tokens/step
++//     over oldest-wins).  Chunks are handed out in ascending index order
++//     (`my_chunk_start = cta_in_group * chunk_size`), so "the highest
++//     `equal_needed` pivot-equal indices" is exactly "walk CTAs from the top
++//     down", which the per-CTA equal counts already answer;
++//   * emission is a prefix sum over ascending element index — no atomic
++//     anywhere on the placement path — so the row is strictly ascending in
++//     index and bit-reproducible.
++//
++// Cost per row: one extra inter-CTA barrier, two extra ballots and one
++// 32-lane shuffle scan per 1,024-element tile, 2 global stores and
++// 2*ctas_per_group global loads.  No second pass over the row in global
++// memory: the pivot-equal count that the tie cut needs is produced by the same
++// shared-memory pass v2.0.1 already runs to count `> pivot`.
++// ============================================================================
++template <int TopK>
++__device__ __noinline__ void radix_emit_deterministic(
++    int32_t* __restrict__ row_output, uint32_t ordered_pivot,
++    uint32_t equal_needed, uint32_t my_chunk_start, uint32_t actual_chunk_size,
++    uint32_t* local_histogram, uint32_t* suffix_sum, uint32_t* shared_ordered,
++    RadixRowState* state, uint32_t cta_in_group, uint32_t ctas_per_group,
++    int& barrier_phase, uint32_t radix_iter, uint32_t tx,
++    unsigned int* counters) {
++  constexpr uint32_t kWarpsPerBlock = kThreadsPerBlock / 32u;
++  // Staging for the published per-CTA counts.  The host gates the switch on
++  // 2 * ctas_per_group <= RADIX, so these two halves never collide.
++  constexpr uint32_t kEqStage = RADIX / 2u;
++
++  // ---- per-CTA counts, out of the resident chunk -------------------------
++  if (tx < 2u) suffix_sum[tx] = 0u;
++  __syncthreads();
++
++  uint32_t my_gt = 0u;
++  uint32_t my_eq = 0u;
++  for (uint32_t i = tx; i < actual_chunk_size; i += kThreadsPerBlock) {
++    const uint32_t ord = shared_ordered[i];
++    if (ord > ordered_pivot) {
++      my_gt++;
++    } else if (ord == ordered_pivot) {
++      my_eq++;
++    }
++  }
++#pragma unroll
++  for (int off = 16; off > 0; off >>= 1) {
++    my_gt += __shfl_down_sync(0xffffffffu, my_gt, off);
++    my_eq += __shfl_down_sync(0xffffffffu, my_eq, off);
++  }
++  if ((tx & 31u) == 0u) {
++    // Integer counts: the atomic's arrival order cannot change the sum, so
++    // this is a reduction, not a placement.
++    if (my_gt > 0u) atomicAdd(&suffix_sum[0], my_gt);
++    if (my_eq > 0u) atomicAdd(&suffix_sum[1], my_eq);
++  }
++  __syncthreads();
++  const uint32_t local_gt = suffix_sum[0];
++  const uint32_t local_eq = suffix_sum[1];
++
++  // ---- barrier X1: the histogram slot is free ----------------------------
++  // Round 3's `current_hist` is state->histogram[(radix_iter*4+3) % 3], i.e.
++  // histogram[radix_iter % 3] (4r+3 == r mod 3).  Every CTA copies it into
++  // shared memory AFTER round 3's own barrier and there is no inter-CTA
++  // barrier between that copy and here, so a fast CTA could otherwise
++  // overwrite the slot while a slow CTA is still reading it.  This barrier is
++  // the one the slot-reuse argument requires.
++  if (tx == 0) {
++    red_release(&state->arrival_counter, 1);
++  }
++  wait_ge(&state->arrival_counter,
++          (barrier_phase + 1) * static_cast<int>(ctas_per_group), tx);
++  barrier_phase++;
++  __syncthreads();
++
++  uint32_t* cta_counts = state->histogram[radix_iter % 3u];
++  if (tx == 0) {
++    cta_counts[cta_in_group] = local_gt;
++    cta_counts[ctas_per_group + cta_in_group] = local_eq;
++  }
++
++  // ---- barrier X2: the counts are published ------------------------------
++  // red_release issues `fence.acq_rel.gpu` before the arrival add and wait_ge
++  // reads with `ld.global.acquire.gpu`, so the two plain stores above are
++  // visible at device scope to every CTA that leaves this barrier.  This is
++  // the same release/acquire pairing the shipped kernel already relies on for
++  // CTA-0's plain-store zeroing of `next_hist`.
++  if (tx == 0) {
++    red_release(&state->arrival_counter, 1);
++  }
++  wait_ge(&state->arrival_counter,
++          (barrier_phase + 1) * static_cast<int>(ctas_per_group), tx);
++  barrier_phase++;
++  __syncthreads();
++
++  // ---- bases and the tie cut ---------------------------------------------
++  for (uint32_t c = tx; c < ctas_per_group; c += kThreadsPerBlock) {
++    local_histogram[c] = cta_counts[c];
++    local_histogram[kEqStage + c] = cta_counts[ctas_per_group + c];
++  }
++  __syncthreads();
++
++  if (tx == 0) {
++    uint32_t gt_base = 0u;
++    uint32_t gt_total = 0u;
++    for (uint32_t c = 0; c < ctas_per_group; ++c) {
++      const uint32_t g = local_histogram[c];
++      if (c < cta_in_group) gt_base += g;
++      gt_total += g;
++    }
++
++    // Most-recent-wins: walk CTAs from the top down, handing each one as many
++    // of the `equal_needed` slots as the CTAs above it left unclaimed.  keep[]
++    // is written over eq[] in place (eq[c] is read before keep[c] is stored).
++    uint32_t eq_above = 0u;
++    for (int c = static_cast<int>(ctas_per_group) - 1; c >= 0; --c) {
++      const uint32_t e = local_histogram[kEqStage + c];
++      const uint32_t want =
++          (eq_above >= equal_needed) ? 0u : (equal_needed - eq_above);
++      local_histogram[kEqStage + c] = (want < e) ? want : e;
++      eq_above += e;
++    }
++    const uint32_t eq_total = eq_above;
++
++    uint32_t eq_keep_base = 0u;
++    for (uint32_t c = 0; c < cta_in_group; ++c) {
++      eq_keep_base += local_histogram[kEqStage + c];
++    }
++    const uint32_t my_keep = local_histogram[kEqStage + cta_in_group];
++
++    // Invariants, all three derived from the medium-path restart design and re-derivable
++    // here: the radix walk guarantees #{key > pivot} == TopK - equal_needed
++    // and equal_needed <= #{key == pivot}, and the two together make the
++    // emission a bijection onto [0, TopK).  Every CTA evaluates this from the
++    // same published integers, so the verdict is group-uniform and needs no
++    // further communication.
++    uint32_t fault = 0u;
++    if (gt_total + equal_needed != static_cast<uint32_t>(TopK)) fault = 1u;
++    if (equal_needed > eq_total) fault = 1u;
++    if (my_keep > local_eq) fault = 1u;
++
++    suffix_sum[2] = gt_base;
++    suffix_sum[3] = eq_keep_base;
++    // Keep the local pivot-equal elements whose ascending rank within this
++    // chunk is >= cut_rank, i.e. the `my_keep` highest-indexed of them.
++    suffix_sum[4] = local_eq - my_keep;
++    suffix_sum[5] = fault;
++
++    if (counters != nullptr && cta_in_group == 0u) {
++      atomicAdd(&counters[kCtrLargeDetRows], 1u);
++      if (eq_total > equal_needed) {
++        atomicAdd(&counters[kCtrLargeTiesCut], 1u);
++        atomicAdd(&counters[kCtrLargeTiesDropped], eq_total - equal_needed);
++      }
++      if (fault != 0u) atomicAdd(&counters[kCtrLargeFault], 1u);
++    }
++  }
++  __syncthreads();
++
++  const uint32_t gt_base = suffix_sum[2];
++  const uint32_t eq_keep_base = suffix_sum[3];
++  const uint32_t cut_rank = suffix_sum[4];
++  const uint32_t row_fault = suffix_sum[5];
++
++  // ---- emission: rank by index, no atomics -------------------------------
++  if (row_fault == 0u) {
++    // Scratch for the tile scan.  The staged per-CTA counts above are dead by
++    // now (thread 0 consumed them before the barrier), so local_histogram is
++    // free again; 33 slots each at 0 and at 64 stay inside RADIX.
++    uint32_t* warp_gt = local_histogram;
++    uint32_t* warp_eq = local_histogram + 64;
++    const uint32_t lane = tx & 31u;
++    const uint32_t warp = tx >> 5;
++    uint32_t gt_run = 0u;
++    uint32_t eq_run = 0u;
++
++    // Block-uniform trip count: every thread runs every tile, so the ballots
++    // and the barriers inside are reached by the whole block.
++    for (uint32_t base = 0u; base < actual_chunk_size;
++         base += kThreadsPerBlock) {
++      const uint32_t i = base + tx;
++      const bool in_range = (i < actual_chunk_size);
++      const uint32_t ord = in_range ? shared_ordered[i] : 0u;
++      const bool f_gt = in_range && (ord > ordered_pivot);
++      const bool f_eq = in_range && (ord == ordered_pivot);
++
++      const uint32_t bgt = __ballot_sync(0xffffffffu, f_gt);
++      const uint32_t beq = __ballot_sync(0xffffffffu, f_eq);
++      const uint32_t lane_mask = (1u << lane) - 1u;
++      const uint32_t gt_in_warp = static_cast<uint32_t>(__popc(bgt & lane_mask));
++      const uint32_t eq_in_warp = static_cast<uint32_t>(__popc(beq & lane_mask));
++      if (lane == 0u) {
++        warp_gt[warp] = static_cast<uint32_t>(__popc(bgt));
++        warp_eq[warp] = static_cast<uint32_t>(__popc(beq));
++      }
++      __syncthreads();
++
++      if (tx < 32u) {
++        const uint32_t cg = (tx < kWarpsPerBlock) ? warp_gt[tx] : 0u;
++        const uint32_t ce = (tx < kWarpsPerBlock) ? warp_eq[tx] : 0u;
++        uint32_t sg = cg;
++        uint32_t se = ce;
++#pragma unroll
++        for (int off = 1; off < 32; off <<= 1) {
++          const uint32_t ng = __shfl_up_sync(0xffffffffu, sg, off);
++          const uint32_t ne = __shfl_up_sync(0xffffffffu, se, off);
++          if (tx >= static_cast<uint32_t>(off)) {
++            sg += ng;
++            se += ne;
++          }
++        }
++        warp_gt[tx] = sg - cg;  // inclusive -> exclusive
++        warp_eq[tx] = se - ce;
++        if (tx == 31u) {
++          warp_gt[32] = sg;  // tile totals (lanes >= kWarpsPerBlock add 0)
++          warp_eq[32] = se;
++        }
++      }
++      __syncthreads();
++
++      const uint32_t gt_rank = gt_run + warp_gt[warp] + gt_in_warp;
++      const uint32_t eq_rank = eq_run + warp_eq[warp] + eq_in_warp;
++      const uint32_t tile_gt = warp_gt[32];
++      const uint32_t tile_eq = warp_eq[32];
++
++      if (f_gt || (f_eq && eq_rank >= cut_rank)) {
++        // Selected elements before this one, in ascending index order:
++        // all `> pivot` ones, plus the pivot-equal ones past the cut.
++        const uint32_t kept_eq_before =
++            (eq_rank > cut_rank) ? (eq_rank - cut_rank) : 0u;
++        const uint32_t slot = gt_base + eq_keep_base + gt_rank + kept_eq_before;
++        if (slot < static_cast<uint32_t>(TopK)) {
++          row_output[slot] = static_cast<int32_t>(my_chunk_start + i);
++        } else if (counters != nullptr) {
++          // Unreachable while the three invariants above hold; bounded store
++          // plus a counter rather than an out-of-range write.
++          atomicAdd(&counters[kCtrLargeFault], 1u);
++        }
++      }
++
++      __syncthreads();  // before warp_gt / warp_eq are rewritten
++      gt_run += tile_gt;
++      eq_run += tile_eq;
++    }
++    // No thread may start the next row's chunk load — which writes
++    // shared_ordered — until every warp has finished reading it here.
++    __syncthreads();
++  } else {
++    // ---- fail loud ------------------------------------------------------
++    // The predicate is group-uniform (same published integers, same fixed
++    // summation order in every CTA), so no CTA of this group emitted anything
++    // and CTA 0 can fill the row alone.  -1 is the kernel's own padding value
++    // and the consumer rejects it, so a faulted row attends nothing instead of
++    // quietly attending the wrong blocks.
++    if (cta_in_group == 0u) {
++      for (uint32_t i = tx; i < static_cast<uint32_t>(TopK);
++           i += kThreadsPerBlock) {
++        row_output[i] = -1;
++      }
++    }
++    __threadfence();
++    __syncthreads();
++#if MERLIN_TOPK_EXACT_TRAP
++    __trap();
++#endif
++  }
++}
++
+ // ============================================================================
+ // Multi-CTA cooperative RadixTopK for a single large row.
+ // Adapted from https://github.com/flashinfer-ai/flashinfer/pull/2215
+@@ -1087,7 +1395,8 @@ __device__ void radix_topk(const float* __restrict__ row_input,
+                            uint32_t* shared_scalars, uint32_t* shared_ordered,
+                            RadixRowState* state, uint32_t cta_in_group,
+                            uint32_t ctas_per_group, int& barrier_phase,
+-                           uint32_t radix_iter, uint32_t tx) {
++                           uint32_t radix_iter, uint32_t tx, bool det_large,
++                           unsigned int* counters) {
+   const uint32_t my_chunk_end = (my_chunk_start + chunk_size < seq_len)
+                                     ? my_chunk_start + chunk_size
+                                     : seq_len;
+@@ -1241,6 +1550,16 @@ __device__ void radix_topk(const float* __restrict__ row_input,
+   // -- Count local > pivot elements --
+   const uint32_t ordered_pivot = shared_scalars[0];
+ 
++  // Deterministic placement + tie membership.  Everything below this
++  // branch is v2.0.1 verbatim and is what MERLIN_TOPK_DET_LARGE=0 runs.
++  if (det_large) {
++    radix_emit_deterministic<TopK>(
++        row_output, ordered_pivot, shared_scalars[1], my_chunk_start,
++        actual_chunk_size, local_histogram, suffix_sum, shared_ordered, state,
++        cta_in_group, ctas_per_group, barrier_phase, radix_iter, tx, counters);
++    return;
++  }
++
+   if (tx == 0) suffix_sum[0] = 0;
+   __syncthreads();
+ 
+@@ -1389,7 +1708,8 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 2)
+     radix_topk<TopK, VEC_SIZE>(
+         row_input, row_output, seq_len, my_chunk_start, chunk_size,
+         local_histogram, suffix_sum, shared_scalars, shared_ordered, state,
+-        cta_in_group, ctas_per_group, barrier_phase, radix_iter, tx);
++        cta_in_group, ctas_per_group, barrier_phase, radix_iter, tx,
++        params.det_large, params.exact_counters);
+     radix_iter++;
+   }
+ }
+diff --git a/csrc/libtorch_stable/topk.cu b/csrc/libtorch_stable/topk.cu
+index 3419344d32..001c782fa8 100644
+--- a/csrc/libtorch_stable/topk.cu
++++ b/csrc/libtorch_stable/topk.cu
+@@ -4,6 +4,7 @@
+ #include <cuda_runtime.h>
+ #include <algorithm>
+ #include <atomic>
++#include <cstdio>
+ #include <cstdlib>
+ #include <mutex>
+ 
+@@ -36,6 +37,24 @@ bool exact_medium_enabled() {
+   return enabled;
+ }
+ 
++// ---------------------------------------------------------------------------
++// MERLIN_TOPK_DET_LARGE switch.
++//
++// Same contract as the medium-path switch: resolved once per process, so it is a
++// launch constant and a cudagraph captures one value.  Default ON on this
++// branch.  MERLIN_TOPK_DET_LARGE=0 is the A/B control arm and runs the
++// v2.0.1 `radix_topk` tail verbatim -- the deterministic emission sits behind
++// one `if (det_large)` in front of it and touches nothing when off, including
++// the large-path counters, which is what makes the control arm the real baseline.
++// ---------------------------------------------------------------------------
++bool det_large_enabled() {
++  static const bool enabled = [] {
++    const char* raw = std::getenv("MERLIN_TOPK_DET_LARGE");
++    return (raw == nullptr || raw[0] == '\0') ? true : (std::atoi(raw) != 0);
++  }();
++  return enabled;
++}
++
+ // Process-lifetime device counters, one block per device.  The kernel only
+ // ever atomicAdds into them, so the launch path needs no host sync and the
+ // values accumulate across cudagraph replays.
+@@ -340,6 +359,30 @@ void launch_persistent_topk(const torch::stable::Tensor& logits,
+     params.ctas_per_group = ctas_per_group;
+     params.max_seq_len = static_cast<uint32_t>(max_seq_len);
+     params.exact_medium = exact_medium_enabled();
++    // The per-CTA selected / pivot-equal counts are staged in ONE
++    // 256-slot RadixRowState histogram row (the slot round 3 has just finished
++    // reading), which holds 2 * ctas_per_group uint32s.  That is the whole
++    // reason the workspace contract is unchanged, and it is also the only
++    // limit: above 128 CTAs per group the deterministic path cannot be
++    // expressed there, so the launch degrades to the v2.0.1 tail rather than
++    // failing.  Unreachable at any shape this kernel serves (ctas_per_group is
++    // 2-3 across our 135K-262K band and <= 16 at the smallest chunk size), but
++    // a silent loss of determinism is exactly what this branch exists to stop,
++    // so say it once.
++    const bool det_large_fits =
++        2u * ctas_per_group <= static_cast<uint32_t>(P::RADIX);
++    params.det_large = det_large_enabled() && det_large_fits;
++    if (det_large_enabled() && !det_large_fits) {
++      static std::atomic<bool> det_large_warned{false};
++      if (!det_large_warned.exchange(true)) {
++        std::fprintf(stderr,
++                     "[vllm] MERLIN_TOPK_DET_LARGE is on but ctas_per_group=%u "
++                     "needs %u of %d staging slots; the large path falls back "
++                     "to nondeterministic placement at this shape (counter [4] "
++                     "stays 0).\n",
++                     ctas_per_group, 2u * ctas_per_group, P::RADIX);
++      }
++    }
+     // Allocate only off the capture path; in the ordinary engine lifecycle the
+     // eager warmup lands here first, long before capture.  The explicit,
+     // quiescent-phase entry point is the reader op.
+@@ -444,12 +487,17 @@ void persistent_topk(const torch::stable::Tensor& logits,
+ // counters.  This is also the explicit pre-capture init path: call it once per
+ // device before any cudagraph capture.
+ //
+-// `out` is an int32 CUDA tensor with at least 5 elements:
++// `out` is an int32 CUDA tensor with at least 10 elements:
+ //   [0] medium-path rows entered           (denominator)
+ //   [1] rows where a 4,096-slot guard would drop a candidate
+ //   [2] rows that took the exact restart   (0 in the control arm)
+ //   [3] exact restarts that could not complete (must stay 0)
+-//   [4] 1 if MERLIN_TOPK_EXACT_MEDIUM is on, else 0
++//   [4] large-path rows emitted deterministically (0 in the control arm)
++//   [5] large-path rows whose pivot-equal group was cut at the k-th value
++//   [6] large-path pivot-equal elements discarded by those cuts
++//   [7] large-path invariant violations (must stay 0)
++//   [8] 1 if MERLIN_TOPK_EXACT_MEDIUM is on, else 0
++//   [9] 1 if MERLIN_TOPK_DET_LARGE is on, else 0
+ //
+ // COHERENCY -- stated precisely, because the earlier wording overclaimed.
+ // With `sync == 0` the snapshot is ordered ONLY against work already enqueued
+@@ -484,9 +532,9 @@ void persistent_topk_exact_counters(torch::stable::Tensor& out, int64_t reset,
+   STD_TORCH_CHECK(out.is_contiguous(),
+                   "out must be contiguous (expanded or strided views would be "
+                   "written out of bounds or into the wrong elements)");
+-  STD_TORCH_CHECK(out.numel() >= vllm::persistent::kNumTopKExactCounters + 1,
++  STD_TORCH_CHECK(out.numel() >= vllm::persistent::kNumTopKExactCounters + 2,
+                   "out must hold at least ",
+-                  vllm::persistent::kNumTopKExactCounters + 1, " elements");
++                  vllm::persistent::kNumTopKExactCounters + 2, " elements");
+   STD_TORCH_CHECK(
+       reset == 0 || sync != 0,
+       "persistent_topk_exact_counters: reset requires sync != 0, otherwise the "
+@@ -531,10 +579,16 @@ void persistent_topk_exact_counters(torch::stable::Tensor& out, int64_t reset,
+   }
+ 
+   // Static storage: the source of an async H2D copy must outlive the copy.
+-  static const int32_t enabled = exact_medium_enabled() ? 1 : 0;
++  // Two flags: [kNumTopKExactCounters] = the medium-path switch,
++  //            [kNumTopKExactCounters + 1] = the large-path switch.  The large
++  // flag reports the ENV value, not the per-launch effective value: a launch
++  // whose ctas_per_group overflowed the staging row still reports 1 here and
++  // leaves counter [4] at 0, which is how that degradation is diagnosed.
++  static const int32_t enabled[2] = {exact_medium_enabled() ? 1 : 0,
++                                     det_large_enabled() ? 1 : 0};
+   STD_TORCH_CHECK(
+-      cudaMemcpyAsync(dst + vllm::persistent::kNumTopKExactCounters, &enabled,
+-                      sizeof(int32_t), cudaMemcpyHostToDevice,
++      cudaMemcpyAsync(dst + vllm::persistent::kNumTopKExactCounters, enabled,
++                      2 * sizeof(int32_t), cudaMemcpyHostToDevice,
+                       stream) == cudaSuccess,
+       "exact counter flag write failed");
+ 
+diff --git a/tests/kernels/test_top_k_per_row.py b/tests/kernels/test_top_k_per_row.py
+index b0564e89bf..daf8ff6461 100644
+--- a/tests/kernels/test_top_k_per_row.py
++++ b/tests/kernels/test_top_k_per_row.py
+@@ -1849,11 +1849,29 @@ def test_sparse_indexer_topk_backend_resolution() -> None:
+ #   3. two runs return bit-identical index tensors, in ascending index order.
+ # ---------------------------------------------------------------------------
+ 
+-_EXACT_COUNTER_SLOTS = 5
++# Slot map of torch.ops._C.persistent_topk_exact_counters (see
++# csrc/libtorch_stable/topk.cu).  The large path appended four counters and a
++# second switch flag, so the medium-path "enabled" flag moved from [4] to [8].
++_SLOT_MEDIUM_ROWS = 0
++_SLOT_MEDIUM_OVERFLOW = 1
++_SLOT_MEDIUM_FALLBACK = 2
++_SLOT_MEDIUM_FAULT = 3
++_SLOT_LARGE_ROWS = 4
++_SLOT_LARGE_TIES_CUT = 5
++_SLOT_LARGE_TIES_DROPPED = 6
++_SLOT_LARGE_FAULT = 7
++_SLOT_EXACT_MEDIUM_ON = 8
++_SLOT_DET_LARGE_ON = 9
++_EXACT_COUNTER_SLOTS = 10
+ 
+ 
+ def _read_exact_counters() -> list[int] | None:
+-    """Cumulative [rows, overflow, fallbacks, faults, enabled], or None."""
++    """Cumulative counters + the two switch flags, or None.
++
++    [0..3] medium:  rows, overflow, exact fallbacks, faults.
++    [4..7] large:   deterministic rows, tie cuts, elements cut, faults.
++    [8]    MERLIN_TOPK_EXACT_MEDIUM, [9] MERLIN_TOPK_DET_LARGE.
++    """
+     op = getattr(torch.ops._C, "persistent_topk_exact_counters", None)
+     if op is None:
+         return None
+@@ -1899,7 +1917,7 @@ def test_persistent_topk_medium_overflow_is_exact(top_k: int, seq_len: int) -> N
+             "no persistent_topk_exact_counters op, so the exact path cannot be "
+             "shown to have run. A skip here does not count as a pass."
+         )
+-    if before[4] == 0:
++    if before[_SLOT_EXACT_MEDIUM_ON] == 0:
+         pytest.skip(
+             "MERLIN_TOPK_EXACT_MEDIUM=0: control arm. Exactness is not claimed "
+             "here, but a qualification run must also execute the arm with the "
+@@ -1969,7 +1987,7 @@ def test_persistent_topk_medium_overflow_is_bit_reproducible() -> None:
+             "no persistent_topk_exact_counters op, so the exact path cannot be "
+             "shown to have run. A skip here does not count as a pass."
+         )
+-    if counters[4] == 0:
++    if counters[_SLOT_EXACT_MEDIUM_ON] == 0:
+         pytest.skip(
+             "MERLIN_TOPK_EXACT_MEDIUM=0: control arm. Emission order is not "
+             "claimed here; a qualification run must also execute the arm with "
+@@ -2020,7 +2038,7 @@ def test_persistent_topk_medium_overflow_tie_keeps_highest_indices() -> None:
+             "QUALIFICATION FAILURE if seen on the branch build: no "
+             "persistent_topk_exact_counters op. A skip is not a pass."
+         )
+-    if before[4] == 0:
++    if before[_SLOT_EXACT_MEDIUM_ON] == 0:
+         pytest.skip(
+             "MERLIN_TOPK_EXACT_MEDIUM=0: control arm, the tie rule is not "
+             "claimed here."
+@@ -2150,3 +2168,213 @@ def test_topk_exact_counters_reader_log_line(monkeypatch) -> None:
+     if getattr(torch.ops._C, "persistent_topk_exact_counters_slots", None) is None:
+         monkeypatch.setenv("MERLIN_TOPK_COUNTER_SLOTS", "7")
+         assert topk_counters.slot_count() == 7
++
++
++# ---------------------------------------------------------------------------
++# Large-path (multi-CTA radix_topk) deterministic placement and ties
++#
++# Above RADIX_THRESHOLD = 32,768 compressed columns a row is split across a
++# group of CTAs.  In v2.0.1 the pivot is exact and order-independent, but
++# everything after it is a race: a CTA's base offset into the row is its
++# arrival order at `state->output_counter`, its slot inside that base is
++# arrival order at a shared counter, and which pivot-equal elements survive the
++# `pos < TopK` cut is decided by whoever gets there first.  The first two
++# permute the selected list — which sparse attention consumes as an ordered
++# gather, so they fork the hidden state — and the third changes the set.
++#
++# The row below is built so all three are visible at once:
++#   * 200 elements strictly above the pivot, scattered over the whole row,
++#   * 700 elements exactly AT the pivot, also scattered, so the tie group spans
++#     every CTA chunk and several index high-byte buckets,
++#   * top_k = 512, so exactly 312 of the 700 must survive and 388 must be cut.
++#
++# `torch.topk`'s own index choice inside a 700-way tie is arbitrary, so it
++# cannot supply the expectation.  The reference is computed from the shipped
++# rule instead — most-recent-wins, i.e. the 312 HIGHEST indices — and
++# torch.topk is used for the weaker check it can make, the value multiset.
++# ---------------------------------------------------------------------------
++
++LARGEDET_SEQ_LEN = 40960  # > RADIX_THRESHOLD (32768): the multi-CTA radix path
++LARGEDET_TOP_K = 512
++LARGEDET_ABOVE = 200  # elements strictly greater than the pivot
++LARGEDET_TIE = 700  # elements exactly equal to the pivot
++LARGEDET_KEPT = LARGEDET_TOP_K - LARGEDET_ABOVE  # 312 of the 700 survive
++LARGEDET_DROPPED = LARGEDET_TIE - LARGEDET_KEPT  # 388 are cut
++
++
++def _build_largedet_tie_row(num_rows: int) -> tuple[torch.Tensor, torch.Tensor]:
++    """Identical rows with a deliberate multi-CTA tie at the cutoff.
++
++    Returns (logits, expected_indices) where expected_indices is the ascending
++    int64 index list the deterministic kernel must return for every row.
++    """
++    gen = torch.Generator(device="cpu").manual_seed(19)
++    perm = torch.randperm(LARGEDET_SEQ_LEN, generator=gen, device="cpu")
++    above_idx = perm[:LARGEDET_ABOVE]
++    tie_idx = perm[LARGEDET_ABOVE : LARGEDET_ABOVE + LARGEDET_TIE]
++
++    # Filler stays in [0, 0.5) so nothing outside the two planted groups can
++    # reach the pivot; the planted values are exact binary fractions, so the
++    # 700 tie elements are bit-identical as float32 and really do tie.
++    row = torch.rand(
++        LARGEDET_SEQ_LEN, generator=gen, dtype=torch.float32, device="cpu"
++    ) * 0.5
++    row[tie_idx] = 2.0
++    row[above_idx] = 3.0
++
++    logits = row.to("cuda").unsqueeze(0).repeat(num_rows, 1).contiguous()
++
++    kept_tie = torch.sort(tie_idx).values[-LARGEDET_KEPT:]
++    expected = torch.sort(torch.cat([above_idx, kept_tie])).values.to(torch.int64)
++    assert expected.numel() == LARGEDET_TOP_K
++    return logits, expected
++
++
++def _run_largedet_row(logits: torch.Tensor) -> torch.Tensor:
++    num_rows, seq_len = logits.shape
++    lengths = torch.full((num_rows,), seq_len, dtype=torch.int32, device="cuda")
++    indices = torch.empty((num_rows, LARGEDET_TOP_K), dtype=torch.int32, device="cuda")
++    _run_topk_backend(
++        "persistent_topk", logits, lengths, indices, LARGEDET_TOP_K, seq_len
++    )
++    torch.accelerator.synchronize()
++    return indices
++
++
++def _largedet_counters_or_skip(require_on: bool) -> list[int]:
++    counters = _read_exact_counters()
++    if counters is None:
++        pytest.skip(
++            "QUALIFICATION FAILURE if seen on the branch build: this build has "
++            "no persistent_topk_exact_counters op, so the large path cannot be "
++            "shown to have run deterministically. A skip is not a pass."
++        )
++    if require_on and counters[_SLOT_DET_LARGE_ON] == 0:
++        pytest.skip(
++            "MERLIN_TOPK_DET_LARGE=0: control arm. Determinism is not claimed "
++            "here; a qualification run must also execute the arm with the "
++            "switch on."
++        )
++    if not require_on and counters[_SLOT_DET_LARGE_ON] != 0:
++        pytest.skip(
++            "MERLIN_TOPK_DET_LARGE=1: this is the control-arm test and must be "
++            "run a second time with the switch off. A qualification run needs "
++            "BOTH arms."
++        )
++    return counters
++
++
++@pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
++@torch.inference_mode()
++def test_persistent_topk_large_tie_keeps_highest_indices() -> None:
++    """Multi-CTA tie at the cutoff: most-recent-wins, ascending, reproducible."""
++    torch.set_default_device("cuda:0")
++    num_rows = 8  # <= 32 keeps the dispatch on persistent_topk
++
++    before = _largedet_counters_or_skip(require_on=True)
++
++    logits, expected = _build_largedet_tie_row(num_rows)
++    first = _run_largedet_row(logits).clone()
++    mid = _read_exact_counters()
++    second = _run_largedet_row(logits)
++    after = _read_exact_counters()
++
++    # 1. The instrument fired, with EXACT deltas. A lower bound would hide
++    #    double counting, and a green assertion below means nothing unless the
++    #    deterministic path is what produced it.
++    assert mid[_SLOT_LARGE_ROWS] - before[_SLOT_LARGE_ROWS] == num_rows, (
++        "the deterministic large path did not run on every row: "
++        f"{mid[_SLOT_LARGE_ROWS] - before[_SLOT_LARGE_ROWS]} of {num_rows}"
++    )
++    assert mid[_SLOT_LARGE_TIES_CUT] - before[_SLOT_LARGE_TIES_CUT] == num_rows, (
++        "the tie cut did not fire; this row is built so it must"
++    )
++    assert (
++        mid[_SLOT_LARGE_TIES_DROPPED] - before[_SLOT_LARGE_TIES_DROPPED]
++        == num_rows * LARGEDET_DROPPED
++    ), "the number of discarded pivot-equal elements is not the expected 388/row"
++    assert after[_SLOT_LARGE_FAULT] - before[_SLOT_LARGE_FAULT] == 0, (
++        "a large-path invariant fired; the output below is not meaningful"
++    )
++
++    ref_values = torch.topk(logits[0], LARGEDET_TOP_K).values.sort().values
++
++    for row in range(num_rows):
++        got = first[row].to(torch.int64)
++
++        # 2. Ascending in index. This is what makes the Python-side
++        #    MERLIN_QSA_SORT a no-op on these rows rather than a correction.
++        assert bool((got[1:] - got[:-1] > 0).all()), (
++            f"row {row}: large-path output is not ascending in index"
++        )
++
++        # 3. The set is the analytic one: everything above the pivot, plus the
++        #    312 HIGHEST-indexed of the 700 pivot-equal elements.
++        assert torch.equal(got.cpu(), expected), (
++            f"row {row}: selected set is not most-recent-wins at the cutoff"
++        )
++
++        # 4. The weaker check torch.topk can make: same value multiset.
++        got_values = logits[row][got].sort().values
++        assert torch.equal(got_values, ref_values), (
++            f"row {row}: selected values are not torch.topk's values"
++        )
++
++    # 5. Bit identity across two launches on identical input -- the property
++    #    that separates this path from the arrival-ordered one at 135K.
++    assert torch.equal(first, second), (
++        "two identical launches returned different index tensors"
++    )
++
++
++@pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
++@torch.inference_mode()
++def test_persistent_topk_large_control_arm_is_untouched() -> None:
++    """MERLIN_TOPK_DET_LARGE=0 must be the real v2.0.1 baseline.
++
++    Run this with the switch OFF. Two things are asserted and one deliberately
++    is not:
++
++      * the large-path counters do not move at all -- the deterministic path adds no
++        instruction to the control arm, so an A/B comparison measures the
++        kernel change and not an added atomic (as on the medium path: a
++        control arm that quietly runs a different algorithm is not a control);
++      * the returned VALUES are still exactly torch.topk's, because v2.0.1's
++        pivot is already exact -- only placement and tie membership are racy;
++      * the index SET and the emission ORDER are NOT asserted, because their
++        being unreproducible is precisely the defect the large-path change fixes. Asserting
++        either way here would be a test that cannot fail, or a flake.
++    """
++    torch.set_default_device("cuda:0")
++    num_rows = 8
++
++    before = _largedet_counters_or_skip(require_on=False)
++
++    logits, _ = _build_largedet_tie_row(num_rows)
++    out = _run_largedet_row(logits)
++    after = _read_exact_counters()
++
++    for slot, name in (
++        (_SLOT_LARGE_ROWS, "rows"),
++        (_SLOT_LARGE_TIES_CUT, "ties_cut"),
++        (_SLOT_LARGE_TIES_DROPPED, "ties_dropped"),
++        (_SLOT_LARGE_FAULT, "faults"),
++    ):
++        assert after[slot] - before[slot] == 0, (
++            f"control arm touched the large-path {name} counter; it is not the "
++            "v2.0.1 baseline"
++        )
++
++    ref_values = torch.topk(logits[0], LARGEDET_TOP_K).values.sort().values
++    for row in range(num_rows):
++        got = out[row].to(torch.int64)
++        assert int(got.min()) >= 0 and int(got.max()) < LARGEDET_SEQ_LEN, (
++            f"row {row}: control arm returned an out-of-range index"
++        )
++        assert got.unique().numel() == LARGEDET_TOP_K, (
++            f"row {row}: control arm returned a duplicate index"
++        )
++        got_values = logits[row][got].sort().values
++        assert torch.equal(got_values, ref_values), (
++            f"row {row}: control-arm values are not torch.topk's values"
++        )

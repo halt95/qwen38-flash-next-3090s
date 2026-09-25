@@ -1,0 +1,3032 @@
+From fb765a6da98cfb9a92afde65b18da60c2dc81c9c Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Wed, 23 Sep 2026 09:58:46 -0400
+Subject: [PATCH 49/58] qsa: tag every raw-key ring row and validate it before
+ pooling
+
+The fused pre-indexer could read a stale or uncommitted raw-key ring row and
+pass its int64 tail to RoPE as a position (illegal address). The writer now
+tags each row with logical_position + 1; the reader checks the tag of every
+source row and, on a mismatch, masks the pooled load, the RoPE-tail read and
+the compressed-slot store. New guard site 11 (always fatal under warn). The
+KV pool size is unchanged.
+---
+ .../models/qwen4_exp/test_qsa_pre_indexer.py  | 163 +++++-
+ tests/models/qwen4_exp/test_qsa_reference.py  |   6 +-
+ .../qwen4_exp/test_qsa_ring_tag_contract.py   | 371 ++++++++++++++
+ .../v1/core/test_qsa_ring_resume_alignment.py | 266 ++++++++++
+ tests/v1/core/test_ring_tag_clear.py          | 367 ++++++++++++++
+ tests/v1/test_pp_kv_projection.py             |   5 +-
+ tests/v1/worker/gpu/ring_tag_replay.py        | 467 ++++++++++++++++++
+ .../worker/gpu/test_guard_telemetry_limits.py |   8 +-
+ .../gpu/test_qsa_ring_skip_telemetry.py       |  11 +-
+ tests/v1/worker/gpu/test_qsa_ring_tags_gpu.py | 311 ++++++++++++
+ .../gpu/test_qsa_rope_position_guard.py       |  13 +-
+ vllm/models/qwen4_exp/amd/indexer_qsa.py      |   9 +
+ vllm/models/qwen4_exp/common/qsa_cache.py     |  76 ++-
+ vllm/models/qwen4_exp/nvidia/indexer_qsa.py   |  14 +
+ .../qwen4_exp/nvidia/ops/qsa_pre_indexer.py   | 118 ++++-
+ vllm/v1/core/kv_cache_manager.py              |  15 +
+ vllm/v1/core/sched/output.py                  |   7 +
+ vllm/v1/core/sched/scheduler.py               |  24 +
+ vllm/v1/core/single_type_kv_cache_manager.py  |  46 ++
+ vllm/v1/worker/gpu/model_runner.py            |  10 +
+ vllm/v1/worker/gpu_model_runner.py            |   9 +
+ vllm/v1/worker/guard_telemetry.py             |  73 ++-
+ vllm/v1/worker/ring_tags.py                   |  63 +++
+ 23 files changed, 2420 insertions(+), 32 deletions(-)
+ create mode 100644 tests/models/qwen4_exp/test_qsa_ring_tag_contract.py
+ create mode 100644 tests/v1/core/test_qsa_ring_resume_alignment.py
+ create mode 100644 tests/v1/core/test_ring_tag_clear.py
+ create mode 100644 tests/v1/worker/gpu/ring_tag_replay.py
+ create mode 100644 tests/v1/worker/gpu/test_qsa_ring_tags_gpu.py
+ create mode 100644 vllm/v1/worker/ring_tags.py
+
+diff --git a/tests/models/qwen4_exp/test_qsa_pre_indexer.py b/tests/models/qwen4_exp/test_qsa_pre_indexer.py
+index 8d4df3dbc9..13b9a8d082 100644
+--- a/tests/models/qwen4_exp/test_qsa_pre_indexer.py
++++ b/tests/models/qwen4_exp/test_qsa_pre_indexer.py
+@@ -6,9 +6,12 @@ import pytest
+ import torch
+ 
+ from vllm.models.qwen4_exp.common.qsa_cache import (
++    QSA_RING_TAG_WORD,
++    QSA_RING_TAIL_ELEMENTS,
+     canonical_qsa_rope_positions,
+     circular_qsa_slot_mapping,
+     compressed_qsa_slot_mapping,
++    qsa_ring_row_tags,
+ )
+ from vllm.models.qwen4_exp.nvidia.indexer_qsa import apply_qsa_rope
+ from vllm.models.qwen4_exp.nvidia.ops.qsa import (
+@@ -20,6 +23,7 @@ from vllm.models.qwen4_exp.nvidia.ops.qsa_pre_indexer import (
+ )
+ from vllm.platforms import current_platform
+ from vllm.triton_utils import HAS_TRITON
++from vllm.v1.worker import guard_telemetry
+ 
+ requires_qsa_kernels = pytest.mark.skipif(
+     not current_platform.is_cuda() or not HAS_TRITON,
+@@ -195,7 +199,9 @@ def test_qsa_fused_pre_indexer_matches_unfused(
+         (work_requests, local_work), dim=1
+     )
+ 
+-    raw_width = D + 12 if cache_rope_positions else D
++    # Every ring row is key + four int64 words (pos_t, pos_h, pos_w, tag),
++    # with or without cached RoPE positions.
++    raw_width = D + QSA_RING_TAIL_ELEMENTS
+     # Match vLLM's padded-page cache layout: rows are contiguous, while physical
+     # blocks have a larger stride than their logical contents.
+     raw_page_elements = state_size * raw_width
+@@ -217,14 +223,17 @@ def test_qsa_fused_pre_indexer_matches_unfused(
+             row = fused_raw[block, position % state_size, 0]
+             row[:D] = torch.randn(D, dtype=torch.bfloat16, device=device)
+             if cache_rope_positions:
+-                row[ROPE_POS_OFFSET:].view(torch.int64).copy_(
++                row[ROPE_POS_OFFSET:].view(torch.int64)[:3].copy_(
+                     torch.tensor(
+                         [position, position // 7 + 3, position // 13 + 11],
+                         dtype=torch.int64,
+                         device=device,
+                     )
+                 )
++            # the history was committed by this request: its tag names it
++            row[ROPE_POS_OFFSET:].view(torch.int64)[QSA_RING_TAG_WORD] = position + 1
+     unfused_raw = fused_raw.clone()
++    unfused_raw_history = fused_raw.clone()  # pre-launch ring, for the reference
+     compressed_page_elements = COMP_PAGE * D
+     fused_compressed_storage = torch.zeros(
+         num_compressed_blocks,
+@@ -246,6 +255,8 @@ def test_qsa_fused_pre_indexer_matches_unfused(
+     k_weight = torch.randn(D, dtype=torch.bfloat16, device=device) * 0.2
+ 
+     fused_query = torch.empty(num_tokens, HQ, D, dtype=indexer_dtype, device=device)
++    guard_telemetry.prealloc(torch.device(device, torch.cuda.current_device()))
++    guard_telemetry.reset_for_test()
+     qsa_pre_indexer(
+         projected_qk[:, : HQ * D],
+         projected_qk[:, HQ * D :],
+@@ -275,11 +286,9 @@ def test_qsa_fused_pre_indexer_matches_unfused(
+     unfused_query = apply_qsa_rope(rope, positions, unfused_query)
+ 
+     raw_keys = unfused_raw[..., :D]
+-    rope_positions = (
+-        unfused_raw[..., ROPE_POS_OFFSET:].view(torch.int64)
+-        if cache_rope_positions
+-        else None
+-    )
++    raw_tail = unfused_raw[..., ROPE_POS_OFFSET:].view(torch.int64)
++    rope_positions = raw_tail[..., :3] if cache_rope_positions else None
++    raw_tags = raw_tail[..., QSA_RING_TAG_WORD : QSA_RING_TAG_WORD + 1]
+     pooled, first_positions = qsa_compress_groups_with_ratio(
+         projected_qk[:, HQ * D :].reshape(-1, 1, D),
+         position_rows,
+@@ -303,6 +312,9 @@ def test_qsa_fused_pre_indexer_matches_unfused(
+     qsa_store_cache_rows(raw_keys, raw_slots, projected_qk[:, HQ * D :])
+     if rope_positions is not None:
+         qsa_store_cache_rows(rope_positions, raw_slots, position_rows)
++    qsa_store_cache_rows(
++        raw_tags, raw_slots, qsa_ring_row_tags(logical_positions).view(-1, 1, 1)
++    )
+ 
+     if indexer_dtype == torch.float8_e4m3fn:
+         # Both paths round the same ~bf16 intermediates to e4m3. Bitwise
+@@ -320,3 +332,140 @@ def test_qsa_fused_pre_indexer_matches_unfused(
+         torch.testing.assert_close(
+             fused_compressed, unfused_compressed, rtol=RTOL, atol=ATOL
+         )
++    # Committed history only, so the uncommitted-row site stays at 0...
++    torch.cuda.synchronize()
++    ring_site = guard_telemetry.counter(
++        guard_telemetry.SITE_QSA_RING_UNCOMMITTED, torch.device(device)
++    )
++    assert ring_site.tolist() == [0, 0, 0]
++    # ...and every committed row now carries its tag (the fused writer's).
++    fused_tags = fused_raw[..., ROPE_POS_OFFSET:].view(torch.int64)[
++        ..., QSA_RING_TAG_WORD
++    ]
++    committed = raw_slots >= 0
++    slot_blocks = raw_slots[committed] // state_size
++    slot_rows = raw_slots[committed] % state_size
++    assert torch.equal(
++        fused_tags[slot_blocks, slot_rows, 0],
++        qsa_ring_row_tags(logical_positions[committed]),
++    )
++
++    # INDEPENDENT reference: V1 and V2 could agree on the same wrong read,
++    # so every completed group is recomputed here in plain torch from the
++    # inputs alone -- the history rows as written above, this chunk's keys --
++    # and compared with the fused compressed cache.
++    reference = _reference_compressed_rows(
++        rope.cos_sin_cache,
++        k_weight,
++        projected_qk[:, HQ * D :],
++        positions,
++        logical_positions,
++        query_start_loc,
++        compressed_slots,
++        unfused_raw_history,
++        raw_block_table,
++        state_size,
++        mrope=mrope,
++        cache_rope_positions=cache_rope_positions,
++        is_2d_positions=is_2d_positions,
++    )
++    for slot, expected in reference.items():
++        block, row = divmod(slot, COMP_PAGE)
++        got = fused_compressed[block, row, 0]
++        if indexer_dtype == torch.float8_e4m3fn:
++            assert_fp8_within_one_ulp(got, expected.to(indexer_dtype))
++        else:
++            torch.testing.assert_close(
++                got, expected.to(indexer_dtype), rtol=RTOL, atol=ATOL
++            )
++    assert reference, "no completed group: the reference compared nothing"
++
++
++def _reference_rope_rows(
++    cos_sin_cache: torch.Tensor,
++    x: torch.Tensor,
++    pos_t: int,
++    pos_h: int,
++    pos_w: int,
++    mrope: bool,
++) -> torch.Tensor:
++    """NeoX rotary on the first half of D, torch only (independent of both the
++    fused _norm_rope and apply_qsa_rope). MRoPE picks the axis per rotary pair
++    the way Qwen interleaves them: h on pairs 1,4,7.. up to 3*MROPE_H, w on
++    pairs 2,5,8.. up to 3*MROPE_W, t elsewhere."""
++    half, quarter = D // 2, D // 4
++    table = cos_sin_cache.float()
++    pairs = torch.arange(quarter, device=x.device)
++    if mrope:
++        h_mask = ((pairs % 3) == 1) & (pairs <= 3 * MROPE_SECTION[1])
++        w_mask = ((pairs % 3) == 2) & (pairs <= 3 * MROPE_SECTION[2])
++        axis_pos = torch.where(
++            h_mask,
++            torch.full_like(pairs, pos_h),
++            torch.where(w_mask, torch.full_like(pairs, pos_w), pos_t),
++        )
++    else:
++        axis_pos = torch.full_like(pairs, pos_t)
++    cos = table[axis_pos, pairs]
++    sin = table[axis_pos, quarter + pairs]
++    r0, r1 = x[:quarter], x[quarter:half]
++    return torch.cat((r0 * cos - r1 * sin, r1 * cos + r0 * sin, x[half:]))
++
++
++def _reference_compressed_rows(
++    cos_sin_cache,
++    k_weight,
++    keys,
++    positions,
++    logical_positions,
++    query_start_loc,
++    compressed_slots,
++    history,
++    raw_block_table,
++    state_size,
++    *,
++    mrope,
++    cache_rope_positions,
++    is_2d_positions,
++) -> dict[int, torch.Tensor]:
++    """{compressed slot: expected row} for every completed group, recomputed
++    from the inputs: mean of the group's four raw keys (historical ones from
++    the pre-launch ring, rounded to bf16 like the model), Gemma RMSNorm, then
++    RoPE at the group's first token."""
++    out: dict[int, torch.Tensor] = {}
++    starts = query_start_loc.tolist()
++    for request in range(len(starts) - 1):
++        q0, q1 = starts[request], starts[request + 1]
++        chunk_start = int(logical_positions[q0])
++        block = int(raw_block_table[request, 0])
++        for token in range(q0, q1):
++            slot = int(compressed_slots[token])
++            if slot < 0:
++                continue
++            end = int(logical_positions[token])
++            rows, first = [], None
++            for position in range(end - CR + 1, end + 1):
++                if position >= chunk_start:
++                    t = q0 + position - chunk_start
++                    rows.append(keys[t].float())
++                    pos3 = (
++                        [int(positions[a, t]) for a in range(3)]
++                        if is_2d_positions
++                        else [int(positions[t])] * 3
++                    )
++                else:
++                    ring_row = history[block, position % state_size, 0]
++                    rows.append(ring_row[:D].float())
++                    tail = ring_row[ROPE_POS_OFFSET:].view(torch.int64)
++                    pos3 = [int(v) for v in tail[:3]]
++                if not cache_rope_positions:
++                    # without cached coordinates the kernel rotates the group
++                    # by its first LOGICAL position on every axis
++                    pos3 = [position] * 3
++                if first is None:
++                    first = pos3
++            pooled = (torch.stack(rows).sum(0) / CR).to(torch.bfloat16).float()
++            normed = pooled * torch.rsqrt(pooled.pow(2).mean() + EPS)
++            normed = (normed * (k_weight.float() + 1.0)).to(torch.bfloat16).float()
++            out[slot] = _reference_rope_rows(cos_sin_cache, normed, *first, mrope=mrope)
++    return out
+diff --git a/tests/models/qwen4_exp/test_qsa_reference.py b/tests/models/qwen4_exp/test_qsa_reference.py
+index 16294a30d7..29f7bcefd6 100644
+--- a/tests/models/qwen4_exp/test_qsa_reference.py
++++ b/tests/models/qwen4_exp/test_qsa_reference.py
+@@ -56,6 +56,7 @@ def test_qsa_mtp_index_share_updates_cache_but_skips_selection(
+         ),
+         compressed_key_cache=SimpleNamespace(kv_cache=torch.empty(0)),
+         use_fused_pre_indexer=True,
++        layer_id=0,  # the fused launch names the layer in its record
+         rotary_emb=SimpleNamespace(cos_sin_cache=torch.empty(0)),
+         q_layernorm=SimpleNamespace(weight=torch.ones(1), variance_epsilon=1e-6),
+         k_layernorm=SimpleNamespace(weight=torch.ones(1)),
+@@ -381,13 +382,14 @@ def test_qsa_state_caches_adapt_the_unified_logical_layout() -> None:
+         ),
+         compress_ratio=4,
+     )
+-    raw_view = torch.empty(2, 1, 8, 64, dtype=torch.bfloat16)
++    # Every ring row carries the four-word int64 tail (+16 bf16).
++    raw_view = torch.empty(2, 1, 8, 64 + 16, dtype=torch.bfloat16)
+     compressed_view = torch.empty(2, 1, 8, 64, dtype=torch.bfloat16)
+ 
+     raw_cache.bind_kv_cache(raw_view)
+     compressed_cache.bind_kv_cache(compressed_view)
+ 
+-    assert raw_cache.kv_cache.shape == (2, 8, 1, 64)
++    assert raw_cache.kv_cache.shape == (2, 8, 1, 64 + 16)
+     assert compressed_cache.kv_cache.shape == (2, 8, 1, 64)
+     assert raw_cache.kv_cache.data_ptr() == raw_view.data_ptr()
+     assert compressed_cache.kv_cache.data_ptr() == compressed_view.data_ptr()
+diff --git a/tests/models/qwen4_exp/test_qsa_ring_tag_contract.py b/tests/models/qwen4_exp/test_qsa_ring_tag_contract.py
+new file mode 100644
+index 0000000000..6714070be5
+--- /dev/null
++++ b/tests/models/qwen4_exp/test_qsa_ring_tag_contract.py
+@@ -0,0 +1,371 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""v2.2 ring-row tag fix, CPU half: the raw-key ring row contract.
++
++The pre-indexer used to read a historical ring row's int64 position tail with
++nothing tying the row to the request or the position (the ring-residue
++illegal-address class). The ring-row tag fix grows the tail to four int64 words
++(pos_t, pos_h, pos_w, tag = logical_position + 1), validates the tag of EVERY
++historical row before pooling, and clears the tag words of a ring block when it
++is claimed. This file pins, without Triton or a GPU:
++
++  * the layout: spec width D+16 (was D+12 with MRoPE, D without), the V1
++    position view (3 int64, same bytes as before) and the tag view (word 3);
++  * the claim clear touches the tag words of the named blocks and nothing else;
++  * the torch reference of the reader's rule, including the every-row case
++    (only the 2nd or 3rd row of a group bad) that guard 9 cannot see;
++  * the new telemetry site: declared, named, fatal, coherent record packing;
++  * the production KV-pool impact of the wider row (0 blocks at 4.1e9).
++
++FAILING CONTROL: on the unmodified tree (without this fix) every
++test here fails -- the constants/helpers do not exist (ImportError at
++collection) and the spec width is 140, not 144.
++"""
++
++from types import SimpleNamespace
++
++import pytest
++import torch
++
++from vllm.models.qwen4_exp.common import qsa_cache
++from vllm.models.qwen4_exp.common.qsa_cache import (
++    QSA_RING_TAG_WORD,
++    QSA_RING_TAIL_ELEMENTS,
++    QSA_RING_TAIL_WORDS,
++    qsa_ring_group_rows_valid,
++    qsa_ring_row_tags,
++)
++from vllm.v1.kv_cache_interface import CircularBufferSpec
++from vllm.v1.worker import guard_telemetry as gt
++
++D = 128
++CR = 4
++STATE = 8
++
++
++def _key_cache(*, rope: bool, head: int = D, block_size: int = 3200):
++    return qsa_cache.QSAKeyStateCache(
++        head_size=head,
++        dtype=torch.bfloat16,
++        cache_rope_positions=rope,
++        cache_config=SimpleNamespace(block_size=block_size),
++        prefix=f"ringtag.raw.{rope}.{head}.{block_size}",
++        vllm_config=SimpleNamespace(
++            compilation_config=SimpleNamespace(static_forward_context={})
++        ),
++        compress_ratio=CR,
++    )
++
++
++# --------------------------------------------------------------------------
++# layout: spec width, strides, views
++# --------------------------------------------------------------------------
++
++
++@pytest.mark.parametrize("rope", [True, False], ids=["mrope", "text"])
++def test_spec_width_is_key_plus_four_int64_words(rope):
++    cache = _key_cache(rope=rope)
++    assert QSA_RING_TAIL_WORDS == 4 and QSA_RING_TAIL_ELEMENTS == 16
++    assert cache.head_size == D + 16
++    # production: MTP K=3 -> ring capacity 8, row 144 bf16 = 288 bytes
++    spec = cache.get_kv_cache_spec(SimpleNamespace(num_speculative_tokens=3))
++    assert isinstance(spec, CircularBufferSpec)
++    assert spec.head_size == 144 and spec.block_size == STATE
++    assert spec.page_size_bytes == STATE * 144 * 2 == 2304
++
++
++def test_tail_starts_on_an_int64_boundary_for_odd_key_widths():
++    # a key width that is not a multiple of 4 bf16 is padded before the tail
++    cache = _key_cache(rope=True, head=126, block_size=32)
++    assert cache.rope_position_offset == 128
++    assert cache.head_size == 128 + 16
++
++
++def _bound(rope: bool, num_blocks: int = 3):
++    cache = _key_cache(rope=rope, block_size=32)
++    # the unified [blocks, 1, states, width] view, with a padded block stride
++    # like the real packed pool (block stride > states * width)
++    width = cache.head_size
++    storage = torch.zeros(num_blocks, STATE * width + 32, dtype=torch.bfloat16)
++    unified = torch.as_strided(
++        storage, (num_blocks, 1, STATE, width), (STATE * width + 32, 0, width, 1)
++    )
++    cache.bind_kv_cache(unified)
++    return cache
++
++
++def test_views_alias_the_right_bytes():
++    cache = _bound(rope=True)
++    assert cache.key_cache.shape == (3, STATE, 1, D)
++    assert cache.rope_position_cache.shape == (3, STATE, 1, 3)
++    assert cache.rope_position_cache.dtype == torch.int64
++    assert cache.ring_tag_cache.shape == (3, STATE, 1, 1)
++    # same storage, word 3 of the tail
++    cache.rope_position_cache[1, 5, 0] = torch.tensor([11, 22, 33])
++    cache.ring_tag_cache[1, 5, 0, 0] = 44
++    tail_bytes = cache.kv_cache[1, 5, 0, D:].contiguous().view(torch.int64)
++    assert tail_bytes.tolist() == [11, 22, 33, 44]
++    # the position view is the pre-tag view (first 3 words): V1 stores into
++    # it unchanged and never reaches the tag
++    assert cache.rope_position_cache.stride(-1) == 1
++
++
++def test_text_ring_has_a_tag_but_no_position_view():
++    cache = _bound(rope=False)
++    assert cache.rope_position_cache is None
++    assert cache.ring_tag_cache is not None
++    cache.ring_tag_cache[2, 7, 0, 0] = 9
++    assert cache.kv_cache[2, 7, 0, D:].contiguous().view(torch.int64)[3] == 9
++
++
++def test_bind_rejects_the_pre_tag_width():
++    cache = _key_cache(rope=True, block_size=32)
++    old = torch.zeros(2, 1, STATE, D + 12, dtype=torch.bfloat16)
++    with pytest.raises(ValueError, match="width"):
++        cache.bind_kv_cache(old)
++
++
++# --------------------------------------------------------------------------
++# the claim clear
++# --------------------------------------------------------------------------
++
++
++def test_claim_clear_zeroes_only_the_tag_words_of_the_named_blocks():
++    cache = _bound(rope=True, num_blocks=4)
++    # every byte non-zero, then remember it
++    cache.kv_cache.view(torch.int16).fill_(0x1234)
++    storage_before = cache.kv_cache.clone()
++    cache.clear_ring_row_tags(torch.tensor([1, 3]))
++    after = cache.kv_cache
++    tags = cache.ring_tag_cache[..., 0]
++    assert torch.all(tags[[1, 3]] == 0)
++    assert torch.all(tags[[0, 2]] != 0)
++    # nothing but the tag words changed
++    changed = after.view(torch.int16) != storage_before.view(torch.int16)
++    changed_cols = changed.nonzero()[:, -1].unique().tolist()
++    tag_cols = list(range(D + 4 * QSA_RING_TAG_WORD, D + 4 * QSA_RING_TAG_WORD + 4))
++    assert changed_cols == tag_cols
++    assert changed.nonzero()[:, 0].unique().tolist() == [1, 3]
++
++
++def test_claim_clear_before_bind_is_loud():
++    cache = _key_cache(rope=True, block_size=32)
++    with pytest.raises(RuntimeError, match="before the KV cache was bound"):
++        cache.clear_ring_row_tags(torch.tensor([0]))
++
++
++# --------------------------------------------------------------------------
++# the reader's rule (torch reference of the kernel check)
++# --------------------------------------------------------------------------
++
++
++def _group(chunk_start: int):
++    """The first group of a chunk starting at chunk_start (the only one that
++    can cross): its four source positions and which of them are historical."""
++    first_boundary = ((chunk_start + CR) // CR) * CR - 1
++    positions = torch.arange(first_boundary - CR + 1, first_boundary + 1)
++    return positions, positions < chunk_start
++
++
++def _committed_ring(positions):
++    """found tags for rows this request committed at exactly these positions"""
++    return qsa_ring_row_tags(positions)
++
++
++def test_tags_are_logical_position_plus_one_and_never_zero():
++    tags = qsa_ring_row_tags(torch.tensor([0, 1, 52933]))
++    assert tags.dtype == torch.int64
++    assert tags.tolist() == [1, 2, 52934]
++
++
++@pytest.mark.parametrize("chunk_start", [52933, 52934, 52935, 52936])
++def test_committed_history_validates(chunk_start):
++    positions, historical = _group(chunk_start)
++    ok = qsa_ring_group_rows_valid(
++        _committed_ring(positions)[None], positions[None], historical[None]
++    )
++    assert ok.tolist() == [True]
++
++
++@pytest.mark.parametrize("bad_row", [1, 2], ids=["row2", "row3"])
++def test_every_row_is_checked_not_only_the_first(bad_row):
++    """First row valid, only the 2nd or 3rd row of the group stale -- an
++    in-range position and key from the previous lap of the ring (the row
++    holds position p-8). Guard 9 is blind to this (the position is in
++    range); a first-row-only check is blind to it too."""
++    chunk_start = 52935  # 3 historical rows: 52932, 52933, 52934
++    positions, historical = _group(chunk_start)
++    assert historical.tolist() == [True, True, True, False]
++    found = _committed_ring(positions).clone()
++    found[bad_row] = positions[bad_row] - STATE + 1  # previous lap's tag
++    ok = qsa_ring_group_rows_valid(found[None], positions[None], historical[None])
++    assert ok.tolist() == [False]
++    # ...and the first row alone would have passed
++    first_only = qsa_ring_group_rows_valid(
++        found[None, :1], positions[None, :1], historical[None, :1]
++    )
++    assert first_only.tolist() == [True]
++
++
++@pytest.mark.parametrize(
++    "found_tag",
++    [0, 0x3E803E803E803E80, -1, 7],
++    ids=["cleared", "bf16-filler-residue", "negative-residue", "other-position"],
++)
++def test_uncommitted_rows_fail(found_tag):
++    positions, historical = _group(52934)
++    found = torch.full_like(positions, found_tag)
++    ok = qsa_ring_group_rows_valid(found[None], positions[None], historical[None])
++    assert ok.tolist() == [False]
++
++
++def test_in_chunk_rows_are_never_checked():
++    # aligned chunk start: no historical row, garbage in the ring is irrelevant
++    positions, historical = _group(52936)
++    assert not historical.any()
++    found = torch.full_like(positions, 0x3E803E803E803E80)
++    ok = qsa_ring_group_rows_valid(found[None], positions[None], historical[None])
++    assert ok.tolist() == [True]
++
++
++def test_previous_occupant_same_position_needs_the_claim_clear():
++    """The collision the claim clear exists for: the previous occupant
++    committed the SAME logical positions into the same rows, so its tags are
++    exactly the ones the new owner expects. The reader alone cannot tell;
++    after the clear the rows read 0 and fail."""
++    positions, historical = _group(52934)
++    found = _committed_ring(positions)  # left by the previous occupant
++    assert qsa_ring_group_rows_valid(
++        found[None], positions[None], historical[None]
++    ).tolist() == [True]
++    cache = _bound(rope=True, num_blocks=2)
++    for p, tag in zip(positions.tolist(), found.tolist()):
++        cache.ring_tag_cache[1, p % STATE, 0, 0] = tag
++    cache.clear_ring_row_tags(torch.tensor([1]))
++    after = cache.ring_tag_cache[1, positions % STATE, 0, 0]
++    assert qsa_ring_group_rows_valid(
++        after[None], positions[None], historical[None]
++    ).tolist() == [False]
++
++
++# --------------------------------------------------------------------------
++# telemetry site
++# --------------------------------------------------------------------------
++
++
++def test_site_is_declared_named_and_fatal():
++    site = gt.SITE_QSA_RING_UNCOMMITTED
++    assert site == 11 and gt.NUM_SITES == 12
++    assert "UNCOMMITTED" in gt.SITE_NAMES[site]
++    assert site in gt._ALWAYS_FATAL_SITES
++    ctr = gt.counter(site, torch.device("cpu"))
++    assert ctr.dtype == torch.int64 and ctr.numel() == gt.SLOTS_PER_SITE
++    assert ctr.data_ptr() != gt.counter(gt.SITE_QSA_RING_SKIP, "cpu").data_ptr()
++
++
++@pytest.mark.parametrize(
++    "layer,row,pos", [(3, 0, 52932), (48, 255, 262143), (-1, 7, 0)]
++)
++def test_record_packing_round_trips(layer, row, pos):
++    biased = gt.encode_ring_record(layer, row, pos) + gt.GUARD_BIAS
++    assert 0 < biased <= (1 << 63) - 1
++    assert gt.decode_ring_record(biased) == {
++        "layer": layer,
++        "request_row": row,
++        "source_position": pos,
++    }
++    assert gt.decode_ring_record(0) is None
++
++
++def test_reader_reports_one_coherent_record_and_arms(monkeypatch):
++    gt.reset_for_test()
++    msgs = []
++    monkeypatch.setattr(gt.logger, "warning", lambda fmt, m: msgs.append(m))
++    rows = [[0, 0, 0] for _ in range(gt.NUM_SITES)]
++    rows[gt.SITE_QSA_RING_UNCOMMITTED] = [
++        2,
++        gt.encode_ring_record(7, 1, 52933) + gt.GUARD_BIAS,
++        0 + gt.GUARD_BIAS,  # the row held tag 0: cleared, never committed
++    ]
++    gt._report_rows(torch.device("cpu"), rows)
++    assert len(msgs) == 1
++    text = msgs[0]
++    assert "2 uncommitted" in text
++    assert "'layer': 7" in text and "'request_row': 1" in text
++    assert "'source_position': 52933" in text
++    assert "held tag 0" in text
++    with pytest.raises(RuntimeError, match="uncommitted"):
++        gt.check_pending()
++    gt.reset_for_test()
++
++
++# --------------------------------------------------------------------------
++# KV capacity: the wider row at the production shape
++# --------------------------------------------------------------------------
++
++
++def test_production_pool_blocks_unchanged_by_the_tag_word():
++    """Qwen3.8-Flash-Next at TP2 x PP2 (25/23), MTP K=3, fp8 KV, block 3200,
++    --kv-cache-memory 4100000000: 317 blocks with the D+12 row and with the
++    D+16 row. The ring is a one-block-per-request state group whose pages
++    (6-7 layers x 2,304 B) sit in a 11.5-12.9 MB block, so four more bf16 per
++    row cannot change the block count or the per-request block need; the
++    reported pool (806,792 tokens on the reference host) therefore stays. (This offline
++    stand-in reports 839,390 for both widths: it does not annotate the draft
++    group, so its blocks-per-request differ from the reference host's; the DELTA is the
++    measurement.)"""
++    import tests.v1.test_pp_kv_projection as prod
++    from vllm.v1.core import kv_cache_utils as ku
++
++    real = _key_cache(rope=True).get_kv_cache_spec(
++        SimpleNamespace(num_speculative_tokens=3)
++    )
++    assert real.head_size == 144  # the row this tree actually allocates
++    results = {}
++    for name, ring in (
++        (
++            # instrument check: an absurdly wide ring DOES move the capacity,
++            # so equality below is a measurement, not a probe that ignores
++            # the ring (the ring group splits and costs blocks per request)
++            "sensitivity",
++            CircularBufferSpec(
++                block_size=8,
++                num_kv_heads=1,
++                head_size=262144,
++                head_size_v=0,
++                dtype=torch.bfloat16,
++            ),
++        ),
++        (
++            "pre_tag",
++            CircularBufferSpec(
++                block_size=8,
++                num_kv_heads=1,
++                head_size=140,
++                head_size_v=0,
++                dtype=torch.bfloat16,
++            ),
++        ),
++        ("tagged", real),
++    ):
++        saved = prod._RING
++        prod._RING = ring
++        try:
++            specs = [
++                prod._stage(0, 25, mtp=False),
++                prod._stage(0, 25, mtp=False),
++                prod._stage(25, 48, mtp=True),
++                prod._stage(25, 48, mtp=True),
++            ]
++            cfg = prod._config()
++            configs = ku.get_kv_cache_configs(cfg, specs, [4_100_000_000] * 4)
++            sched = ku.generate_scheduler_kv_cache_config(configs)
++            results[name] = (
++                [c.num_blocks for c in configs],
++                ku.get_kv_cache_capacity(cfg, sched)[0],
++            )
++        finally:
++            prod._RING = saved
++    assert results["sensitivity"][1] < results["pre_tag"][1]
++    assert results["pre_tag"][0] == [317] * 4
++    assert results["tagged"] == results["pre_tag"]
+diff --git a/tests/v1/core/test_qsa_ring_resume_alignment.py b/tests/v1/core/test_qsa_ring_resume_alignment.py
+new file mode 100644
+index 0000000000..9bc5cf446c
+--- /dev/null
++++ b/tests/v1/core/test_qsa_ring_resume_alignment.py
+@@ -0,0 +1,266 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Ring-row tag fix: can a prefix-cache hit make a request's
++FIRST QSA group read raw-key ring rows this request never wrote?
++
++The ring (CircularBufferSpec) is not prefix-cacheable: a request that resumes
++from a cache hit at position k starts with an empty ring. The pre-indexer's
++first group reads ring rows iff k is not a multiple of the compression ratio R
++(rows [k - k % R, k)). The ring-row tag fix makes such a read rank-fatal, so a legitimate
++unaligned resume would be a false positive. This file pins, on the local
++(no KV connector) path the model runs in production, that k % R == 0 always:
++
++  1. the ring never takes part in hit lookup (prefix_cacheable False, skipped
++     by the coordinator, its finder returns 0) -- kv_cache_coordinator.py
++     attention_groups loop, single_type_kv_cache_manager.py
++     CircularBufferManager.find_longest_cache_hit;
++  2. every hit length is a multiple of the coordinator's cache-hit alignment
++     (scheduler block, or the hash block under Mamba "align" partial hits),
++     including the full-prompt "recompute the last token" cap and the EAGLE
++     block drop -- kv_cache_manager.py get_computed_blocks;
++  3. boot refuses any alignment that is not a multiple of every
++     prefix-cacheable tokens_per_state, i.e. of R -- kv_cache_utils.py
++     resolve_kv_cache_block_sizes;
++  4. preemption restarts from 0 -- scheduler.py _preempt_request.
++
++The one path that CAN resume unaligned is an external KV connector
++(num_external_computed_tokens is arbitrary; a full-prompt async load resets
++to num_tokens - 1, scheduler.py _update_waiting_for_remote_kv). There the ring
++history must come from the connector: a connector that transfers the ring
++brings the producer's committed rows and tags (and the tag fix no longer clears the
++tags of a block an async load is filling); one that does not has no history
++to give, and failing closed is the correct outcome -- the recurrent GDN state
++at k cannot be rewound to an aligned k' < k. Production runs no connector.
++"""
++
++import ast
++from pathlib import Path
++from types import SimpleNamespace
++
++import pytest
++import torch
++
++from vllm.sampling_params import SamplingParams
++from vllm.utils.hashing import sha256
++from vllm.v1.core import kv_cache_utils as ku
++from vllm.v1.core.kv_cache_manager import KVCacheManager
++from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
++from vllm.v1.kv_cache_interface import (
++    CircularBufferSpec,
++    FullAttentionSpec,
++    KVCacheConfig,
++    KVCacheGroupSpec,
++    MambaSpec,
++    MLAAttentionSpec,
++)
++from vllm.v1.request import Request
++
++pytestmark = pytest.mark.cpu_test
++
++R = 4  # QSA compress ratio == MLAAttentionSpec.tokens_per_state
++BLOCK = 16  # stands in for the production 3200 (both multiples of R)
++REPO = Path(__file__).resolve().parents[3]
++
++
++def first_group_ring_rows(chunk_start: int, ratio: int = R) -> list[int]:
++    """Ring rows the pre-indexer's first group reads for a chunk starting at
++    chunk_start -- the kernel's arithmetic (qsa_pre_indexer.py: first_boundary,
++    first_position, source_in_chunk)."""
++    first_boundary = ((chunk_start + ratio) // ratio) * ratio - 1
++    first_position = first_boundary - (ratio - 1)
++    return [p for p in range(first_position, first_position + ratio) if p < chunk_start]
++
++
++def test_the_checker_can_fail():
++    """Negative control for everything below: an unaligned resume (the
++    connector full-prompt reset to num_tokens - 1) DOES read ring rows."""
++    assert first_group_ring_rows(52934) == [52932, 52933]
++    assert first_group_ring_rows(53 - 1) == []  # 52 is aligned
++    assert first_group_ring_rows(54 - 1) == [52]
++    for k in range(0, 64, R):
++        assert first_group_ring_rows(k) == []
++
++
++def _config() -> KVCacheConfig:
++    return KVCacheConfig(
++        num_blocks=256,
++        kv_cache_tensors=[],
++        kv_cache_groups=[
++            KVCacheGroupSpec(
++                ["attn"],
++                FullAttentionSpec(
++                    block_size=BLOCK, num_kv_heads=1, head_size=1, dtype=torch.float32
++                ),
++            ),
++            KVCacheGroupSpec(
++                ["comp"],
++                MLAAttentionSpec(
++                    block_size=BLOCK,
++                    num_kv_heads=1,
++                    head_size=1,
++                    dtype=torch.float32,
++                    tokens_per_state=R,
++                ),
++            ),
++            KVCacheGroupSpec(
++                ["ring"],
++                CircularBufferSpec(
++                    block_size=8, num_kv_heads=1, head_size=1, dtype=torch.float32
++                ),
++            ),
++        ],
++    )
++
++
++def _request(rid: str, tokens: list[int], hash_block: int) -> Request:
++    params = SamplingParams(max_tokens=4)
++    params.update_from_generation_config({}, eos_token_id=100)
++    return Request(
++        request_id=rid,
++        prompt_token_ids=tokens,
++        mm_features=None,
++        sampling_params=params,
++        pooling_params=None,
++        block_hasher=get_request_block_hasher(hash_block, sha256),
++    )
++
++
++def _mamba_align_group() -> KVCacheGroupSpec:
++    return KVCacheGroupSpec(
++        ["gdn"],
++        MambaSpec(
++            shapes=((4,),),
++            dtypes=(torch.float32,),
++            block_size=BLOCK,
++            mamba_cache_mode="align",
++        ),
++    )
++
++
++def _sweep_hits(*, use_eagle: bool, hash_block: int, mamba_align: bool) -> set[int]:
++    """Every hit length the real KVCacheManager returns for prompts of every
++    length in a range, for both a full-prompt repeat (capped to
++    num_tokens - 1) and a prompt continuation."""
++    init_none_hash(sha256)
++    config = _config()
++    if mamba_align:
++        config.kv_cache_groups.append(_mamba_align_group())
++    assert not config.kv_cache_groups[2].kv_cache_spec.prefix_cacheable
++    hits = set()
++    for length in range(BLOCK + 1, 5 * BLOCK + 3):
++        mgr = KVCacheManager(
++            config,
++            max_model_len=4096,
++            scheduler_block_size=BLOCK,
++            hash_block_size=hash_block,
++            enable_caching=True,
++            use_eagle=use_eagle,
++        )
++        prompt = list(range(1000, 1000 + length))
++        first = _request("a", prompt, hash_block)
++        blocks, hit, _ = mgr.get_computed_blocks(first)
++        assert hit == 0
++        assert mgr.allocate_slots(first, length, hit, blocks) is not None
++        mgr.free(first)
++        for rid, tokens in (("b", prompt), ("c", prompt + [7, 8, 9])):
++            req = _request(rid, tokens, hash_block)
++            blocks, hit, _ = mgr.get_computed_blocks(req)
++            hits.add(hit)
++            # the ring contributes no cached block: its history starts empty
++            assert len(blocks.blocks[2]) == 0
++    return hits
++
++
++@pytest.mark.parametrize(
++    "use_eagle,hash_block,mamba_align",
++    [
++        (False, BLOCK, False),
++        (True, BLOCK, False),
++        # Mamba "align" fine-grained (partial) hits: lengths 20, 24, 28, ...
++        # (EAGLE + Mamba needs the eagle-group annotation this stand-in does
++        # not model -- it returns no hit at all, so it is not swept here.)
++        (False, R, True),
++    ],
++    ids=["block", "block-eagle", "partial-hits"],
++)
++def test_every_local_prefix_hit_resumes_on_a_group_boundary(
++    use_eagle, hash_block, mamba_align
++):
++    hits = _sweep_hits(
++        use_eagle=use_eagle, hash_block=hash_block, mamba_align=mamba_align
++    )
++    for hit in hits:
++        assert hit % R == 0 and first_group_ring_rows(hit) == [], hit
++    # the sweep really produced non-trivial hits (else it proves nothing)
++    assert max(hits) >= 3 * BLOCK
++    if mamba_align:  # ...and really partial ones
++        assert any(hit % BLOCK for hit in hits)
++
++
++def test_failing_control_a_finer_hash_block_would_open_the_path():
++    """What the boot check below closes: with partial hits on a hash block of
++    2 (not a multiple of R) the SAME sweep returns hits that make the first
++    group read ring rows this request never wrote."""
++    hits = _sweep_hits(use_eagle=False, hash_block=2, mamba_align=True)
++    assert any(first_group_ring_rows(hit) for hit in hits), sorted(hits)
++
++
++def _boot_config(prefix_match_unit):
++    return SimpleNamespace(
++        cache_config=SimpleNamespace(
++            block_size=BLOCK,
++            enable_prefix_caching=True,
++            prefix_match_unit=prefix_match_unit,
++        ),
++        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
++        kv_transfer_config=None,
++    )
++
++
++def _boot_groups():
++    return KVCacheConfig(
++        num_blocks=64,
++        kv_cache_tensors=[],
++        kv_cache_groups=[
++            *_config().kv_cache_groups,
++            KVCacheGroupSpec(
++                ["gdn"],
++                MambaSpec(
++                    shapes=((4,),),
++                    dtypes=(torch.float32,),
++                    block_size=BLOCK,
++                    mamba_cache_mode="align",
++                ),
++            ),
++        ],
++    )
++
++
++def test_boot_refuses_a_hit_alignment_finer_than_the_qsa_group():
++    """With Mamba "align" partial hits the alignment drops to the hash block;
++    a hash block that is not a multiple of R would allow an unaligned resume,
++    and boot refuses it."""
++    with pytest.raises(ValueError, match="per-state compression"):
++        ku.resolve_kv_cache_block_sizes(_boot_groups(), _boot_config(2))
++    # control: an R-multiple hash block is accepted and stays R-aligned
++    sched, hash_bs = ku.resolve_kv_cache_block_sizes(_boot_groups(), _boot_config(4))
++    assert sched == BLOCK and hash_bs % R == 0
++
++
++def _function(path: Path, name: str) -> ast.FunctionDef:
++    tree = ast.parse(path.read_text(encoding="utf-8"))
++    for node in ast.walk(tree):
++        if isinstance(node, ast.FunctionDef) and node.name == name:
++            return node
++    raise AssertionError(f"{name} not found in {path}")
++
++
++def test_preemption_restarts_from_zero():
++    fn = _function(REPO / "vllm/v1/core/sched/scheduler.py", "_preempt_request")
++    assigns = [
++        ast.unparse(n)
++        for n in ast.walk(fn)
++        if isinstance(n, ast.Assign)
++        and any("num_computed_tokens" in ast.unparse(t) for t in n.targets)
++    ]
++    assert "request.num_computed_tokens = 0" in assigns
+diff --git a/tests/v1/core/test_ring_tag_clear.py b/tests/v1/core/test_ring_tag_clear.py
+new file mode 100644
+index 0000000000..0c5b3d5265
+--- /dev/null
++++ b/tests/v1/core/test_ring_tag_clear.py
+@@ -0,0 +1,367 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""v2.2 ring-row tag fix, manager half: the unconditional, ordered ring tag clear.
++
++`_record_new_block_ids` keeps `CircularBufferSpec` out of whole-block zeroing
++(single_type_kv_cache_manager.py:117-121), so a re-claimed ring block keeps
++its previous occupant's bytes. The tag fix does not change that; it records EVERY
++ring claim on a separate list, unconditionally (never under
++`needs_kv_cache_zeroing`), ships it as `SchedulerOutput.new_ring_block_ids_to_clear`
++and the runner clears the rows' TAG words right after the zeroer and before
++copies and the forward -- i.e. before the new owner's first ring access.
++
++FAILING CONTROL: on the unmodified tree (without this fix) every
++test here fails -- `take_new_ring_block_ids`, the SchedulerOutput field and
++`vllm.v1.worker.ring_tags` do not exist, and nothing calls a ring clear.
++"""
++
++import ast
++from pathlib import Path
++from types import SimpleNamespace
++
++import pytest
++import torch
++
++from vllm.v1.core.block_pool import BlockPool
++from vllm.v1.core.kv_cache_manager import KVCacheManager
++from vllm.v1.core.sched.output import SchedulerOutput
++from vllm.v1.core.single_type_kv_cache_manager import (
++    CircularBufferManager,
++    FullAttentionManager,
++)
++from vllm.v1.kv_cache_interface import CircularBufferSpec, FullAttentionSpec
++from vllm.v1.worker.ring_tags import clear_ring_row_tags, ring_tag_layers
++
++pytestmark = pytest.mark.cpu_test
++
++REPO = Path(__file__).resolve().parents[3]
++
++
++def _ring_manager(pool: BlockPool, *, zeroing: bool) -> CircularBufferManager:
++    spec = CircularBufferSpec(
++        block_size=8, num_kv_heads=1, head_size=144, dtype=torch.bfloat16
++    )
++    return CircularBufferManager(
++        spec,
++        block_pool=pool,
++        enable_caching=False,
++        kv_cache_group_id=0,
++        scheduler_block_size=8,
++        needs_kv_cache_zeroing=zeroing,
++        max_admission_blocks_per_request=1,
++    )
++
++
++@pytest.mark.parametrize("zeroing", [False, True], ids=["no-zeroing", "zeroing"])
++def test_every_ring_claim_is_recorded_whatever_the_zeroing_gate(zeroing):
++    pool = BlockPool(num_gpu_blocks=10, enable_caching=False, hash_block_size=8)
++    mgr = _ring_manager(pool, zeroing=zeroing)
++    (a,) = mgr.allocate_new_blocks("a", num_tokens=100, num_tokens_main_model=100)
++    (b,) = mgr.allocate_new_blocks("b", num_tokens=3, num_tokens_main_model=3)
++    # later steps of the same request claim nothing new
++    assert mgr.allocate_new_blocks("a", 200, 200) == []
++    assert mgr.take_new_ring_block_ids() == [a.block_id, b.block_id]
++    # drained: a second take is empty
++    assert mgr.take_new_ring_block_ids() == []
++    # the ring stays OUT of whole-block zeroing (unchanged behaviour)
++    assert not mgr.records_new_block_ids
++    assert mgr.take_new_block_ids() == []
++
++
++def test_external_claim_is_recorded_too():
++    pool = BlockPool(num_gpu_blocks=10, enable_caching=False, hash_block_size=8)
++    mgr = _ring_manager(pool, zeroing=False)
++    mgr.allocate_external_computed_blocks("x", 16, 16)
++    (block,) = mgr.req_to_blocks["x"]
++    assert mgr.take_new_ring_block_ids() == [block.block_id]
++
++
++def test_a_block_freed_before_the_drain_is_not_cleared():
++    """Claimed then freed in the same scheduling pass (the request was
++    preempted after its allocation): the block may belong to another group
++    by the time the worker runs, so the clear must not touch it."""
++    pool = BlockPool(num_gpu_blocks=10, enable_caching=False, hash_block_size=8)
++    mgr = _ring_manager(pool, zeroing=False)
++    (a,) = mgr.allocate_new_blocks("a", 8, 8)
++    (b,) = mgr.allocate_new_blocks("b", 8, 8)
++    mgr.free("a")
++    assert mgr.take_new_ring_block_ids() == [b.block_id]
++
++
++def test_a_block_freed_and_reclaimed_in_one_pass_is_cleared_once():
++    pool = BlockPool(num_gpu_blocks=2, enable_caching=False, hash_block_size=8)
++    mgr = _ring_manager(pool, zeroing=False)  # one usable block (0 is null)
++    (a,) = mgr.allocate_new_blocks("a", 8, 8)
++    mgr.free("a")
++    (b,) = mgr.allocate_new_blocks("b", 8, 8)
++    assert b.block_id == a.block_id  # same physical block, new owner
++    assert mgr.take_new_ring_block_ids() == [b.block_id]
++
++
++def test_non_ring_managers_report_nothing():
++    pool = BlockPool(num_gpu_blocks=10, enable_caching=False, hash_block_size=4)
++    spec = FullAttentionSpec(
++        block_size=4, num_kv_heads=1, head_size=1, dtype=torch.float32
++    )
++    mgr = FullAttentionManager(
++        spec,
++        block_pool=pool,
++        enable_caching=False,
++        kv_cache_group_id=0,
++        scheduler_block_size=4,
++        needs_kv_cache_zeroing=True,
++    )
++    mgr.allocate_new_blocks("a", 16, 16)
++    assert mgr.take_new_ring_block_ids() == []
++    assert mgr.take_new_block_ids()  # attention still goes to the zeroer
++
++
++def test_kv_cache_manager_aggregates_every_group():
++    pool = BlockPool(num_gpu_blocks=10, enable_caching=False, hash_block_size=8)
++    ring_a, ring_b = (
++        _ring_manager(pool, zeroing=False),
++        _ring_manager(pool, zeroing=True),
++    )
++    (x,) = ring_a.allocate_new_blocks("r", 8, 8)
++    (y,) = ring_b.allocate_new_blocks("r", 8, 8)
++    fake = SimpleNamespace(
++        coordinator=SimpleNamespace(single_type_managers=(ring_a, ring_b))
++    )
++    assert KVCacheManager.take_new_ring_block_ids(fake) == [x.block_id, y.block_id]
++    assert KVCacheManager.take_new_ring_block_ids(fake) == []
++
++
++def test_scheduler_output_carries_the_field_default_none():
++    field = SchedulerOutput.__dataclass_fields__["new_ring_block_ids_to_clear"]
++    assert field.default is None
++
++
++# --------------------------------------------------------------------------
++# wiring, checked on the source (the scheduler and runners need a model /
++# Triton to construct; the behavioural twin of the scheduler check is
++# test_scheduler_ships_ring_claims_without_kv_zeroing below)
++# --------------------------------------------------------------------------
++
++
++def _function(path: Path, name: str) -> ast.FunctionDef:
++    tree = ast.parse(path.read_text(encoding="utf-8"))
++    for node in ast.walk(tree):
++        if isinstance(node, ast.FunctionDef) and node.name == name:
++            return node
++    raise AssertionError(f"{name} not found in {path}")
++
++
++def test_scheduler_drains_ring_claims_unconditionally():
++    path = REPO / "vllm/v1/core/sched/scheduler.py"
++    fn = _function(path, "schedule")
++    found = False
++    for node in ast.walk(fn):
++        if isinstance(node, ast.keyword) and node.arg == "new_ring_block_ids_to_clear":
++            src = ast.unparse(node.value)
++            assert "_get_new_ring_block_ids_to_clear" in src
++            assert "needs_kv_cache_zeroing" not in src
++            found = True
++    assert found, "SchedulerOutput is built without new_ring_block_ids_to_clear"
++    body = _function(path, "_get_new_ring_block_ids_to_clear").body
++    if isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant):
++        body = body[1:]  # the docstring may name the gate it is not under
++    drain = "\n".join(ast.unparse(stmt) for stmt in body)
++    assert "take_new_ring_block_ids" in drain
++    assert "needs_kv_cache_zeroing" not in drain
++
++
++def _drain_scheduler(ring_ids, skip):
++    from vllm.v1.core.sched.scheduler import Scheduler
++
++    sched = Scheduler.__new__(Scheduler)
++    sched.kv_cache_manager = SimpleNamespace(
++        take_new_ring_block_ids=lambda: list(ring_ids)
++    )
++    sched._skip_ring_clear_block_ids = set(skip)
++    return sched
++
++
++def test_drain_ships_every_claim_and_skips_only_async_load_targets():
++    sched = _drain_scheduler([3, 5, 9], skip={5})
++    assert sched._get_new_ring_block_ids_to_clear() == [3, 9]
++    # the skip set is one-shot, like _skip_zero_block_ids
++    assert sched._skip_ring_clear_block_ids == set()
++    assert _drain_scheduler([], skip=set())._get_new_ring_block_ids_to_clear() is None
++
++
++def test_async_kv_load_marks_the_request_ring_blocks_for_skipping():
++    """The async-load branch of schedule() records the request's ring blocks
++    in _skip_ring_clear_block_ids OUTSIDE the needs_kv_cache_zeroing guard
++    (an out-of-band write of the producer's ring must not be followed by a
++    tag clear that wipes its committed tags)."""
++    fn = _function(REPO / "vllm/v1/core/sched/scheduler.py", "schedule")
++    hits = []
++    for node in ast.walk(fn):
++        if isinstance(node, ast.Call) and "_skip_ring_clear_block_ids.update" in (
++            ast.unparse(node.func)
++        ):
++            hits.append(ast.unparse(node))
++    assert hits and all("get_ring_block_ids" in h for h in hits)
++    for node in ast.walk(fn):
++        if isinstance(node, ast.If) and "needs_kv_cache_zeroing" in ast.unparse(
++            node.test
++        ):
++            assert "_skip_ring_clear_block_ids" not in ast.unparse(node)
++
++
++def test_ring_block_ids_of_a_request():
++    pool = BlockPool(num_gpu_blocks=10, enable_caching=False, hash_block_size=8)
++    ring = _ring_manager(pool, zeroing=False)
++    (x,) = ring.allocate_new_blocks("r", 8, 8)
++    assert ring.get_ring_block_ids("r") == [x.block_id]
++    assert ring.get_ring_block_ids("absent") == []
++    fake = SimpleNamespace(coordinator=SimpleNamespace(single_type_managers=(ring,)))
++    assert KVCacheManager.get_ring_block_ids(fake, "r") == [x.block_id]
++
++
++@pytest.mark.parametrize(
++    "path,func,zero_call,copy_call",
++    [
++        (
++            "vllm/v1/worker/gpu/model_runner.py",
++            "update_requests",
++            "zero_block_ids",
++            "copy_kv_cache_blocks_inplace",
++        ),
++        (
++            "vllm/v1/worker/gpu_model_runner.py",
++            "_update_states",
++            "_zero_block_ids",
++            "copy_kv_cache_blocks_inplace",
++        ),
++    ],
++    ids=["v2-runner", "v1-runner"],
++)
++def test_runner_clears_after_the_zeroer_and_before_copies(
++    path, func, zero_call, copy_call
++):
++    fn = _function(REPO / path, func)
++    lines: dict[str, int] = {}
++    for node in ast.walk(fn):
++        if isinstance(node, ast.Call):
++            name = ast.unparse(node.func).rsplit(".", 1)[-1]
++            lines[name] = min(lines.get(name, node.lineno), node.lineno)
++    assert "clear_ring_row_tags" in lines, f"{path}:{func} never clears ring tags"
++    assert lines[zero_call] < lines["clear_ring_row_tags"] < lines[copy_call]
++    # and the clear is not nested under the zeroing branch
++    for node in ast.walk(fn):
++        if isinstance(node, ast.If) and "new_block_ids_to_zero" in ast.unparse(
++            node.test
++        ):
++            inner = {ast.unparse(n) for n in ast.walk(node)}
++            assert not any("clear_ring_row_tags" in s for s in inner)
++
++
++# --------------------------------------------------------------------------
++# the worker helper
++# --------------------------------------------------------------------------
++
++
++class _TagLayer:
++    def __init__(self, num_blocks: int, prefix: str = "layer"):
++        self.prefix = prefix
++        self.ring_tag_cache = torch.arange(
++            1, num_blocks * 8 + 1, dtype=torch.int64
++        ).view(num_blocks, 8, 1, 1)
++        self.cleared: list[list[int]] = []
++
++    def clear_ring_row_tags(self, block_ids: torch.Tensor) -> None:
++        self.cleared.append(block_ids.tolist())
++        self.ring_tag_cache.index_fill_(0, block_ids, 0)
++
++
++def test_helper_clears_every_tag_layer_and_skips_others():
++    a, b = _TagLayer(4, "a"), _TagLayer(4, "b")
++    ctx = {"a": a, "attn": object(), "b": b}
++    layers = ring_tag_layers(ctx)
++    assert layers == [a, b]
++    assert clear_ring_row_tags(layers, [2, 0], torch.device("cpu")) == 2
++    for layer in (a, b):
++        assert layer.cleared == [[2, 0]]
++        assert torch.all(layer.ring_tag_cache[[0, 2]] == 0)
++        assert torch.all(layer.ring_tag_cache[[1, 3]] != 0)
++
++
++def test_helper_is_a_noop_without_ids_or_layers():
++    a = _TagLayer(2)
++    assert clear_ring_row_tags([a], [], torch.device("cpu")) == 0
++    assert clear_ring_row_tags([], [1], torch.device("cpu")) == 0
++    assert a.cleared == []
++
++
++def test_helper_fails_loud_on_a_block_outside_the_pool():
++    a = _TagLayer(2)
++    with pytest.raises(ValueError, match="outside the pool"):
++        clear_ring_row_tags([a], [1, 2], torch.device("cpu"))
++    assert a.cleared == []
++
++
++def test_helper_fails_loud_on_an_unbound_layer():
++    a = _TagLayer(2)
++    a.ring_tag_cache = None
++    with pytest.raises(RuntimeError, match="no bound ring_tag_cache"):
++        clear_ring_row_tags([a], [1], torch.device("cpu"))
++
++
++def test_clear_then_commit_orders_correctly_on_a_real_ring():
++    """Claim -> clear -> the new owner's commit: the commit survives (the
++    clear never lands after it), and an uncommitted row reads tag 0."""
++    from vllm.models.qwen4_exp.common import qsa_cache
++
++    cache = qsa_cache.QSAKeyStateCache(
++        head_size=128,
++        dtype=torch.bfloat16,
++        cache_rope_positions=True,
++        cache_config=SimpleNamespace(block_size=32),
++        prefix="ringtag.order",
++        vllm_config=SimpleNamespace(
++            compilation_config=SimpleNamespace(static_forward_context={})
++        ),
++        compress_ratio=4,
++    )
++    unified = torch.full((3, 1, 8, 144), 0.25, dtype=torch.bfloat16)
++    cache.bind_kv_cache(unified)
++    residue = int(cache.ring_tag_cache[1, 0, 0, 0])
++    assert residue != 0
++    # step N: scheduler claimed block 1; the runner clears before the forward
++    clear_ring_row_tags(ring_tag_layers({"l": cache}), [1], torch.device("cpu"))
++    # step N forward: the new owner commits positions 100, 101
++    for position in (100, 101):
++        cache.ring_tag_cache[1, position % 8, 0, 0] = position + 1
++    tags = cache.ring_tag_cache[1, :, 0, 0].tolist()
++    assert tags[100 % 8] == 101 and tags[101 % 8] == 102
++    assert [t for i, t in enumerate(tags) if i not in (100 % 8, 101 % 8)] == [0] * 6
++    # other blocks untouched
++    assert int(cache.ring_tag_cache[0, 0, 0, 0]) == residue
++
++
++# --------------------------------------------------------------------------
++# behavioural scheduler check (needs the HF config of the test model: runs on
++# the reference host / CI, not offline without the model)
++# --------------------------------------------------------------------------
++
++
++def test_scheduler_ships_ring_claims_without_kv_zeroing():
++    from .utils import create_requests, create_scheduler
++
++    spec = CircularBufferSpec(
++        block_size=16, num_kv_heads=1, head_size=1, dtype=torch.float32
++    )
++    scheduler = create_scheduler(kv_cache_spec=spec)
++    assert not scheduler.needs_kv_cache_zeroing
++    requests = create_requests(num_requests=2, num_tokens=10)
++    scheduler.add_request(requests[0])
++    out0 = scheduler.schedule()
++    blocks0 = scheduler.kv_cache_manager.get_block_ids(requests[0].request_id)[0]
++    assert out0.new_ring_block_ids_to_clear == list(blocks0)
++    assert out0.new_block_ids_to_zero is None
++    scheduler.add_request(requests[1])
++    out1 = scheduler.schedule()
++    blocks1 = scheduler.kv_cache_manager.get_block_ids(requests[1].request_id)[0]
++    # only the NEW claim, never the first request's block again
++    assert out1.new_ring_block_ids_to_clear == list(blocks1)
+diff --git a/tests/v1/test_pp_kv_projection.py b/tests/v1/test_pp_kv_projection.py
+index 2c699ab094..2f8cc59cdb 100644
+--- a/tests/v1/test_pp_kv_projection.py
++++ b/tests/v1/test_pp_kv_projection.py
+@@ -51,9 +51,10 @@ _MAIN = FullAttentionSpec(
+     dtype=torch.uint8,
+     kv_quant_mode=get_kv_quant_mode("fp8_e4m3"),
+ )
+-# QSAKeyStateCache: ring = 4 * cdiv(4 + K, 4) = 8, head 128 + MRoPE tail 12.
++# QSAKeyStateCache: ring = 4 * cdiv(4 + K, 4) = 8, head 128 + int64 tail 16
++# (pos_t, pos_h, pos_w, tag; the ring-row tag fix -- was 12 before the tag word).
+ _RING = CircularBufferSpec(
+-    block_size=8, num_kv_heads=1, head_size=140, head_size_v=0, dtype=torch.bfloat16
++    block_size=8, num_kv_heads=1, head_size=144, head_size_v=0, dtype=torch.bfloat16
+ )
+ # QSACompressedKeyCache: bf16 indexer, compress ratio 4.
+ _COMP = MLAAttentionSpec(
+diff --git a/tests/v1/worker/gpu/ring_tag_replay.py b/tests/v1/worker/gpu/ring_tag_replay.py
+new file mode 100644
+index 0000000000..bd09d8564f
+--- /dev/null
++++ b/tests/v1/worker/gpu/ring_tag_replay.py
+@@ -0,0 +1,467 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Ring-row tag fix reference-host harness: the ring-residue variants, before and after the fix.
++
++Derived from an earlier crash-replay harness.
++The decode row under test (52,934 computed,
++4 scheduled -> chunk start 2 mod 4, so its first group reads two ring rows),
++real metadata from build_qsa_metadata_triton, one process per variant (an
++illegal address is sticky and would void every later variant).
++
++It runs unchanged on BOTH trees and says which one it is on:
++  * fixed   (tag fix): rows are D+16 wide with a tag word; SITE_QSA_RING_UNCOMMITTED
++                   exists; layer_id is passed.
++  * unfixed (pre-fix kernels, an earlier commit): rows D+12, no tag.
++
++--disable-guard9 swaps _norm_rope for a clone WITHOUT the guard-9 clamp
++before the first launch (Triton resolves the callee from the kernel module's
++globals at compile time). The `guard9_probe` variant proves the swap took:
++it feeds a valid-tag row whose position is one past the cos/sin table, which
++guard 9 counts (> 0) and the clone does not (== 0).
++
++Expected outcomes (ACCEPT column of the summary):
++  variant                unfixed, guard 9 off   unfixed, guard 9 on   fixed
++  ring_realistic         clean                  clean                 clean, site 0
++  ring_uncommitted_row   FAULT (memcheck/IMA)   guard9 > 0 (masked)   request_error
++  ring_untouched_residue FAULT or silent*       guard9 >= 0*          request_error
++  ring_every_row_2/_3    silent (blind)         silent (blind)        request_error
++  guard9_probe           guard9 == 0            guard9 > 0            guard9 > 0, site 0
++* untouched residue is whatever the allocator left; the crash replay measured it
++  reaching the rope load (11 memcheck reads), but a run where it decodes in
++  range is the silent-corruption outcome, not a clean one.
++"request_error" = no fault, SITE_QSA_RING_UNCOMMITTED count > 0, its record
++names request row 0 and a historical source position, guard 9 count 0, and
++the group's compressed slot left unwritten.
++
++  python ring_tag_replay.py --self-test            # CPU, geometry only
++  python ring_tag_replay.py [--disable-guard9]     # all variants, isolated
++  compute-sanitizer --tool memcheck python ring_tag_replay.py --only X
++"""
++
++from __future__ import annotations
++
++import argparse
++import json
++import os
++import subprocess
++import sys
++
++D = 128
++HQ = 4
++CR = 4
++STATE = 8
++COMP_PAGE = 800
++NUM_BLOCKS = 317
++TABLE_WIDTH = 82
++MAX_MODEL_LEN = 262144
++MROPE = (11, 11, 10)
++LAYER = 3
++VICTIM_RING, FRESH_RING = 5, 60
++
++# (computed, scheduled) of the request under test
++SHAPES = {
++    "ring_realistic": (52934, 4),
++    "ring_uncommitted_row": (52934, 4),
++    "ring_untouched_residue": (52934, 4),
++    "ring_every_row_2": (52935, 4),
++    "ring_every_row_3": (52935, 4),
++    "guard9_probe": (52934, 4),
++}
++VARIANTS = list(SHAPES)
++
++
++def historical_positions(computed: int) -> list[int]:
++    """Ring rows the first group of a chunk starting at `computed` reads."""
++    first = computed - computed % CR
++    return list(range(first, computed))
++
++
++def self_test() -> int:
++    ok = True
++
++    def check(name, cond):
++        nonlocal ok
++        ok = ok and bool(cond)
++        print(f"  {'PASS' if cond else 'FAIL'}  {name}")
++
++    check("the decode row reads two ring rows", historical_positions(52934) == [52932, 52933])
++    check(
++        "every-row shape reads three",
++        historical_positions(52935) == [52932, 52933, 52934],
++    )
++    check("rows 4,5 for the decode row", [p % STATE for p in (52932, 52933)] == [4, 5])
++    # the crash replay's victim committed positions 100/101, i.e. rows 4/5 -- the
++    # very rows the reader picks. Here the victim sits at 96/97 (rows 0/1) so
++    # the reader's rows stay residue, which is the case being asked about.
++    check("victim rows 96,97 -> 0,1, disjoint from 4,5", [96 % 8, 97 % 8] == [0, 1])
++    check("the group ends inside the chunk", (52934 - 52934 % 4 + 3) < 52934 + 4)
++    print(f"self-test: {'PASS' if ok else 'FAIL'}")
++    return 0 if ok else 1
++
++
++def _unguarded_norm_rope():
++    """_norm_rope with the guard-9 block and clamp removed, same signature."""
++    from vllm.triton_utils import tl, triton
++
++    @triton.jit
++    def _norm_rope(
++        x,
++        pos_t,
++        pos_h,
++        pos_w,
++        cos_sin_ptr,
++        cos_sin_stride,
++        cos_sin_rows,
++        guard_ctr,
++        norm_weight_ptr,
++        eps,
++        IS_MROPE: tl.constexpr,
++        MROPE_H: tl.constexpr,
++        MROPE_W: tl.constexpr,
++    ):
++        TILE_T: tl.constexpr = x.shape[0]
++        TILE_H: tl.constexpr = x.shape[1]
++        DD: tl.constexpr = x.shape[2]
++        ROWS: tl.constexpr = TILE_T * TILE_H
++        HALF: tl.constexpr = DD // 2
++        QUARTER: tl.constexpr = DD // 4
++        pairs = tl.arange(0, QUARTER)
++        if IS_MROPE:
++            h_mask = ((pairs % 3) == 1) & (pairs <= 3 * MROPE_H)
++            w_mask = ((pairs % 3) == 2) & (pairs <= 3 * MROPE_W)
++            t_mask = ~(h_mask | w_mask)
++            base = cos_sin_ptr + pairs[None, :]
++            pos_rows = (pos_t, pos_h, pos_w)
++            axis_masks = (t_mask, h_mask, w_mask)
++            cos = tl.zeros((TILE_T, QUARTER), dtype=cos_sin_ptr.dtype.element_ty)
++            sin = tl.zeros((TILE_T, QUARTER), dtype=cos_sin_ptr.dtype.element_ty)
++            for axis in tl.static_range(3):
++                cos += tl.load(
++                    base + pos_rows[axis][:, None] * cos_sin_stride,
++                    mask=axis_masks[axis][None, :],
++                    other=0,
++                )
++                sin += tl.load(
++                    base + pos_rows[axis][:, None] * cos_sin_stride + QUARTER,
++                    mask=axis_masks[axis][None, :],
++                    other=0,
++                )
++        else:
++            cos = tl.load(
++                cos_sin_ptr + pos_t[:, None] * cos_sin_stride + pairs[None, :]
++            )
++            sin = tl.load(
++                cos_sin_ptr + pos_t[:, None] * cos_sin_stride + QUARTER + pairs[None, :]
++            )
++        cos = tl.reshape(
++            tl.broadcast_to(cos[:, None, :], (TILE_T, TILE_H, QUARTER)), (ROWS, QUARTER)
++        )
++        sin = tl.reshape(
++            tl.broadcast_to(sin[:, None, :], (TILE_T, TILE_H, QUARTER)), (ROWS, QUARTER)
++        )
++        x = tl.reshape(x, (ROWS, DD)).to(tl.float32)
++        weight = tl.load(norm_weight_ptr + tl.arange(0, DD)).to(tl.float32) + 1.0
++        rrms = tl.rsqrt(tl.sum(x * x, axis=1) / DD + eps)
++        y = (x * rrms[:, None] * weight[None, :]).to(cos.dtype)
++        rotated, passthrough = tl.split(
++            tl.permute(tl.reshape(y, (ROWS, 2, HALF)), (0, 2, 1))
++        )
++        r0, r1 = tl.split(
++            tl.permute(tl.reshape(rotated, (ROWS, 2, QUARTER)), (0, 2, 1))
++        )
++        out0 = r0 * cos - r1 * sin
++        out1 = r1 * cos + r0 * sin
++        rotated = tl.reshape(tl.permute(tl.join(out0, out1), (0, 2, 1)), (ROWS, HALF))
++        result = tl.reshape(
++            tl.permute(tl.join(rotated, passthrough), (0, 2, 1)), (ROWS, DD)
++        )
++        return tl.reshape(result, (TILE_T, TILE_H, DD))
++
++    return _norm_rope
++
++
++def run_variant(variant: str, disable_guard9: bool) -> dict:
++    import torch
++
++    from vllm.models.qwen4_exp.common import qsa_cache as qc
++    from vllm.models.qwen4_exp.nvidia.ops import qsa_pre_indexer as qpi
++    from vllm.v1.attention.backend import CommonAttentionMetadata
++    from vllm.v1.worker import guard_telemetry as gt
++
++    fixed = hasattr(gt, "SITE_QSA_RING_UNCOMMITTED")
++    width = D + (16 if fixed else 12)
++    rec: dict = {
++        "variant": variant,
++        "tree": "fixed" if fixed else "unfixed",
++        "guard9": "disabled" if disable_guard9 else "present",
++    }
++    if disable_guard9:
++        qpi._norm_rope = _unguarded_norm_rope()
++    device = torch.device("cuda:0")
++    torch.manual_seed(20260923)
++    gt.prealloc(device)
++    gt.reset_for_test()
++
++    computed, sched = SHAPES[variant]
++    seq = computed + sched
++    qsl = torch.tensor([0, sched], dtype=torch.int32)
++    ring_tab = torch.full((1, 1), VICTIM_RING, dtype=torch.int32, device=device)
++
++    def md_for(table):
++        return CommonAttentionMetadata(
++            query_start_loc=qsl.to(device),
++            query_start_loc_cpu=qsl,
++            seq_lens=torch.tensor([seq], dtype=torch.int32, device=device),
++            num_reqs=1,
++            num_actual_tokens=sched,
++            max_query_len=sched,
++            max_seq_len=seq,
++            block_table_tensor=table,
++            slot_mapping=torch.zeros(sched, dtype=torch.int64, device=device),
++        )
++
++    def bufs():
++        return [
++            torch.empty(sched, dtype=d, device=device)
++            for d in (torch.int32, torch.int64, torch.int32, torch.int64)
++        ]
++
++    _t, logical, _v, state_slots = qc.build_qsa_metadata_triton(
++        md_for(ring_tab),
++        *bufs(),
++        storage_block_size=STATE,
++        compress_ratio=1,
++        circular_buffer_size=STATE,
++        k_work_metadata_buffer=None,
++        request_capacity=None,
++    )
++    comp_tab = (
++        ((torch.arange(TABLE_WIDTH, device=device) % (NUM_BLOCKS - 1)) + 1)
++        .to(torch.int32)
++        .reshape(1, -1)
++    )
++    kwb = torch.empty(
++        max((sched + CR - 1) // CR, 1), 2, dtype=torch.int32, device=device
++    )
++    _t2, _l2, _v2, comp_slots = qc.build_qsa_metadata_triton(
++        md_for(comp_tab),
++        *bufs(),
++        storage_block_size=COMP_PAGE,
++        compress_ratio=CR,
++        circular_buffer_size=0,
++        k_work_metadata_buffer=kwb,
++        request_capacity=8,
++    )
++
++    shape = (NUM_BLOCKS, STATE, 1, width)
++    if variant == "ring_untouched_residue":
++        dirty = torch.empty(shape, dtype=torch.bfloat16, device=device)
++        dirty.normal_(mean=0.0, std=6.0e4)
++        del dirty
++        ring = torch.empty(shape, dtype=torch.bfloat16, device=device)
++    else:
++        ring = torch.zeros(shape, dtype=torch.bfloat16, device=device)
++    # 64 rows of slack past the table the kernel is told about, so the
++    # guard9_probe read one row past the end stays inside this allocation
++    cos_sin = torch.randn(
++        (MAX_MODEL_LEN + 64, D // 2), dtype=torch.bfloat16, device=device
++    )[:MAX_MODEL_LEN]
++    comp = torch.full(
++        (NUM_BLOCKS, COMP_PAGE, 1, D), 7.0, dtype=torch.bfloat16, device=device
++    )
++    ones = torch.ones(D, dtype=torch.bfloat16, device=device)
++
++    def write_row(position: int, pos_value: int | None, tag: int | None):
++        row = ring[VICTIM_RING, position % STATE, 0]
++        row[:D].normal_()
++        tail = row[D:].view(torch.int64)
++        tail[:3] = pos_value if pos_value is not None else position
++        if fixed:
++            tail[3] = position + 1 if tag is None else tag
++
++    hist = historical_positions(computed)
++    rec["historical_positions"] = hist
++    if variant == "ring_realistic":
++        for p in hist:  # this request committed them
++            write_row(p, 1234, None)
++    elif variant == "ring_uncommitted_row":
++        ring[VICTIM_RING].fill_(0.25)  # residue everywhere...
++        for p in (96, 97):  # ...but the previous occupant's
++            write_row(p, 1234, None)  # rows 0-1 (its own positions)
++    elif variant.startswith("ring_every_row"):
++        bad = hist[1] if variant.endswith("_2") else hist[2]
++        for p in hist:
++            write_row(p, 1234, None)
++        write_row(bad - STATE, 1234, None)  # same row, previous lap
++        rec["stale_position"] = bad
++    elif variant == "guard9_probe":
++        for p in hist:
++            write_row(p, MAX_MODEL_LEN, None)  # one past the table, valid tag
++
++    kw = dict(compress_ratio=CR, mrope_section=MROPE, rope_pos_offset=D)
++    if fixed:
++        kw["layer_id"] = LAYER
++    if variant == "ring_untouched_residue":
++        # the victim step commits rows 0-1 through the kernel itself
++        v_logical = torch.tensor([96, 97], dtype=torch.int64, device=device)
++        qpi.qsa_pre_indexer(
++            torch.randn((2, HQ * D), dtype=torch.bfloat16, device=device),
++            torch.randn((2, D), dtype=torch.bfloat16, device=device),
++            v_logical.unsqueeze(0).expand(3, -1).contiguous(),
++            cos_sin,
++            ones,
++            ones,
++            1e-6,
++            torch.empty((2, HQ, D), dtype=torch.bfloat16, device=device),
++            ring,
++            torch.tensor(
++                [VICTIM_RING * STATE, VICTIM_RING * STATE + 1],
++                dtype=torch.int64,
++                device=device,
++            ),
++            ring_tab,
++            torch.tensor([0, 2], dtype=torch.int32, device=device),
++            v_logical,
++            comp,
++            torch.full((2,), -1, dtype=torch.int64, device=device),
++            torch.zeros(1, 2, dtype=torch.int32, device=device),
++            **kw,
++        )
++        torch.cuda.synchronize()
++        gt.reset_for_test()
++
++    q = torch.randn((sched, HQ * D), dtype=torch.bfloat16, device=device)
++    k = torch.randn((sched, D), dtype=torch.bfloat16, device=device)
++    pos = logical.to(torch.int64).unsqueeze(0).expand(3, -1).contiguous()
++    q_out = torch.empty((sched, HQ, D), dtype=torch.bfloat16, device=device)
++    qpi.qsa_pre_indexer(
++        q,
++        k,
++        pos,
++        cos_sin,
++        ones,
++        ones,
++        1e-6,
++        q_out,
++        ring,
++        state_slots,
++        ring_tab,
++        md_for(ring_tab).query_start_loc,
++        logical,
++        comp,
++        comp_slots,
++        kwb,
++        **kw,
++    )
++    torch.cuda.synchronize()
++
++    g9 = gt.counter(gt.SITE_QSA_ROPE_POS, device).tolist()
++    rec["guard9_count"] = g9[0]
++    if fixed:
++        site = gt.counter(gt.SITE_QSA_RING_UNCOMMITTED, device).tolist()
++        rec["ring_site_count"] = site[0]
++        rec["ring_record"] = gt.decode_ring_record(site[1])
++        rec["ring_found_tag"] = gt.decode_slot(site[2])
++    first_boundary = computed - computed % CR + CR - 1
++    tok = first_boundary - computed
++    slot = int(comp_slots[tok])
++    rec["group_slot_written"] = bool(
++        (comp[slot // COMP_PAGE, slot % COMP_PAGE, 0] != 7.0).any()
++    )
++    rec["status"] = "ran"
++    return rec
++
++
++def verdict(rec: dict) -> str:
++    v, tree, g9off = rec["variant"], rec.get("tree"), rec.get("guard9") == "disabled"
++    if rec["status"] != "ran":
++        return "FAULT"
++    if tree == "fixed":
++        if v in ("ring_realistic",):
++            ok = (
++                rec["ring_site_count"] == 0
++                and rec["guard9_count"] == 0
++                and rec["group_slot_written"]
++            )
++            return "clean" if ok else "UNEXPECTED"
++        if v == "guard9_probe":
++            want = 0 if g9off else 1
++            ok = rec["ring_site_count"] == 0 and (
++                (rec["guard9_count"] > 0) == bool(want)
++            )
++            return (
++                f"guard9 {'off' if g9off else 'on'} confirmed" if ok else "UNEXPECTED"
++            )
++        r = rec.get("ring_record") or {}
++        ok = (
++            rec["ring_site_count"] > 0
++            and rec["guard9_count"] == 0
++            and not rec["group_slot_written"]
++            and r.get("request_row") == 0
++            and r.get("layer") == LAYER
++            and r.get("source_position") in rec["historical_positions"]
++        )
++        return "request_error" if ok else "UNEXPECTED"
++    # unfixed tree
++    if v == "guard9_probe":
++        ok = (rec["guard9_count"] == 0) if g9off else (rec["guard9_count"] > 0)
++        return f"guard9 {'off' if g9off else 'on'} confirmed" if ok else "UNEXPECTED"
++    if v.startswith("ring_every_row") or v == "ring_realistic":
++        return "silent" if rec["guard9_count"] == 0 else "UNEXPECTED"
++    return "masked by guard 9" if rec["guard9_count"] > 0 else "silent"
++
++
++def main(argv) -> int:
++    p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
++    p.add_argument("--self-test", action="store_true")
++    p.add_argument("--only", default="")
++    p.add_argument("--disable-guard9", action="store_true")
++    p.add_argument(
++        "--in-process",
++        action="store_true",
++        help="run the named variant(s) here (child mode)",
++    )
++    args = p.parse_args(argv)
++    if args.self_test:
++        os.environ["CUDA_VISIBLE_DEVICES"] = ""
++        return self_test()
++    names = [n for n in args.only.split(",") if n] or VARIANTS
++    for n in names:
++        if n not in SHAPES:
++            print(f"unknown variant {n!r}; known: {', '.join(VARIANTS)}")
++            return 2
++    if args.in_process:
++        for n in names:
++            rec = run_variant(n, args.disable_guard9)
++            rec["accept"] = verdict(rec)
++            print(json.dumps(rec, sort_keys=True), flush=True)
++        return 0
++    rc = 0
++    for n in names:
++        child = [
++            sys.executable,
++            os.path.abspath(__file__),
++            "--in-process",
++            "--only",
++            n,
++        ] + (["--disable-guard9"] if args.disable_guard9 else [])
++        out = subprocess.run(child, capture_output=True, text=True)
++        lines = [ln for ln in out.stdout.splitlines() if ln.startswith("{")]
++        if out.returncode != 0 or not lines:
++            rec = {
++                "variant": n,
++                "status": "fault",
++                "accept": "FAULT",
++                "exit": out.returncode,
++                "stderr_tail": out.stderr.strip().splitlines()[-4:],
++            }
++            print(json.dumps(rec, sort_keys=True), flush=True)
++        else:
++            for ln in lines:
++                print(ln, flush=True)
++                if json.loads(ln).get("accept") == "UNEXPECTED":
++                    rc = 1
++    return rc
++
++
++if __name__ == "__main__":
++    sys.exit(main(sys.argv[1:]))
+diff --git a/tests/v1/worker/gpu/test_guard_telemetry_limits.py b/tests/v1/worker/gpu/test_guard_telemetry_limits.py
+index 9fa75364bf..09d2865196 100644
+--- a/tests/v1/worker/gpu/test_guard_telemetry_limits.py
++++ b/tests/v1/worker/gpu/test_guard_telemetry_limits.py
+@@ -256,10 +256,16 @@ def test_zero_hits_is_not_bitwise_equivalence() -> None:
+     guard set is still a bounds-check set of the size this argument was
+     written against; if a site is added, this argument is re-read.
+     """
+-    assert gt.NUM_SITES == 11
++    assert gt.NUM_SITES == 12
+     assert set(gt.SITE_NAMES) == set(range(gt.NUM_SITES))
+     # The one non-bounds site, which is telemetry and not a masked fault.
+     assert "SKIPPED" in gt.SITE_NAMES[gt.SITE_QSA_RING_SKIP]
++    # Re-read for the ring-row tag fix (site 11): the one CONTENT check. It sees an in-range
++    # but wrong ring row only when the row's tag is wrong (never committed for
++    # that position); a row committed for the right position with the wrong
++    # speculative candidate's key still passes. So point 1 above stands for
++    # every other site and narrows, not vanishes, for this one.
++    assert "UNCOMMITTED" in gt.SITE_NAMES[gt.SITE_QSA_RING_UNCOMMITTED]
+ 
+ 
+ # ---------------------------------------------------------------------------
+diff --git a/tests/v1/worker/gpu/test_qsa_ring_skip_telemetry.py b/tests/v1/worker/gpu/test_qsa_ring_skip_telemetry.py
+index 84f109df78..6e07e6d286 100644
+--- a/tests/v1/worker/gpu/test_qsa_ring_skip_telemetry.py
++++ b/tests/v1/worker/gpu/test_qsa_ring_skip_telemetry.py
+@@ -24,7 +24,7 @@ COMPRESS_RATIO = 4
+ HEAD_DIM = 128
+ N_HEADS = 4
+ STATE_SIZE = 8  # ring capacity
+-ROW_WIDTH = 140  # head dim + the int64 position triple in the tail
++ROW_WIDTH = 144  # head dim + the int64 tail (pos_t, pos_h, pos_w, tag)
+ MAX_MODEL_LEN = 4096
+ NUM_BLOCKS = 8
+ RING_CAPACITY = NUM_BLOCKS * STATE_SIZE
+@@ -122,7 +122,7 @@ def test_site_is_declared_named_and_not_fatal():
+     that is fatal would abort a boot on the older behaviour it merely
+     observes. Both are the wrong instrument."""
+     site = guard_telemetry.SITE_QSA_RING_SKIP
+-    assert site == 10 and guard_telemetry.NUM_SITES == 11
++    assert site == 10 and guard_telemetry.NUM_SITES == 12  # the ring-row tag fix added site 11
+     assert site in guard_telemetry.SITE_NAMES
+     assert "SKIPPED" in guard_telemetry.SITE_NAMES[site]
+     assert site not in guard_telemetry._ALWAYS_FATAL_SITES
+@@ -174,12 +174,13 @@ def test_negative_control_valid_slots_count_zero():
+     torch.cuda.synchronize()
+     ctr = guard_telemetry.counter(guard_telemetry.SITE_QSA_RING_SKIP, device)
+     assert ctr.tolist() == [0, 0, 0]
+-    # and the commit happened: every token's raw key and position tail
++    # and the commit happened: every token's raw key and position tail, and
++    # the tag word = logical position + 1
+     for t in range(kw["k"].shape[0]):
+         row = kw["state_cache"][0, t, 0, :]
+         assert torch.equal(row[:HEAD_DIM], kw["k"][t])
+-        tail = row[HEAD_DIM : HEAD_DIM + 12].contiguous().view(torch.int64)
+-        assert tail.tolist() == [t, t, t]
++        tail = row[HEAD_DIM : HEAD_DIM + 16].contiguous().view(torch.int64)
++        assert tail.tolist() == [t, t, t, t + 1]
+ 
+ 
+ @pytest.mark.gpu
+diff --git a/tests/v1/worker/gpu/test_qsa_ring_tags_gpu.py b/tests/v1/worker/gpu/test_qsa_ring_tags_gpu.py
+new file mode 100644
+index 0000000000..8987e52fac
+--- /dev/null
++++ b/tests/v1/worker/gpu/test_qsa_ring_tags_gpu.py
+@@ -0,0 +1,311 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""v2.2 ring-row tag fix, kernel half (GPU): the pre-indexer's ring-row tag contract.
++
++Writer: every committed ring row gets tag = logical_position + 1 in word 3 of
++its int64 tail. Reader: every HISTORICAL source row of a pooled group must
++carry exactly source_position + 1; otherwise the group's pooled load, its RoPE
++tail read and its compressed-slot store are masked and SITE_QSA_RING_UNCOMMITTED
++records one coherent first-offender record (layer, request row, source position
+++ the tag found there).
++
++Each positive case is paired with its clean twin in the same test (same batch,
++history committed correctly) that must count 0 and write the slot -- a counter
++that reads the same in both worlds measures nothing.
++
++FAILING CONTROL: on the unmodified tree (an earlier commit) the module fails at
++collection (QSA_RING_TAIL_ELEMENTS / QSA_RING_TAG_WORD do not exist). Were the
++constants shimmed, the old launcher also has no ``layer_id`` (TypeError), no
++tag writer (the writer test reads tag 0) and no reader check (the every-row
++test counts nothing and writes the slot).
++"""
++
++import pytest
++import torch
++
++from vllm.models.qwen4_exp.common.qsa_cache import (
++    QSA_RING_TAG_WORD,
++    QSA_RING_TAIL_ELEMENTS,
++)
++from vllm.v1.worker import guard_telemetry as gt
++
++pytestmark = pytest.mark.gpu
++
++CR = 4
++D = 128
++HQ = 4
++STATE = 8
++WIDTH = D + QSA_RING_TAIL_ELEMENTS
++NUM_BLOCKS = 8
++COMP_PAGE = 800
++MAX_POS = 4096
++LAYER = 7
++SENTINEL = 7.0
++MROPE = (11, 11, 10)
++
++
++def _device():
++    return torch.device("cuda", torch.cuda.current_device())
++
++
++def _pos3(position: int) -> list[int]:
++    # distinct, in-range MRoPE coordinates per position
++    return [position, position // 7 + 3, position // 13 + 11]
++
++
++class _Batch:
++    """Requests (ring block, chunk_start, query_len) as one decode/prefill batch."""
++
++    def __init__(self, requests, device):
++        self.device = device
++        self.requests = requests
++        logical, slots, comp, qsl, work = [], [], [], [0], []
++        comp_next = 0
++        self.group_slot: dict[tuple[int, int], int] = {}
++        for r, (block, start, qlen) in enumerate(requests):
++            for i in range(qlen):
++                p = start + i
++                logical.append(p)
++                slots.append(block * STATE + p % STATE if i >= qlen - STATE else -1)
++                if (p + 1) % CR == 0:
++                    comp.append(comp_next)
++                    self.group_slot[(r, p)] = comp_next
++                    comp_next += 1
++                else:
++                    comp.append(-1)
++            qsl.append(qsl[-1] + qlen)
++            groups = (start + qlen) // CR - start // CR
++            work += [[r, w] for w in range(max(groups, 1))]
++        T = len(logical)
++        self.T = T
++        self.logical = torch.tensor(logical, dtype=torch.int64, device=device)
++        self.positions = (
++            torch.tensor([_pos3(p) for p in logical], dtype=torch.int64)
++            .t()
++            .contiguous()
++            .to(device)
++        )
++        self.state_slots = torch.tensor(slots, dtype=torch.int64, device=device)
++        self.comp_slots = torch.tensor(comp, dtype=torch.int64, device=device)
++        self.qsl = torch.tensor(qsl, dtype=torch.int32, device=device)
++        self.state_table = torch.tensor(
++            [[b] for b, _s, _q in requests], dtype=torch.int32, device=device
++        )
++        self.work = torch.tensor(work, dtype=torch.int32, device=device)
++        g = torch.Generator(device="cpu").manual_seed(1234)
++        self.q = torch.randn(T, HQ * D, generator=g).to(device, torch.bfloat16)
++        self.k = torch.randn(T, D, generator=g).to(device, torch.bfloat16)
++        self.cos_sin = torch.randn(MAX_POS, D // 2, generator=g).to(
++            device, torch.bfloat16
++        )
++        self.ring = torch.zeros(
++            NUM_BLOCKS, STATE, 1, WIDTH, dtype=torch.bfloat16, device=device
++        )
++        self.comp = torch.full(
++            (NUM_BLOCKS, COMP_PAGE, 1, D), SENTINEL, dtype=torch.bfloat16, device=device
++        )
++        self.q_out = torch.empty(T, HQ, D, dtype=torch.bfloat16, device=device)
++
++    def commit(self, block: int, position: int, *, tag: int | None = None):
++        """What a correct earlier step of this request leaves in the ring."""
++        row = self.ring[block, position % STATE, 0]
++        g = torch.Generator(device="cpu").manual_seed(position)
++        row[:D] = torch.randn(D, generator=g).to(self.device, torch.bfloat16)
++        tail = row[D:].view(torch.int64)
++        tail[:3] = torch.tensor(_pos3(position), device=self.device)
++        tail[QSA_RING_TAG_WORD] = position + 1 if tag is None else tag
++
++    def tag(self, block: int, row: int) -> int:
++        return int(self.ring[block, row, 0, D:].view(torch.int64)[QSA_RING_TAG_WORD])
++
++    def run(self, *, rope=True):
++        from vllm.models.qwen4_exp.nvidia.ops.qsa_pre_indexer import qsa_pre_indexer
++
++        qsa_pre_indexer(
++            self.q,
++            self.k,
++            self.positions if rope else self.logical,
++            self.cos_sin,
++            torch.ones(D, dtype=torch.bfloat16, device=self.device),
++            torch.ones(D, dtype=torch.bfloat16, device=self.device),
++            1e-6,
++            self.q_out,
++            self.ring,
++            self.state_slots,
++            self.state_table,
++            self.qsl,
++            self.logical,
++            self.comp,
++            self.comp_slots,
++            self.work,
++            compress_ratio=CR,
++            mrope_section=MROPE if rope else None,
++            rope_pos_offset=D if rope else None,
++            layer_id=LAYER,
++        )
++        torch.cuda.synchronize()
++
++    def slot_written(self, request: int, end_position: int) -> bool:
++        slot = self.group_slot[(request, end_position)]
++        row = self.comp[slot // COMP_PAGE, slot % COMP_PAGE, 0]
++        return not bool(torch.all(row == SENTINEL))
++
++
++def _site():
++    return gt.counter(gt.SITE_QSA_RING_UNCOMMITTED, _device()).tolist()
++
++
++def _rope_site():
++    return gt.counter(gt.SITE_QSA_ROPE_POS, _device()).tolist()
++
++
++@pytest.fixture(autouse=True)
++def _fresh_counters():
++    gt.prealloc(_device())
++    gt.reset_for_test()
++    yield
++    gt.reset_for_test()
++
++
++# --------------------------------------------------------------------------
++# writer
++# --------------------------------------------------------------------------
++
++
++@pytest.mark.parametrize("rope", [True, False], ids=["mrope", "text"])
++@pytest.mark.parametrize("qlen", [3, 6, 13], ids=["no-group", "short", "long"])
++def test_writer_tags_every_committed_row(rope, qlen):
++    b = _Batch([(2, 40, qlen)], _device())
++    b.run(rope=rope)
++    committed = list(range(40 + max(qlen - STATE, 0), 40 + qlen))
++    for p in committed:
++        assert b.tag(2, p % STATE) == p + 1, f"row for position {p}"
++        if rope:
++            tail = b.ring[2, p % STATE, 0, D:].view(torch.int64)
++            assert tail[:3].tolist() == _pos3(p)
++    untouched = set(range(STATE)) - {p % STATE for p in committed}
++    for row in untouched:
++        assert b.tag(2, row) == 0
++    assert _site() == [0, 0, 0]
++
++
++# --------------------------------------------------------------------------
++# reader: the every-row control and its clean twin
++# --------------------------------------------------------------------------
++
++
++def _three_historical_rows(device):
++    # chunk start 1003 = 3 mod 4: the first group is 1000..1003 and 1000,
++    # 1001, 1002 all come from the ring
++    b = _Batch([(3, 1003, 4)], device)
++    for p in (1000, 1001, 1002):
++        b.commit(3, p)
++    return b
++
++
++def test_clean_twin_counts_zero_and_writes_the_slot():
++    b = _three_historical_rows(_device())
++    b.run()
++    assert _site() == [0, 0, 0]
++    assert b.slot_written(0, 1003)
++    assert _rope_site()[0] == 0
++
++
++@pytest.mark.parametrize("bad", [1001, 1002], ids=["row2", "row3"])
++def test_only_the_second_or_third_row_stale_is_flagged(bad):
++    """First row valid; ONE later row holds an in-range stale position and key
++    from the previous lap of the ring (it was committed for bad - 8). Guard 9
++    cannot see it (the position is in range) and neither could a first-row
++    check. The group must not be pooled and its slot must stay unwritten."""
++    b = _three_historical_rows(_device())
++    b.commit(3, bad - STATE)  # overwrites the row with the previous lap
++    assert b.tag(3, bad % STATE) == bad - STATE + 1
++    b.run()
++    n, rec, found = _site()
++    assert n == 1
++    assert gt.decode_ring_record(rec) == {
++        "layer": LAYER,
++        "request_row": 0,
++        "source_position": bad,
++    }
++    assert gt.decode_slot(found) == bad - STATE + 1
++    assert not b.slot_written(0, 1003)
++    assert _rope_site()[0] == 0  # guard 9 blind, as argued
++    # the Q path is independent of the ring and still ran
++    assert torch.isfinite(b.q_out.float()).all()
++
++
++@pytest.mark.parametrize(
++    "residue",
++    ["bf16-filler", "cleared", "negative"],
++)
++def test_uncommitted_history_is_flagged_not_faulted(residue):
++    """The production ring-residue shape: the rows the reader needs were never committed
++    by this request (allocator residue / a claimed block after the tag clear /
++    a negative int64). Before the ring-row tag fix the filler case decoded to position
++    ~0x3E803E803E803E80 and faulted in _norm_rope (guard 9 disabled) or was
++    clamped and counted (guard 9)."""
++    b = _Batch([(5, 52934 % 1024, 4)], _device())  # chunk start 2 mod 4
++    start = 52934 % 1024
++    first = start - start % CR
++    if residue == "bf16-filler":
++        b.ring[5].fill_(0.25)
++    elif residue == "negative":
++        b.ring[5].view(torch.int16).fill_(-1)
++    # "cleared": zeros, which is what the claim clear leaves
++    b.run()
++    n, rec, found = _site()
++    assert n == start - first  # both historical rows
++    assert gt.decode_ring_record(rec)["source_position"] == first
++    expect_found = {
++        "bf16-filler": 0x3E803E803E803E80,
++        "cleared": 0,
++        "negative": -1,
++    }[residue]
++    assert gt.decode_slot(found) == expect_found
++    assert not b.slot_written(0, first + CR - 1)
++    assert _rope_site()[0] == 0  # the garbage tail was never read
++
++
++def test_missing_ring_block_is_flagged():
++    """A historical row with no ring block at all (state table entry -1):
++    before the ring-row tag fix the load was masked and the group silently pooled zeros."""
++    b = _Batch([(1, 1002, 4)], _device())
++    b.state_table.fill_(-1)
++    b.run()
++    n, rec, found = _site()
++    assert n == 2
++    assert gt.decode_ring_record(rec)["source_position"] == 1000
++    assert gt.decode_slot(found) == 0
++    assert not b.slot_written(0, 1003)
++
++
++def test_one_poisoned_request_leaves_its_neighbour_intact():
++    """Containment inside the launch: only the poisoned request's group is
++    masked; the clean request's group is pooled and stored as normal."""
++    b = _Batch([(2, 1002, 4), (4, 2002, 4)], _device())
++    b.commit(2, 1000)
++    b.commit(2, 1001)
++    b.ring[4].fill_(0.25)  # request 1's history was never committed
++    b.run()
++    n, rec, _found = _site()
++    assert n == 2
++    assert gt.decode_ring_record(rec)["request_row"] == 1
++    assert b.slot_written(0, 1003)
++    assert not b.slot_written(1, 2003)
++
++
++def test_first_offender_wins_and_the_count_takes_all():
++    """Two poisoned requests: the count covers every flagged row, the record
++    is ONE of them whole (never request A's row with request B's tag)."""
++    b = _Batch([(2, 1002, 4), (4, 2003, 4)], _device())
++    b.ring[2].fill_(0.25)
++    b.commit(4, 2000)
++    b.commit(4, 2001, tag=7)  # stale: committed for another position
++    b.commit(4, 2002)
++    b.run()
++    n, rec, found = _site()
++    assert n == 3  # 2 rows of request 0 + 1 row of request 1
++    record = gt.decode_ring_record(rec)
++    pair = (record["request_row"], record["source_position"], gt.decode_slot(found))
++    assert pair in {(0, 1000, 0x3E803E803E803E80), (1, 2001, 7)}
+diff --git a/tests/v1/worker/gpu/test_qsa_rope_position_guard.py b/tests/v1/worker/gpu/test_qsa_rope_position_guard.py
+index 0628dd2215..037a20f408 100644
+--- a/tests/v1/worker/gpu/test_qsa_rope_position_guard.py
++++ b/tests/v1/worker/gpu/test_qsa_rope_position_guard.py
+@@ -34,7 +34,7 @@ COMPRESS_RATIO = 4
+ HEAD_DIM = 128
+ N_HEADS = 4
+ STATE_SIZE = 8  # ring capacity
+-ROW_WIDTH = 140  # head dim + the int64 position triple in the tail
++ROW_WIDTH = 144  # head dim + the int64 tail (pos_t, pos_h, pos_w, tag)
+ MAX_MODEL_LEN = 4096
+ NUM_BLOCKS = 8
+ 
+@@ -242,6 +242,14 @@ def test_ring_filler_bytes_are_masked_and_counted():
+     )
+     # ...and the row the reader picks must be one carrying the filler.
+     assert 0 <= (first_position % STATE_SIZE) < STATE_SIZE
++    # Guard 9 is now the SECOND net. A row whose tag does not name its
++    # logical position is rejected before its tail is read, so the filler
++    # would never reach _norm_rope and this control would count 0. Give the
++    # historical rows VALID tags (bad coordinates with valid tags) so the
++    # garbage position tail is what reaches the guard.
++    for position in range(first_position, chunk_start):
++        tail = kw["state_cache"][0, position % STATE_SIZE, 0, HEAD_DIM:]
++        tail.view(torch.int64)[3] = position + 1
+ 
+     kw["k_work_metadata"][:, 0] = 0
+     kw["k_work_metadata"][:, 1] = 0
+@@ -280,6 +288,9 @@ def test_ring_filler_bytes_are_masked_and_counted():
+     assert worst >= MAX_MODEL_LEN or worst < 0, (
+         f"guard fired but recorded an in-range position {worst}"
+     )
++    # the tags were valid, so the ring-tag site must not have claimed this one
++    ring = guard_telemetry.counter(guard_telemetry.SITE_QSA_RING_UNCOMMITTED, device)
++    assert int(ring[0].item()) == 0
+ 
+ 
+ @pytest.mark.gpu
+diff --git a/vllm/models/qwen4_exp/amd/indexer_qsa.py b/vllm/models/qwen4_exp/amd/indexer_qsa.py
+index 6b7d8f9f93..1391bdbedb 100644
+--- a/vllm/models/qwen4_exp/amd/indexer_qsa.py
++++ b/vllm/models/qwen4_exp/amd/indexer_qsa.py
+@@ -123,6 +123,15 @@ class QSAIndexer(nn.Module):
+             eps=float(getattr(config, "rms_norm_eps", 1e-6)),
+         )
+ 
++        # QSAKeyStateCache rows now carry
++        # a tag word the NVIDIA pre-indexer writes and validates; this path
++        # neither writes nor checks it, so it would run the widened layout
++        # with no ring validation at all. Refuse it rather than share it.
++        raise NotImplementedError(
++            "Qwen4Exp QSA on the AMD path is not supported on this fork: the "
++            "ring-row tag contract is implemented for the NVIDIA "
++            "pre-indexer only (vllm/models/qwen4_exp/nvidia/ops/qsa_pre_indexer.py)."
++        )
+         cache_config = vllm_config.cache_config
+         cache_prefix = f"{prefix}." if prefix else ""
+         self.raw_key_cache = QSAKeyStateCache(
+diff --git a/vllm/models/qwen4_exp/common/qsa_cache.py b/vllm/models/qwen4_exp/common/qsa_cache.py
+index e806dc0375..fbc517f606 100644
+--- a/vllm/models/qwen4_exp/common/qsa_cache.py
++++ b/vllm/models/qwen4_exp/common/qsa_cache.py
+@@ -44,6 +44,42 @@ from vllm.v1.kv_cache_interface import (
+     MLAAttentionSpec,
+ )
+ 
++# Ring-row tag contract. Every raw-key ring row is the key (bf16), padded to a
++# whole int64, followed by a tail of four int64 words:
++#     (pos_t, pos_h, pos_w, tag),  tag = logical_position + 1.
++# The tail exists on every ring, with or without cached RoPE positions: the tag
++# is what lets the reader prove the row it is about to pool was committed by
++# this request for exactly that logical position. 0 is never a valid tag (so a
++# cleared row can never validate) and the manager clears the tag word of every
++# newly claimed ring block before its new owner's first step.
++QSA_RING_TAIL_WORDS = 4
++QSA_RING_TAG_WORD = 3
++QSA_RING_BF16_PER_INT64 = 4
++QSA_RING_TAIL_ELEMENTS = QSA_RING_TAIL_WORDS * QSA_RING_BF16_PER_INT64
++
++
++def qsa_ring_row_tags(logical_positions: torch.Tensor) -> torch.Tensor:
++    """The tag the writer stores for each committed row (int64)."""
++    return logical_positions.to(torch.int64) + 1
++
++
++def qsa_ring_group_rows_valid(
++    found_tags: torch.Tensor,
++    source_positions: torch.Tensor,
++    historical: torch.Tensor,
++) -> torch.Tensor:
++    """Reference for the pre-indexer's per-group check (torch, any device).
++
++    ``found_tags``/``source_positions``/``historical`` are ``[groups, ratio]``:
++    the tag word read from each source row's ring slot, the row's logical
++    position, and whether the row must come from the ring (it precedes the
++    chunk start). Returns a ``[groups]`` bool: True when EVERY historical row
++    carries ``source_position + 1``. In-chunk rows are never checked.
++    """
++    expected = qsa_ring_row_tags(source_positions)
++    bad = historical & (found_tags.to(torch.int64) != expected)
++    return ~bad.any(dim=-1)
++
+ 
+ def canonical_qsa_rope_positions(positions: torch.Tensor) -> torch.Tensor:
+     """Return exact per-token positions as ``[tokens, 1, 3]`` int64 rows."""
+@@ -809,34 +845,51 @@ class _QSAStateCache(nn.Module, AttentionLayerBase):
+ 
+ 
+ class QSAKeyStateCache(_QSAStateCache):
+-    """Raw BF16 key, optionally followed by exact int64 MRoPE positions."""
++    """Raw BF16 key followed by the int64 ring tail (pos_t, pos_h, pos_w, tag).
+ 
+-    _BF16_PER_INT64 = 4
++    The position words are consumed only when ``cache_rope_positions``; the tag
++    word is always written and always validated."""
++
++    _BF16_PER_INT64 = QSA_RING_BF16_PER_INT64
+     _NUM_ROPE_AXES = 3
+ 
+     def __init__(self, *, cache_rope_positions: bool = False, **kwargs) -> None:
+         key_head_size = int(kwargs.pop("head_size"))
+         self.key_head_size = key_head_size
+         self.cache_rope_positions = bool(cache_rope_positions)
++        # Element offset of the int64 tail (the name predates the tag word).
+         self.rope_position_offset = (
+             (key_head_size + self._BF16_PER_INT64 - 1) // self._BF16_PER_INT64
+         ) * self._BF16_PER_INT64
+-        storage_head_size = key_head_size
+-        if self.cache_rope_positions:
+-            storage_head_size = self.rope_position_offset + (
+-                self._NUM_ROPE_AXES * self._BF16_PER_INT64
+-            )
++        storage_head_size = self.rope_position_offset + QSA_RING_TAIL_ELEMENTS
+         super().__init__(head_size=storage_head_size, **kwargs)
++        self.rope_position_cache: torch.Tensor | None = None
++        self.ring_tag_cache: torch.Tensor | None = None
+ 
+     def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
+         super().bind_kv_cache(kv_cache)
+         qsa_cache = self.kv_cache
+         self.key_cache = qsa_cache[..., : self.key_head_size]
++        tail_end = self.rope_position_offset + QSA_RING_TAIL_ELEMENTS
++        tail = qsa_cache[..., self.rope_position_offset : tail_end].view(torch.int64)
++        assert tail.shape[-1] == QSA_RING_TAIL_WORDS
+         if self.cache_rope_positions:
+-            position_tail = qsa_cache[..., self.rope_position_offset :]
+-            self.rope_position_cache = position_tail.view(torch.int64)
++            self.rope_position_cache = tail[..., : self._NUM_ROPE_AXES]
+         else:
+             self.rope_position_cache = None
++        self.ring_tag_cache = tail[..., QSA_RING_TAG_WORD : QSA_RING_TAG_WORD + 1]
++
++    def clear_ring_row_tags(self, block_ids: torch.Tensor) -> None:
++        """Zero the tag word of every row of ``block_ids`` (ring-row tag claim clear).
++
++        Only the tag word: a claimed ring block's keys and positions stay as
++        the previous occupant left them, and the zero tag is what makes every
++        such row fail validation until this request commits it."""
++        if self.ring_tag_cache is None:
++            raise RuntimeError(
++                f"{self.prefix}: ring tag clear before the KV cache was bound"
++            )
++        self.ring_tag_cache.index_fill_(0, block_ids, 0)
+ 
+     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
+         # Hold the open group's committed keys plus every row a speculative
+@@ -874,6 +927,9 @@ class QSACompressedKeyCache(_QSAStateCache):
+ 
+ 
+ __all__ = [
++    "QSA_RING_TAG_WORD",
++    "QSA_RING_TAIL_ELEMENTS",
++    "QSA_RING_TAIL_WORDS",
+     "QSACompressedKeyCache",
+     "QSAForwardMetadata",
+     "QSAKeyStateCache",
+@@ -882,4 +938,6 @@ __all__ = [
+     "canonical_qsa_rope_positions",
+     "circular_qsa_slot_mapping",
+     "compressed_qsa_slot_mapping",
++    "qsa_ring_group_rows_valid",
++    "qsa_ring_row_tags",
+ ]
+diff --git a/vllm/models/qwen4_exp/nvidia/indexer_qsa.py b/vllm/models/qwen4_exp/nvidia/indexer_qsa.py
+index bbdc5e4feb..ea1865fa8d 100644
+--- a/vllm/models/qwen4_exp/nvidia/indexer_qsa.py
++++ b/vllm/models/qwen4_exp/nvidia/indexer_qsa.py
+@@ -22,6 +22,7 @@ from ..common.qsa_cache import (
+     QSAForwardMetadata,
+     QSAKeyStateCache,
+     canonical_qsa_rope_positions,
++    qsa_ring_row_tags,
+ )
+ from .ops.qsa_pre_indexer import qsa_pre_indexer
+ 
+@@ -317,6 +318,7 @@ class QSAIndexer(nn.Module):
+                     if raw_key_state_cache.rope_position_cache is not None
+                     else None
+                 ),
++                layer_id=self.layer_id,
+             )
+         else:
+             # Unfused reference path
+@@ -383,6 +385,18 @@ class QSAIndexer(nn.Module):
+                     raw_metadata.slot_mapping,
+                     position_rows,
+                 )
++            # The unfused writer commits the same tag word as the fused
++            # one, so both paths leave byte-identical rings. (This reference
++            # reader does not validate tags; the fused kernel does.)
++            ring_tag_cache = getattr(raw_key_state_cache, "ring_tag_cache", None)
++            if ring_tag_cache is not None:
++                qsa_store_cache_rows(
++                    ring_tag_cache,
++                    raw_metadata.slot_mapping,
++                    qsa_ring_row_tags(raw_metadata.logical_positions[:num_tokens]).view(
++                        -1, 1, 1
++                    ),
++                )
+ 
+         if self.skip_topk:
+             if out is None:
+diff --git a/vllm/models/qwen4_exp/nvidia/ops/qsa_pre_indexer.py b/vllm/models/qwen4_exp/nvidia/ops/qsa_pre_indexer.py
+index 912bef33b7..cc5ab36e9d 100644
+--- a/vllm/models/qwen4_exp/nvidia/ops/qsa_pre_indexer.py
++++ b/vllm/models/qwen4_exp/nvidia/ops/qsa_pre_indexer.py
+@@ -4,6 +4,10 @@
+ 
+ import torch
+ 
++from vllm.models.qwen4_exp.common.qsa_cache import (
++    QSA_RING_TAG_WORD,
++    QSA_RING_TAIL_ELEMENTS,
++)
+ from vllm.triton_utils import tl, triton
+ from vllm.v1.worker import guard_telemetry
+ 
+@@ -12,6 +16,14 @@ from vllm.v1.worker import guard_telemetry
+ # from a @triton.jit body -- an earlier build shipped one and every guarded kernel died
+ # with "NameError: Cannot access global variable _GUARD_BIAS" on the smoke.
+ _GUARD_BIAS = tl.constexpr(guard_telemetry.GUARD_BIAS)
++# Int64 word of the ring tail that carries `logical_position + 1`.
++_RING_TAG_WORD = tl.constexpr(QSA_RING_TAG_WORD)
++# Ring-row tag record packing and the encodable range of the found-tag slot.
++_REC_POS_BITS = tl.constexpr(guard_telemetry.RING_RECORD_POS_BITS)
++_REC_REQ_BITS = tl.constexpr(guard_telemetry.RING_RECORD_REQ_BITS)
++_REC_LAYER_BITS = tl.constexpr(guard_telemetry.RING_RECORD_LAYER_BITS)
++_GUARD_MAX_ENC = tl.constexpr(guard_telemetry.GUARD_MAX_ENCODABLE)
++_GUARD_MIN_ENC = tl.constexpr(guard_telemetry.GUARD_MIN_ENCODABLE)
+ 
+ 
+ 
+@@ -163,6 +175,7 @@ def _norm_rope(
+         "num_compressed_blocks",
+         "num_k_work",
+         "num_requests",
++        "layer_id",
+     ]
+ )
+ def _qsa_pre_indexer_kernel(
+@@ -202,6 +215,8 @@ def _qsa_pre_indexer_kernel(
+     num_requests,  # bounds-guard instrumentation
+     guard_ctr,  # bounds-guard instrumentation: persistent int64[3]
+     ring_skip_ctr,  # ring-skip telemetry, persistent int64[3], SITE_QSA_RING_SKIP
++    ring_uncommitted_ctr,  # ring-row tag fix, persistent int64[3], SITE_QSA_RING_UNCOMMITTED
++    layer_id,  # ring-row tag fix: named in the uncommitted-row record only
+     HQ: tl.constexpr,
+     D: tl.constexpr,
+     TILE_T_Q: tl.constexpr,
+@@ -345,6 +360,64 @@ def _qsa_pre_indexer_kernel(
+                 + safe_state_block * state_cache_stride_block
+                 + (source_positions % STATE_SIZE)[:, None] * state_cache_stride_token
+             )
++            # Ring-row tag fix: EVERY historical source row must carry the tag the
++            # writer stores for exactly this logical position, before anything
++            # reads its key or its position tail. A missing ring block (state
++            # table entry out of range) reads tag 0 and fails the same way --
++            # before the ring-row tag fix it pooled zeros silently. In-chunk rows come from
++            # this launch's own k and are never checked.
++            historical = valid & ~source_in_chunk
++            source_tags = tl.load(
++                (
++                    state_cache_ptr
++                    + safe_state_block * state_cache_stride_block
++                    + (source_positions % STATE_SIZE) * state_cache_stride_token
++                    + D
++                ).to(tl.pointer_type(tl.int64))
++                + _RING_TAG_WORD,
++                mask=historical & state_block_valid,
++                other=0,
++            )
++            row_bad = historical & (source_tags != source_positions.to(tl.int64) + 1)
++            num_bad_rows = tl.sum(row_bad.to(tl.int32), axis=0)
++            group_ok = num_bad_rows == 0
++            if num_bad_rows > 0:
++                # One coherent record per site, first offender wins: the CAS
++                # claims slot 1 and only its winner writes slot 2, so both
++                # fields always describe the same row.
++                bad_position = tl.min(
++                    tl.where(row_bad, source_positions.to(tl.int64), 1 << 62),
++                    axis=0,
++                )
++                bad_tag = tl.sum(
++                    tl.where(
++                        row_bad & (source_positions.to(tl.int64) == bad_position),
++                        source_tags,
++                        0,
++                    ),
++                    axis=0,
++                )
++                record = (
++                    (
++                        ((layer_id + 1).to(tl.int64) & ((1 << _REC_LAYER_BITS) - 1))
++                        << (_REC_REQ_BITS + _REC_POS_BITS)
++                    )
++                    | (
++                        (request.to(tl.int64) & ((1 << _REC_REQ_BITS) - 1))
++                        << _REC_POS_BITS
++                    )
++                    | (bad_position & ((1 << _REC_POS_BITS) - 1))
++                )
++                tl.atomic_add(ring_uncommitted_ctr, num_bad_rows.to(tl.int64))
++                zero64 = bad_position * 0
++                prev = tl.atomic_cas(
++                    ring_uncommitted_ctr + 1, zero64, record + _GUARD_BIAS
++                )
++                if prev == 0:
++                    clamped_tag = tl.minimum(
++                        tl.maximum(bad_tag, _GUARD_MIN_ENC), _GUARD_MAX_ENC
++                    )
++                    tl.atomic_xchg(ring_uncommitted_ctr + 2, clamped_tag + _GUARD_BIAS)
+             # Only the first completed group can cross the chunk boundary. Select
+             # historical rows from the ring without issuing two masked loads.
+             source_base = tl.where(source_in_chunk[:, None], current_base, cached_base)
+@@ -353,9 +426,11 @@ def _qsa_pre_indexer_kernel(
+             source_valid = tl.where(
+                 source_in_chunk, source_tokens_valid, state_block_valid
+             )
++            # A failed group loads nothing (the mask, not a tl.where on the
++            # result, is what suppresses the memory operation).
+             source = tl.load(
+                 source_base + dims[None, :],
+-                mask=valid & source_valid[:, None],
++                mask=valid & group_ok & source_valid[:, None],
+                 other=0.0,
+             ).to(tl.float32)
+             # Match the unfused path's BF16 pooled tensor before RMSNorm.
+@@ -403,7 +478,9 @@ def _qsa_pre_indexer_kernel(
+                     + (first_position % STATE_SIZE) * state_cache_stride_token
+                     + D
+                 ).to(tl.pointer_type(tl.int64))
+-                load_cached_position = ~first_in_chunk & state_block_valid
++                # The first row's tag was validated above with the rest;
++                # a failed group never reads its tail (pos stays 0, in range).
++                load_cached_position = ~first_in_chunk & state_block_valid & group_ok
+                 cached_pos_t = tl.load(tail, mask=load_cached_position, other=0)
+                 cached_pos_h = tl.load(tail + 1, mask=load_cached_position, other=0)
+                 cached_pos_w = tl.load(tail + 2, mask=load_cached_position, other=0)
+@@ -431,13 +508,16 @@ def _qsa_pre_indexer_kernel(
+             )
+             compressed_block = (compressed_slot // COMP_PAGE_SIZE).to(tl.int64)
+             compressed_row = compressed_slot % COMP_PAGE_SIZE
++            # A group built from an uncommitted row must never become
++            # usable compressed state. The slot stays unwritten; the site is
++            # fatal because the selection kernels will still read it.
+             tl.store(
+                 compressed_cache_ptr
+                 + compressed_block * compressed_cache_stride_block
+                 + compressed_row * compressed_cache_stride_token
+                 + dims,
+                 tl.reshape(y, (D,)),
+-                mask=valid,
++                mask=valid & group_ok,
+             )
+ 
+         if work_in_request == 0:
+@@ -508,6 +588,20 @@ def _qsa_pre_indexer_kernel(
+                     tl.store(tail, pos_t.to(tl.int64), mask=valid_slot)
+                     tl.store(tail + 1, pos_h.to(tl.int64), mask=valid_slot)
+                     tl.store(tail + 2, pos_w.to(tl.int64), mask=valid_slot)
++                # Ring-row tag fix: the tag names the logical position this row now
++                # holds, taken from the authoritative per-token metadata (not
++                # re-derived from chunk arithmetic), stored after key + tail.
++                # Every committed row gets one, with or without RoPE positions.
++                token_logical = tl.load(
++                    logical_positions_ptr + tl.maximum(token, 0),
++                    mask=valid_slot,
++                    other=-1,
++                )
++                tl.store(
++                    (state_row + D).to(tl.pointer_type(tl.int64)) + _RING_TAG_WORD,
++                    token_logical.to(tl.int64) + 1,
++                    mask=valid_slot,
++                )
+ 
+ 
+ def qsa_pre_indexer(
+@@ -531,8 +625,13 @@ def qsa_pre_indexer(
+     compress_ratio: int,
+     mrope_section: tuple[int, int, int] | None,
+     rope_pos_offset: int | None,
++    layer_id: int = -1,
+ ) -> None:
+-    """Normalize Q, compress K, then update the circular raw state."""
++    """Normalize Q, compress K, then update the circular raw state.
++
++    ``state_cache`` rows are ``[key D bf16 | 4 int64: pos_t, pos_h, pos_w, tag]``
++    (``QSAKeyStateCache``, ring-row tag fix); the tail is present with or without
++    ``rope_pos_offset``. ``layer_id`` only labels the uncommitted-row record."""
+     num_tokens = q.shape[0]
+     if num_tokens == 0:
+         return
+@@ -551,6 +650,15 @@ def qsa_pre_indexer(
+     is_k_mrope = bool(mrope_section)
+     cache_has_rope_pos = rope_pos_offset is not None
+     assert rope_pos_offset is None or rope_pos_offset == head_dim
++    # The kernel addresses the tail at +head_dim and the tag at word 3 of
++    # it. A ring without the four-word tail (the older D or D+12 layouts)
++    # would put the tag store into the NEXT row, so refuse it outright.
++    assert state_cache.shape[-1] == head_dim + QSA_RING_TAIL_ELEMENTS, (
++        f"QSA ring row width {state_cache.shape[-1]} != head_dim + "
++        f"{QSA_RING_TAIL_ELEMENTS} (key + pos_t/h/w + tag)"
++    )
++    assert state_cache.dtype == torch.bfloat16
++    assert state_cache.stride(1) % 4 == 0 and state_cache.stride(0) % 4 == 0
+     if is_2d_positions:
+         assert positions.shape == (3, num_tokens)
+         assert is_k_mrope
+@@ -604,6 +712,8 @@ def qsa_pre_indexer(
+         min(query_start_loc.numel() - 1, state_block_table.shape[0]),
+         guard_telemetry.counter(guard_telemetry.SITE_QSA_PRE_INDEXER, q.device),
+         guard_telemetry.counter(guard_telemetry.SITE_QSA_RING_SKIP, q.device),
++        guard_telemetry.counter(guard_telemetry.SITE_QSA_RING_UNCOMMITTED, q.device),
++        int(layer_id),
+         HQ=num_q_heads,
+         D=head_dim,
+         TILE_T_Q=TILE_T_Q,
+diff --git a/vllm/v1/core/kv_cache_manager.py b/vllm/v1/core/kv_cache_manager.py
+index 675ca1e8cb..c0b94f0ad7 100644
+--- a/vllm/v1/core/kv_cache_manager.py
++++ b/vllm/v1/core/kv_cache_manager.py
+@@ -844,6 +844,21 @@ class KVCacheManager:
+             ids.extend(mgr.take_new_block_ids())
+         return ids
+ 
++    def take_new_ring_block_ids(self) -> list[int]:
++        """Drain ring blocks claimed since the last call (ring-row tag clear).
++        Independent of KV zeroing: every claim is returned."""
++        ids: list[int] = []
++        for mgr in self.coordinator.single_type_managers:
++            ids.extend(mgr.take_new_ring_block_ids())
++        return ids
++
++    def get_ring_block_ids(self, request_id: str) -> list[int]:
++        """The request's ring (CircularBufferSpec) block ids, all groups."""
++        ids: list[int] = []
++        for mgr in self.coordinator.single_type_managers:
++            ids.extend(mgr.get_ring_block_ids(request_id))
++        return ids
++
+     def get_zeroing_block_ids_in_range(
+         self, request_id: str, start_token: int, end_token: int
+     ) -> list[int]:
+diff --git a/vllm/v1/core/sched/output.py b/vllm/v1/core/sched/output.py
+index 03bb2cd041..afcaf42ece 100644
+--- a/vllm/v1/core/sched/output.py
++++ b/vllm/v1/core/sched/output.py
+@@ -291,6 +291,13 @@ class SchedulerOutput:
+     # preventing stale NaN/data from corrupting attention or SSM computation.
+     new_block_ids_to_zero: list[int] | None = None
+ 
++    # v2.2 ring-row tag fix: ring (CircularBufferSpec) blocks claimed during this
++    # scheduling step. Independent of new_block_ids_to_zero and of
++    # needs_kv_cache_zeroing: the worker clears only the rows' tag words, after
++    # the zeroer and before any copy or forward of this step, i.e. before the
++    # new owner's first read or write of the ring.
++    new_ring_block_ids_to_clear: list[int] | None = None
++
+     # CoW copies to apply after zeroing new blocks and before forward.
+     kv_cache_block_copies: list[KVCacheBlockCopy] | None = None
+ 
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 3b942cb9af..30704d06b5 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -366,6 +366,11 @@ class Scheduler(SchedulerInterface):
+         # Blocks that async KV loads will overwrite this step, skipped from
+         # zeroing since the zeroing could race the out-of-band write.
+         self._skip_zero_block_ids: set[int] = set()
++        # Ring blocks an async KV load is about to fill. Their tag clear
++        # is skipped for the same reason as zeroing (it could land after the
++        # out-of-band write and wipe the producer's committed tags). Tracked
++        # whatever needs_kv_cache_zeroing says, like the clear itself.
++        self._skip_ring_clear_block_ids: set[int] = set()
+         self.need_mamba_block_aligned_split = (
+             self.has_mamba_layers and self.cache_config.mamba_cache_mode == "align"
+         )
+@@ -1276,6 +1281,12 @@ class Scheduler(SchedulerInterface):
+                                 num_computed_tokens,
+                             )
+                         )
++                    # Same race for the ring's tag clear; the load
++                    # brings the producer's rows and tags (or none, and the
++                    # reader then fails closed on the missing history).
++                    self._skip_ring_clear_block_ids.update(
++                        self.kv_cache_manager.get_ring_block_ids(request.request_id)
++                    )
+                     continue
+ 
+                 self.running.append(request)
+@@ -1461,6 +1472,8 @@ class Scheduler(SchedulerInterface):
+             finished_req_ids=self.finished_req_ids,
+             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
+             new_block_ids_to_zero=self._get_new_block_ids_to_zero(),
++            # Drained every step, never gated on KV zeroing.
++            new_ring_block_ids_to_clear=self._get_new_ring_block_ids_to_clear(),
+             has_sync_kv_loads=has_sync_kv_loads,
+             kv_cache_block_copies=pending_kv_cache_block_copies,
+             kv_connector_block_state=kv_connector_block_state,
+@@ -1501,6 +1514,17 @@ class Scheduler(SchedulerInterface):
+     ) -> KVConnectorMetadata:
+         return connector.build_connector_meta(scheduler_output)
+ 
++    def _get_new_ring_block_ids_to_clear(self) -> list[int] | None:
++        """Ring claims of this step whose tag words the worker clears.
++        Unconditional (not under needs_kv_cache_zeroing); only blocks an async
++        KV load is about to write are left out."""
++        ids = self.kv_cache_manager.take_new_ring_block_ids()
++        if self._skip_ring_clear_block_ids:
++            skip = self._skip_ring_clear_block_ids
++            ids = [b for b in ids if b not in skip]
++            skip.clear()
++        return ids or None
++
+     def _get_new_block_ids_to_zero(self) -> list[int] | None:
+         # Drain new attention block ids every step so the manager-side list
+         # does not grow unbounded; only kv-cache zeroing consumes them.
+diff --git a/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/v1/core/single_type_kv_cache_manager.py
+index 611e1cef8a..8242e250ab 100644
+--- a/vllm/v1/core/single_type_kv_cache_manager.py
++++ b/vllm/v1/core/single_type_kv_cache_manager.py
+@@ -120,6 +120,12 @@ class SingleTypeKVCacheManager(ABC):
+             and not isinstance(kv_cache_spec, CircularBufferSpec)
+         )
+         self.new_block_ids: list[int] = []
++        # v2.2 ring-row tag fix: ring blocks claimed since the last drain. The ring stays
++        # OUT of whole-block zeroing above; instead every claim is recorded
++        # UNCONDITIONALLY (never under needs_kv_cache_zeroing) so the worker
++        # clears the rows' tag words before the new owner's first step. Only
++        # CircularBufferManager appends here.
++        self.new_ring_block_ids: list[int] = []
+ 
+         # Mapping from request ID to blocks to track the blocks allocated
+         # for each request, so that we can free the blocks when the request
+@@ -413,6 +419,17 @@ class SingleTypeKVCacheManager(ABC):
+         self.new_block_ids = []
+         return ids
+ 
++    def take_new_ring_block_ids(self) -> list[int]:
++        """Drain ring blocks claimed since the last call; empty for
++        every manager but CircularBufferManager."""
++        ids = self.new_ring_block_ids
++        self.new_ring_block_ids = []
++        return ids
++
++    def get_ring_block_ids(self, request_id: str) -> list[int]:
++        """The request's ring block ids; empty for non-ring managers."""
++        return []
++
+     def take_pending_cow_copies(
+         self,
+     ) -> list[tuple[KVCacheBlock, KVCacheBlock]]:
+@@ -1203,8 +1220,37 @@ class CircularBufferManager(FullAttentionManager):
+         req_blocks.extend(new_blocks)
+         if self._record_new_block_ids:
+             self.new_block_ids.extend(block.block_id for block in new_blocks)
++        # Unconditional -- not gated on needs_kv_cache_zeroing.
++        self.new_ring_block_ids.extend(block.block_id for block in new_blocks)
+         return new_blocks
+ 
++    def take_new_ring_block_ids(self) -> list[int]:
++        """Drain the ring blocks claimed since the last call, keeping only
++        blocks a request of this manager still holds, in claim order, once.
++
++        A block claimed and then freed within the same scheduling pass (the
++        request was preempted after its allocation) may already belong to
++        another group by the time the worker acts; clearing its tag words
++        there would write into that group's page, so it is dropped here.
++        """
++        claimed = self.new_ring_block_ids
++        self.new_ring_block_ids = []
++        if not claimed:
++            return []
++        held = {
++            block.block_id for blocks in self.req_to_blocks.values() for block in blocks
++        }
++        out: list[int] = []
++        seen: set[int] = set()
++        for block_id in claimed:
++            if block_id in held and block_id not in seen:
++                seen.add(block_id)
++                out.append(block_id)
++        return out
++
++    def get_ring_block_ids(self, request_id: str) -> list[int]:
++        return [block.block_id for block in self.req_to_blocks.get(request_id, ())]
++
+     def get_num_blocks_to_allocate(
+         self,
+         request_id: str,
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index f37f7419ad..92ae922578 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -179,6 +179,7 @@ from vllm.v1.worker.gpu.ubatch_utils import (
+     maybe_build_ubatch_runner,
+ )
+ from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
++from vllm.v1.worker.ring_tags import clear_ring_row_tags, ring_tag_layers
+ from vllm.v1.worker.utils import (
+     KVBlockZeroer,
+     clear_layer_kv_caches,
+@@ -1291,6 +1292,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             assert self.kv_block_zeroer is not None
+             self.kv_block_zeroer.zero_block_ids(scheduler_output.new_block_ids_to_zero)
+ 
++        # v2.2 ring-row tag fix: clear the tag words of newly claimed ring blocks. Not
++        # under the zeroing gate; after the zeroer, before copies and forward.
++        if scheduler_output.new_ring_block_ids_to_clear:
++            clear_ring_row_tags(
++                ring_tag_layers(self.compilation_config.static_forward_context),
++                scheduler_output.new_ring_block_ids_to_clear,
++                self.device,
++            )
++
+         # Apply copy-on-write block copies for partial prefix-cache hits, after
+         # zeroing new blocks and before the forward pass reads them.
+         if scheduler_output.kv_cache_block_copies:
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index 743c593b8a..910c72c55c 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -222,6 +222,7 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
+ from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
+ from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorModelRunnerMixin
+ from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
++from vllm.v1.worker.ring_tags import clear_ring_row_tags, ring_tag_layers
+ from vllm.v1.worker.ubatch_utils import (
+     UBatchSlices,
+     check_ubatch_thresholds,
+@@ -1243,6 +1244,14 @@ class GPUModelRunner(
+         # stale NaN/data from corrupting attention or SSM computation.
+         if scheduler_output.new_block_ids_to_zero:
+             self._zero_block_ids(scheduler_output.new_block_ids_to_zero)
++        # v2.2 ring-row tag fix: clear the tag words of newly claimed ring blocks. Not
++        # under the zeroing gate; after the zeroer, before copies and forward.
++        if scheduler_output.new_ring_block_ids_to_clear:
++            clear_ring_row_tags(
++                ring_tag_layers(self.compilation_config.static_forward_context),
++                scheduler_output.new_ring_block_ids_to_clear,
++                self.device,
++            )
+         if scheduler_output.kv_cache_block_copies:
+             copy_kv_cache_blocks_inplace(
+                 self.kv_caches,
+diff --git a/vllm/v1/worker/guard_telemetry.py b/vllm/v1/worker/guard_telemetry.py
+index adca93049f..63c450f14d 100644
+--- a/vllm/v1/worker/guard_telemetry.py
++++ b/vllm/v1/worker/guard_telemetry.py
+@@ -146,7 +146,53 @@ SITE_QSA_ROPE_POS = 9
+ # The skip itself is the earlier behaviour; the count is the instrument
+ # for the v2.2 ring-row reconciliation. Telemetry only: warn.
+ SITE_QSA_RING_SKIP = 10
+-NUM_SITES = 11
++# The pre-indexer found a historical raw-key ring row whose tag is
++# not `logical_position + 1` -- a row this request never committed for that
++# position (claim residue, a skipped suffix commit, a stale mapping). The
++# group's pooled load, its RoPE-tail read and its compressed-slot store are all
++# MASKED, so the compressed slot is left unwritten: durable damage, fatal.
++# Unlike the other sites the three slots form ONE coherent record, claimed
++# first-offender-wins with atomic_cas: slot 0 = rows flagged (all offenders),
++# slot 1 = packed (layer + 1, batch request row, source logical position) of
++# the first offender, slot 2 = the tag that offender's row actually held.
++# Decode slot 1 with decode_ring_record().
++SITE_QSA_RING_UNCOMMITTED = 11
++NUM_SITES = 12
++
++# Bit layout of the SITE_QSA_RING_UNCOMMITTED record (before GUARD_BIAS).
++RING_RECORD_POS_BITS = 32
++RING_RECORD_REQ_BITS = 16
++RING_RECORD_LAYER_BITS = 14
++
++
++def encode_ring_record(layer_id: int, request_row: int, position: int) -> int:
++    """Python twin of the kernel's packing (tests; the kernel inlines it)."""
++    layer = (int(layer_id) + 1) & ((1 << RING_RECORD_LAYER_BITS) - 1)
++    row = int(request_row) & ((1 << RING_RECORD_REQ_BITS) - 1)
++    pos = int(position) & ((1 << RING_RECORD_POS_BITS) - 1)
++    return (
++        (layer << (RING_RECORD_REQ_BITS + RING_RECORD_POS_BITS))
++        | (row << RING_RECORD_POS_BITS)
++        | pos
++    )
++
++
++def decode_ring_record(biased: int) -> dict[str, int] | None:
++    """Unpack slot 1 of SITE_QSA_RING_UNCOMMITTED. ``layer`` is -1 when the
++    launcher was not given one. None = nothing recorded (or not yet visible)."""
++    value = decode_slot(biased)
++    if value is None:
++        return None
++    pos_mask = (1 << RING_RECORD_POS_BITS) - 1
++    req_mask = (1 << RING_RECORD_REQ_BITS) - 1
++    layer_mask = (1 << RING_RECORD_LAYER_BITS) - 1
++    return {
++        "layer": ((value >> (RING_RECORD_REQ_BITS + RING_RECORD_POS_BITS)) & layer_mask)
++        - 1,
++        "request_row": (value >> RING_RECORD_POS_BITS) & req_mask,
++        "source_position": value & pos_mask,
++    }
++
+ 
+ SITE_NAMES = {
+     SITE_MAMBA_COPY: "_copy_mamba_state_block (block-table row/column)",
+@@ -165,6 +211,10 @@ SITE_NAMES = {
+     SITE_QSA_RING_SKIP: "_qsa_pre_indexer_kernel suffix commit SKIPPED "
+     "(state slot < 0 or >= ring capacity; slot 1 = token index, "
+     "slot 2 = state slot value)",
++    SITE_QSA_RING_UNCOMMITTED: "_qsa_pre_indexer_kernel historical ring row "
++    "UNCOMMITTED (tag != logical_position + 1; group load, RoPE tail and "
++    "compressed-slot store masked; slot 1 = packed first-offender record, "
++    "slot 2 = the tag its row held)",
+ }
+ 
+ 
+@@ -373,6 +423,14 @@ _ALWAYS_FATAL_SITES: set[int] = set()
+ # whatever VLLM_E2_GUARD_MODE says. (bounds-guard instrumentation, rope site)
+ _ALWAYS_FATAL_SITES.add(SITE_QSA_ROPE_POS)
+ 
++# An uncommitted ring row leaves the group's compressed slot
++# UNWRITTEN (the store is masked, there is no correct value to store), and the
++# selection kernels will read that slot on every later step. That is durable
++# damage by the same argument as the rope site, so it stops the rank under
++# warn too. The failure boundary is the rank, not the request: per-request
++# containment (discard + quarantine + TP/PP coordination) is not implemented.
++_ALWAYS_FATAL_SITES.add(SITE_QSA_RING_UNCOMMITTED)
++
+ 
+ def _normalize(device: torch.device) -> torch.device:
+     """torch.device("cuda") and torch.device("cuda:0") are different dict keys.
+@@ -479,6 +537,19 @@ def _report_rows(device: torch.device, rows: list[list[int]]) -> None:
+         _seen[(device, site)] = n_masked
+         row = decode_slot(biased_row)
+         val = decode_slot(biased_val)
++        if site == SITE_QSA_RING_UNCOMMITTED:
++            # One coherent first-offender record, not independent maxima.
++            record = decode_ring_record(biased_row)
++            msg = (
++                f"ring-row tag guard masked {n_masked} uncommitted historical "
++                f"ring row(s) in {SITE_NAMES[site]} on {device}; first "
++                f"offender {record}, its row held tag {val} (expected "
++                f"source_position + 1). The group was not pooled and its "
++                f"compressed slot was NOT written."
++            )
++            logger.warning("%s", msg)
++            _arm(msg)
++            continue
+         msg = (
+             f"bounds guard masked {n_masked} out-of-range access(es) "
+             f"in {SITE_NAMES.get(site, site)} on {device} "
+diff --git a/vllm/v1/worker/ring_tags.py b/vllm/v1/worker/ring_tags.py
+new file mode 100644
+index 0000000000..ef0a8b7c4a
+--- /dev/null
++++ b/vllm/v1/worker/ring_tags.py
+@@ -0,0 +1,63 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""v2.2 ring-row tag fix: worker side of the ring-row tag clear.
++
++The scheduler reports every newly claimed ring (``CircularBufferSpec``) block
++in ``SchedulerOutput.new_ring_block_ids_to_clear``, whether or not KV zeroing
++is on. Before the step's forward, the runner hands them to every layer that
++keeps a tagged ring (``clear_ring_row_tags``; today ``QSAKeyStateCache``),
++which zeroes only the tag word of each row. A zero tag never validates, so the
++new owner cannot pool a row it did not commit itself, whatever the previous
++occupant (or another group that held the block) left there.
++
++ORDER. The runners call this right after the KV zeroer and before the CoW
++copies and the forward, on the same stream, inside the same execute_model as
++the claim's first step. So: previous owner's work done (deferred free) ->
++claim -> tag clear -> new owner's first read/write.
++"""
++
++from collections.abc import Iterable, Mapping
++
++import torch
++
++
++def ring_tag_layers(static_forward_context: Mapping[str, object]) -> list:
++    """Layers of this worker that keep a tagged ring."""
++    return [
++        layer
++        for layer in static_forward_context.values()
++        if callable(getattr(layer, "clear_ring_row_tags", None))
++    ]
++
++
++def clear_ring_row_tags(
++    layers: Iterable,
++    block_ids: list[int],
++    device: torch.device,
++) -> int:
++    """Zero the tag word of every row of ``block_ids`` in every layer.
++
++    Returns the number of layers cleared. Raises (fail loud) on a block id
++    outside a layer's pool: an index_fill_ with a bad index is a device-side
++    assert, far from its cause."""
++    if not block_ids:
++        return 0
++    layers = list(layers)
++    if not layers:
++        return 0
++    lo, hi = min(block_ids), max(block_ids)
++    index = torch.tensor(block_ids, dtype=torch.long, device=device)
++    for layer in layers:
++        tags = getattr(layer, "ring_tag_cache", None)
++        if tags is None:
++            raise RuntimeError(
++                f"ring tag clear: layer {getattr(layer, 'prefix', layer)!r} has "
++                "no bound ring_tag_cache"
++            )
++        if lo < 0 or hi >= tags.shape[0]:
++            raise ValueError(
++                f"ring tag clear: block ids [{lo}, {hi}] outside the pool of "
++                f"{tags.shape[0]} blocks ({getattr(layer, 'prefix', layer)!r})"
++            )
++        layer.clear_ring_row_tags(index)
++    return len(layers)

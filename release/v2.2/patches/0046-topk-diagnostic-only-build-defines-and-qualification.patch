@@ -1,0 +1,1375 @@
+From f7bb1a1130991e7440077f2244a210c41ef31ec7 Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Wed, 23 Sep 2026 08:35:52 -0400
+Subject: [PATCH 46/58] topk: diagnostic-only build defines and qualification
+ test cells
+
+Compile-time defines (default 0, device code unchanged by default) for the
+delayed-publication stress, the pre-repair control and a forced-fault cell;
+test cells for the OFF-arm controls, the QSA_SORT contract, FULL_K attribution
+on the Marlin MoE GEMM and legacy-tail repeated-row membership.
+---
+ csrc/libtorch_stable/persistent_topk.cuh |  85 +++
+ csrc/libtorch_stable/topk.cu             |  25 +
+ tests/kernels/moe/merlin_full_k_child.py | 128 +++++
+ tests/kernels/moe/test_merlin_full_k.py  | 188 +++++++
+ tests/kernels/test_merlin_qsa_sort.py    | 161 ++++++
+ tests/kernels/test_top_k_per_row.py      | 689 +++++++++++++++++++++++
+ 6 files changed, 1276 insertions(+)
+ create mode 100644 tests/kernels/moe/merlin_full_k_child.py
+ create mode 100644 tests/kernels/moe/test_merlin_full_k.py
+ create mode 100644 tests/kernels/test_merlin_qsa_sort.py
+
+diff --git a/csrc/libtorch_stable/persistent_topk.cuh b/csrc/libtorch_stable/persistent_topk.cuh
+index 85d217f9be..749d2d9ac3 100644
+--- a/csrc/libtorch_stable/persistent_topk.cuh
++++ b/csrc/libtorch_stable/persistent_topk.cuh
+@@ -685,6 +685,74 @@ __device__ __noinline__ bool histogram_2048_topk(
+   #define MERLIN_TOPK_EXACT_TRAP 1
+ #endif
+ 
++// ============================================================================
++// DIAGNOSTIC BUILDS ONLY -- never set in a release or serving build.
++//
++// Three compile-time defines exist so the reference host can run the two large-path
++// diagnostic cells.  Every one defaults to 0 and every use
++// sits behind `#if`, so the default build's device code is identical to the
++// tree without them (offline, real TU, sm_86, against an earlier commit: SASS identical,
++// cubin identical after masking nvcc's per-compile internal-linkage TU hash,
++// which differs even between two compiles of the SAME source -- see the
++// diagnostic-build notes).  A build carrying any of them prints a
++// `[merlin] persistent_topk DIAGNOSTIC BUILD` line on its first launch
++// (topk.cu), which the smoke's startup-warning scan must reject.
++//
++//   MERLIN_TOPK_DIAG_DELAY=<cycles>
++//       In `radix_topk`'s round loop, every NON-LEADER warp (warp != 0) of
++//       every NON-LEADER CTA (cta_in_group != 0) spins <cycles> clock64 ticks
++//       before merging its shared bins into the group's global histogram.
++//       Warp 0 holds thread 0, the arrival publisher, so it is never delayed:
++//       the delay opens exactly the window the histogram-publication barrier closes -- a
++//       publisher that announces arrival before its own CTA's other warps have
++//       produced.  CTA 0 is never delayed, so it reads the histogram as soon
++//       as the arrival count completes.
++//   MERLIN_TOPK_DIAG_PREREPAIR=1
++//       Compile out the histogram-publication barrier.  This is the
++//       PRE-REPAIR control for the delayed-publication stress: with a delay it
++//       is expected to return wrong or faulted rows; the repaired build with
++//       the same delay must not.  Only meaningful with MERLIN_TOPK_DIAG_DELAY.
++//       Do NOT run it with MERLIN_TOPK_DET_LARGE=0: the legacy tail bounds no
++//       emission slot, so a disagreeing pivot writes out of bounds there.
++//   MERLIN_TOPK_DIAG_FORCE_FAULT=1  (+ MERLIN_TOPK_DIAG_FORCE_FAULT_CTA, 1)
++//       Force the CTA-local X3 predicate in that CTA on every deterministic
++//       large row, exactly as MERLIN_TOPK_LARGE_FAULT_INJECT does -- but WITHOUT
++//       suppressing `__trap()`.  The trap-ON fault arm: the process's CUDA
++//       context dies.  Run only in a disposable subprocess.
++// ============================================================================
++#ifndef MERLIN_TOPK_DIAG_DELAY
++  #define MERLIN_TOPK_DIAG_DELAY 0
++#endif
++#ifndef MERLIN_TOPK_DIAG_PREREPAIR
++  #define MERLIN_TOPK_DIAG_PREREPAIR 0
++#endif
++#ifndef MERLIN_TOPK_DIAG_FORCE_FAULT
++  #define MERLIN_TOPK_DIAG_FORCE_FAULT 0
++#endif
++#ifndef MERLIN_TOPK_DIAG_FORCE_FAULT_CTA
++  #define MERLIN_TOPK_DIAG_FORCE_FAULT_CTA 1
++#endif
++#define MERLIN_TOPK_DIAG_ANY                               \
++  ((MERLIN_TOPK_DIAG_DELAY) != 0 || (MERLIN_TOPK_DIAG_PREREPAIR) != 0 || \
++   (MERLIN_TOPK_DIAG_FORCE_FAULT) != 0)
++#if MERLIN_TOPK_DIAG_FORCE_FAULT && !MERLIN_TOPK_EXACT_TRAP
++  #error "MERLIN_TOPK_DIAG_FORCE_FAULT is the trap-ON cell; it needs MERLIN_TOPK_EXACT_TRAP=1"
++#endif
++#if MERLIN_TOPK_DIAG_FORCE_FAULT && (MERLIN_TOPK_DIAG_DELAY || MERLIN_TOPK_DIAG_PREREPAIR)
++  #error "build the trap-ON and the delayed-publication diagnostics separately"
++#endif
++
++#if MERLIN_TOPK_DIAG_DELAY
++// Busy-wait on the SM clock.  `volatile` sink so the loop is not elided.
++__device__ __noinline__ void merlin_topk_diag_spin(long long cycles) {
++  const long long start = clock64();
++  volatile long long now = start;
++  while (now - start < cycles) {
++    now = clock64();
++  }
++}
++#endif
++
+ // Exact, bounded-memory re-selection for a single medium-path row.
+ //
+ // `scores` is already offset to the row.  Every radix round rescans the whole
+@@ -1621,6 +1689,13 @@ __device__ __noinline__ void radix_emit_deterministic(
+         static_cast<int>(cta_in_group) == fault_inject_cta) {
+       my_keep_checked = local_eq + 1u;
+     }
++#if MERLIN_TOPK_DIAG_FORCE_FAULT
++    // DIAGNOSTIC BUILD ONLY: the same CTA-local predicate, forced at compile
++    // time, so the trap below is NOT suppressed (fault_inject_cta stays -1).
++    if (cta_in_group == static_cast<uint32_t>(MERLIN_TOPK_DIAG_FORCE_FAULT_CTA)) {
++      my_keep_checked = local_eq + 1u;
++    }
++#endif
+     if (my_keep_checked > local_eq) fault = 1u;
+     if (gt_base + eq_keep_base + local_gt + my_keep >
+         static_cast<uint32_t>(TopK)) {
+@@ -1954,6 +2029,14 @@ __device__ void radix_topk(const float* __restrict__ row_input,
+     }
+     __syncthreads();
+ 
++#if MERLIN_TOPK_DIAG_DELAY
++    // DIAGNOSTIC BUILD ONLY (see the define block): hold back the producers
++    // that are NOT the arrival publisher, in every CTA that is not the leader.
++    if (cta_in_group != 0u && (tx >> 5) != 0u) {
++      merlin_topk_diag_spin(static_cast<long long>(MERLIN_TOPK_DIAG_DELAY));
++    }
++#endif
++
+     for (uint32_t i = tx; i < RADIX; i += kThreadsPerBlock) {
+       if (local_histogram[i] > 0) {
+         atomicAdd(&current_hist[i], local_histogram[i]);
+@@ -1976,7 +2059,9 @@ __device__ void radix_topk(const float* __restrict__ row_input,
+     // nothing here -- and reads a half-written histogram, which changes the
+     // pivot.  The barrier must be between the producing stores and the leader's
+     // publication; program order in one thread is not cross-thread ordering.
++#if !MERLIN_TOPK_DIAG_PREREPAIR
+     __syncthreads();
++#endif
+ 
+     if (tx == 0) {
+       red_release(&state->arrival_counter, 1);
+diff --git a/csrc/libtorch_stable/topk.cu b/csrc/libtorch_stable/topk.cu
+index 56b0af4cf8..b52a34b08c 100644
+--- a/csrc/libtorch_stable/topk.cu
++++ b/csrc/libtorch_stable/topk.cu
+@@ -201,6 +201,28 @@ void report_tie_policy_once() {
+   (void)reported;
+ }
+ 
++#if MERLIN_TOPK_DIAG_ANY
++// DIAGNOSTIC BUILD ONLY (persistent_topk.cuh, "DIAGNOSTIC BUILDS ONLY").  Say
++// so once per process, on stderr, before the first launch: the diagnostic-build tests
++// key on this line to prove which build they ran against, and the smoke's
++// startup-warning scan must reject any process that prints it.
++void report_diag_build_once() {
++  static const bool reported = [] {
++    std::fprintf(stderr,
++                 "[merlin] persistent_topk DIAGNOSTIC BUILD: "
++                 "MERLIN_TOPK_DIAG_DELAY=%lld MERLIN_TOPK_DIAG_PREREPAIR=%d "
++                 "MERLIN_TOPK_DIAG_FORCE_FAULT=%d "
++                 "MERLIN_TOPK_DIAG_FORCE_FAULT_CTA=%d -- NOT FOR SERVING\n",
++                 static_cast<long long>(MERLIN_TOPK_DIAG_DELAY),
++                 static_cast<int>(MERLIN_TOPK_DIAG_PREREPAIR),
++                 static_cast<int>(MERLIN_TOPK_DIAG_FORCE_FAULT),
++                 static_cast<int>(MERLIN_TOPK_DIAG_FORCE_FAULT_CTA));
++    return true;
++  }();
++  (void)reported;
++}
++#endif
++
+ // Process-lifetime device counters, one block per device.  The kernel only
+ // ever atomicAdds into them, so the launch path needs no host sync and the
+ // values accumulate across cudagraph replays.
+@@ -552,6 +574,9 @@ void launch_persistent_topk(const torch::stable::Tensor& logits,
+     params.tie_recent = tie_recent_enabled();
+     params.exact_decode = exact_decode_enabled();
+     report_tie_policy_once();
++#if MERLIN_TOPK_DIAG_ANY
++    report_diag_build_once();
++#endif
+     // Allocate only off the capture path; in the ordinary engine lifecycle the
+     // eager warmup lands here first, long before capture.  The explicit,
+     // quiescent-phase entry point is the reader op.
+diff --git a/tests/kernels/moe/merlin_full_k_child.py b/tests/kernels/moe/merlin_full_k_child.py
+new file mode 100644
+index 0000000000..3a42008be3
+--- /dev/null
++++ b/tests/kernels/moe/merlin_full_k_child.py
+@@ -0,0 +1,128 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Child process for the MERLIN_FULL_K attribution cell.
++
++NOT a test module (no `test_` prefix).  Run by tests/kernels/moe/
++test_merlin_full_k.py once per arm -- MERLIN_FULL_K=0, MERLIN_FULL_K=1 and,
++optionally, the untouched v2.0.1 install's interpreter -- because the switch
++is a function-local static read on the first Marlin launch and so is fixed
++for a process's lifetime.  It deliberately imports only what v2.0.1 also
++ships, so the same file runs against the production wheel.
++
++Calls the Marlin MoE GEMM (`ops.moe_wna16_marlin_gemm`) DIRECTLY on fixed,
++seeded inputs -- one expert, top_k 1, W4A16 uint4b8 group 128, bf16, K 2048,
++moe_block_size 16, `use_fp32_reduce=True, use_atomic_add=False` as the
++serving path passes them -- and saves every output to argv[1]:
++
++  cases   per (config, geometry): TWO launches on identical inputs.  With the
++          explicit config (thread_k = thread_n = 128, blocks_per_sm = 1) the
++          grid is exactly `sms` CTAs, so the geometries put the tile count
++          (= num_tokens_past_padded / 16 * N / 128) below, equal to and above
++          one grid, the last two above-grid shapes landing on both stream-K
++          branches (remainder * 3 > grid: data-parallel + split tail;
++          remainder * 3 <= grid: remainder + one full grid of two-tile SK).
++          The auto config gets the same shapes; its grid is the heuristic's.
++  series  per config: one weight matrix, token prefixes of 16..96 rows, so
++          the SAME first 16 tokens are computed at 1..6 m-blocks -- tile
++          counts T..6T with T = sms // 2 (41 on a 3090: 41, 82 = one grid,
++          123, 164, 205, 246).  This is the batch-invariance property FULL_K
++          exists for: a token's output must not depend on how many other
++          tokens share the launch.
++"""
++
++import os
++import sys
++
++import torch
++
++
++def main(out_path: str) -> None:
++    from vllm import _custom_ops as ops
++    from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
++        moe_align_block_size,
++    )
++    from vllm.model_executor.layers.quantization.utils.marlin_utils import (
++        marlin_make_workspace_new,
++    )
++    from vllm.model_executor.layers.quantization.utils.marlin_utils_test import (
++        marlin_quantize,
++    )
++    from vllm.scalar_type import scalar_types
++
++    dev = torch.device("cuda:0")
++    torch.cuda.set_device(dev)
++    sms = torch.cuda.get_device_properties(dev).multi_processor_count
++    dtype = torch.bfloat16
++    qtype = scalar_types.uint4b8
++    K, GROUP, BLOCK = 2048, 128, 16
++    TN = 128  # thread_n of the explicit config
++    configs = {"explicit": (128, 128, 1), "auto": (-1, -1, -1)}
++
++    gen = torch.Generator(device="cpu").manual_seed(46639)
++    a_full = (torch.randn(96, K, generator=gen) / 10).to(dtype).to(dev)
++
++    def weights(n: int):
++        w = (torch.randn(K, n, generator=gen) / 10).to(dtype).to(dev)
++        _, q, s, _, _, _ = marlin_quantize(w, qtype, GROUP, False)
++        return q.unsqueeze(0).contiguous(), s.unsqueeze(0).contiguous()
++
++    def gemm(m: int, n: int, q, s, cfg):
++        tk, tn, bps = cfg
++        a = a_full[:m].contiguous()
++        topk_ids = torch.zeros((m, 1), dtype=torch.int32, device=dev)
++        topk_w = torch.ones((m, 1), dtype=torch.float32, device=dev)
++        sorted_ids, expert_ids, ntpp = moe_align_block_size(topk_ids, BLOCK, 1)
++        ws = marlin_make_workspace_new(dev, 4)
++        out = ops.moe_wna16_marlin_gemm(
++            a, None, q, None, s, None, None, None, None, None, ws,
++            sorted_ids, expert_ids, ntpp, topk_w,
++            moe_block_size=BLOCK, top_k=1, mul_topk_weights=False,
++            b_q_type=qtype, size_m=m, size_n=n, size_k=K, is_k_full=True,
++            use_atomic_add=False, use_fp32_reduce=True, is_zp_float=False,
++            thread_k=tk, thread_n=tn, blocks_per_sm=bps,
++        )  # fmt: skip
++        torch.cuda.synchronize()
++        tiles = int(ntpp.item()) // BLOCK * (n // TN)
++        return out.float().cpu(), tiles
++
++    half = sms // 2
++    geometries = {
++        # name: n_tiles at one m-block (M = 16)
++        "below": sms - 2,
++        "equal": sms,
++        "above_dp_plus_split": 2 * sms + half,  # remainder*3 > grid
++        "above_two_tile_sk": 2 * sms + 3,  # remainder*3 <= grid
++    }
++    result = {
++        "sms": sms,
++        "env_MERLIN_FULL_K": os.environ.get("MERLIN_FULL_K"),
++        "torch": str(torch.__version__),
++        "cases": {},
++        "series": {},
++    }
++    for gname, n_tiles in geometries.items():
++        n = TN * n_tiles
++        q, s = weights(n)
++        for cname, cfg in configs.items():
++            o1, tiles = gemm(16, n, q, s, cfg)
++            o2, _ = gemm(16, n, q, s, cfg)
++            result["cases"][f"{cname}/{gname}"] = {
++                "tiles": tiles,
++                "grid_explicit": sms if cname == "explicit" else None,
++                "first": o1,
++                "second": o2,
++            }
++    n = TN * half
++    q, s = weights(n)
++    for cname, cfg in configs.items():
++        series = {}
++        for m in (16, 32, 48, 64, 80, 96):
++            o, tiles = gemm(m, n, q, s, cfg)
++            series[m] = {"tiles": tiles, "out": o}
++        result["series"][cname] = series
++    torch.save(result, out_path)
++    print(f"FULL_K_CHILD_DONE sms={sms} env={result['env_MERLIN_FULL_K']}")
++
++
++if __name__ == "__main__":
++    main(sys.argv[1])
+diff --git a/tests/kernels/moe/test_merlin_full_k.py b/tests/kernels/moe/test_merlin_full_k.py
+new file mode 100644
+index 0000000000..88904b056b
+--- /dev/null
++++ b/tests/kernels/moe/test_merlin_full_k.py
+@@ -0,0 +1,188 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""MERLIN_FULL_K attribution cell.
++
++The Marlin MoE GEMM called DIRECTLY on fixed inputs (see
++merlin_full_k_child.py for the shapes and why) in separate child processes,
++because `MERLIN_FULL_K` is read once per process:
++
++  arm OFF   MERLIN_FULL_K=0, this build
++  arm ON    MERLIN_FULL_K=1, this build
++  arm V201  optional: the untouched v2.0.1 install, when
++            MERLIN_FULL_K_BASELINE_PYTHON (and, if needed,
++            MERLIN_FULL_K_BASELINE_PYTHONPATH) name its interpreter
++
++Asserted:
++  * ON: two launches on identical inputs are bit-identical, every geometry
++    (below / equal / above one grid, both stream-K branches), explicit and
++    auto config;
++  * ON, explicit config: the same 16 tokens computed inside launches of 1..6
++    m-blocks (tile counts T..6T, T = sms // 2) are bit-identical -- the
++    batch-invariance claim FULL_K is for;
++  * ON vs OFF: numerically close (bf16 tolerance);
++  * the toggle is OBSERVABLE: ON differs from OFF somewhere, or OFF breaks
++    the series invariance somewhere -- otherwise the cell cannot attribute
++    anything to FULL_K and says so;
++  * V201 (when run): bit-identical to same-build OFF, i.e. OFF really is the
++    v2.0.1 algorithm ("FULL_K=0 is not the production binary").
++Reported, NOT asserted: OFF two-launch variability and OFF series drift.
++Set MERLIN_FULL_K_REPORT_DIR to also write the report as JSON.
++"""
++
++import json
++import os
++import subprocess
++import sys
++from pathlib import Path
++
++import pytest
++import torch
++
++CHILD = Path(__file__).with_name("merlin_full_k_child.py")
++
++pytestmark = pytest.mark.skipif(
++    not torch.cuda.is_available(), reason="needs a CUDA GPU (sm_86)"
++)
++
++
++def _run_child(out_dir: Path, tag: str, full_k: str | None, python: str | None = None,
++               pythonpath: str | None = None) -> dict:
++    env = dict(os.environ)
++    env.pop("MERLIN_FULL_K", None)
++    if full_k is not None:
++        env["MERLIN_FULL_K"] = full_k
++    if pythonpath is not None:
++        env["PYTHONPATH"] = pythonpath
++    out = out_dir / f"full_k_{tag}.pt"
++    proc = subprocess.run(
++        [python or sys.executable, str(CHILD), str(out)],
++        env=env,
++        capture_output=True,
++        text=True,
++        timeout=3600,
++    )
++    assert proc.returncode == 0 and out.exists(), (
++        f"FULL_K child '{tag}' failed rc={proc.returncode}\n"
++        f"{proc.stdout[-1500:]}\n{proc.stderr[-3000:]}"
++    )
++    return torch.load(out, weights_only=True)
++
++
++@pytest.fixture(scope="module")
++def arms(tmp_path_factory) -> dict:
++    d = tmp_path_factory.mktemp("full_k")
++    return {"off": _run_child(d, "off", "0"), "on": _run_child(d, "on", "1"),
++            "dir": d}
++
++
++def _ndiff(a: torch.Tensor, b: torch.Tensor) -> int:
++    return int((a != b).sum())
++
++
++def _report(arms: dict) -> dict:
++    off, on = arms["off"], arms["on"]
++    rep = {"sms": on["sms"], "cases": {}, "series": {}}
++    for name, c_on in on["cases"].items():
++        c_off = off["cases"][name]
++        rep["cases"][name] = {
++            "tiles": c_on["tiles"],
++            "off_two_launch_diff": _ndiff(c_off["first"], c_off["second"]),
++            "on_two_launch_diff": _ndiff(c_on["first"], c_on["second"]),
++            "on_vs_off_diff": _ndiff(c_on["first"], c_off["first"]),
++            "on_vs_off_maxabs": float((c_on["first"] - c_off["first"]).abs().max()),
++            "numel": c_on["first"].numel(),
++        }
++    for cfg, s_on in on["series"].items():
++        s_off = off["series"][cfg]
++        ref_on, ref_off = s_on[16]["out"], s_off[16]["out"]
++        rep["series"][cfg] = {
++            m: {
++                "tiles": s_on[m]["tiles"],
++                "on_prefix_diff_vs_m16": _ndiff(s_on[m]["out"][:16], ref_on),
++                "off_prefix_diff_vs_m16": _ndiff(s_off[m]["out"][:16], ref_off),
++                "on_vs_off_diff": _ndiff(s_on[m]["out"], s_off[m]["out"]),
++            }
++            for m in s_on
++        }
++    print("\n[full-K isolated case] MERLIN_FULL_K report:\n" + json.dumps(rep, indent=1))
++    out_dir = os.environ.get("MERLIN_FULL_K_REPORT_DIR")
++    if out_dir:
++        Path(out_dir).mkdir(parents=True, exist_ok=True)
++        (Path(out_dir) / "full_k_report.json").write_text(json.dumps(rep, indent=1))
++    return rep
++
++
++def test_isolated_full_k_on_is_bit_stable_and_batch_invariant(arms) -> None:
++    on = arms["on"]
++    assert on["env_MERLIN_FULL_K"] == "1" and arms["off"]["env_MERLIN_FULL_K"] == "0"
++    rep = _report(arms)
++    sms = on["sms"]
++    # the geometry claims the docstring makes, checked on the explicit config
++    tiles = {n.split("/", 1)[1]: c["tiles"] for n, c in on["cases"].items()
++             if n.startswith("explicit/")}
++    assert tiles["below"] < sms == tiles["equal"] < tiles["above_dp_plus_split"]
++    assert (tiles["above_dp_plus_split"] % sms) * 3 > sms
++    assert 0 < (tiles["above_two_tile_sk"] % sms) * 3 <= sms
++
++    for name, c in on["cases"].items():
++        assert torch.equal(c["first"], c["second"]), (
++            f"MERLIN_FULL_K=1 {name} ({c['tiles']} tiles): two launches on "
++            f"identical inputs differ in {rep['cases'][name]['on_two_launch_diff']}"
++            " elements"
++        )
++    ser = on["series"]["explicit"]
++    for m, e in ser.items():
++        assert torch.equal(e["out"][:16], ser[16]["out"]), (
++            f"MERLIN_FULL_K=1, explicit config: the first 16 tokens at M={m} "
++            f"({e['tiles']} tiles) differ from M=16 ({ser[16]['tiles']} tiles) in "
++            f"{rep['series']['explicit'][m]['on_prefix_diff_vs_m16']} elements --"
++            " the output depends on the batch"
++        )
++
++
++def test_isolated_full_k_on_vs_off_close_and_observable(arms) -> None:
++    rep = _report(arms)
++    off, on = arms["off"], arms["on"]
++    for name, c in on["cases"].items():
++        torch.testing.assert_close(
++            c["first"], off["cases"][name]["first"], atol=2e-2, rtol=2e-2,
++            msg=lambda m, name=name: f"{name}: ON vs OFF not close. {m}",
++        )
++    for cfg, s in on["series"].items():
++        for m, e in s.items():
++            torch.testing.assert_close(e["out"], off["series"][cfg][m]["out"],
++                                       atol=2e-2, rtol=2e-2)
++    differs = sum(v["on_vs_off_diff"] for v in rep["cases"].values()) + sum(
++        v["on_vs_off_diff"] + v["off_prefix_diff_vs_m16"]
++        for s in rep["series"].values() for v in s.values()
++    )
++    assert differs > 0, (
++        "ON and OFF are bit-identical on every shape and OFF is batch-invariant "
++        "too: this cell cannot attribute anything to MERLIN_FULL_K at these "
++        "shapes (not a kernel failure -- the instrument does not discriminate)"
++    )
++
++
++def test_isolated_full_k_off_is_the_untouched_v201_algorithm(arms) -> None:
++    py = os.environ.get("MERLIN_FULL_K_BASELINE_PYTHON")
++    if not py:
++        pytest.skip(
++            "third arm not run: set MERLIN_FULL_K_BASELINE_PYTHON (and "
++            "MERLIN_FULL_K_BASELINE_PYTHONPATH) to the untouched v2.0.1 "
++            "install. A skip is not a pass."
++        )
++    base = _run_child(arms["dir"], "v201", None, python=py,
++                      pythonpath=os.environ.get("MERLIN_FULL_K_BASELINE_PYTHONPATH"))
++    off = arms["off"]
++    for name, c in base["cases"].items():
++        # first launches only: OFF's second launch may legitimately vary
++        assert torch.equal(c["first"], off["cases"][name]["first"]), (
++            f"{name}: the untouched v2.0.1 Marlin and same-build MERLIN_FULL_K=0 "
++            f"differ in {_ndiff(c['first'], off['cases'][name]['first'])} "
++            "elements -- OFF is not the production algorithm"
++        )
++    for cfg, s in base["series"].items():
++        for m, e in s.items():
++            assert torch.equal(e["out"], off["series"][cfg][m]["out"]), (
++                f"series {cfg} M={m}: v2.0.1 and same-build OFF differ"
++            )
+diff --git a/tests/kernels/test_merlin_qsa_sort.py b/tests/kernels/test_merlin_qsa_sort.py
+new file mode 100644
+index 0000000000..7496e3cfe1
+--- /dev/null
++++ b/tests/kernels/test_merlin_qsa_sort.py
+@@ -0,0 +1,161 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""MERLIN_QSA_SORT attribution cell.
++
++`_qsa_canonicalise` (qsa_indexer.py) sorts the selected block indices of each
++row ascending, pushes negative padding to the END as -1, in place, shape
++preserved, and does it without a host sync so it can sit inside a captured
++cudagraph.  These tests pin exactly that contract on CPU and GPU:
++
++  * permutations of a valid row come back as the one ascending row;
++  * mixed padding (negatives interleaved anywhere) -> valid ascending prefix,
++    then -1s, count of valid entries preserved;
++  * all padding -> all -1;
++  * the switch OFF is a byte-for-byte no-op;
++  * CUDA: no host synchronisation (torch.cuda sync-debug mode "error"), and
++    `torch.cuda.graph` capture SUCCEEDS and the replay equals the eager result
++    on fresh data copied into the static input.
++
++The module-level `_QSA_SORT` is resolved once at import from the environment,
++so the tests set it with monkeypatch on the module, not through the env.
++"""
++
++import pytest
++import torch
++
++qsa_indexer = pytest.importorskip(
++    "vllm.models.qwen4_exp.nvidia.ops.qsa_indexer",
++    reason="qsa_indexer needs triton (the reference-host venv has it)",
++)
++
++DEVICES = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
++
++
++def _reference(rows: torch.Tensor) -> torch.Tensor:
++    """Per row: valid (>= 0) entries ascending, then -1 for every negative."""
++    out = torch.full_like(rows, -1)
++    for i in range(rows.shape[0]):
++        valid = rows[i][rows[i] >= 0].sort().values
++        out[i, : valid.numel()] = valid
++    return out
++
++
++@pytest.fixture
++def sort_on(monkeypatch):
++    monkeypatch.setattr(qsa_indexer, "_QSA_SORT", True)
++
++
++def _rows(kind: str, n_rows: int, width: int, dtype: torch.dtype, seed: int):
++    gen = torch.Generator(device="cpu").manual_seed(seed)
++    base = torch.stack(
++        [torch.randperm(4 * width, generator=gen)[:width] for _ in range(n_rows)]
++    ).to(dtype)
++    if kind == "permutation":
++        return base
++    if kind == "mixed_padding":
++        # negatives interleaved anywhere, several spellings of "invalid"
++        mask = torch.rand(n_rows, width, generator=gen) < 0.35
++        pad = torch.tensor([-1, -2, -7], dtype=dtype)[
++            torch.randint(0, 3, (n_rows, width), generator=gen)
++        ]
++        rows = torch.where(mask, pad, base)
++        rows[0, :] = -1  # one fully padded row among mixed ones
++        rows[1, :] = base[1]  # and one with no padding at all
++        return rows
++    if kind == "all_padding":
++        return torch.full((n_rows, width), -1, dtype=dtype)
++    raise ValueError(kind)
++
++
++@pytest.mark.parametrize("device", DEVICES)
++@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
++@pytest.mark.parametrize("kind", ["permutation", "mixed_padding", "all_padding"])
++def test_isolated_qsa_canonicalise_contract(sort_on, device, dtype, kind) -> None:
++    rows = _rows(kind, n_rows=8, width=512, dtype=dtype, seed=3).to(device)
++    expected = _reference(rows.cpu())
++    ptr = rows.data_ptr()
++    qsa_indexer._qsa_canonicalise(rows)
++    assert rows.data_ptr() == ptr, "not in place"
++    assert rows.dtype == dtype and rows.shape == expected.shape
++    assert torch.equal(rows.cpu(), expected), f"{kind}: not the canonical row"
++
++
++@pytest.mark.parametrize("device", DEVICES)
++def test_isolated_qsa_canonicalise_permutation_invariance(sort_on, device) -> None:
++    """Any permutation of one selected set gives the SAME output bytes."""
++    gen = torch.Generator(device="cpu").manual_seed(5)
++    selected = torch.randperm(100_000, generator=gen)[:2048].to(torch.int32)
++    selected[::7] = -1  # padding scattered through
++    outs = []
++    for s in range(6):
++        g = torch.Generator(device="cpu").manual_seed(100 + s)
++        row = selected[torch.randperm(selected.numel(), generator=g)]
++        row = row.view(1, -1).to(device).contiguous()
++        qsa_indexer._qsa_canonicalise(row)
++        outs.append(row.cpu())
++    for o in outs[1:]:
++        assert torch.equal(o, outs[0]), "permutations of one set disagree"
++
++
++@pytest.mark.parametrize("device", DEVICES)
++def test_isolated_qsa_canonicalise_higher_rank(sort_on, device) -> None:
++    """Sorts along the LAST dim only; leading dims untouched."""
++    rows = _rows("mixed_padding", n_rows=12, width=64, dtype=torch.int32, seed=9)
++    rows3 = rows.view(3, 4, 64).to(device)
++    qsa_indexer._qsa_canonicalise(rows3)
++    assert torch.equal(rows3.cpu().view(12, 64), _reference(rows))
++
++
++@pytest.mark.parametrize("device", DEVICES)
++def test_isolated_qsa_canonicalise_off_is_a_noop(monkeypatch, device) -> None:
++    monkeypatch.setattr(qsa_indexer, "_QSA_SORT", False)
++    rows = _rows("mixed_padding", n_rows=4, width=128, dtype=torch.int32, seed=1)
++    rows = rows.to(device)
++    before = rows.clone()
++    qsa_indexer._qsa_canonicalise(rows)
++    assert torch.equal(rows, before), "MERLIN_QSA_SORT=0 must not touch the row"
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
++def test_isolated_qsa_canonicalise_no_host_sync(sort_on) -> None:
++    """The branch-free design claim: no device->host synchronisation."""
++    rows = _rows("mixed_padding", n_rows=8, width=2048, dtype=torch.int32, seed=11)
++    rows = rows.cuda()
++    expected = _reference(rows.cpu())
++    torch.cuda.synchronize()
++    prev = torch.cuda.get_sync_debug_mode()
++    torch.cuda.set_sync_debug_mode("error")
++    try:
++        qsa_indexer._qsa_canonicalise(rows)
++    finally:
++        torch.cuda.set_sync_debug_mode(prev)
++    torch.cuda.synchronize()
++    assert torch.equal(rows.cpu(), expected)
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
++@pytest.mark.parametrize("width", [512, 2048])
++def test_isolated_qsa_canonicalise_under_cudagraph_capture(sort_on, width) -> None:
++    """Capture must SUCCEED (no .item()/.any() sync) and replay must be exact."""
++    static = _rows("mixed_padding", 8, width, torch.int32, seed=21).cuda()
++    # warm up on a side stream, as vLLM does before capture
++    s = torch.cuda.Stream()
++    s.wait_stream(torch.cuda.current_stream())
++    with torch.cuda.stream(s):
++        qsa_indexer._qsa_canonicalise(static.clone())
++    torch.cuda.current_stream().wait_stream(s)
++    torch.cuda.synchronize()
++
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph):  # raises if anything in the op syncs
++        qsa_indexer._qsa_canonicalise(static)
++
++    for seed in (22, 23, 24):
++        fresh = _rows("mixed_padding", 8, width, torch.int32, seed=seed)
++        fresh[2] = fresh[2].flip(0)
++        static.copy_(fresh.cuda())
++        graph.replay()
++        torch.cuda.synchronize()
++        assert torch.equal(static.cpu(), _reference(fresh)), (
++            f"replay on seed {seed} differs from the eager contract"
++        )
+diff --git a/tests/kernels/test_top_k_per_row.py b/tests/kernels/test_top_k_per_row.py
+index 2b45b3ba48..58bcb7f143 100644
+--- a/tests/kernels/test_top_k_per_row.py
++++ b/tests/kernels/test_top_k_per_row.py
+@@ -3330,3 +3330,692 @@ def test_persistent_topk_large_within_group_mixed_reuse() -> None:
+                 "deterministic selected set, but two identical launches "
+                 "selected different indices"
+             )
++
++
++# ===========================================================================
++# Cells that need a GPU host or a diagnostic build, prepared
++# offline.  Every test here is named
++# `test_isolated_*` so one `-k isolated` selects them; each SKIPS outside the process
++# environment (or the diagnostic build) it exists for, and every skip names
++# the environment that runs it.  A skip is never a pass.
++#
++#   cell 1  OFF-arm oracle controls that CAN fail (medium + decode), and the
++#           ON arms on the identical inputs
++#   cell 4  MERLIN_TIE_DET non-overflow cutoff ties, both directions, oracle
++#   cell 5  delayed-producer publication stress (MERLIN_TOPK_DIAG_DELAY build,
++#           repaired vs MERLIN_TOPK_DIAG_PREREPAIR=1)
++#   cell 6  trap-ON fault in a disposable subprocess
++#           (MERLIN_TOPK_DIAG_FORCE_FAULT build)
++# Cells 2 (FULL_K) and 3 (QSA_SORT) live in tests/kernels/moe/
++# test_merlin_full_k.py and tests/kernels/test_merlin_qsa_sort.py.
++# ===========================================================================
++
++ISOLATED_MEDIUM_CAP = 4096  # MAX_BUFFERED_ITEMS, persistent_topk.cuh
++ISOLATED_DECODE_DBUF = 3708  # DBUF in histogram_2048_topk
++ISOLATED_THREADS = 1024  # kThreadsPerBlock
++ISOLATED_NUM_ROWS = 4
++
++
++def _isolated_bins_or_fail() -> None:
++    """The fixtures rest on these bin facts; assert them rather than assume."""
++
++    def half_key(v: float) -> int:
++        h = int(np.float16(np.float32(v)).view(np.uint16))
++        return (h | 0x8000) if not (h & 0x8000) else (~h) & 0xFFFF
++
++    # medium coarse bin = half key >> 8; decode bin = half key >> 5
++    assert half_key(1.0) >> 8 == half_key(1.01) >> 8 == 0xBC
++    assert half_key(2.0) >> 8 > 0xBC > half_key(0.5) >> 8
++    assert half_key(1.0) >> 5 == half_key(1.01) >> 5
++    assert half_key(2.0) >> 5 > half_key(1.0) >> 5 > half_key(0.5) >> 5
++    assert np.float32(1.01) > np.float32(1.0)
++
++
++def _isolated_medium_drop_fixture(top_k: int) -> tuple[torch.Tensor, torch.Tensor]:
++    """A medium row whose 4,096-slot overflow PROVABLY drops a true winner.
++
++    `histogram_256_topk`'s collection loop hands buffer slots out with one
++    per-ELEMENT atomicAdd; thread t visits idx = t, t + 1024, t + 2048, ... in
++    program order, so ITS appends are ordered, and nothing else is.  The
++    fixture puts threshold-bin candidates (1.0, coarse bin 0xBC) in the first
++    `per_thread` visits of `threads` threads and makes each such thread's LAST
++    candidate a true winner (1.01: same coarse bin, larger at FP32).  The
++    candidate count exceeds 4,096, so the append that lands last in the global
++    atomic order gets a slot >= 4,096 and is dropped -- and whichever thread
++    issued it, it is that thread's last append, i.e. a winner.  Every legal
++    interleaving drops at least one winner: the OFF arm is wrong on every row,
++    deterministically.
++    """
++    _isolated_bins_or_fail()
++    seq_len = 32768  # the widest medium row (<= RADIX_THRESHOLD)
++    if top_k == 2048:
++        threads, per_thread, above = 1024, 5, 512
++    elif top_k == 512:
++        threads, per_thread, above = 512, 9, 0
++    else:
++        raise ValueError(top_k)
++    with torch.device("cpu"):
++        row = torch.full((seq_len,), 0.5, dtype=torch.float32)
++        t = torch.arange(threads)
++        for j in range(per_thread):
++            row[t + ISOLATED_THREADS * j] = 1.0
++        winners = t + ISOLATED_THREADS * (per_thread - 1)
++        row[winners] = float(np.float32(1.01))
++        start = ISOLATED_THREADS * per_thread
++        row[start : start + above] = 2.0
++    candidates = threads * per_thread
++    assert candidates > ISOLATED_MEDIUM_CAP, "the fixture must overflow"
++    assert threads <= top_k - above, "every winner must belong in the exact top-k"
++    assert int((row == 1.0).sum()) + threads == candidates
++    return row, winners
++
++
++def _isolated_decode_drop_fixture(top_k: int) -> tuple[torch.Tensor, torch.Tensor]:
++    """A decode row whose 3,708-slot overflow PROVABLY drops a true winner.
++
++    The decode collection is warp-aggregated: per (iteration, sub-element)
++    step, lane 0 reserves one contiguous range for the whole ballot and the
++    lane of rank `r` writes slot `base + r` only if it is < DBUF.  A warp's
++    reservations are in program order (iteration 0 sub 0..3, then iteration
++    1); across warps there is no order.  The fixture fills every element of
++    iteration 0 (indices [0, 4096): 32 warps x 4 sub-steps x 32 lanes) with
++    threshold-bin candidates and makes lane 31 of each warp's LAST candidate
++    step (iteration 0, sub 3) a true winner.  4,096 > 3,708 candidates, so the
++    reservation that lands last globally starts at 4,064 >= 3,708 and is
++    dropped whole -- and it is some warp's last one, whose top lane is a
++    winner.  Every legal interleaving drops at least one winner.
++    """
++    _isolated_bins_or_fail()
++    seq_len = 8192  # the widest decode row (<= HIST2048_THRESHOLD)
++    above = 64
++    with torch.device("cpu"):
++        row = torch.full((seq_len,), 0.5, dtype=torch.float32)
++        row[:4096] = 1.0
++        warps = torch.arange(32)
++        winners = 4 * (warps * 32 + 31) + 3
++        row[winners] = float(np.float32(1.01))
++        row[4096 : 4096 + above] = 2.0
++    assert 4096 > ISOLATED_DECODE_DBUF
++    assert 32 <= top_k - above
++    return row, winners
++
++
++def _isolated_launch(row: torch.Tensor, top_k: int, num_rows: int = ISOLATED_NUM_ROWS):
++    seq_len = row.numel()
++    logits = row.to("cuda").unsqueeze(0).repeat(num_rows, 1).contiguous()
++    lengths = torch.full((num_rows,), seq_len, dtype=torch.int32, device="cuda")
++    indices = torch.empty((num_rows, top_k), dtype=torch.int32, device="cuda")
++    _run_topk_backend("persistent_topk", logits, lengths, indices, top_k, seq_len)
++    torch.accelerator.synchronize()
++    return indices.cpu().to(torch.int64)
++
++
++def _isolated_counters_or_skip() -> list[int]:
++    counters = _read_exact_counters()
++    if counters is None:
++        pytest.skip(
++            "QUALIFICATION FAILURE if seen on the branch build: no "
++            "persistent_topk_exact_counters op. A skip is not a pass."
++        )
++    return counters
++
++
++def _isolated_assert_off_arm_failed(
++    row: torch.Tensor, got: torch.Tensor, winners: torch.Tensor, top_k: int, arm: str
++) -> None:
++    with torch.device("cpu"):
++        ref_values = torch.topk(row, top_k).values.sort().values
++        for r in range(got.shape[0]):
++            g = got[r]
++            # Well-formed: the failure under test is a WRONG top-k, not garbage.
++            assert int(g.min()) >= 0 and int(g.max()) < row.numel(), f"{arm} row {r}"
++            assert g.unique().numel() == top_k, f"{arm} row {r}: duplicate index"
++            missing = int((~torch.isin(winners, g)).sum())
++            assert missing >= 1, (
++                f"{arm} row {r}: the OFF arm kept every true winner. The "
++                "fixture is built so that no legal append order can do that -- "
++                "the control did not exercise the defect, so it proves nothing."
++            )
++            assert not torch.equal(row[g].sort().values, ref_values), (
++                f"{arm} row {r}: OFF-arm values equal torch.topk's although "
++                f"{missing} winner(s) are missing"
++            )
++
++
++@pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
++@pytest.mark.parametrize("top_k", [512, 2048])
++@torch.inference_mode()
++def test_isolated_medium_off_arm_drops_a_true_winner(top_k: int) -> None:
++    """Cell 1 (medium control): MERLIN_TOPK_EXACT_MEDIUM=0 must be WRONG here.
++
++    The same-input, oracle-sensitive control that was missing (the
++    existing OFF test skips before constructing an overflow row).  Asserts the
++    overflow counted, no restart taken, and a returned set that misses a true
++    winner on every row.  Its ON twin below runs the identical input.
++    """
++    torch.set_default_device("cuda:0")
++    before = _isolated_counters_or_skip()
++    if before[_SLOT_EXACT_MEDIUM_ON] != 0:
++        pytest.skip(
++            "MERLIN_TOPK_EXACT_MEDIUM=1 in this process: this is the OFF-arm "
++            "control. Run it in a fresh process with MERLIN_TOPK_EXACT_MEDIUM=0."
++            " A skip is not a pass."
++        )
++    row, winners = _isolated_medium_drop_fixture(top_k)
++    got = _isolated_launch(row, top_k)
++    after = _read_exact_counters()
++    n = ISOLATED_NUM_ROWS
++    assert after[_SLOT_MEDIUM_ROWS] - before[_SLOT_MEDIUM_ROWS] == n
++    assert after[_SLOT_MEDIUM_OVERFLOW] - before[_SLOT_MEDIUM_OVERFLOW] == n, (
++        "the overflow counter must fire once per row in the control arm too"
++    )
++    assert after[_SLOT_MEDIUM_FALLBACK] == before[_SLOT_MEDIUM_FALLBACK], (
++        "the OFF arm took the exact restart"
++    )
++    assert after[_SLOT_MEDIUM_FAULT] == before[_SLOT_MEDIUM_FAULT]
++    _isolated_assert_off_arm_failed(row, got, winners, top_k, "medium OFF")
++
++
++@pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
++@pytest.mark.parametrize("top_k", [512, 2048])
++@torch.inference_mode()
++def test_isolated_medium_on_arm_is_exact_on_the_drop_fixture(top_k: int) -> None:
++    """Cell 1 (medium treatment): the identical input with the restart ON is exact."""
++    torch.set_default_device("cuda:0")
++    before = _isolated_counters_or_skip()
++    if before[_SLOT_EXACT_MEDIUM_ON] == 0:
++        pytest.skip(
++            "MERLIN_TOPK_EXACT_MEDIUM=0 in this process: this is the ON arm. "
++            "Run it with the switch on (the default). A skip is not a pass."
++        )
++    row, winners = _isolated_medium_drop_fixture(top_k)
++    expected = _largedet_reference(row, top_k)  # the restart's effective direction
++    got = _isolated_launch(row, top_k)
++    after = _read_exact_counters()
++    n = ISOLATED_NUM_ROWS
++    assert after[_SLOT_MEDIUM_OVERFLOW] - before[_SLOT_MEDIUM_OVERFLOW] == n
++    assert after[_SLOT_MEDIUM_FALLBACK] - before[_SLOT_MEDIUM_FALLBACK] == n
++    assert after[_SLOT_MEDIUM_FAULT] == before[_SLOT_MEDIUM_FAULT]
++    for r in range(n):
++        assert bool(torch.isin(winners, got[r]).all()), f"row {r}: a winner is missing"
++        assert torch.equal(got[r], expected), (
++            f"row {r}: the exact restart did not return the oracle set in "
++            "ascending order"
++        )
++
++
++@pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
++@pytest.mark.parametrize("top_k", [512, 2048])
++@torch.inference_mode()
++def test_isolated_decode_off_arm_drops_a_true_winner(top_k: int) -> None:
++    """Cell 1 (decode control): MERLIN_TOPK_EXACT_DECODE=0 must be WRONG here.
++
++    Replaces the detect-only test as the control; there the tail
++    winner is dropped only if warp scheduling happens to append it last: here
++    the drop is forced for every interleaving (see the fixture).
++    """
++    torch.set_default_device("cuda:0")
++    if _largedet_env_on("MERLIN_TOPK_EXACT_DECODE", False):
++        pytest.skip(
++            "MERLIN_TOPK_EXACT_DECODE=1 in this process: this is the OFF-arm "
++            "control. Run it in a process with the variable unset or 0. A skip "
++            "is not a pass."
++        )
++    before = _isolated_counters_or_skip()
++    row, winners = _isolated_decode_drop_fixture(top_k)
++    got = _isolated_launch(row, top_k)
++    after = _read_exact_counters()
++    fired = after[_SLOT_DECODE_OVERFLOW] - before[_SLOT_DECODE_OVERFLOW]
++    assert fired == ISOLATED_NUM_ROWS, f"decode overflow counter moved by {fired}"
++    assert after[_SLOT_MEDIUM_FAULT] == before[_SLOT_MEDIUM_FAULT]
++    _isolated_assert_off_arm_failed(row, got, winners, top_k, "decode OFF")
++
++
++@pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
++@pytest.mark.parametrize("top_k", [512, 2048])
++@torch.inference_mode()
++def test_isolated_decode_on_arm_is_exact_on_the_drop_fixture(top_k: int) -> None:
++    """Cell 1 (decode treatment): the identical input with the restart ON."""
++    torch.set_default_device("cuda:0")
++    if not _largedet_env_on("MERLIN_TOPK_EXACT_DECODE", False):
++        pytest.skip(
++            "MERLIN_TOPK_EXACT_DECODE unset/0: this is the ON arm. Run it in a "
++            "fresh process with MERLIN_TOPK_EXACT_DECODE=1. A skip is not a pass."
++        )
++    before = _isolated_counters_or_skip()
++    row, winners = _isolated_decode_drop_fixture(top_k)
++    expected = _largedet_reference(row, top_k)
++    got = _isolated_launch(row, top_k)
++    after = _read_exact_counters()
++    fired = after[_SLOT_DECODE_OVERFLOW] - before[_SLOT_DECODE_OVERFLOW]
++    assert fired == ISOLATED_NUM_ROWS, f"decode overflow counter moved by {fired}"
++    assert after[_SLOT_MEDIUM_FAULT] == before[_SLOT_MEDIUM_FAULT], (
++        "the decode restart shares the medium restart's fault counter"
++    )
++    for r in range(ISOLATED_NUM_ROWS):
++        assert bool(torch.isin(winners, got[r]).all()), f"row {r}: a winner is missing"
++        assert torch.equal(got[r], expected), (
++            f"row {r}: the exact decode restart did not return the oracle set "
++            "in ascending order"
++        )
++
++
++def _isolated_tie_fixture(path: str) -> tuple[torch.Tensor, int, int]:
++    """A NON-overflowing row with an exact 32-bit tie AT the k-th value.
++
++    Returns (row, top_k, need).  `above` elements at 3.0 and `tie` elements at
++    2.0, scattered by a seeded permutation over the whole row so the tie group
++    spans every warp; filler in [0, 0.5).  The tie group is one coarse bin and
++    fits the buffer (decode 700 <= 3,708; medium 2,048 <= 4,096), so the
++    BUFFERED path -- not a restart -- ranks it at pass 3.
++    """
++    if path == "decode":
++        seq_len, top_k, above, tie = 6000, 512, 200, 700
++    elif path == "medium":
++        seq_len, top_k, above, tie = 20000, 2048, 683, 2048
++    else:
++        raise ValueError(path)
++    with torch.device("cpu"):
++        gen = torch.Generator(device="cpu").manual_seed(4242)
++        row = torch.rand(seq_len, generator=gen, dtype=torch.float32) * 0.5
++        perm = torch.randperm(seq_len, generator=gen)
++        row[perm[:above]] = 3.0
++        row[perm[above : above + tie]] = 2.0
++    need = top_k - above
++    assert 0 < need < tie, "the cut must fall strictly inside the tie group"
++    return row, top_k, need
++
++
++@pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
++@pytest.mark.parametrize("path", ["decode", "medium"])
++@pytest.mark.parametrize("want_recent", [True, False])
++@torch.inference_mode()
++def test_isolated_tie_det_nonoverflow_cutoff_direction(path: str, want_recent: bool) -> None:
++    """Cell 4: MERLIN_TIE_DET's buffered cutoff tie, both directions, oracle.
++
++    Why: the mixed-path test's sorted-set equality of two launches is
++    a sampled repeatability check; it does not show that cutoff ties follow
++    the configured direction.  Here the kept tied indices are FORCED -- the
++    `need` highest (most-recent-wins) or lowest (oldest-wins) indices of the
++    tie group -- and `_largedet_reference` states them.  Compared as SETS (sorted):
++    TIE_DET fixes membership; raw order is atomic arrival on these paths.
++    """
++    torch.set_default_device("cuda:0")
++    if not _largedet_env_on("MERLIN_TIE_DET", False):
++        pytest.skip(
++            "MERLIN_TIE_DET unset/0: the buffered paths have no tie direction. "
++            "Run with MERLIN_TIE_DET=1 MERLIN_TIE_RECENT=1 (most-recent) and "
++            "MERLIN_TIE_DET=1 MERLIN_TIE_RECENT=0 (oldest), each in a fresh "
++            "process. A skip is not a pass."
++        )
++    if _largedet_effective_tie_recent() != want_recent:
++        pytest.skip(
++            f"this process resolves {'oldest' if want_recent else 'most-recent'}"
++            f"-wins; the {'most-recent' if want_recent else 'oldest'}-wins arm "
++            "runs in the other MERLIN_TIE_RECENT process."
++        )
++    row, top_k, need = _isolated_tie_fixture(path)
++    expected = _largedet_reference(row, top_k, tie_recent=want_recent)
++    other = _largedet_reference(row, top_k, tie_recent=not want_recent)
++    assert not torch.equal(expected, other), "the fixture cannot tell the directions apart"
++
++    before = _isolated_counters_or_skip()
++    first = _isolated_launch(row, top_k)
++    second = _isolated_launch(row, top_k)
++    after = _read_exact_counters()
++
++    assert after[_SLOT_DECODE_OVERFLOW] == before[_SLOT_DECODE_OVERFLOW], (
++        "the tie fixture overflowed the decode buffer; it must not"
++    )
++    assert after[_SLOT_MEDIUM_OVERFLOW] == before[_SLOT_MEDIUM_OVERFLOW], (
++        "the tie fixture overflowed the medium buffer; it must not"
++    )
++    assert after[_SLOT_MEDIUM_FALLBACK] == before[_SLOT_MEDIUM_FALLBACK]
++    medium_rows = after[_SLOT_MEDIUM_ROWS] - before[_SLOT_MEDIUM_ROWS]
++    assert medium_rows == (2 * ISOLATED_NUM_ROWS if path == "medium" else 0), (
++        f"the {path} fixture was dispatched to the wrong path ({medium_rows} "
++        "medium rows)"
++    )
++    rule = "most-recent" if want_recent else "oldest"
++    for launch, got in (("first", first), ("second", second)):
++        for r in range(ISOLATED_NUM_ROWS):
++            assert torch.equal(got[r].sort().values, expected), (
++                f"{path} {launch} launch row {r}: the {rule}-wins cutoff set is "
++                f"wrong ({int((~torch.isin(expected, got[r])).sum())} of the "
++                f"{top_k} oracle indices missing; the cut keeps {need})"
++            )
++
++
++# ---------------------------------------------------------------------------
++# Cells 5 and 6: DIAGNOSTIC BUILDS.  Both run the kernel in a CHILD process
++# (this file executed as a script), so a trap or a corrupted context cannot
++# take the pytest process with it, and both key on the build's own
++# `[merlin] persistent_topk DIAGNOSTIC BUILD:` stderr line to prove which
++# build the child ran.  On a normal build they SKIP after a one-row probe.
++# ---------------------------------------------------------------------------
++
++_ISOLATED_DIAG_RE = re.compile(
++    r"\[merlin\] persistent_topk DIAGNOSTIC BUILD: MERLIN_TOPK_DIAG_DELAY=(\d+) "
++    r"MERLIN_TOPK_DIAG_PREREPAIR=(\d+) MERLIN_TOPK_DIAG_FORCE_FAULT=(\d+) "
++    r"MERLIN_TOPK_DIAG_FORCE_FAULT_CTA=(\d+)"
++)
++_ISOLATED_RESULT_TAG = "ISOLATED_DIAG_RESULT "
++
++
++def _isolated_spawn(mode: str, *args: str, drop_env: tuple[str, ...] = ()):
++    import json
++    import subprocess
++    import sys
++
++    env = dict(os.environ)
++    for name in drop_env:
++        env.pop(name, None)
++    proc = subprocess.run(
++        [sys.executable, os.path.abspath(__file__), "--isolated-diag-child", mode, *args],
++        env=env,
++        capture_output=True,
++        text=True,
++        timeout=1800,
++    )
++    result = None
++    for line in proc.stdout.splitlines():
++        if line.startswith(_ISOLATED_RESULT_TAG):
++            result = json.loads(line[len(_ISOLATED_RESULT_TAG) :])
++    m = _ISOLATED_DIAG_RE.search(proc.stderr)
++    banner = tuple(int(x) for x in m.groups()) if m else None
++    return proc, result, banner
++
++
++def _isolated_diag_banner_or_skip(want: str) -> tuple[int, ...]:
++    proc, _, banner = _isolated_spawn("probe")
++    if banner is None:
++        pytest.skip(
++            f"not a diagnostic build (no DIAGNOSTIC BUILD line from the probe "
++            f"child, rc={proc.returncode}); the {want} cell runs only against "
++            "the diagnostic .so built with the MERLIN_TOPK_DIAG_* defines. A skip is "
++            "not a pass."
++        )
++    return banner
++
++
++def _isolated_tail(text: str, n: int = 1500) -> str:
++    return text[-n:] if text else ""
++
++
++@pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
++def test_isolated_diag_delayed_publication_matches_oracle() -> None:
++    """Cell 5: delayed non-leader histogram publication, repeated large rows.
++
++    Build with -DMERLIN_TOPK_DIAG_DELAY=<cycles> (repaired) and additionally
++    -DMERLIN_TOPK_DIAG_PREREPAIR=1 (the earlier arrival barrier compiled out).  The
++    child runs repeated large rows (four shapes, ctas_per_group 2..11) and
++    compares every row with the oracle.  EXPECTED: PASS on the repaired
++    diagnostic build; FAIL on the pre-repair one (wrong set, all -1 rows with
++    faults_large > 0, or a trapped child) -- that failure is the control that
++    shows the stress can see the defect the barrier repairs.
++    """
++    if not _largedet_env_on("MERLIN_TOPK_DET_LARGE", True):
++        pytest.skip(
++            "MERLIN_TOPK_DET_LARGE=0: the legacy tail does not bound its "
++            "emission slot, so a pre-repair pivot disagreement would write out "
++            "of bounds. This cell runs on the deterministic path only."
++        )
++    delay, prerepair, force_fault, _ = _isolated_diag_banner_or_skip("publication")
++    if delay == 0 or force_fault:
++        pytest.skip(
++            f"diagnostic build without the publication delay (delay={delay}, "
++            f"force_fault={force_fault}); build the delay variant."
++        )
++    proc, res, banner = _isolated_spawn("publication", "12")
++    tag = (
++        f"[{'PRE-REPAIR' if prerepair else 'REPAIRED'} diagnostic build, "
++        f"MERLIN_TOPK_DIAG_DELAY={delay}]"
++    )
++    assert banner is not None and banner[0] == delay, f"{tag} child ran another build"
++    assert proc.returncode == 0 and res is not None and "error" not in res, (
++        f"{tag} the stress child died (rc={proc.returncode}): "
++        f"{(res or {}).get('error')}\n--- child stderr tail ---\n"
++        f"{_isolated_tail(proc.stderr)}"
++    )
++    assert res["rows_large"] == res["rows_launched"], (
++        f"{tag} the deterministic large path counted {res['rows_large']} of "
++        f"{res['rows_launched']} rows; the stress did not run where it claims"
++    )
++    assert res["faults_large"] == 0 and res["all_minus_one_rows"] == 0, (
++        f"{tag} {res['faults_large']} large-path faults, "
++        f"{res['all_minus_one_rows']} all -1 rows under delayed publication: "
++        f"{res['per_shape']}"
++    )
++    assert res["mismatched_rows"] == 0, (
++        f"{tag} {res['mismatched_rows']} of {res['rows_launched']} rows differ "
++        f"from the oracle under delayed publication: {res['per_shape']}"
++    )
++
++
++@pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
++def test_isolated_diag_trap_on_kills_only_the_child() -> None:
++    """Cell 6: trap-ON fault arm, in a disposable subprocess.
++
++    Build with -DMERLIN_TOPK_DIAG_FORCE_FAULT=1 (CTA 1 by default).  The child
++    runs deterministic large rows with the runtime injector UNSET, so nothing
++    suppresses `__trap()`: the child must die with a CUDA launch failure and
++    never print its no-trap marker.  The parent then proves its own context is
++    intact with a kernel that does not touch the large path (a large row in
++    this process would trap too -- run this test alone, `-k trap_on`).
++    """
++    _, _, force_fault, cta = _isolated_diag_banner_or_skip("trap-on")
++    if not force_fault:
++        pytest.skip("diagnostic build without MERLIN_TOPK_DIAG_FORCE_FAULT")
++    proc, res, banner = _isolated_spawn(
++        "trap",
++        drop_env=("MERLIN_TOPK_LARGE_FAULT_INJECT", "MERLIN_TOPK_LARGE_FAULT_KIND"),
++    )
++    text = proc.stdout + proc.stderr
++    assert banner is not None and banner[2] == 1, "the trap child ran another build"
++    assert "ISOLATED_NO_TRAP" not in proc.stdout, (
++        f"the forced X3 fault in CTA {cta} did NOT trap: the child finished "
++        f"its launch normally. Result: {res}"
++    )
++    assert proc.returncode != 0, "the trap child exited 0"
++    assert re.search(
++        r"unspecified launch failure|illegal instruction|device-side|"
++        r"CUDA error|AcceleratorError|cudaErrorLaunchFailure",
++        text,
++    ), f"the child died without a CUDA error:\n{_isolated_tail(text)}"
++    # The parent survives: its own context still runs kernels.
++    x = torch.arange(4096, dtype=torch.float32, device="cuda")
++    assert float(x.sum().item()) == 4095 * 4096 / 2
++    torch.accelerator.synchronize()
++
++
++@pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
++def test_isolated_legacy_repeated_rows_membership() -> None:
++    """Repeated-row control on the LEGACY large tail.
++
++    Run in its own process with MERLIN_TOPK_DET_LARGE=0 on a NORMAL build.
++    The deterministic path's delayed-publication cell cannot cover this arm
++    (a disagreeing pivot under the diagnostic delay would write out of bounds
++    in the legacy tail), so this is the legacy tail at production timing:
++    repeated large rows, every row held to policy-correct membership. There is
++    no failing control -- the pre-repair legacy tail is not safe to run.
++    """
++    if _largedet_env_on("MERLIN_TOPK_DET_LARGE", True):
++        pytest.skip(
++            "MERLIN_TOPK_DET_LARGE on: this is the legacy-tail control. Run it "
++            "in a fresh process with MERLIN_TOPK_DET_LARGE=0. A skip is not a pass."
++        )
++    proc, res, banner = _isolated_spawn("legacy", "12")
++    assert banner is None, (
++        f"diagnostic build {banner}: the legacy control runs on the normal build only"
++    )
++    assert proc.returncode == 0 and res is not None and "error" not in res, (
++        f"the legacy child died (rc={proc.returncode}): {(res or {}).get('error')}\n"
++        f"--- child stderr tail ---\n{_isolated_tail(proc.stderr)}"
++    )
++    assert res["rows_large"] == 0, (
++        f"the deterministic large path counted {res['rows_large']} rows with "
++        "MERLIN_TOPK_DET_LARGE=0; the legacy tail did not run"
++    )
++    assert res["faults_large"] == 0 and res["all_minus_one_rows"] == 0, (
++        f"{res['faults_large']} large faults, {res['all_minus_one_rows']} all -1 "
++        f"rows on the legacy tail: {res['per_shape']}"
++    )
++    assert res["invalid_rows"] == 0, (
++        f"{res['invalid_rows']} of {res['rows_launched']} legacy rows fail "
++        f"membership (first: {res['first_invalid']}): {res['per_shape']}"
++    )
++
++
++def _isolated_diag_child(argv: list[str]) -> None:
++    """Child entry point for cells 5 and 6.  Prints one ISOLATED_DIAG_RESULT line."""
++    import json
++    import sys
++
++    mode = argv[0]
++    result: dict = {"mode": mode}
++
++    def emit(code: int) -> None:
++        print(_ISOLATED_RESULT_TAG + json.dumps(result), flush=True)
++        sys.stderr.flush()
++        os._exit(code)
++
++    try:
++        import vllm._custom_ops  # noqa: F401  (loads the extensions)
++
++        if mode == "probe":
++            # One decode row reaches the launcher, so the build's banner (if
++            # any) is printed; it touches no large row, so it cannot trap.
++            with torch.device("cpu"):
++                probe = torch.linspace(0, 1, 4096)
++            _isolated_launch(probe, 512, num_rows=1)
++            emit(0)
++
++        if mode == "trap":
++            logits, _ = _build_largedet_tie_row(8)
++            _run_largedet_row(logits)  # synchronizes: a trap raises here
++            print("ISOLATED_NO_TRAP", flush=True)
++            emit(0)
++
++        if mode == "publication":
++            iters = int(argv[1]) if len(argv) > 1 else 12
++            shapes = [
++                # (distribution, seq_len, num_rows, top_k)
++                ("cross_cta_ties", 262144, 32, 512),
++                ("cross_cta_ties", 131072, 8, 2048),
++                ("narrow_distinct", 65536, 4, 2048),
++                ("all_equal", 40960, 4, 512),
++            ]
++            before = _read_exact_counters()
++            launched = mismatched = minus_one = 0
++            per_shape = {}
++            for kind, seq_len, num_rows, top_k in shapes:
++                cpu_row = _largedet_distribution(kind, seq_len, top_k, seed=1905)
++                expected = _largedet_reference(cpu_row, top_k)
++                logits = (
++                    cpu_row.to("cuda").unsqueeze(0).repeat(num_rows, 1).contiguous()
++                )
++                lengths = torch.full(
++                    (num_rows,), seq_len, dtype=torch.int32, device="cuda"
++                )
++                bad = neg = 0
++                for _ in range(iters):
++                    got = _largedet_launch(logits, lengths, top_k).cpu().to(torch.int64)
++                    for r in range(num_rows):
++                        if bool((got[r] == -1).all()):
++                            neg += 1
++                        if not torch.equal(got[r], expected):
++                            bad += 1
++                    launched += num_rows
++                per_shape[f"{kind}/{seq_len}x{num_rows}/k{top_k}"] = {
++                    "mismatched": bad,
++                    "all_minus_one": neg,
++                    "rows": iters * num_rows,
++                }
++                mismatched += bad
++                minus_one += neg
++            after = _read_exact_counters()
++            result.update(
++                rows_launched=launched,
++                mismatched_rows=mismatched,
++                all_minus_one_rows=minus_one,
++                rows_large=after[_SLOT_LARGE_ROWS] - before[_SLOT_LARGE_ROWS],
++                faults_large=after[_SLOT_LARGE_FAULT] - before[_SLOT_LARGE_FAULT],
++                per_shape=per_shape,
++            )
++            emit(0)
++
++        if mode == "legacy":
++            # Repeated large rows on the LEGACY tail
++            # (MERLIN_TOPK_DET_LARGE=0, normal build). Raw order and the tie
++            # choice are not canonical there, so each row is held to
++            # policy-correct membership (_assert_valid_topk_membership); the
++            # reuse race the closing barrier repairs would show as
++            # out-of-range/duplicate indices, below-pivot picks or all -1 rows.
++            iters = int(argv[1]) if len(argv) > 1 else 12
++            shapes = [
++                ("cross_cta_ties", 262144, 32, 512),
++                ("cross_cta_ties", 131072, 8, 2048),
++                ("narrow_distinct", 65536, 4, 2048),
++                ("all_equal", 40960, 4, 512),
++                ("no_cutoff_tie", 262144, 8, 2048),
++            ]
++            before = _read_exact_counters()
++            launched = invalid = minus_one = 0
++            per_shape = {}
++            first_bad = None
++            for kind, seq_len, num_rows, top_k in shapes:
++                cpu_row = _largedet_distribution(kind, seq_len, top_k, seed=1906)
++                logits = (
++                    cpu_row.to("cuda").unsqueeze(0).repeat(num_rows, 1).contiguous()
++                )
++                lengths = torch.full(
++                    (num_rows,), seq_len, dtype=torch.int32, device="cuda"
++                )
++                bad = neg = 0
++                for it in range(iters):
++                    got = _largedet_launch(logits, lengths, top_k).cpu().to(torch.int64)
++                    for r in range(num_rows):
++                        if bool((got[r] == -1).all()):
++                            neg += 1
++                        try:
++                            with torch.device("cpu"):
++                                _assert_valid_topk_membership(
++                                    cpu_row, got[r], top_k, f"{kind} it{it} r{r}"
++                                )
++                        except AssertionError as exc:
++                            bad += 1
++                            if first_bad is None:
++                                first_bad = str(exc)[:300]
++                    launched += num_rows
++                per_shape[f"{kind}/{seq_len}x{num_rows}/k{top_k}"] = {
++                    "invalid": bad,
++                    "all_minus_one": neg,
++                    "rows": iters * num_rows,
++                }
++                invalid += bad
++                minus_one += neg
++            after = _read_exact_counters()
++            result.update(
++                rows_launched=launched,
++                invalid_rows=invalid,
++                all_minus_one_rows=minus_one,
++                first_invalid=first_bad,
++                rows_large=after[_SLOT_LARGE_ROWS] - before[_SLOT_LARGE_ROWS],
++                faults_large=after[_SLOT_LARGE_FAULT] - before[_SLOT_LARGE_FAULT],
++                per_shape=per_shape,
++            )
++            emit(0)
++
++        result["error"] = f"unknown mode {mode!r}"
++        emit(2)
++    except Exception as exc:  # noqa: BLE001 -- report, then die
++        result["error"] = f"{type(exc).__name__}: {exc}"[:800]
++        emit(3)
++
++
++if __name__ == "__main__":
++    import sys
++
++    if len(sys.argv) >= 3 and sys.argv[1] == "--isolated-diag-child":
++        _isolated_diag_child(sys.argv[2:])
++    raise SystemExit("usage: test_top_k_per_row.py --isolated-diag-child <mode> [args]")

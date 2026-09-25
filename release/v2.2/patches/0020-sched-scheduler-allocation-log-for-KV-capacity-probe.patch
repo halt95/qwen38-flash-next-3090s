@@ -1,0 +1,152 @@
+From 6bf89fe31e7ca38a4e303c289ab34006d9e6fda5 Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Tue, 22 Sep 2026 04:13:10 -0400
+Subject: [PATCH 20/58] sched: scheduler allocation log for KV capacity probes
+
+Env-gated per-step log of blocks allocated and freed and scheduled tokens per
+request; prefix-cache hits are read behind a schema check so an upstream field
+rename fails visibly.
+---
+ vllm/v1/core/sched/e2_alloc_log.py | 111 +++++++++++++++++++++++++++++
+ vllm/v1/core/sched/scheduler.py    |   3 +
+ 2 files changed, 114 insertions(+)
+ create mode 100644 vllm/v1/core/sched/e2_alloc_log.py
+
+diff --git a/vllm/v1/core/sched/e2_alloc_log.py b/vllm/v1/core/sched/e2_alloc_log.py
+new file mode 100644
+index 0000000000..0efcbd74f0
+--- /dev/null
++++ b/vllm/v1/core/sched/e2_alloc_log.py
+@@ -0,0 +1,111 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Debug-only scheduler allocation log for KV capacity probes (off unless VLLM_E2_SCHED_LOG=<path>).
++
++One JSON line per scheduler update while any request exists, and one "fin" line per request as it is freed:
++  {"t": wall, "m": monotonic, "step": n, "total": pool blocks, "free": free blocks, "running": r, "waiting": w,
++   "tot": tokens scheduled this step,
++   "reqs": [[id, prompt, computed, output, cached, preemptions, spec_scheduled, status, [blocks per group],
++             tokens scheduled for this request this step]]}
++  {"t": wall, "m": monotonic, "fin": [id, prompt, computed, output, cached, preemptions, status, [blocks per group]]}
++Blocks are counted per KV-cache group, null blocks excluded. A logging failure writes an "error" line and never
++raises into the scheduler. Unset = the scheduler only pays one env check per update.
++"""
++import json
++import os
++import time
++
++_PATH = os.environ.get("VLLM_E2_SCHED_LOG", "")
++_state = {"f": None, "step": 0, "flush": 0.0, "wrapped": False, "errors": 0, "checked": False}
++REQ_FIELDS = ("request_id", "num_prompt_tokens", "num_computed_tokens", "num_output_tokens", "num_preemptions",
++              "status", "prefill_stats")
++
++
++def enabled() -> bool:
++    return bool(_PATH)
++
++
++def _blocks(sched, rid):
++    return [sum(1 for b in m.req_to_blocks.get(rid, ()) if not b.is_null)
++            for m in sched.kv_cache_manager.coordinator.single_type_managers]
++
++
++def _status(r):
++    return getattr(r.status, "name", str(r.status))
++
++
++def _cached(r):
++    """Prefix-cache hit for this request. vLLM keeps it in `request.prefill_stats` (PrefillStats.num_cached_tokens =
++    local + external); the output processor takes those stats after the first prefill (`take_prefill_stats` sets the
++    attribute to None), so -1 means "no longer knowable from the scheduler", never a silent zero."""
++    ps = getattr(r, "prefill_stats", None)
++    return int(getattr(ps, "num_cached_tokens", -1)) if ps is not None else -1
++
++
++def _contract(r):
++    """Once per process: every field this log reads must exist on the real Request object. A missing field is written
++    once as a schema_error record — the evaluator fails closed on it — instead of turning every row into an error."""
++    if _state["checked"]:
++        return
++    _state["checked"] = True
++    missing = [f for f in REQ_FIELDS if not hasattr(r, f)]
++    if missing:
++        _write({"t": round(time.time(), 4), "m": round(time.monotonic(), 4), "schema_error": missing}, force=True)
++
++
++def _write(rec, force=False):
++    f = _state["f"]
++    if f is None:
++        f = _state["f"] = open(_PATH, "a", buffering=1 << 16)
++    f.write(json.dumps(rec, separators=(",", ":")) + "\n")
++    if force or rec["t"] - _state["flush"] > 0.5:
++        f.flush()
++        _state["flush"] = rec["t"]
++
++
++def _error(e):
++    _state["errors"] += 1
++    if _state["errors"] <= 20:
++        try:
++            _write({"t": round(time.time(), 4), "m": round(time.monotonic(), 4),
++                    "error": f"{type(e).__name__}: {e}"[:300]}, force=True)
++        except Exception:  # noqa: BLE001
++            pass
++
++
++def _wrap_free(sched):
++    orig = sched._free_request
++
++    def _free_request(request, *args, **kwargs):
++        try:
++            _write({"t": round(time.time(), 4), "m": round(time.monotonic(), 4),
++                    "fin": [request.request_id, request.num_prompt_tokens, request.num_computed_tokens,
++                            request.num_output_tokens, _cached(request), request.num_preemptions,
++                            _status(request), _blocks(sched, request.request_id)]}, force=True)
++        except Exception as e:  # noqa: BLE001 - the debug log must never break the scheduler
++            _error(e)
++        return orig(request, *args, **kwargs)
++
++    sched._free_request = _free_request
++    _state["wrapped"] = True
++
++
++def log_step(sched, scheduler_output) -> None:
++    try:
++        if not _state["wrapped"]:
++            _wrap_free(sched)
++        if not sched.requests:
++            return
++        _state["step"] += 1
++        spec = getattr(scheduler_output, "scheduled_spec_decode_tokens", None) or {}
++        pool = sched.kv_cache_manager.block_pool
++        nsched = getattr(scheduler_output, "num_scheduled_tokens", None) or {}
++        _contract(next(iter(sched.requests.values())))
++        rows = [[rid, r.num_prompt_tokens, r.num_computed_tokens, r.num_output_tokens, _cached(r),
++                 r.num_preemptions, len(spec.get(rid, ())), _status(r), _blocks(sched, rid), int(nsched.get(rid, 0))]
++                for rid, r in sched.requests.items()]
++        _write({"t": round(time.time(), 4), "m": round(time.monotonic(), 4), "step": _state["step"],
++                "total": pool.num_gpu_blocks, "free": pool.get_num_free_blocks(),
++                "running": len(sched.running), "waiting": len(sched.waiting),
++                "tot": int(getattr(scheduler_output, "total_num_scheduled_tokens", 0) or 0), "reqs": rows})
++    except Exception as e:  # noqa: BLE001
++        _error(e)
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index f1c9b79b02..25af1b6c33 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -70,6 +70,7 @@ from vllm.v1.metrics.stats import (
+     SchedulerStats,
+ )
+ from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
++from vllm.v1.core.sched import e2_alloc_log as _e2_alloc_log
+ from vllm.v1.request import Request, RequestStatus, StreamingUpdate
+ from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
+ from vllm.v1.spec_decode.metrics import SpecDecodingStats
+@@ -2359,6 +2360,8 @@ class Scheduler(SchedulerInterface):
+                 engine_core_outputs[0] = eco = EngineCoreOutputs()
+             eco.scheduler_stats = stats
+ 
++        if _e2_alloc_log.enabled():
++            _e2_alloc_log.log_step(self, scheduler_output)
+         return engine_core_outputs
+ 
+     def _ec_transfer_pending(self, request: Request, num_computed_tokens: int) -> bool:

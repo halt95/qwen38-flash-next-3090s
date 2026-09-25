@@ -2,6 +2,11 @@
 .gitattributes
 vllm-v2
 venv-v2
+# the v2.2 build dirs the README route creates in the repo root (and BUILD_OWN ones)
+vllm-v2.2
+venv-v2.2
+vllm-own
+venv-own
 .vllm-cache*
 __pycache__
 *.pyc
@@ -9,6 +14,8 @@ benchmarks
 calib
 release/v2/patches
 release/v2/v2.0.1-combined.diff
+release/v2.2/patches
+release/v2.2/v2.2.0-combined.diff
 patches
 src-ref
 *.bak-*

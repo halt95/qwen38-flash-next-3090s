@@ -1,0 +1,82 @@
+From 698f7bdcbeefe689a10d3d698208cbc2071de1b3 Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Wed, 23 Sep 2026 07:53:15 -0400
+Subject: [PATCH 38/58] e2_guards: the draft guard reports the draft model's
+ own architecture
+
+---
+ tests/v1/test_ple_pull_compile_profile.py | 24 +++++++++++++++++++++++
+ vllm/v1/e2_guards.py                      | 20 ++++++++++++++++---
+ 2 files changed, 41 insertions(+), 3 deletions(-)
+
+diff --git a/tests/v1/test_ple_pull_compile_profile.py b/tests/v1/test_ple_pull_compile_profile.py
+index 4f7b17516f..d5bf87e307 100644
+--- a/tests/v1/test_ple_pull_compile_profile.py
++++ b/tests/v1/test_ple_pull_compile_profile.py
+@@ -442,3 +442,27 @@ def test_wait_copy_is_a_splitting_op() -> None:
+ 
+     assert "vllm::ple_offload_wait_copy" in CompilationConfig._attention_ops
+     assert "vllm::ple_offload_wait_copy" in REQUIRED_SPLITTING_OPS
++
++
++def test_draft_guard_reports_the_draft_architecture() -> None:
++    """On the reference host, the draft guard line printed the TARGET
++    architecture (the drafter is built with the target's VllmConfig), so S
++    could not prove the drafter's identity. The draft role must read
++    speculative_config.draft_model_config; the target role is unchanged."""
++    from types import SimpleNamespace
++
++    from vllm.v1 import e2_guards
++
++    cfg = SimpleNamespace(
++        model_config=SimpleNamespace(architectures=["Qwen4ExpForConditionalGeneration"]),
++        compilation_config=SimpleNamespace(
++            mode="VLLM_COMPILE", cudagraph_mode="FULL_AND_PIECEWISE", splitting_ops=[]
++        ),
++        speculative_config=SimpleNamespace(
++            draft_model_config=SimpleNamespace(architectures=["Qwen4ExpMTP"])
++        ),
++    )
++    assert e2_guards._profile(cfg, "target")[0] == ["Qwen4ExpForConditionalGeneration"]
++    assert e2_guards._profile(cfg, "draft")[0] == ["Qwen4ExpMTP"]
++    no_spec = SimpleNamespace(**{**vars(cfg), "speculative_config": None})
++    assert e2_guards._profile(no_spec, "draft")[0] == ["Qwen4ExpForConditionalGeneration"]
+diff --git a/vllm/v1/e2_guards.py b/vllm/v1/e2_guards.py
+index 5f0ed88ad4..7624ae1d96 100644
+--- a/vllm/v1/e2_guards.py
++++ b/vllm/v1/e2_guards.py
+@@ -100,9 +100,23 @@ def _name(value) -> str:
+     return getattr(value, "name", str(value))
+ 
+ 
+-def _profile(vllm_config) -> tuple[list[str], object, object, list[str] | None]:
+-    """Resolved (architectures, mode, cudagraph mode, splitting ops)."""
++def _profile(
++    vllm_config, role: str = "target"
++) -> tuple[list[str], object, object, list[str] | None]:
++    """Resolved (architectures, mode, cudagraph mode, splitting ops).
++
++    For ``role="draft"`` the architectures are the DRAFT model's
++    (``speculative_config.draft_model_config``): the drafter is constructed
++    with the target's VllmConfig, whose model_config names the target. The reference host
++    logged the target architecture on the draft line before this fix.
++    The graph profile is the engine's single CompilationConfig for both roles.
++    """
+     model_config = getattr(vllm_config, "model_config", None)
++    if role == "draft":
++        spec = getattr(vllm_config, "speculative_config", None)
++        draft_config = getattr(spec, "draft_model_config", None)
++        if draft_config is not None:
++            model_config = draft_config
+     if model_config is None:
+         raise RuntimeError("e2-guard: vllm_config has no model_config to check")
+     compilation_config = getattr(vllm_config, "compilation_config", None)
+@@ -137,7 +151,7 @@ def assert_graph_profile_is_executable(vllm_config, *, role: str = "target") ->
+     ``Qwen4ExpMTP`` builds ``Qwen4ExpMultiTokenPredictor`` rather than
+     ``Qwen4ExpForCausalLM``, from a config rebuilt in ``mtp.py``.
+     """
+-    architectures, mode, cudagraph_mode, splitting_ops = _profile(vllm_config)
++    architectures, mode, cudagraph_mode, splitting_ops = _profile(vllm_config, role)
+     detail = (
+         f"architectures={architectures} breakable={os.environ.get(BREAKABLE_ENV)} "
+         f"compilation_mode={_name(mode)} cudagraph_mode={_name(cudagraph_mode)}"

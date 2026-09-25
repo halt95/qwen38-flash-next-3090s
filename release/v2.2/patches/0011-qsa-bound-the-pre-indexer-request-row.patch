@@ -1,0 +1,72 @@
+From 186161819913788e925c665722a99e83c2e7acdb Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Tue, 22 Sep 2026 04:13:07 -0400
+Subject: [PATCH 11/58] qsa: bound the pre-indexer request row
+
+---
+ .../qwen4_exp/nvidia/ops/qsa_pre_indexer.py   | 24 +++++++++++++++++++
+ 1 file changed, 24 insertions(+)
+
+diff --git a/vllm/models/qwen4_exp/nvidia/ops/qsa_pre_indexer.py b/vllm/models/qwen4_exp/nvidia/ops/qsa_pre_indexer.py
+index d996f3977a..f682ee90c8 100644
+--- a/vllm/models/qwen4_exp/nvidia/ops/qsa_pre_indexer.py
++++ b/vllm/models/qwen4_exp/nvidia/ops/qsa_pre_indexer.py
+@@ -5,6 +5,14 @@
+ import torch
+ 
+ from vllm.triton_utils import tl, triton
++from vllm.v1.worker import guard_telemetry
++
++# Bias so a negative row/index survives atomic_max on a zeroed counter
++# -- it MUST be a tl.constexpr: a plain module-level int is not readable
++# from a @triton.jit body -- an earlier build shipped one and every guarded kernel died
++# with "NameError: Cannot access global variable _GUARD_BIAS" on the smoke.
++_GUARD_BIAS = tl.constexpr(guard_telemetry.GUARD_BIAS)
++
+ 
+ 
+ @triton.jit
+@@ -86,6 +94,7 @@ def _norm_rope(
+         "num_state_blocks",
+         "num_compressed_blocks",
+         "num_k_work",
++        "num_requests",
+     ]
+ )
+ def _qsa_pre_indexer_kernel(
+@@ -120,6 +129,8 @@ def _qsa_pre_indexer_kernel(
+     num_state_blocks,
+     num_compressed_blocks,
+     num_k_work,
++    num_requests,  # bounds-guard instrumentation
++    guard_ctr,  # bounds-guard instrumentation: persistent int64[3]
+     HQ: tl.constexpr,
+     D: tl.constexpr,
+     TILE_T_Q: tl.constexpr,
+@@ -200,6 +211,17 @@ def _qsa_pre_indexer_kernel(
+         request, work_in_request = tl.split(work_metadata)
+         if request < 0:
+             return
++        # Second bounds guard: the early return above rejects only the -1
++        # sentinel the builder writes for inactive work items. Any other
++        # corrupted value was loaded straight out of query_start_loc, which has
++        # num_requests + 1 entries -- 8 bytes for a single-request batch. The
++        # chunk_end load below derives its index from query_end, so a bad row
++        # also walked logical_positions; returning here stops both.
++        if request >= num_requests:
++            tl.atomic_add(guard_ctr, 1)
++            tl.atomic_max(guard_ctr + 1, (request).to(tl.int64) + _GUARD_BIAS)
++            tl.atomic_max(guard_ctr + 2, (work_in_request).to(tl.int64) + _GUARD_BIAS)
++            return
+ 
+         query_start = tl.load(query_start_loc_ptr + request)
+         query_end = tl.load(query_start_loc_ptr + request + 1)
+@@ -489,6 +511,8 @@ def qsa_pre_indexer(
+         state_cache.shape[0],
+         compressed_cache.shape[0],
+         num_k_work,
++        min(query_start_loc.numel() - 1, state_block_table.shape[0]),
++        guard_telemetry.counter(guard_telemetry.SITE_QSA_PRE_INDEXER, q.device),
+         HQ=num_q_heads,
+         D=head_dim,
+         TILE_T_Q=TILE_T_Q,

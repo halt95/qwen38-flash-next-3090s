@@ -1,0 +1,1506 @@
+From a7b7cfc45b153e9d1a5af077c2a0f4edf08aaa09 Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Wed, 23 Sep 2026 00:15:23 -0400
+Subject: [PATCH 33/58] ple: integrate the pull transport on v0.30.0 with
+ upstream UVA refused
+
+- VLLM_E2_PLE_PULL_TRANSPORT replaces the fork's old switch name, which
+  v0.30.0 reuses for its UVA backend with the opposite default; strict parser;
+  compile/capture factor.
+- The pull transport is reachable on v0.30.0 through a pull embedding class
+  that inherits upstream's without editing it; the upstream UVA backend is
+  provably off while the pull switch is on.
+- resolve_ple_mode()/assert_ple_mode() log and assert the effective PLE mode
+  for target and drafter, and refuse a mixed configuration.
+- Producer log lines for the PLE backend and weight dtype.
+- CPU tests for mode resolution and the mixed-config refusal.
+---
+ tests/test_envs.py                            |   3 +
+ .../ple_offload/test_fault_injector_basics.py |   2 -
+ .../ple_offload/test_transport_bounded_io.py  |   3 -
+ tests/v1/test_e2_ple_mode.py                  | 338 +++++++++++++++++
+ vllm/config/engram.py                         |   9 +-
+ vllm/config/parallel.py                       |  10 +-
+ vllm/config/vllm.py                           |   5 +
+ vllm/envs.py                                  |  31 ++
+ .../layers/ple_offload_layer.py               |   4 +-
+ vllm/models/qwen4_exp/nvidia/model.py         |   3 +-
+ vllm/models/qwen4_exp/nvidia/mtp.py           |   3 +-
+ .../qwen4_exp/nvidia/ngram_embedding.py       |  28 +-
+ vllm/models/qwen4_exp/nvidia/ple_layer.py     |  41 ++-
+ vllm/models/qwen4_exp/nvidia/ple_pull.py      | 342 ++++++++++++++++++
+ vllm/v1/e2_guards.py                          | 146 ++++++++
+ vllm/v1/executor/multiproc_executor.py        |   6 +
+ vllm/v1/executor/uniproc_executor.py          |   4 +
+ vllm/v1/ple_offload/connector.py              |   2 +-
+ vllm/v1/ple_offload/test_fault.py             |  13 +
+ vllm/v1/ple_offload/worker.py                 |   2 +-
+ vllm/v1/worker/gpu/model_runner.py            |  33 ++
+ vllm/v1/worker/gpu_worker.py                  |  34 +-
+ 22 files changed, 1033 insertions(+), 29 deletions(-)
+ create mode 100644 tests/v1/test_e2_ple_mode.py
+ create mode 100644 vllm/models/qwen4_exp/nvidia/ple_pull.py
+ create mode 100644 vllm/v1/ple_offload/test_fault.py
+
+diff --git a/tests/test_envs.py b/tests/test_envs.py
+index 920229d8f0..891954bb4b 100644
+--- a/tests/test_envs.py
++++ b/tests/test_envs.py
+@@ -615,6 +615,9 @@ _FORK_HASHED = [
+     # Capture-configuration factor read in C++ (topk.cu exact_medium_enabled);
+     # the Python entry is a raw passthrough, never a second parser.
+     ("MERLIN_TOPK_EXACT_MEDIUM", "0", "0"),
++    # PLE pull transport: selects a different PLE module class and captured
++    # forward, so it is hashed. Strict "0"/"1" parser (envs._e2_strict_switch).
++    ("VLLM_E2_PLE_PULL_TRANSPORT", "1", True),
+ ]
+ 
+ _FORK_IGNORED = [
+diff --git a/tests/v1/ple_offload/test_fault_injector_basics.py b/tests/v1/ple_offload/test_fault_injector_basics.py
+index 0a9fd2333f..a47796d9f3 100644
+--- a/tests/v1/ple_offload/test_fault_injector_basics.py
++++ b/tests/v1/ple_offload/test_fault_injector_basics.py
+@@ -6,8 +6,6 @@ import queue
+ import subprocess
+ import sys
+ import threading
+-from collections import deque
+-from pathlib import Path
+ from types import SimpleNamespace
+ from unittest.mock import Mock
+ 
+diff --git a/tests/v1/ple_offload/test_transport_bounded_io.py b/tests/v1/ple_offload/test_transport_bounded_io.py
+index fb37122de9..748fd46744 100644
+--- a/tests/v1/ple_offload/test_transport_bounded_io.py
++++ b/tests/v1/ple_offload/test_transport_bounded_io.py
+@@ -1,9 +1,6 @@
+ # SPDX-License-Identifier: Apache-2.0
+ 
+ import multiprocessing
+-import os
+-import signal
+-import struct
+ import subprocess
+ import sys
+ import time
+diff --git a/tests/v1/test_e2_ple_mode.py b/tests/v1/test_e2_ple_mode.py
+new file mode 100644
+index 0000000000..40177717b1
+--- /dev/null
++++ b/tests/v1/test_e2_ple_mode.py
+@@ -0,0 +1,338 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""PLE mode resolution and the guard's refusal of mixed configs.
++
++CPU-only. Imports nothing beyond ``vllm.envs`` and ``vllm.v1.e2_guards`` (plus
++the standard library), so it runs under ``pytest --noconftest`` on a CPU-only machine
++without pyzmq or a CUDA build. Configs are stand-ins: the resolver reads only
++``engram_config.cpu_offload`` and ``model_config.hf_text_config.ple_layer_ids``.
++
++Every refusal has a FAILING CONTROL: the same input with the one deciding
++factor flipped must pass, or a deliberately lax implementation must be shown
++to accept what the real one rejects -- otherwise the refusal test could pass
++because everything raises.
++"""
++
++import re
++from pathlib import Path
++from types import SimpleNamespace
++
++import pytest
++
++import vllm.envs as envs
++from vllm.v1 import e2_guards
++from vllm.v1.e2_guards import (
++    PLE_MODE_DEVICE,
++    PLE_MODE_NONE,
++    PLE_MODE_PULL,
++    PLE_MODE_UVA,
++    PULL_TRANSPORT_ENV,
++    UPSTREAM_UVA_ENV,
++    assert_ple_mode,
++    check_upstream_uva_env_against_pull,
++    pull_transport_cpu_offload_default,
++    pull_transport_enabled,
++    resolve_ple_mode,
++    verify_engram_against_pull,
++)
++
++REPO = Path(__file__).resolve().parents[2]
++
++
++def _clear_envs_cache() -> None:
++    if hasattr(envs.__getattr__, "cache_clear"):
++        envs.__getattr__.cache_clear()
++
++
++@pytest.fixture(autouse=True)
++def _clean_env(monkeypatch):
++    monkeypatch.delenv(PULL_TRANSPORT_ENV, raising=False)
++    monkeypatch.delenv(UPSTREAM_UVA_ENV, raising=False)
++    _clear_envs_cache()
++    yield
++    _clear_envs_cache()
++
++
++def _set(monkeypatch, name: str, value: str | None) -> None:
++    if value is None:
++        monkeypatch.delenv(name, raising=False)
++    else:
++        monkeypatch.setenv(name, value)
++    _clear_envs_cache()
++
++
++def _config(cpu_offload: bool | None, ple_layer_ids=(2,)):
++    return SimpleNamespace(
++        engram_config=(
++            None if cpu_offload is None else SimpleNamespace(cpu_offload=cpu_offload)
++        ),
++        model_config=SimpleNamespace(
++            hf_text_config=SimpleNamespace(ple_layer_ids=list(ple_layer_ids))
++        ),
++    )
++
++
++# ------------------------------------------------------ the strict switch
++
++
++@pytest.mark.parametrize(
++    ("raw", "expected"), [(None, False), ("0", False), ("1", True)]
++)
++def test_switch_accepts_exactly_unset_0_1(monkeypatch, raw, expected) -> None:
++    _set(monkeypatch, PULL_TRANSPORT_ENV, raw)
++    assert pull_transport_enabled() is expected
++
++
++@pytest.mark.parametrize(
++    "raw", ["true", "True", "yes", "on", "", " 1", "1 ", "01", "2"]
++)
++def test_switch_rejects_every_other_spelling(monkeypatch, raw) -> None:
++    _set(monkeypatch, PULL_TRANSPORT_ENV, raw)
++    with pytest.raises(ValueError, match=PULL_TRANSPORT_ENV):
++        pull_transport_enabled()
++
++
++def test_switch_rejection_control_a_lax_parser_accepts_true(monkeypatch) -> None:
++    """Failing control: the E2 base's parser (``.lower() in ("true", "1")``)
++    would have turned the transport ON for "true"; the registered one must not.
++    Without this, the rejection test above could pass on a parser that raises
++    for everything -- so "1" is re-checked through the same path."""
++
++    def e2_base_parser(raw: str) -> bool:
++        return raw.lower() in ("true", "1")
++
++    assert e2_base_parser("true") is True
++    monkeypatch.setenv(PULL_TRANSPORT_ENV, "true")
++    with pytest.raises(ValueError):
++        envs._e2_strict_switch(PULL_TRANSPORT_ENV)
++    monkeypatch.setenv(PULL_TRANSPORT_ENV, "1")
++    assert envs._e2_strict_switch(PULL_TRANSPORT_ENV) is True
++
++
++def test_switch_is_registered_and_hashed(monkeypatch) -> None:
++    """Registered, live, and NOT in compile_factors' deny-list.
++
++    compile_factors() itself is exercised by tests/test_envs.py's
++    _FORK_HASHED row; on a CPU-only machine without pyzmq an unrelated getter makes it
++    raise, so here the deny-list is read from source instead.
++    """
++    assert PULL_TRANSPORT_ENV in envs.environment_variables
++    _set(monkeypatch, PULL_TRANSPORT_ENV, "1")
++    assert envs.environment_variables[PULL_TRANSPORT_ENV]() is True
++    src = _src("vllm/envs.py")
++    start = src.index("    ignored_factors: set[str] = {")
++    end = src.index("\n    }\n", start)
++    assert PULL_TRANSPORT_ENV not in src[start:end]
++    # Control: a knob that IS ignored is found by the same slice.
++    assert '"VLLM_E2_ALLOW_BREAKABLE"' in src[start:end]
++
++
++# ------------------------------------------- the old name while pull is on
++
++
++@pytest.mark.parametrize("old", [None, "0"])
++def test_old_name_unset_or_zero_is_accepted_with_pull_on(monkeypatch, old) -> None:
++    _set(monkeypatch, PULL_TRANSPORT_ENV, "1")
++    _set(monkeypatch, UPSTREAM_UVA_ENV, old)
++    check_upstream_uva_env_against_pull()
++
++
++def test_old_name_one_with_pull_on_is_the_double_offload(monkeypatch) -> None:
++    _set(monkeypatch, PULL_TRANSPORT_ENV, "1")
++    _set(monkeypatch, UPSTREAM_UVA_ENV, "1")
++    with pytest.raises(RuntimeError, match="both transports"):
++        check_upstream_uva_env_against_pull()
++
++
++@pytest.mark.parametrize("old", ["2", "true", "00", ""])
++def test_old_name_other_values_with_pull_on_are_refused(monkeypatch, old) -> None:
++    _set(monkeypatch, PULL_TRANSPORT_ENV, "1")
++    _set(monkeypatch, UPSTREAM_UVA_ENV, old)
++    with pytest.raises(ValueError, match=UPSTREAM_UVA_ENV):
++        check_upstream_uva_env_against_pull()
++
++
++@pytest.mark.parametrize("pull", [None, "0"])
++def test_old_name_control_pull_off_leaves_it_to_upstream(monkeypatch, pull) -> None:
++    """Failing control: the SAME VLLM_PLE_CPU_OFFLOAD=1 passes with pull off."""
++    _set(monkeypatch, PULL_TRANSPORT_ENV, pull)
++    _set(monkeypatch, UPSTREAM_UVA_ENV, "1")
++    check_upstream_uva_env_against_pull()
++
++
++# ------------------------------------------------ the Engram default
++
++
++@pytest.mark.parametrize("upstream_default", [True, False])
++def test_default_is_upstream_verbatim_with_pull_off(monkeypatch, upstream_default):
++    assert pull_transport_cpu_offload_default(upstream_default) is upstream_default
++
++
++def test_default_is_false_with_pull_on_even_if_upstream_says_true(monkeypatch):
++    _set(monkeypatch, PULL_TRANSPORT_ENV, "1")
++    assert pull_transport_cpu_offload_default(True) is False
++
++
++def test_default_with_pull_on_still_refuses_the_old_name(monkeypatch):
++    _set(monkeypatch, PULL_TRANSPORT_ENV, "1")
++    _set(monkeypatch, UPSTREAM_UVA_ENV, "1")
++    with pytest.raises(RuntimeError):
++        pull_transport_cpu_offload_default(True)
++
++
++# ------------------------------------------------ mode resolution
++
++
++@pytest.mark.parametrize(
++    ("pull", "cpu_offload", "mode"),
++    [
++        (None, None, PLE_MODE_NONE),
++        (None, True, PLE_MODE_UVA),
++        (None, False, PLE_MODE_DEVICE),
++        ("0", True, PLE_MODE_UVA),
++        ("1", False, PLE_MODE_PULL),
++        ("1", None, PLE_MODE_PULL),
++    ],
++)
++def test_mode_resolution_table(monkeypatch, pull, cpu_offload, mode) -> None:
++    _set(monkeypatch, PULL_TRANSPORT_ENV, pull)
++    assert resolve_ple_mode(_config(cpu_offload)) == mode
++
++
++def test_mixed_config_is_refused(monkeypatch) -> None:
++    """Pull on + an explicit --engram-config cpu_offload=true: no fallback."""
++    _set(monkeypatch, PULL_TRANSPORT_ENV, "1")
++    with pytest.raises(RuntimeError, match="both own the PLE table"):
++        resolve_ple_mode(_config(True))
++    with pytest.raises(RuntimeError, match="cpu_offload=True"):
++        verify_engram_against_pull(SimpleNamespace(cpu_offload=True))
++
++
++def test_mixed_config_control_same_engram_with_pull_off_is_uva(monkeypatch) -> None:
++    """Failing control: the identical EngramConfig resolves (to UVA) and
++    verifies cleanly once the one deciding factor, the switch, is off."""
++    _set(monkeypatch, PULL_TRANSPORT_ENV, "0")
++    assert resolve_ple_mode(_config(True)) == PLE_MODE_UVA
++    verify_engram_against_pull(SimpleNamespace(cpu_offload=True))
++
++
++def test_mixed_config_control_pull_on_with_cpu_offload_false_is_pull(monkeypatch):
++    """Failing control on the other factor: pull on, cpu_offload flipped."""
++    _set(monkeypatch, PULL_TRANSPORT_ENV, "1")
++    assert resolve_ple_mode(_config(False)) == PLE_MODE_PULL
++    verify_engram_against_pull(SimpleNamespace(cpu_offload=False))
++
++
++# ------------------------------------------------ the guard line
++
++
++_GUARD_LINE = re.compile(
++    r"e2-guard\[(?P<role>\w+)\]: ple_mode=(?P<mode>\w+) pull_transport=(?P<p>[01]) "
++    r"engram_cpu_offload=(?P<co>True|False|None) VLLM_PLE_CPU_OFFLOAD=(?P<old>\S+) "
++    r"ple_layer_ids=(?P<ids>\[[^\]]*\])\."
++)
++
++
++def _captured_guard_line(monkeypatch, config, role: str) -> str:
++    lines: list[str] = []
++    monkeypatch.setattr(
++        e2_guards.logger, "info", lambda fmt, *args: lines.append(fmt % args)
++    )
++    assert_ple_mode(config, role=role)
++    assert len(lines) == 1, lines
++    return lines[0]
++
++
++@pytest.mark.parametrize("role", ["target", "draft"])
++def test_guard_line_names_the_mode_for_both_roles(monkeypatch, role) -> None:
++    _set(monkeypatch, PULL_TRANSPORT_ENV, "1")
++    ids = (2,) if role == "target" else ()  # the MTP drafter forces PLE off
++    line = _captured_guard_line(monkeypatch, _config(False, ids), role)
++    m = _GUARD_LINE.fullmatch(line)
++    assert m, line
++    assert m["role"] == role and m["mode"] == PLE_MODE_PULL and m["p"] == "1"
++    assert m["co"] == "False" and m["old"] == "<unset>"
++
++
++def test_guard_refuses_the_drafter_too(monkeypatch) -> None:
++    _set(monkeypatch, PULL_TRANSPORT_ENV, "1")
++    with pytest.raises(RuntimeError):
++        assert_ple_mode(_config(True, ()), role="draft")
++
++
++def test_guard_ignores_the_breakable_opt_out(monkeypatch) -> None:
++    """VLLM_E2_ALLOW_BREAKABLE=1 must not disarm the PLE refusal."""
++    _set(monkeypatch, PULL_TRANSPORT_ENV, "1")
++    monkeypatch.setenv(e2_guards.ALLOW_BREAKABLE_ENV, "1")
++    with pytest.raises(RuntimeError):
++        assert_ple_mode(_config(True))
++
++
++# --------------------------------------- source-level wiring (no imports)
++
++
++def _src(rel: str) -> str:
++    return (REPO / rel).read_text(encoding="utf-8")
++
++
++def test_uva_constructor_and_selector_refuse_the_pull_switch() -> None:
++    """ngram_embedding.py cannot be imported CPU-only; check the two
++    refusal sites exist in source, before the UVA table is allocated."""
++    src = _src("vllm/models/qwen4_exp/nvidia/ngram_embedding.py")
++    init = src.index("class Qwen4ExpPLEPinnedHostEmbedding")
++    refuse = src.index("if envs.VLLM_E2_PLE_PULL_TRANSPORT:", init)
++    alloc = src.index("get_accelerator_view_from_cpu_tensor(self.weight)", init)
++    assert refuse < alloc
++    assert "if use_uva and envs.VLLM_E2_PLE_PULL_TRANSPORT:" in src
++
++
++def test_no_fork_code_reads_the_old_name() -> None:
++    offenders = []
++    for rel in (
++        "vllm/model_executor/layers/ple_offload_layer.py",
++        "vllm/v1/ple_offload/worker.py",
++        "vllm/v1/ple_offload/connector.py",
++        "vllm/v1/worker/gpu_worker.py",
++        "vllm/v1/executor/multiproc_executor.py",
++        "vllm/v1/executor/uniproc_executor.py",
++        "vllm/config/parallel.py",
++        "vllm/models/qwen4_exp/nvidia/ple_layer.py",
++        "vllm/models/qwen4_exp/nvidia/ple_pull.py",
++    ):
++        if "VLLM_PLE_CPU_OFFLOAD" in _src(rel):
++            offenders.append(rel)
++    assert not offenders
++
++
++_SMOKE_PLE = re.compile(
++    r"Initialized PLE embedding (?P<prefix>\S+?): quantization_method=(?P<method>"
++    r"[A-Za-z0-9_]+), weight_dtype=(?P<dtype>[A-Za-z0-9_.]+), weight_device=(?P<dev>"
++    r"[A-Za-z0-9_:]+), pinned=(?P<pin>True|False)"
++)  # the startup smoke's parser, copied verbatim
++
++
++@pytest.mark.parametrize(
++    "rel",
++    [
++        "vllm/models/qwen4_exp/nvidia/ple_pull.py",
++        "vllm/models/qwen4_exp/nvidia/ngram_embedding.py",
++    ],
++)
++def test_producer_line_format_matches_the_smoke(rel) -> None:
++    src = _src(rel)
++    fmt = (
++        "Initialized PLE embedding %s: quantization_method=%s, "
++        "weight_dtype=%s, weight_device=%s, pinned=%s, backend=%s"
++    )
++    joined = re.sub(r'"\s*\n\s*"', "", src)
++    assert fmt in joined
++    line = fmt % (
++        "model.layers.1.ple.ple_embedding.ngram_embedding",
++        "Qwen4ExpPLEFp8EmbeddingMethod",
++        "torch.float8_e4m3fn",
++        "cpu",
++        False,
++        "E2PullTransport",
++    )
++    m = _SMOKE_PLE.search(line)
++    assert m and m["dtype"] == "torch.float8_e4m3fn" and m["pin"] == "False"
+diff --git a/vllm/config/engram.py b/vllm/config/engram.py
+index 5abb2bd34a..56b5df1d36 100644
+--- a/vllm/config/engram.py
++++ b/vllm/config/engram.py
+@@ -24,7 +24,14 @@ _NGRAM_LAYER_FIELDS = {
+ 
+ 
+ def _default_cpu_offload() -> bool:
+-    return envs.VLLM_PLE_CPU_OFFLOAD
++    # Fork: with VLLM_E2_PLE_PULL_TRANSPORT=1 the default is False and a
++    # VLLM_PLE_CPU_OFFLOAD value that would enable UVA fails the boot. With the
++    # pull transport off, the upstream default below is returned unchanged.
++    from vllm.v1.e2_guards import pull_transport_cpu_offload_default
++
++    if not envs.VLLM_E2_PLE_PULL_TRANSPORT:
++        return envs.VLLM_PLE_CPU_OFFLOAD
++    return pull_transport_cpu_offload_default(False)
+ 
+ 
+ def model_has_engram_layers(model_config: "ModelConfig | None") -> bool:
+diff --git a/vllm/config/parallel.py b/vllm/config/parallel.py
+index 0213e06283..7e8b9c4970 100644
+--- a/vllm/config/parallel.py
++++ b/vllm/config/parallel.py
+@@ -17,7 +17,7 @@ from vllm.config.fault_tolerance import FaultToleranceConfig
+ from vllm.config.utils import config
+ from vllm.logger import init_logger
+ from vllm.platforms import current_platform
+-from vllm.utils.network_utils import get_open_ports_list
++from vllm.utils.network_utils import get_open_ports_list, get_open_zmq_ipc_path
+ 
+ if TYPE_CHECKING:
+     from ray.runtime_env import RuntimeEnv
+@@ -350,6 +350,10 @@ class ParallelConfig:
+     """Port of the coordination TCPStore. Can be set by the API server; workers
+     connect as clients to exchange self-picked group ports at runtime."""
+ 
++    _ple_offload_ipc_path: str = ""
++    """Node-local ZMQ IPC address for the fork's PLE pull-transport offload
++    process. Set only when VLLM_E2_PLE_PULL_TRANSPORT=1."""
++
+     decode_context_parallel_size: int = Field(default=1, ge=1)
+     """Number of ranks that shard the decode KV cache. DCP does not expand
+     the process world size. Without PCP, DCP reuses TP ranks. With PCP, DCP
+@@ -498,6 +502,9 @@ class ParallelConfig:
+                 "The FT system assumes one AsyncMPClient manages all engines."
+             )
+ 
++        if envs.VLLM_E2_PLE_PULL_TRANSPORT and not self._ple_offload_ipc_path:
++            self._ple_offload_ipc_path = get_open_zmq_ipc_path()
++
+         if self.all2all_backend in ["pplx", "naive"]:
+             logger.warning(
+                 "The '%s' all2all backend has been removed. "
+@@ -855,6 +862,7 @@ class ParallelConfig:
+             "worker_extension_cls",
+             "_api_process_count",
+             "_api_process_rank",
++            "_ple_offload_ipc_path",
+             # NUMA binding is per-rank host-side memory locality; it does
+             # not affect collective-communication semantics. When numa_bind
+             # is enabled with auto-detection, each DP rank stores its own
+diff --git a/vllm/config/vllm.py b/vllm/config/vllm.py
+index 8e0846982b..bc9fbbe434 100644
+--- a/vllm/config/vllm.py
++++ b/vllm/config/vllm.py
+@@ -1249,6 +1249,11 @@ class VllmConfig:
+         self.engram_config.verify_model_config(model_config)
+         self.engram_config.verify_parallel_config(self.parallel_config)
+         self.engram_config.verify_load_config(self.load_config)
++        # Fork: an explicit cpu_offload=True beside the pull transport is
++        # a double offload; refused here, before any worker starts.
++        from vllm.v1.e2_guards import verify_engram_against_pull
++
++        verify_engram_against_pull(self.engram_config)
+         logger.info_once("Resolved Engram configuration: %s", str(self.engram_config))
+ 
+     def __post_init__(self):
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 734a95cd0a..35047dd469 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -376,6 +376,18 @@ if TYPE_CHECKING:
+     # to decide behaviour. Registered with the medium-path exact restart
+     # so the cache-factor contract is complete.
+     MERLIN_TOPK_EXACT_MEDIUM: str | None = None
++    # The fork's PLE pull transport -- the host-mapped,
++    # fail-closed offload process in vllm/v1/ple_offload/. Renamed from the E2
++    # base's VLLM_PLE_CPU_OFFLOAD, which vLLM v0.30.0 reuses for a DIFFERENT
++    # subsystem with the OPPOSITE default (upstream: pinned-host UVA lookup,
++    # default ON). The two subsystems no longer share a switch.
++    # Strict: unset or "0" = off, "1" = on, anything else is a boot error.
++    # On: the PLE table lives in the offload process, the GPU placeholder waits
++    # on a host flag and DMAs rows inside the captured forward, and upstream's
++    # UVA backend is refused (vllm/v1/e2_guards.py). Off: the tree is upstream.
++    # AOT: yes (different module class and forward). CAPTURE: yes (the captured
++    # graph contains the wait/copy ops instead of a table lookup). Hashed.
++    VLLM_E2_PLE_PULL_TRANSPORT: bool = False
+     #
+     # RUNTIME-ONLY (registered for validate_environ + a single cached read):
+     # Static K/V scale sidecar: fill_()ed into existing fp32 device buffers
+@@ -768,6 +780,21 @@ def _resolve_rust_cli_path() -> str | None:
+     return raw
+ 
+ 
++def _e2_strict_switch(name: str) -> bool:
++    """Parse a fork on/off switch that accepts exactly ``"0"`` and ``"1"``.
++
++    Unset means off. Anything else -- ``"true"``, ``"yes"``, ``""``, ``" 1"``,
++    ``"01"`` -- is a boot error: a switch that selects a different transport
++    must not be satisfiable by a spelling nobody meant.
++    """
++    raw = os.environ.get(name)
++    if raw is None or raw == "0":
++        return False
++    if raw == "1":
++        return True
++    raise ValueError(f'{name} must be exactly "0" or "1" (or unset), got {raw!r}')
++
++
+ def _e2_diagnostic_mode(name: str) -> str:
+     """Normalize an E2 diagnostic gate to off|warn|raise.
+ 
+@@ -2247,6 +2274,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     "VLLM_QSA_KV_COLLECT": lambda: os.getenv("VLLM_QSA_KV_COLLECT", "").strip(),
+     # Capture-configuration factor, read in C++; raw passthrough on purpose.
+     "MERLIN_TOPK_EXACT_MEDIUM": lambda: os.getenv("MERLIN_TOPK_EXACT_MEDIUM", None),
++    # PLE pull transport switch; strict "0"/"1" (see the TYPE_CHECKING block).
++    "VLLM_E2_PLE_PULL_TRANSPORT": lambda: _e2_strict_switch(
++        "VLLM_E2_PLE_PULL_TRANSPORT"
++    ),
+     # Runtime only; all of the following are in compile_factors.ignored_factors.
+     "VLLM_E2_ALLOW_BREAKABLE": lambda: os.getenv("VLLM_E2_ALLOW_BREAKABLE", "") == "1",
+     "VLLM_E2_EXPECTED_CUDAGRAPH_MODE": lambda: os.getenv(
+diff --git a/vllm/model_executor/layers/ple_offload_layer.py b/vllm/model_executor/layers/ple_offload_layer.py
+index 1b67578d9b..d1f668380b 100644
+--- a/vllm/model_executor/layers/ple_offload_layer.py
++++ b/vllm/model_executor/layers/ple_offload_layer.py
+@@ -346,7 +346,7 @@ class PleOffloadLayer(nn.Module, ABC):
+         def guarded_init(
+             self: "PleOffloadLayer", *args: object, **kwargs: object
+         ) -> None:
+-            if envs.VLLM_PLE_CPU_OFFLOAD and not is_offload_process():
++            if envs.VLLM_E2_PLE_PULL_TRANSPORT and not is_offload_process():
+                 nn.Module.__init__(self)
+                 return
+             original_init(self, *args, **kwargs)
+@@ -356,7 +356,7 @@ class PleOffloadLayer(nn.Module, ABC):
+     @classmethod
+     def get_target_device(cls) -> torch.device:
+         """Return CPU for the offload process and the active GPU otherwise."""
+-        if envs.VLLM_PLE_CPU_OFFLOAD:
++        if envs.VLLM_E2_PLE_PULL_TRANSPORT:
+             return torch.device("cpu")
+         return torch.device("cuda", torch.accelerator.current_device_index())
+ 
+diff --git a/vllm/models/qwen4_exp/nvidia/model.py b/vllm/models/qwen4_exp/nvidia/model.py
+index 8c292687de..3e18f1c8cb 100644
+--- a/vllm/models/qwen4_exp/nvidia/model.py
++++ b/vllm/models/qwen4_exp/nvidia/model.py
+@@ -78,7 +78,7 @@ from vllm.transformers_utils.configs.qwen4_exp import (
+     Qwen4ExpTextConfig,
+ )
+ from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+-from vllm.v1.e2_guards import assert_graph_profile_is_executable
++from vllm.v1.e2_guards import assert_graph_profile_is_executable, assert_ple_mode
+ from vllm.v1.kv_cache_interface import MambaSpec
+ 
+ from ..config import Qwen4ExpConfig
+@@ -794,6 +794,7 @@ class Qwen4ExpForCausalLM(
+         # identity nobody chose. Qwen4ExpForConditionalGeneration constructs
+         # this class; Qwen4ExpMTP does not, and guards itself.
+         assert_graph_profile_is_executable(vllm_config, role="target")
++        assert_ple_mode(vllm_config, role="target")
+         config: Qwen4ExpTextConfig = vllm_config.model_config.hf_text_config
+         self.vllm_config = vllm_config
+         self.model_config = vllm_config.model_config
+diff --git a/vllm/models/qwen4_exp/nvidia/mtp.py b/vllm/models/qwen4_exp/nvidia/mtp.py
+index 468fc3ab8d..e7d1255d6b 100644
+--- a/vllm/models/qwen4_exp/nvidia/mtp.py
++++ b/vllm/models/qwen4_exp/nvidia/mtp.py
+@@ -49,7 +49,7 @@ from vllm.sequence import IntermediateTensors
+ from vllm.transformers_utils.configs.qwen4_exp import (
+     Qwen4ExpTextConfig,
+ )
+-from vllm.v1.e2_guards import assert_graph_profile_is_executable
++from vllm.v1.e2_guards import assert_graph_profile_is_executable, assert_ple_mode
+ 
+ from .hyperconnection import GatedResidual, HyperConnectionConfig
+ from .low_latency_gemm import enable_qwen4_exp_low_latency_gemm
+@@ -400,6 +400,7 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
+         # this class builds Qwen4ExpMultiTokenPredictor directly, from a config
+         # rebuilt at mtp.py:159 -- so its graph profile is checked here.
+         assert_graph_profile_is_executable(vllm_config, role="draft")
++        assert_ple_mode(vllm_config, role="draft")
+         config: Qwen4ExpTextConfig = vllm_config.model_config.hf_text_config
+         self.vllm_config = vllm_config
+         cache_config = vllm_config.cache_config
+diff --git a/vllm/models/qwen4_exp/nvidia/ngram_embedding.py b/vllm/models/qwen4_exp/nvidia/ngram_embedding.py
+index 84c4e7c5e1..573d1e3891 100644
+--- a/vllm/models/qwen4_exp/nvidia/ngram_embedding.py
++++ b/vllm/models/qwen4_exp/nvidia/ngram_embedding.py
+@@ -10,6 +10,7 @@ import torch
+ import torch.nn.functional as F
+ from torch import nn
+ 
++import vllm.envs as envs
+ from vllm.compilation.breakable_cudagraph import eager_break_during_capture
+ from vllm.config import get_current_vllm_config
+ from vllm.distributed import get_dp_group, get_etp_group, get_tp_group
+@@ -402,6 +403,13 @@ class Qwen4ExpPLEPinnedHostEmbedding(Qwen4ExpPLEEmbedding):
+         max_total_tokens: int = 0,
+         data_parallel_rank: int = 0,
+     ) -> None:
++        # Fork: never build the UVA table beside the E2 pull transport --
++        # that would be a second offload of the same PLE table.
++        if envs.VLLM_E2_PLE_PULL_TRANSPORT:
++            raise RuntimeError(
++                "Qwen4ExpPLEPinnedHostEmbedding (upstream UVA PLE backend) "
++                "refused: VLLM_E2_PLE_PULL_TRANSPORT=1 owns the PLE table"
++            )
+         if not is_uva_available():
+             raise RuntimeError("Engram CPU offload requires UVA support")
+         super().__init__(
+@@ -700,10 +708,15 @@ class Qwen4ExpNGramEmbedding(nn.Module):
+         if params_dtype is None:
+             params_dtype = torch.get_default_dtype()
+         engram_config = get_current_vllm_config().engram_config
++        use_uva = engram_config is not None and engram_config.cpu_offload
++        if use_uva and envs.VLLM_E2_PLE_PULL_TRANSPORT:
++            # Fork: no silent fallback between transports.
++            raise RuntimeError(
++                "PLE backend selection: cpu_offload=True (upstream UVA) with "
++                "VLLM_E2_PLE_PULL_TRANSPORT=1 -- refusing a double offload"
++            )
+         embedding_cls = (
+-            Qwen4ExpPLEPinnedHostEmbedding
+-            if engram_config is not None and engram_config.cpu_offload
+-            else Qwen4ExpPLEDeviceEmbedding
++            Qwen4ExpPLEPinnedHostEmbedding if use_uva else Qwen4ExpPLEDeviceEmbedding
+         )
+         self.ngram_embedding = embedding_cls(
+             padded_vocab_size,
+@@ -717,14 +730,21 @@ class Qwen4ExpNGramEmbedding(nn.Module):
+             data_parallel_rank=data_parallel_rank,
+         )
+         weight = self.ngram_embedding.weight
++        # Fork: backend= names the class (or, inside the pull transport's
++        # offload process, the table it serves), so a smoke need not derive
++        # the backend from pinned=. Fields before it are upstream's, unchanged.
++        backend = type(self.ngram_embedding).__name__
++        if envs.VLLM_E2_PLE_PULL_TRANSPORT:
++            backend = f"E2PullTransport.offload_table:{backend}"
+         logger.info(
+             "Initialized PLE embedding %s: quantization_method=%s, "
+-            "weight_dtype=%s, weight_device=%s, pinned=%s",
++            "weight_dtype=%s, weight_device=%s, pinned=%s, backend=%s",
+             embedding_prefix,
+             type(embedding_quant_method).__name__,
+             weight.dtype,
+             weight.device,
+             weight.is_pinned(),
++            backend,
+         )
+ 
+     @staticmethod
+diff --git a/vllm/models/qwen4_exp/nvidia/ple_layer.py b/vllm/models/qwen4_exp/nvidia/ple_layer.py
+index 2ec8790e8d..d50781bfca 100644
+--- a/vllm/models/qwen4_exp/nvidia/ple_layer.py
++++ b/vllm/models/qwen4_exp/nvidia/ple_layer.py
+@@ -7,6 +7,7 @@ from collections.abc import Sequence
+ import torch
+ from torch import nn
+ 
++import vllm.envs as envs
+ from vllm.compilation.breakable_cudagraph import eager_break_during_capture
+ from vllm.config import CacheConfig, ModelConfig, VllmConfig, get_current_vllm_config
+ from vllm.forward_context import get_forward_context
+@@ -93,16 +94,32 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
+         self.conv_state_len = (self.conv_kernel_size - 1) * self.short_conv_dilation
+         self.num_spec_tokens = vllm_config.num_speculative_tokens
+         self.activation = "silu"
+-        self.ple_embedding = Qwen4ExpNGramEmbedding(
+-            config,
+-            int(config.ple_embed_dim),
+-            self.ple_dense_layer_id,
+-            vllm_config.scheduler_config.max_num_batched_tokens,
+-            data_parallel_rank=vllm_config.parallel_config.data_parallel_rank,
+-            prefix=f"{prefix}.ple_embedding",
+-            quant_config=quant_config,
+-            params_dtype=model_config.dtype,
+-        )
++        if envs.VLLM_E2_PLE_PULL_TRANSPORT:
++            # Fork: the E2 pull transport owns the table in a CPU-only
++            # offload process; upstream's device/UVA backends are never built.
++            from .ple_pull import Qwen4ExpNGramEmbeddingPull
++
++            self.ple_embedding = Qwen4ExpNGramEmbeddingPull.build(
++                config,
++                int(config.ple_embed_dim),
++                self.ple_dense_layer_id,
++                vllm_config.scheduler_config.max_num_batched_tokens,
++                data_parallel_rank=vllm_config.parallel_config.data_parallel_rank,
++                prefix=f"{prefix}.ple_embedding",
++                quant_config=quant_config,
++                params_dtype=model_config.dtype,
++            )
++        else:
++            self.ple_embedding = Qwen4ExpNGramEmbedding(
++                config,
++                int(config.ple_embed_dim),
++                self.ple_dense_layer_id,
++                vllm_config.scheduler_config.max_num_batched_tokens,
++                data_parallel_rank=vllm_config.parallel_config.data_parallel_rank,
++                prefix=f"{prefix}.ple_embedding",
++                quant_config=quant_config,
++                params_dtype=model_config.dtype,
++            )
+         # The PLE cache is TP-replicated, so this merged projection is too.
+         self.kv_proj = MergedColumnParallelLinear(
+             int(config.ple_embed_dim),
+@@ -147,6 +164,10 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
+     ) -> torch.Tensor:
+         """Dequantize PLE lookup output."""
+ 
++        dequantize_pulled = getattr(self.ple_embedding, "dequantize_pulled", None)
++        if dequantize_pulled is not None:
++            # Fork pull transport: no local table; FP8 scale kept here.
++            return dequantize_pulled(embeddings, output_dtype)
+         return self.ple_embedding.ngram_embedding.dequantize(
+             embeddings,
+             output_dtype,
+diff --git a/vllm/models/qwen4_exp/nvidia/ple_pull.py b/vllm/models/qwen4_exp/nvidia/ple_pull.py
+new file mode 100644
+index 0000000000..f52000c8d9
+--- /dev/null
++++ b/vllm/models/qwen4_exp/nvidia/ple_pull.py
+@@ -0,0 +1,342 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""The fork's PLE pull transport, re-seated on vLLM v0.30.0.
++
++v0.30.0 split the E2 base's offload-aware ``Qwen4ExpNGramEmbedding`` into an
++upstream-only module (``ngram_embedding.py``, device or pinned-host UVA table).
++This module puts the E2 pull transport back WITHOUT editing that upstream
++class: ``Qwen4ExpNGramEmbeddingPull`` inherits it and ``PleOffloadLayer``.
++
++* In a GPU worker, ``PleOffloadLayer.__init_subclass__`` skips the constructor:
++  the module is an empty placeholder with no table. ``PleOffloadConnector``
++  binds it to a host-mapped flag/buffer; its forward is the captured
++  ``ple_offload_wait_copy`` op. Only the FP8 global scale is kept on the GPU.
++* In the CPU-only offload process the constructor runs in full, on CPU. The
++  table is upstream's ``Qwen4ExpPLEDeviceEmbedding`` allocated on CPU;
++  ``forward_impl`` computes n-gram IDs and gathers raw (FP8) rows.
++
++Selected only when ``VLLM_E2_PLE_PULL_TRANSPORT=1``; with the switch off this
++module is never imported by the model and the tree is upstream.
++
++Supported table formats: FP8 (global scale) and unquantized -- the two
++``Qwen4ExpPLEEmbeddingMethod`` families v0.30.0 itself supports. The E2 NVFP4
++path is not carried (v0.30.0 has no NVFP4 PLE method to select).
++"""
++
++from collections.abc import Iterable
++
++import torch
++
++from vllm.config import get_current_vllm_config
++from vllm.logger import init_logger
++from vllm.model_executor.layers.ple_offload_layer import (
++    PleOffloadLayer,
++    is_offload_process,
++)
++from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
++from vllm.transformers_utils.configs.qwen4_exp import Qwen4ExpTextConfig
++
++from .ngram_embedding import (
++    Qwen4ExpNGramEmbedding,
++    Qwen4ExpPLEEmbeddingMethod,
++    Qwen4ExpPLEFp8EmbeddingMethod,
++    Qwen4ExpPLEUnquantizedEmbeddingMethod,
++)
++
++logger = init_logger(__name__)
++
++#: The backend name this module reports in the PLE producer log line.
++PULL_BACKEND_NAME = "E2PullTransport"
++
++
++class Qwen4ExpNGramEmbeddingPull(PleOffloadLayer, Qwen4ExpNGramEmbedding):
++    """Upstream n-gram embedding whose table lives in the offload process."""
++
++    #: GPU placeholder: the method the offload process will use for the table,
++    #: resolved with upstream's own selector (set by ``build``).
++    _offload_quant_method: Qwen4ExpPLEEmbeddingMethod | None = None
++
++    def __init__(
++        self,
++        config: Qwen4ExpTextConfig,
++        embedding_dim: int,
++        ple_dense_layer_id: int,
++        max_total_tokens: int,
++        *,
++        data_parallel_rank: int,
++        prefix: str,
++        quant_config: QuantizationConfig | None = None,
++        params_dtype: torch.dtype | None = None,
++    ) -> None:
++        # Runs only in the offload process (guarded by PleOffloadLayer).
++        engram_config = get_current_vllm_config().engram_config
++        if engram_config is not None and engram_config.cpu_offload:
++            raise RuntimeError(
++                "PLE pull transport: the offload process resolved "
++                "cpu_offload=True; refusing to build upstream's UVA table here."
++            )
++        Qwen4ExpNGramEmbedding.__init__(
++            self,
++            config,
++            embedding_dim,
++            ple_dense_layer_id,
++            max_total_tokens,
++            data_parallel_rank=data_parallel_rank,
++            prefix=prefix,
++            quant_config=quant_config,
++            params_dtype=params_dtype,
++        )
++
++    @classmethod
++    def build(
++        cls,
++        config: Qwen4ExpTextConfig,
++        embedding_dim: int,
++        ple_dense_layer_id: int,
++        max_total_tokens: int,
++        *,
++        data_parallel_rank: int,
++        prefix: str,
++        quant_config: QuantizationConfig | None,
++        params_dtype: torch.dtype | None,
++    ) -> "Qwen4ExpNGramEmbeddingPull":
++        """Construct the placeholder (GPU) or the full CPU module (offload)."""
++        # The offload process builds the surrounding model on meta; this
++        # subtree must own real CPU storage. In a GPU worker the constructor is
++        # skipped, so the device context allocates nothing.
++        with torch.device(cls.get_target_device()):
++            module = cls(
++                config,
++                embedding_dim,
++                ple_dense_layer_id,
++                max_total_tokens,
++                data_parallel_rank=data_parallel_rank,
++                prefix=prefix,
++                quant_config=quant_config,
++                params_dtype=params_dtype,
++            )
++        embedding_prefix = f"{prefix}.ngram_embedding"
++        method = Qwen4ExpPLEEmbeddingMethod.from_quant_config(
++            quant_config,
++            embedding_prefix,
++            getattr(config, "ple_embedding_dtype", None),
++        )
++        if not isinstance(
++            method,
++            (Qwen4ExpPLEFp8EmbeddingMethod, Qwen4ExpPLEUnquantizedEmbeddingMethod),
++        ):
++            raise NotImplementedError(
++                f"PLE pull transport does not support {type(method).__name__}"
++            )
++        module._offload_quant_method = method
++        module._pull_params_dtype = params_dtype or torch.get_default_dtype()
++        module._pull_embedding_prefix = embedding_prefix
++        if not is_offload_process():
++            # The GPU-rank producer line, in upstream's format plus backend=
++            # (the offload process logs its own table line from upstream's
++            # constructor). The table lives in the offload process's CPU memory
++            # and is not pinned; rows cross via host-mapped buffers.
++            logger.info(
++                "Initialized PLE embedding %s: quantization_method=%s, "
++                "weight_dtype=%s, weight_device=%s, pinned=%s, backend=%s",
++                embedding_prefix,
++                type(method).__name__,
++                module.get_offload_output_dtype(module._pull_params_dtype),
++                "cpu",
++                False,
++                PULL_BACKEND_NAME,
++            )
++        return module
++
++    # ------------------------------------------------------------- formats
++
++    def get_offload_output_dtype(self, default_dtype: torch.dtype) -> torch.dtype:
++        """Rows cross the transport in their table storage dtype."""
++        embedding = getattr(self, "ngram_embedding", None)
++        weight = getattr(embedding, "weight", None)
++        if weight is not None:
++            return weight.dtype
++        if isinstance(self._offload_quant_method, Qwen4ExpPLEFp8EmbeddingMethod):
++            return torch.float8_e4m3fn
++        return getattr(self, "_pull_params_dtype", default_dtype)
++
++    def get_offload_output_dim(self, default_dim: int) -> int:
++        return default_dim
++
++    def initialize_dummy_offload_metadata(self, device: torch.device) -> None:
++        """Dummy loads skip checkpoint scales; give FP8 a unit scale."""
++        if isinstance(self._offload_quant_method, Qwen4ExpPLEFp8EmbeddingMethod):
++            self.register_buffer(
++                "_offload_weight_scale",
++                torch.ones((), dtype=torch.float32, device=device),
++                persistent=False,
++            )
++
++    def dequantize_pulled(
++        self, embeddings: torch.Tensor, output_dtype: torch.dtype
++    ) -> torch.Tensor:
++        """GPU-side dequantization of rows DMA'd from the offload process.
++
++        Same arithmetic as upstream ``Qwen4ExpPLEFp8EmbeddingMethod.dequantize``
++        (and the E2 ``_dequantize_embeddings`` FP8 branch).
++        """
++        method = self._offload_quant_method
++        if isinstance(method, Qwen4ExpPLEUnquantizedEmbeddingMethod):
++            return embeddings
++        weight_scale = getattr(self, "_offload_weight_scale", None)
++        if weight_scale is None:
++            raise RuntimeError(
++                "FP8 PLE pull transport is missing its global scale on the GPU"
++            )
++        if weight_scale.device != embeddings.device:
++            raise RuntimeError("FP8 PLE embedding scale must be on the output device")
++        return embeddings.to(output_dtype) * weight_scale.to(output_dtype)
++
++    # ------------------------------------------------------------- execution
++
++    def start_prefetch(
++        self,
++        hidden_states: torch.Tensor,
++        input_ids: torch.Tensor,
++        query_start_loc: torch.Tensor,
++        ngram_context: torch.Tensor,
++    ) -> None:
++        """No prefetch: rows are published by the offload process."""
++        return None
++
++    def _compute_ngram_ids_offload(
++        self,
++        input_ids: torch.Tensor,
++        query_start_loc: torch.Tensor,
++        ngram_context: torch.Tensor,
++    ) -> torch.Tensor:
++        """CPU n-gram IDs, carried unchanged from the E2 offload path.
++
++        Differs from upstream's CPU branch in two E2 fixes: the packed layout
++        is (num_reqs, max_seq_len) rather than (num_reqs, num_tokens), and
++        CUDA-graph padding rows beyond ``query_start_loc[-1]`` are not written,
++        so they cannot overwrite a request's final real token.
++        """
++        input_ids = input_ids.reshape(-1).long()
++        query_start_loc = query_start_loc.long()
++        num_reqs = query_start_loc.numel() - 1
++        num_tokens = input_ids.shape[0]
++        if num_reqs <= 0:
++            raise ValueError("PLE requires at least one request")
++        max_seq_len = max(
++            1,
++            int((query_start_loc[1:] - query_start_loc[:-1]).max().item()),
++        )
++        num_valid_tokens = min(int(query_start_loc[-1].item()), num_tokens)
++
++        positions = torch.arange(num_tokens, device=input_ids.device, dtype=torch.int64)
++        packed = torch.full(
++            (num_reqs, max_seq_len),
++            self.eos_token_id,
++            device=input_ids.device,
++            dtype=torch.int64,
++        )
++        request_indices = torch.searchsorted(query_start_loc, positions, right=True) - 1
++        request_indices.clamp_(max=num_reqs - 1)
++        columns = (positions - query_start_loc[request_indices]).clamp(
++            0, packed.shape[1] - 1
++        )
++        packed[request_indices[:num_valid_tokens], columns[:num_valid_tokens]] = (
++            input_ids[:num_valid_tokens]
++        )
++        ngram_context = ngram_context[:num_reqs].to(
++            device=input_ids.device, dtype=torch.long
++        )
++
++        context = torch.cat([ngram_context, packed], dim=-1)
++        positions_2d, position_in_segment = self._shift_precompute(
++            context, self.eos_token_id
++        )
++        shifted = [context]
++        for shift in range(1, self.ngram_size):
++            shifted.append(
++                self._shift_apply(
++                    context,
++                    positions_2d,
++                    position_in_segment,
++                    shift,
++                    self.eos_token_id,
++                )
++            )
++        adjusted_columns = columns + self.ngram_size - 1
++        id_blocks = []
++        for ngram in range(2, self.ngram_size + 1):
++            start = (ngram - 2) * self.heads_per_ngram
++            end = start + self.heads_per_ngram
++            mixed = shifted[0] * self.layer_multipliers[0]
++            for index in range(1, ngram):
++                mixed = torch.bitwise_xor(
++                    mixed, shifted[index] * self.layer_multipliers[index]
++                )
++            sizes = self.ngram_heads_vocab_sizes[start:end]
++            offsets = self.ngram_heads_offsets[start:end]
++            ids = torch.remainder(mixed.unsqueeze(-1), sizes) + offsets
++            id_blocks.append(ids[request_indices, adjusted_columns])
++        return torch.cat(id_blocks, dim=-1)
++
++    def forward_impl(  # type: ignore[override]
++        self,
++        hidden_states: torch.Tensor,
++        input_ids: torch.Tensor,
++        query_start_loc: torch.Tensor,
++        ngram_context: torch.Tensor,
++        output_buffer: torch.Tensor | None = None,
++    ) -> torch.Tensor:
++        """Offload process only: gather raw table rows for these tokens."""
++        del hidden_states
++        if not is_offload_process():
++            raise RuntimeError(
++                "PLE pull transport: forward_impl ran outside the offload "
++                "process -- the GPU placeholder was never bound by the connector"
++            )
++        ngram_ids = self._compute_ngram_ids_offload(
++            input_ids, query_start_loc, ngram_context
++        )
++        num_tokens = input_ids.reshape(-1).shape[0]
++        weight = self.ngram_embedding.weight
++        if output_buffer is not None:
++            output = output_buffer[:num_tokens, : self.embedding_dim]
++            torch.index_select(
++                weight,
++                0,
++                ngram_ids.reshape(-1),
++                out=output.reshape(-1, self.head_dim),
++            )
++            return output
++        return torch.index_select(weight, 0, ngram_ids.reshape(-1)).reshape(
++            num_tokens, self.embedding_dim
++        )
++
++    # ------------------------------------------------------------- loading
++
++    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
++        """Offload process: upstream loading. GPU worker: keep the FP8 scale.
++
++        The GPU placeholder owns no table; every other checkpoint tensor for
++        this subtree is consumed and dropped here (the offload process loads
++        the table itself). Prefix grouping may call this more than once.
++        """
++        if is_offload_process():
++            return Qwen4ExpNGramEmbedding.load_weights(self, weights)
++        retained: set[str] = set()
++        fp8 = isinstance(self._offload_quant_method, Qwen4ExpPLEFp8EmbeddingMethod)
++        for name, loaded_weight in weights:
++            if fp8 and name == "ngram_embedding.weight_scale":
++                self.register_buffer(
++                    "_offload_weight_scale",
++                    loaded_weight.reshape(()).to(
++                        device=torch.accelerator.current_accelerator(),
++                        dtype=torch.float32,
++                    ),
++                    persistent=False,
++                )
++                retained.add(name)
++        return retained
++
++
++__all__ = ["PULL_BACKEND_NAME", "Qwen4ExpNGramEmbeddingPull"]
+diff --git a/vllm/v1/e2_guards.py b/vllm/v1/e2_guards.py
+index 9971ccd39a..12a0d4864e 100644
+--- a/vllm/v1/e2_guards.py
++++ b/vllm/v1/e2_guards.py
+@@ -214,5 +214,151 @@ def assert_graph_profile_is_executable(vllm_config, *, role: str = "target") ->
+     )
+ 
+ 
++# --------------------------------------------------------------------------
++# PLE transport: carry the pull transport, UVA disabled.
++# --------------------------------------------------------------------------
++
++#: The fork's pull-transport switch (strict "0"/"1"; registered and hashed in
++#: vllm/envs.py). Renamed from the E2 base's VLLM_PLE_CPU_OFFLOAD.
++PULL_TRANSPORT_ENV = "VLLM_E2_PLE_PULL_TRANSPORT"
++#: Upstream v0.30.0's switch for the pinned-host UVA PLE backend. Same name as
++#: the E2 base's pull switch, opposite default (upstream: "1").
++UPSTREAM_UVA_ENV = "VLLM_PLE_CPU_OFFLOAD"
++
++
++def pull_transport_enabled() -> bool:
++    """Whether the fork's pull transport is on. Strict; raises on bad values.
++
++    One source: the registered accessor ``envs.VLLM_E2_PLE_PULL_TRANSPORT``,
++    whose parser (``envs._e2_strict_switch``) accepts exactly unset/"0"/"1".
++    """
++    import vllm.envs as envs
++
++    return bool(envs.VLLM_E2_PLE_PULL_TRANSPORT)
++
++
++def check_upstream_uva_env_against_pull() -> None:
++    """Fail loud if the old name would turn upstream's UVA path on.
++
++    With the pull transport on, ``VLLM_PLE_CPU_OFFLOAD`` may be unset (the
++    fork then supplies ``cpu_offload=False`` as the Engram default) or exactly
++    ``"0"``. ``"1"`` -- the E2-era spelling of "enable our offload" -- would
++    enable upstream's pinned-host UVA backend beside ours: a double offload.
++    Any other value is rejected rather than interpreted. With the pull
++    transport off this function does nothing: the name is upstream's.
++    """
++    if not pull_transport_enabled():
++        return
++    raw = os.environ.get(UPSTREAM_UVA_ENV)
++    if raw is None or raw == "0":
++        return
++    if raw == "1":
++        raise RuntimeError(
++            f"e2-guard: {PULL_TRANSPORT_ENV}=1 and {UPSTREAM_UVA_ENV}=1. On "
++            f"vLLM v0.30.0 {UPSTREAM_UVA_ENV} is UPSTREAM's switch for the "
++            "pinned-host UVA PLE backend (default on), not the E2 pull "
++            "transport, so this launch asks for both transports at once. Unset "
++            f"{UPSTREAM_UVA_ENV} or export {UPSTREAM_UVA_ENV}=0 "
++            "(the pull transport replaces that switch)."
++        )
++    raise ValueError(
++        f"e2-guard: {PULL_TRANSPORT_ENV}=1 and {UPSTREAM_UVA_ENV}={raw!r}. "
++        f'With the pull transport on, {UPSTREAM_UVA_ENV} must be unset or '
++        'exactly "0"; any other value is refused rather than guessed.'
++    )
++
++
++def pull_transport_cpu_offload_default(upstream_default: bool) -> bool:
++    """The Engram ``cpu_offload`` default, as this fork resolves it.
++
++    Pull off: ``upstream_default`` unchanged (the tree behaves as upstream).
++    Pull on: the old-name check above, then ``False`` -- upstream's UVA
++    backend is never the default beside the pull transport.
++    """
++    if not pull_transport_enabled():
++        return upstream_default
++    check_upstream_uva_env_against_pull()
++    return False
++
++
++def verify_engram_against_pull(engram_config) -> None:
++    """Refuse an explicit ``cpu_offload=True`` while the pull transport is on.
++
++    ``--engram-config '{"cpu_offload": true}'`` takes precedence over every
++    default, so it is checked on the resolved object, not the environment.
++    """
++    if not pull_transport_enabled():
++        return
++    check_upstream_uva_env_against_pull()
++    if engram_config is not None and bool(engram_config.cpu_offload):
++        raise RuntimeError(
++            f"e2-guard: {PULL_TRANSPORT_ENV}=1 but the resolved EngramConfig "
++            "has cpu_offload=True (upstream's pinned-host UVA PLE backend). "
++            "Both transports would own the PLE table. Drop cpu_offload from "
++            "--engram-config (or set it false), or turn the pull transport off."
++        )
++
++
++#: Effective PLE modes, as the guard names them.
++PLE_MODE_PULL = "pull"  # E2 pull transport (VLLM_E2_PLE_PULL_TRANSPORT=1)
++PLE_MODE_UVA = "uva"  # upstream Qwen4ExpPLEPinnedHostEmbedding
++PLE_MODE_DEVICE = "device"  # upstream Qwen4ExpPLEDeviceEmbedding
++PLE_MODE_NONE = "none"  # no Engram config resolved (no PLE layers / not CUDA)
++
++
++def resolve_ple_mode(vllm_config) -> str:
++    """The PLE transport this process will build, or an error if mixed.
++
++    Reads the two inputs that decide it -- the pull switch (strict) and the
++    RESOLVED ``engram_config.cpu_offload`` -- and nothing else. Mixed states
++    raise; there is no fallback from one transport to another.
++    """
++    pull = pull_transport_enabled()
++    check_upstream_uva_env_against_pull()
++    engram_config = getattr(vllm_config, "engram_config", None)
++    cpu_offload = (
++        None if engram_config is None else bool(engram_config.cpu_offload)
++    )
++    if pull:
++        if cpu_offload:
++            raise RuntimeError(
++                f"e2-guard: {PULL_TRANSPORT_ENV}=1 with a resolved Engram "
++                "cpu_offload=True: the pull transport and upstream's UVA "
++                "backend would both own the PLE table."
++            )
++        return PLE_MODE_PULL
++    if cpu_offload is None:
++        return PLE_MODE_NONE
++    return PLE_MODE_UVA if cpu_offload else PLE_MODE_DEVICE
++
++
++def assert_ple_mode(vllm_config, *, role: str = "target") -> str:
++    """Startup guard: resolve, assert and log the effective PLE mode.
++
++    Runs beside ``assert_graph_profile_is_executable`` at model construction
++    for ``role="target"`` and ``role="draft"`` (the MTP drafter carries the
++    target's EngramConfig and the same process environment, so a mixed
++    configuration fails there too). NOT disabled by VLLM_E2_ALLOW_BREAKABLE:
++    that opt-out is about graph identity, not about owning the PLE table twice.
++    """
++    mode = resolve_ple_mode(vllm_config)
++    model_config = getattr(vllm_config, "model_config", None)
++    text_config = getattr(model_config, "hf_text_config", None)
++    ple_layer_ids = list(getattr(text_config, "ple_layer_ids", None) or [])
++    engram_config = getattr(vllm_config, "engram_config", None)
++    logger.info(
++        "e2-guard[%s]: ple_mode=%s pull_transport=%d engram_cpu_offload=%s "
++        "%s=%s ple_layer_ids=%s.",
++        role,
++        mode,
++        1 if mode == PLE_MODE_PULL else 0,
++        None if engram_config is None else bool(engram_config.cpu_offload),
++        UPSTREAM_UVA_ENV,
++        os.environ.get(UPSTREAM_UVA_ENV, "<unset>"),
++        ple_layer_ids,
++    )
++    return mode
++
++
+ #: Back-compatible name for the earlier call sites.
+ assert_breakable_cudagraph_pinned = assert_graph_profile_is_executable
+diff --git a/vllm/v1/executor/multiproc_executor.py b/vllm/v1/executor/multiproc_executor.py
+index e27a18bb36..fc744cbd2b 100644
+--- a/vllm/v1/executor/multiproc_executor.py
++++ b/vllm/v1/executor/multiproc_executor.py
+@@ -713,6 +713,10 @@ class WorkerProc:
+ 
+         # Load model
+         self.worker.init_device()
++        # PLE pull transport: DP0/TP0 starts the CPU-only PLE process before
++        # load_model, so its weight load overlaps ours; READY is awaited after.
++        if envs.VLLM_E2_PLE_PULL_TRANSPORT:
++            self.worker.spawn_ple_offload()
+         # Update process title now that parallel groups are initialized
+         self.setup_proc_title_and_log_prefix(
+             enable_ep=vllm_config.parallel_config.enable_expert_parallel
+@@ -721,6 +725,8 @@ class WorkerProc:
+             self.worker.elastic_ep_execute("load_model")
+         else:
+             self.worker.load_model()
++        if envs.VLLM_E2_PLE_PULL_TRANSPORT:
++            self.worker.wait_ple_offload_ready()
+ 
+         scheduler_config = vllm_config.scheduler_config
+         self.use_async_scheduling = scheduler_config.async_scheduling
+diff --git a/vllm/v1/executor/uniproc_executor.py b/vllm/v1/executor/uniproc_executor.py
+index dc798cdc5c..eeb0786297 100644
+--- a/vllm/v1/executor/uniproc_executor.py
++++ b/vllm/v1/executor/uniproc_executor.py
+@@ -67,11 +67,15 @@ class UniProcExecutor(Executor):
+ 
+         self.driver_worker.init_worker(all_kwargs=[kwargs])
+         self.driver_worker.init_device()
++        if envs.VLLM_E2_PLE_PULL_TRANSPORT:
++            self.driver_worker.spawn_ple_offload()
+ 
+         if envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH:
+             self.driver_worker.elastic_ep_execute("load_model")
+         else:
+             self.driver_worker.load_model()
++        if envs.VLLM_E2_PLE_PULL_TRANSPORT:
++            self.driver_worker.wait_ple_offload_ready()
+         current_platform.update_block_size_for_backend(self.vllm_config)
+ 
+     def _distributed_args(self) -> tuple[str, int, int]:
+diff --git a/vllm/v1/ple_offload/connector.py b/vllm/v1/ple_offload/connector.py
+index 52bc4622e7..2779edf3b5 100644
+--- a/vllm/v1/ple_offload/connector.py
++++ b/vllm/v1/ple_offload/connector.py
+@@ -257,7 +257,7 @@ class PleOffloadConnector:
+         }
+         if not layers:
+             raise RuntimeError(
+-                "VLLM_PLE_CPU_OFFLOAD is enabled, but the model has no PleOffloadLayer"
++                "VLLM_E2_PLE_PULL_TRANSPORT is enabled, but the model has no PleOffloadLayer"
+             )
+ 
+         config = vllm_config.model_config.hf_text_config
+diff --git a/vllm/v1/ple_offload/test_fault.py b/vllm/v1/ple_offload/test_fault.py
+new file mode 100644
+index 0000000000..9ae74f7205
+--- /dev/null
++++ b/vllm/v1/ple_offload/test_fault.py
+@@ -0,0 +1,13 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Compatibility exports for the top-level test-only fault singleton."""
++
++from vllm_ple_test_fault import (
++    _FAULT as _FAULT,
++)
++from vllm_ple_test_fault import (  # noqa: F401
++    FaultSpec as FaultSpec,
++)
++from vllm_ple_test_fault import (
++    _parse_fault_spec as _parse_fault_spec,
++)
+diff --git a/vllm/v1/ple_offload/worker.py b/vllm/v1/ple_offload/worker.py
+index 24beebdea6..a5f039e407 100644
+--- a/vllm/v1/ple_offload/worker.py
++++ b/vllm/v1/ple_offload/worker.py
+@@ -830,7 +830,7 @@ class PleOffloadRunner:
+         }
+         if not offload_layers:
+             raise RuntimeError(
+-                "VLLM_PLE_CPU_OFFLOAD is enabled, but no PleOffloadLayer "
++                "VLLM_E2_PLE_PULL_TRANSPORT is enabled, but no PleOffloadLayer "
+                 "was found in the initialized model"
+             )
+         logger.info(
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index e2ddc52014..2d80a375b3 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -398,6 +398,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+ 
+         # For transferring state from execute_model to subsequent sample_tokens call.
+         self.execute_model_state: ExecuteModelState | None = None
++        # PLE pull transport: set by _setup_ple_offload() from Worker.load_model
++        # when VLLM_E2_PLE_PULL_TRANSPORT=1 and this rank owns a PLE layer.
++        # None otherwise, and every hook below is then a no-op (upstream path).
++        self._ple_offload_connector: PleOffloadConnector | None = None
+ 
+         # Expert parallelism load balancer.
+         self.eplb = EPLBController(self.parallel_config, self.device)
+@@ -429,6 +433,26 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             tasks.extend(PoolingRunner.get_supported_tasks(self.model))
+         return tuple(tasks)
+ 
++    def _setup_ple_offload(self, ipc_addr: str) -> None:
++        """Initialize PLE offload after the model state is available."""
++        # PLE placeholders are created by model loading, so CUDA output
++        # registration cannot happen in the runner constructor.
++        query_start_loc_source = getattr(self.model_state, "ple_query_start_loc", None)
++        ngram_context_source = getattr(self.model_state, "ngram_context", None)
++        if not isinstance(query_start_loc_source, torch.Tensor):
++            raise RuntimeError("PLE offload requires a query_start_loc source")
++        if not isinstance(ngram_context_source, torch.Tensor):
++            raise RuntimeError("PLE offload requires an ngram_context source")
++        self._ple_offload_connector = PleOffloadConnector(
++            self.vllm_config,
++            self.model,
++            self.device,
++            ipc_addr,
++            input_ids_source=self.input_buffers.input_ids,
++            query_start_loc_source=query_start_loc_source,
++            ngram_context_source=ngram_context_source,
++        )
++
+     def load_model(self, load_dummy_weights: bool = False, *args, **kwargs) -> None:
+         time_before_load = time.perf_counter()
+         if load_dummy_weights:
+@@ -1065,6 +1089,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             torch.accelerator.empty_cache()
+             start_free_gpu_memory = torch.accelerator.get_memory_info()[0]
+ 
++            # Decoder capture calls the model outside execute_model. Keep dummy
++            # PLE outputs signaled until all graphs capture their semaphore wait.
++            if self._ple_offload_connector is not None and capture_decoder:
++                self._ple_offload_connector.signal_dummy_outputs(self.max_num_tokens)
+             with self.maybe_setup_dummy_loras(self.lora_config):
+                 if capture_encoder:
+                     self.model_state.encoder_runner.capture()
+@@ -1100,6 +1128,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                         self.adaptive_verification.set_initial_cost_curves(timings)
+                     self.kv_connector.reset_capture_state()
+ 
++            if self._ple_offload_connector is not None and capture_decoder:
++                self._ple_offload_connector.release_outputs()
+             end_free_gpu_memory = torch.accelerator.get_memory_info()[0]
+ 
+         if not profile_only:
+@@ -2442,6 +2472,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         """Release GPU tensors (model weights, KV caches, workspace) so that
+         memory is reclaimable when running in the same process."""
+         torch.accelerator.synchronize()
++        if self._ple_offload_connector is not None:
++            self._ple_offload_connector.close()
++            self._ple_offload_connector = None
+         self.cudagraph_manager = None
+         self.fast_prefill = None
+         if hasattr(self, "kv_caches"):
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index cafeb73c99..847837d77d 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -226,6 +226,22 @@ class Worker(WorkerBase):
+         self.profiler_config = vllm_config.profiler_config
+ 
+         self.use_v2_model_runner = vllm_config.use_v2_model_runner
++        # PLE pull transport (VLLM_E2_PLE_PULL_TRANSPORT). Off: both stay
++        # None/False and every PLE hook in this class is a no-op.
++        self._ple_offload_worker_handle: Any | None = None
++        self._ple_offload_stopping = False
++        self._ple_offload_enabled = self._has_ple_layers()
++        if envs.VLLM_E2_PLE_PULL_TRANSPORT:
++            if self._ple_offload_enabled:
++                self._validate_ple_offload_config()
++            elif self.rank == 0 and self.parallel_config.data_parallel_rank == 0:
++                text_config = self.model_config.hf_text_config
++                logger.warning(
++                    "VLLM_E2_PLE_PULL_TRANSPORT is enabled, but this rank owns "
++                    "no PLE layer (ple_layer_ids=%s); no PLE offload connector "
++                    "is created here.",
++                    getattr(text_config, "ple_layer_ids", None),
++                )
+ 
+         # Device handles of the previous step's PP intermediate-tensor send.
+         self._pp_send_work: list[Handle] = []
+@@ -235,7 +251,7 @@ class Worker(WorkerBase):
+ 
+     def _has_ple_layers(self) -> bool:
+         """Return whether this model configuration constructs PLE layers."""
+-        if not envs.VLLM_PLE_CPU_OFFLOAD:
++        if not envs.VLLM_E2_PLE_PULL_TRANSPORT:
+             return False
+         text_config = self.model_config.hf_text_config
+         ple_layer_ids = getattr(text_config, "ple_layer_ids", None)
+@@ -297,7 +313,7 @@ class Worker(WorkerBase):
+ 
+         if unsupported:
+             raise ValueError(
+-                "VLLM_PLE_CPU_OFFLOAD does not support the requested "
++                "VLLM_E2_PLE_PULL_TRANSPORT does not support the requested "
+                 "configuration. Unsupported settings: "
+                 f"{', '.join(unsupported)}"
+             )
+@@ -651,6 +667,12 @@ class Worker(WorkerBase):
+         ):
+             self.model_runner.load_model(load_dummy_weights=load_dummy_weights)
+ 
++        # Model loading constructs the PLE placeholders whose buffers are
++        # registered with the offload process by the model runner V2 connector.
++        if self._ple_offload_enabled:
++            model_runner = cast("GPUModelRunnerV2", self.model_runner)
++            model_runner._setup_ple_offload(self.parallel_config._ple_offload_ipc_path)
++
+         if has_ec_transfer():
+             get_ec_transfer().start_worker_services()
+ 
+@@ -666,6 +688,10 @@ class Worker(WorkerBase):
+         self.model_runner.update_config(overrides)
+ 
+     def reload_weights(self, *args, **kwargs) -> None:
++        if self._ple_offload_enabled:
++            raise NotImplementedError(
++                "Weight reload is not supported with the PLE pull transport"
++            )
+         with set_current_vllm_config(self.vllm_config):
+             self.model_runner.reload_weights(*args, **kwargs)
+ 
+@@ -1661,6 +1687,10 @@ class Worker(WorkerBase):
+ 
+         self.elastic_ep_executor.shutdown()
+ 
++        if self._ple_offload_worker_handle is not None:
++            self._ple_offload_worker_handle.close()
++            self._ple_offload_worker_handle = None
++
+         # Release GPU resources held by the model runner so that memory
+         # can be reclaimed when running in-process
+         if model_runner := getattr(self, "model_runner", None):

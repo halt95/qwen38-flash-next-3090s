@@ -1,0 +1,2040 @@
+From 04781aba03425673e651e7e5194c51d5d8c2b975 Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Wed, 23 Sep 2026 08:35:40 -0400
+Subject: [PATCH 44/58] topk: determinism toggles for greedy repeatability
+
+- MERLIN_FULL_K: deterministic Marlin MoE split-K (after unmerged upstream #46639).
+- MERLIN_QSA_SORT: canonical order for the QSA selected blocks.
+- MERLIN_TIE_DET: deterministic tie-break at the persistent_topk cutoff.
+- MERLIN_TIE_RECENT: cutoff ties keep the highest indices.
+- Decode candidate truncation is detected; one tie direction across the
+  medium path; the kernel switches are registered.
+---
+ .../moe/marlin_moe_wna16/kernel.h             |   3 +-
+ .../moe/marlin_moe_wna16/marlin_template.h    |  12 +-
+ .../moe/marlin_moe_wna16/ops.cu               |  40 +-
+ csrc/libtorch_stable/ops.h                    |   4 +
+ csrc/libtorch_stable/persistent_topk.cuh      | 392 +++++++++++++++---
+ csrc/libtorch_stable/topk.cu                  | 183 +++++++-
+ csrc/libtorch_stable/torch_bindings.cpp       |   3 +
+ tests/kernels/test_top_k_per_row.py           | 234 ++++++++++-
+ tests/test_envs.py                            | 199 +++++++--
+ vllm/envs.py                                  | 151 +++++--
+ .../qwen4_exp/nvidia/ops/qsa_indexer.py       |  41 ++
+ .../qwen4_exp/nvidia/ops/topk_counters.py     |  43 +-
+ 12 files changed, 1141 insertions(+), 164 deletions(-)
+
+diff --git a/csrc/libtorch_stable/moe/marlin_moe_wna16/kernel.h b/csrc/libtorch_stable/moe/marlin_moe_wna16/kernel.h
+index 25c57f3b2d..15f8018d60 100644
+--- a/csrc/libtorch_stable/moe/marlin_moe_wna16/kernel.h
++++ b/csrc/libtorch_stable/moe/marlin_moe_wna16/kernel.h
+@@ -20,7 +20,8 @@
+       const int32_t *__restrict__ num_tokens_past_padded_ptr,                \
+       const float *__restrict__ topk_weights_ptr, int top_k,                 \
+       bool mul_topk_weights, int prob_m, int prob_n, int prob_k, int *locks, \
+-      bool has_bias, bool use_atomic_add, bool use_fp32_reduce
++      bool has_bias, bool use_atomic_add, bool use_fp32_reduce,              \
++      bool use_full_k
+ 
+ namespace MARLIN_NAMESPACE_NAME {
+ template <const vllm::ScalarTypeId a_type_id,  // A ScalarType id
+diff --git a/csrc/libtorch_stable/moe/marlin_moe_wna16/marlin_template.h b/csrc/libtorch_stable/moe/marlin_moe_wna16/marlin_template.h
+index aac9bd157f..d552679562 100644
+--- a/csrc/libtorch_stable/moe/marlin_moe_wna16/marlin_template.h
++++ b/csrc/libtorch_stable/moe/marlin_moe_wna16/marlin_template.h
+@@ -74,7 +74,8 @@ __global__ void Marlin(
+     int prob_k,             // reduction dimension k
+     int* locks,             // extra global storage for barrier synchronization
+     bool use_atomic_add,    // whether to use atomic add to reduce
+-    bool use_fp32_reduce    // whether to use fp32 global reduce
++    bool use_fp32_reduce,   // whether to use fp32 global reduce
++    bool use_full_k         // whether to reduce over full K per block
+ ) {}
+ 
+ }  // namespace MARLIN_NAMESPACE_NAME
+@@ -250,7 +251,8 @@ __global__ void Marlin(
+     int* locks,             // extra global storage for barrier synchronization
+     bool has_bias,
+     bool use_atomic_add,  // whether to use atomic add to reduce
+-    bool use_fp32_reduce  // whether to use fp32 global reduce
++    bool use_fp32_reduce,  // whether to use fp32 global reduce
++    bool use_full_k        // whether to reduce over full K per block
+ ) {
+   // Each threadblock processes one "stripe" of the B matrix with (roughly) the
+   // same size, which might involve multiple column "slices" (of width 16 *
+@@ -370,11 +372,13 @@ __global__ void Marlin(
+   // see https://github.com/vllm-project/vllm/pull/24722 for more details
+   if (global_mn_tiles > gridDim.x) {
+     part2_mn_tiles = global_mn_tiles % gridDim.x;
+-    if (part2_mn_tiles * 3 <= gridDim.x) part2_mn_tiles += gridDim.x;
++    if (!use_full_k && part2_mn_tiles * 3 <= gridDim.x)
++      part2_mn_tiles += gridDim.x;
+     part1_mn_iters = (global_mn_tiles - part2_mn_tiles) / gridDim.x;
+   }
+ 
+-  int iters = div_ceil(k_tiles * part2_mn_tiles, gridDim.x);
++  int iters =
++      use_full_k ? k_tiles : div_ceil(k_tiles * part2_mn_tiles, gridDim.x);
+ 
+   if constexpr (group_blocks != -1) {
+     if (group_blocks >= thread_k_blocks) {
+diff --git a/csrc/libtorch_stable/moe/marlin_moe_wna16/ops.cu b/csrc/libtorch_stable/moe/marlin_moe_wna16/ops.cu
+index 48de07dc75..2c6ad7666a 100644
+--- a/csrc/libtorch_stable/moe/marlin_moe_wna16/ops.cu
++++ b/csrc/libtorch_stable/moe/marlin_moe_wna16/ops.cu
+@@ -33,6 +33,35 @@
+ #include <torch/headeronly/util/Exception.h>
+ 
+ #include "libtorch_stable/torch_utils.h"
++#include <cstdlib>
++
++namespace {
++// -------------------------------------------------------------------------
++// MERLIN_FULL_K: the CUDA half of the unmerged upstream PR #46639
++// (`use_full_k`), which makes the Marlin MoE split-K reduction order
++// independent of how many blocks the launch was split across.
++//
++// Our own toggle rather than upstream's VLLM_BATCH_INVARIANT, because that
++// one aborts engine startup on GDN models (upstream #42960) and so can never
++// reach this kernel on Flash-Next.
++//
++// Resolved ONCE per process, not per launch, so it is a launch constant in
++// exactly the sense topk.cu's exact_medium_enabled() is: a cudagraph bakes in
++// the value that was live at capture time and every replay agrees with it.
++// Default OFF -- enabling it by default is a separate release decision.
++//
++// This std::getenv is the SINGLE source of truth. vllm/envs.py carries a raw
++// passthrough entry for validate_environ and the compile-factor hash only;
++// nothing in Python may parse this name a second time.
++// -------------------------------------------------------------------------
++bool merlin_full_k() {
++  static const bool enabled = [] {
++    const char* raw = std::getenv("MERLIN_FULL_K");
++    return (raw != nullptr && raw[0] != '\0') ? (std::atoi(raw) != 0) : false;
++  }();
++  return enabled;
++}
++}  // namespace
+ 
+ #define STATIC_ASSERT_SCALAR_TYPE_VALID(scalar_t)               \
+   static_assert(std::is_same<scalar_t, half>::value ||          \
+@@ -183,7 +212,8 @@ exec_config_t determine_exec_config(
+     const vllm::ScalarType& c_type, const vllm::ScalarType& s_type, int prob_m,
+     int prob_n, int prob_k, int num_experts, int top_k, int thread_m_blocks,
+     bool m_block_size_8, int num_bits, int group_size, bool has_zp,
+-    bool is_zp_float, bool is_a_8bit, int stages, int max_shared_mem, int sms) {
++    bool is_zp_float, bool is_a_8bit, int stages, int max_shared_mem, int sms,
++    bool use_full_k) {
+   exec_config_t exec_cfg = exec_config_t{1, thread_config_t{-1, -1, -1}};
+   thread_config_t* thread_configs = thread_m_blocks > 1
+                                         ? large_batch_thread_configs
+@@ -228,7 +258,8 @@ exec_config_t determine_exec_config(
+     else
+       allow_count = max(min(allow_count, 2), 1);
+ 
+-    if (prob_n / th_config.thread_n * prob_m * top_k * 4 < sms * allow_count) {
++    if (!use_full_k &&
++        prob_n / th_config.thread_n * prob_m * top_k * 4 < sms * allow_count) {
+       allow_count =
+           max(prob_n / th_config.thread_n * prob_m * top_k * 4 / sms, 1);
+     }
+@@ -254,6 +285,7 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
+                int group_size, int dev, cudaStream_t stream, int thread_k,
+                int thread_n, int sms, int blocks_per_sm, bool use_atomic_add,
+                bool use_fp32_reduce, bool is_zp_float) {
++  const bool use_full_k = merlin_full_k();
+   int thread_m_blocks = div_ceil(moe_block_size, 16);
+   bool m_block_size_8 = moe_block_size == 8;
+   bool is_a_8bit = a_type.size_bits() == 8;
+@@ -331,7 +363,7 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
+     exec_cfg = determine_exec_config(
+         a_type, b_type, c_type, s_type, prob_m, prob_n, prob_k, num_experts,
+         top_k, thread_m_blocks, m_block_size_8, num_bits, group_size, has_zp,
+-        is_zp_float, is_a_8bit, stages, max_shared_mem, sms);
++        is_zp_float, is_a_8bit, stages, max_shared_mem, sms, use_full_k);
+     thread_tfg = exec_cfg.tb_cfg;
+   }
+ 
+@@ -383,7 +415,7 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
+       A_ptr, B_ptr, C_ptr, C_tmp_ptr, bias_ptr, a_s_ptr, b_s_ptr, g_s_ptr, zp_ptr,
+       sorted_token_ids_ptr, expert_ids_ptr, num_tokens_past_padded_ptr,
+       topk_weights_ptr, top_k, mul_topk_weights, prob_m, prob_n, prob_k, locks,
+-      has_bias, use_atomic_add, use_fp32_reduce);
++      has_bias, use_atomic_add, use_fp32_reduce, use_full_k);
+   // clang-format on
+ }
+ 
+diff --git a/csrc/libtorch_stable/ops.h b/csrc/libtorch_stable/ops.h
+index ea81216b65..11568011f2 100644
+--- a/csrc/libtorch_stable/ops.h
++++ b/csrc/libtorch_stable/ops.h
+@@ -478,6 +478,10 @@ void persistent_topk(const torch::stable::Tensor& logits,
+ void persistent_topk_exact_counters(torch::stable::Tensor& out, int64_t reset,
+                                     int64_t sync);
+ 
++// The slot count of THIS build's counter array, so the Python
++// reader never has to guess it from an environment variable.
++int64_t persistent_topk_exact_counters_slots();
++
+ #ifdef VLLM_ENABLE_COOPERATIVE_TOPK
+ void cooperative_topk(const torch::stable::Tensor& logits,
+                       const torch::stable::Tensor& lengths,
+diff --git a/csrc/libtorch_stable/persistent_topk.cuh b/csrc/libtorch_stable/persistent_topk.cuh
+index fcbcc7bd1b..f8ce8597f5 100644
+--- a/csrc/libtorch_stable/persistent_topk.cuh
++++ b/csrc/libtorch_stable/persistent_topk.cuh
+@@ -54,6 +54,19 @@ __device__ __forceinline__ auto convert_to_uint32_v2(float x) -> uint32_t {
+   return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
+ }
+ 
++// THE definition of the effective tie direction, called by
++// both the host (to report it) and the device (to obey it), so the reported
++// policy and the executed policy cannot drift.
++//
++// `MERLIN_TIE_DET=0` is the shipped default and leaves the buffered paths on
++// their original racy atomicAdd rule, which has no direction; the medium-path exact
++// restart is deterministic whatever happens, so it keeps the most-recent-wins
++// direction the medium-path restart shipped and was measured with.
++__host__ __device__ __forceinline__ bool effective_tie_recent(bool det_ties,
++                                                              bool tie_recent) {
++  return det_ties ? tie_recent : true;
++}
++
+ __device__ __forceinline__ auto convert_to_uint8(float x) -> uint8_t {
+   __half h = __float2half_rn(x);
+   uint16_t bits = __half_as_ushort(h);
+@@ -147,10 +160,27 @@ struct PersistentTopKParams {
+   // nullptr; the kernel only ever atomicAdds into it, never reads back.
+   bool exact_medium;
+   unsigned long long* exact_counters;
++  // MERLIN_TIE_DET: deterministic tie-break at the k-th cutoff.
++  // Resolved once on the host, like exact_medium above, so it is a launch
++  // constant and is baked into a cudagraph at capture.
++  bool det_ties;
++  // MERLIN_TIE_RECENT: ranks ties by DESCENDING element index, so
++  // the surviving blocks are the most recent rather than the oldest. Both
++  // rules are deterministic; they differ in which tied blocks survive, and
++  // measurably in draft acceptance at depth. Only read when det_ties is set.
++  bool tie_recent;
++  // MERLIN_TOPK_EXACT_DECODE: on an overflowing
++  // DECODE row, take the same exact restart the medium path takes instead of
++  // ranking a truncated candidate set. Detection and the [10] counter are
++  // unconditional; only the repair is gated. Default OFF -- the repair costs
++  // four full-row rescans and the overflow incidence on real traffic has
++  // never been measured, which is what the counter is for.
++  bool exact_decode;
+   // MERLIN_TOPK_DET_LARGE, ANDed on the host with the capacity gate
+-  // 2 * ctas_per_group <= RADIX (the per-CTA counts are staged in one 256-slot
+-  // RadixRowState histogram row).  Resolved once per process, so it is a
+-  // launch constant and a cudagraph captures one value.
++  // 4 * ctas_per_group <= RADIX (the per-CTA counts and the two fault-verdict
++  // regions are staged in one 256-slot RadixRowState histogram row).  Resolved
++  // once per process, so it is a launch constant and a cudagraph captures one
++  // value.
+   bool det_large;
+   // TEST ONLY.  -1 (the default) disables it; any
+   // other value names the `cta_in_group` whose CTA-LOCAL fault predicate is
+@@ -177,10 +207,17 @@ __device__ __forceinline__ uint32_t decode_bin(float x) {
+   return key >> 5;
+ }
+ 
++// Returns TRUE when this row overflowed its candidate buffer AND the caller
++// asked for the exact repair, in which case nothing has been emitted that the
++// restart will not overwrite and the caller must run it.
++// The restart itself lives with the medium path further down and is called
++// from the dispatch site, so this function needs no forward declaration of it
++// -- some host compilers reject one for a `__device__` template.
+ template <int TopK>
+-__device__ __noinline__ void histogram_2048_topk(
++__device__ __noinline__ bool histogram_2048_topk(
+     const float* __restrict__ logits, int32_t* __restrict__ output_indices,
+-    int32_t seq_len) {
++    int32_t seq_len, bool det_ties, bool tie_recent,
++    unsigned long long* __restrict__ counters, bool exact_decode) {
+   extern __shared__ int decode_smem[];
+   const int tx = threadIdx.x;
+   const int lane = tx & 31;
+@@ -193,7 +230,18 @@ __device__ __noinline__ void histogram_2048_topk(
+   constexpr int MAX_ITEMS_PER_THREAD =
+       (HIST2048_THRESHOLD + kThreadsPerBlock - 1) / kThreadsPerBlock;
+ 
+-  enum : int { sTHR = 0, sOUT = 1, sREF = 2, sFIN = 3, sBUF0 = 4, sBUF1 = 5 };
++  // sOVF claims one of the two scalars that were already
++  // being zeroed by the `tx < 8` loop below and never used, so the decode
++  // shared-memory budget is unchanged.
++  enum : int {
++    sTHR = 0,
++    sOUT = 1,
++    sREF = 2,
++    sFIN = 3,
++    sBUF0 = 4,
++    sBUF1 = 5,
++    sOVF = 6
++  };
+ 
+   // ---- Initialize scalars (prevents stale data from prior rows) ----
+   if (tx < 8) {
+@@ -322,7 +370,7 @@ __device__ __noinline__ void histogram_2048_topk(
+   __syncthreads();
+ 
+   int remaining_k = TopK - decode_smem[SBASE + sOUT];
+-  if (remaining_k <= 0) return;
++  if (remaining_k <= 0) return false;
+ 
+   // If all buffered elements fit, output them all (common for short seqs)
+   const int raw_buf0 = decode_smem[SBASE + sBUF0];
+@@ -333,7 +381,7 @@ __device__ __noinline__ void histogram_2048_topk(
+       output_indices[base + i] = bufs[0][i];
+     }
+     __syncthreads();
+-    return;
++    return false;
+   }
+ 
+   // ---- Phase 3: Deferred refinement (rare path) ----
+@@ -372,6 +420,42 @@ __device__ __noinline__ void histogram_2048_topk(
+     const int dst = src ^ 1;
+ 
+     const int raw_buf = decode_smem[SBASE + sBUF0 + src];
++
++    // ---- DECODE TRUNCATION, DETECTED ------------------
++    //
++    // `DBUF` is 3,708 and the Phase-2 append guard drops everything past it,
++    // but the atomicAdd that hands out slots sits OUTSIDE that guard -- so
++    // `raw_buf` keeps counting and a post-hoc test here is exact, exactly as
++    // the medium path's M2 is.  Dropped candidates are invisible to
++    // refinement AND to the deterministic tie ranking further down: ranking
++    // orders the survivors, it cannot recall a winner that was never
++    // buffered.  The failing class: an 8,192-element row inside one coarse bin
++    // with one element larger at FP32 but in the same half-precision bin; a
++    // legal append order drops that winner and the row is silently wrong.
++    //
++    // The historical zero-overflow measurements cover a workload, not a
++    // capacity.  Until this counter has been read on the real traffic, the
++    // determinism claim for the decode path is conditional on it reading 0.
++    if (__builtin_expect(raw_buf > DBUF, 0)) {
++      if (tx == 0 && decode_smem[SBASE + sOVF] == 0) {
++        decode_smem[SBASE + sOVF] = 1;  // once per row, not once per pass
++        if (counters != nullptr) atomicAdd(&counters[kCtrDecodeOverflow], 1ull);
++      }
++      if (exact_decode) {
++        // Hand the row back for the same repair the medium path takes:
++        // throw the buffered state away and re-select from scratch with a
++        // full-row radix rescan.  The restart writes all TopK slots (or
++        // fills the row with -1 and faults), so Phase 2's `> threshold`
++        // emissions are overwritten rather than double-counted.  `raw_buf`
++        // is block-uniform and `exact_decode` is a launch constant, so this
++        // return is taken by the whole block -- which is what makes it safe
++        // to leave a function that still owns the shared-memory window.
++        __syncthreads();
++        return true;
++      }
++      __syncthreads();
++    }
++
+     const int num_buffered = (raw_buf < DBUF) ? raw_buf : DBUF;
+ 
+     compute_suffix_sum();
+@@ -385,6 +469,9 @@ __device__ __noinline__ void histogram_2048_topk(
+     __syncthreads();
+ 
+     const int ref_thr = decode_smem[SBASE + sREF];
++    // Read before any thread decrements sFIN, so every thread agrees on
++    // how many of the tied candidates survive the cutoff.
++    const int fin_total = decode_smem[SBASE + sFIN];
+     remaining_k -= refine[0][ref_thr + 1];
+     const int bit_offset = 24 - pass * 8;
+ 
+@@ -416,8 +503,35 @@ __device__ __noinline__ void histogram_2048_topk(
+         output_indices[pos] = idx;
+       } else if (bin == ref_thr) {
+         if (pass == 3) {
+-          const int slot = atomicAdd(&decode_smem[SBASE + sFIN], -1);
+-          if (slot > 0) output_indices[TopK - slot] = idx;
++          if (det_ties) {
++            // Every candidate that reaches here has an identical 32-bit value,
++            // and the racy branch below hands out slots by atomicAdd -- first
++            // warp to arrive wins, so WHICH tied block survives the cutoff is
++            // a race. Rank by element index instead and place at a position
++            // derived from that rank, so the surviving set is arrival-order
++            // independent. No atomics on this path.
++            //
++            // O(t^2) over the exactly-tied set t. Exact 32-bit ties are rare
++            // (19 occurrences across 12 measured requests, one element each), so
++            // t is small in practice -- but that is measurement at one shape,
++            // not a bound.
++            int rank = 0;
++            for (int j = 0; j < num_buffered; ++j) {
++              const int jdx = bufs[src][j];
++              const bool ahead = tie_recent ? (jdx > idx) : (jdx < idx);
++              if (!ahead) continue;
++              const uint32_t jf = convert_to_uint32_v2(logits[jdx]);
++              if (((jf >> bit_offset) & 0xFF) == static_cast<uint32_t>(ref_thr)) {
++                ++rank;
++              }
++            }
++            if (rank < fin_total) {
++              output_indices[TopK - fin_total + rank] = idx;
++            }
++          } else {
++            const int slot = atomicAdd(&decode_smem[SBASE + sFIN], -1);
++            if (slot > 0) output_indices[TopK - slot] = idx;
++          }
+         } else {
+           const int bp = atomicAdd(&decode_smem[SBASE + sBUF0 + dst], 1);
+           if (__builtin_expect(bp < DBUF, 1)) {
+@@ -430,6 +544,7 @@ __device__ __noinline__ void histogram_2048_topk(
+     }
+     __syncthreads();
+   }
++  return false;
+ }
+ 
+ // ============================================================================
+@@ -457,10 +572,28 @@ __device__ __noinline__ void histogram_2048_topk(
+ // selected keys in output order, so that would re-introduce exactly the
+ // nondeterminism MERLIN_QSA_SORT / MERLIN_TIE_DET / MERLIN_TIE_RECENT exist
+ // to remove.  Ours emits in **ascending index order** via a block scan (no
+-// atomics anywhere on the placement path) and cuts ties at the k-th value by
+-// **most-recent wins** (the highest element indices are kept), matching the
+-// rule measured on the reference host (+3.4 % tokens/step at 12K over
+-// oldest-wins).
++// atomics anywhere on the placement path).
++//
++// TIE DIRECTION IS ONE POLICY, DECIDED CENTRALLY.  The medium-path restart
++// hard-coded most-recent-wins here while the buffered decode/medium paths took
++// their direction from `tie_recent`, so a medium row that grew from 4,096 to
++// 4,097 candidates silently changed tie direction without the configuration
++// changing.  The direction is now a parameter and the ONE place that resolves
++// it is `effective_tie_recent()` in topk.cu:
++//
++//     det_ties ? tie_recent : true
++//
++// i.e. `MERLIN_TIE_DET=1 MERLIN_TIE_RECENT=0` is oldest-wins on the whole
++// medium path (buffered AND restart), and with `MERLIN_TIE_DET=0` the restart
++// keeps its shipped most-recent-wins default (the direction that was
++// measured at +3.4 % tokens/step at 12K over oldest-wins).
++//
++// The deterministic large path takes the SAME value.
++// `radix_emit_deterministic` receives `effective_tie_recent(det_ties,
++// tie_recent)` from the dispatch site and mirrors both halves of its cut --
++// the cross-CTA walk and the within-chunk window -- so all five paths
++// (decode-buffered, decode-restart, medium-buffered, medium-restart, large)
++// obey one decision and the host's policy line prints it for all five.
+ // ============================================================================
+ 
+ // Abort the kernel when the exact fallback cannot complete, instead of
+@@ -483,6 +616,23 @@ __device__ __noinline__ void histogram_2048_topk(
+ // rows and wraps after 66,053, and a delta taken across that boundary is a
+ // wrong number that looks like a measurement.  `atomicAdd(unsigned long long*)`
+ // is native on sm_86, so the width costs nothing on the increment path.
++//
++// SLOT MAP (the tie-determinism + large-path integration, 11 slots).  The tie change numbered its decode
++// counter AROUND the large-path block rather than after the medium-path one, so the merged layout is
++// the union of the two branches with nothing renumbered and no external probe
++// silently re-reading a row count as a switch -- the failure a merged layout
++// must avoid.
++//
++//   [0] medium rows      [1] medium overflow   [2] medium exact fallback
++//   [3] medium exact fault
++//   [4]-[7]  large path (rows_large, ties_cut, ties_dropped, faults_large)
++//   [8] MERLIN_TOPK_EXACT_MEDIUM   [9] MERLIN_TOPK_DET_LARGE
++//   [10] decode overflow
++//
++// Slots 8-9 are written by the HOST after the device copy; the device never
++// touches them, and they are slots INSIDE the array, not two elements appended
++// after it.  A stale five- or ten-element reader buffer is rejected outright by
++// the length check in the reader op, which is the fail-loud direction.
+ enum TopKExactCounter : int {
+   kCtrMediumRows = 0,           // denominator: medium-path rows entered
+   kCtrMediumOverflow = 1,       // rows where a 4,096-slot guard would drop
+@@ -497,7 +647,11 @@ enum TopKExactCounter : int {
+   kCtrLargeTiesCut = 5,       // rows where the pivot-equal group was cut
+   kCtrLargeTiesDropped = 6,   // pivot-equal elements discarded by those cuts
+   kCtrLargeFault = 7,         // large-path invariant violation
+-  kNumTopKExactCounters = 8,
++  kSlotSwitchMedium = 8,        // host-written flag, NOT a device counter
++  kSlotSwitchLarge = 9,         // host-written flag, NOT a device counter
++  kCtrDecodeOverflow = 10,      // decode rows whose buffered-candidate count
++                                // exceeded DBUF before deterministic ranking
++  kNumTopKExactCounters = 11,   // total slots: device buffer AND reader output
+ };
+ 
+ // Exact, bounded-memory re-selection for a single medium-path row.
+@@ -506,10 +660,17 @@ enum TopKExactCounter : int {
+ // row, so correctness does not depend on how many values share a coarse bin.
+ // Entered only after an overflow has been detected, which is 0.1-0.2 % of
+ // medium rows at 38K-51K prompt tokens.
++//
++// `tie_recent` is the EFFECTIVE tie direction for this launch, resolved once
++// on the host (see the header comment above): true keeps the highest element
++// indices among the pivot-equal group, false keeps the lowest.  It is a launch
++// constant and block-uniform, so every walk and the emission predicate below
++// agree on it without a barrier.
+ template <int TopK>
+ __device__ __noinline__ void medium_exact_restart(
+     const float* __restrict__ scores, int32_t* __restrict__ output,
+-    uint32_t length, unsigned long long* __restrict__ counters) {
++    uint32_t length, unsigned long long* __restrict__ counters,
++    bool tie_recent) {
+   static_assert(kThreadsPerBlock >= RADIX,
+                 "the single-thread bin walk assumes RADIX <= blockDim.x");
+ 
+@@ -521,7 +682,8 @@ __device__ __noinline__ void medium_exact_restart(
+     uint32_t prefix;      // ordered-uint radix prefix, grows 8 bits per round
+     uint32_t remaining;   // how many of the pivot-equal group must be kept
+     uint32_t tie_total;   // how many elements have key == pivot in total
+-    uint32_t tie_cut;     // lowest element index kept among the pivot-equal
++    uint32_t tie_cut;     // pivot-equal cut: lowest kept index under
++                          // most-recent-wins, highest kept under oldest-wins
+     uint32_t fault;       // set by the walks; block-wide, read after a barrier
+   };
+ 
+@@ -541,7 +703,11 @@ __device__ __noinline__ void medium_exact_restart(
+     smem->prefix = 0;
+     smem->remaining = static_cast<uint32_t>(TopK);
+     smem->tie_total = 0;
+-    smem->tie_cut = 0;
++    // The cut is a bound on the kept index range, so its identity element is
++    // direction-dependent.  When tie_total == equal_count the walks below are
++    // skipped entirely and this value is what the emission predicate reads:
++    // `idx >= 0` keeps the whole group, and so does `idx <= 0xFFFFFFFF`.
++    smem->tie_cut = tie_recent ? 0u : 0xFFFFFFFFu;
+     // The index-space tie walk below is two 8-bit rounds, so it resolves
+     // indices below 65,536.  The medium path serves seq_len <= 32,768, but
+     // fail loudly rather than silently mis-cut if that ever changes.
+@@ -626,11 +792,18 @@ __device__ __noinline__ void medium_exact_restart(
+   // the end, but wasted work on the fault path and harder to debug.  The
+   // condition is block-uniform (shared, read after the barrier above).
+   if (smem->fault == 0u) {
+-    // ---- tie cut at the k-th value: most-recent wins --------------------
++    // ---- tie cut at the k-th value --------------------------------------
+     //
+     // Keep the `equal_count` HIGHEST element indices among the pivot-equal
+-    // group.  Finding the cut index turns the tie rule into a per-element
+-    // predicate, which is what lets the emission below be atomic-free.
++    // group when `tie_recent`, the `equal_count` LOWEST when not.  Finding the
++    // cut index turns the tie rule into a per-element predicate, which is what
++    // lets the emission below be atomic-free.
++    //
++    // The two index walks below are the only code that has
++    // to know the direction; they differ from each other only in which end of
++    // the index-bin array they start from, so `count_above` means "population
++    // on the far side of the walk" in both directions and the crossing test is
++    // unchanged.
+     //
+     // Exact 32-bit ties at the cutoff are rare (19 occurrences across
+     // 12 requests, one element each), so the common case is tie_total ==
+@@ -651,9 +824,12 @@ __device__ __noinline__ void medium_exact_restart(
+       }
+       __syncthreads();
+       if (tx == 0) {
++        const int first_bin = tie_recent ? RADIX - 1 : 0;
++        const int bin_step = tie_recent ? -1 : 1;
+         uint32_t count_above = 0;
+         bool found = false;
+-        for (int bin = RADIX - 1; bin >= 0; --bin) {
++        for (int n = 0; n < RADIX; ++n) {
++          const int bin = first_bin + n * bin_step;
+           const uint32_t count = smem->histogram[bin];
+           if (count_above + count >= need) {
+             smem->tie_cut = static_cast<uint32_t>(bin);  // high byte, for now
+@@ -684,9 +860,12 @@ __device__ __noinline__ void medium_exact_restart(
+       }
+       __syncthreads();
+       if (tx == 0) {
++        const int first_bin = tie_recent ? RADIX - 1 : 0;
++        const int bin_step = tie_recent ? -1 : 1;
+         uint32_t count_above = 0;
+         bool found = false;
+-        for (int bin = RADIX - 1; bin >= 0; --bin) {
++        for (int n = 0; n < RADIX; ++n) {
++          const int bin = first_bin + n * bin_step;
+           const uint32_t count = smem->histogram[bin];
+           if (count_above + count >= need) {
+             smem->tie_cut = (high_byte << 8) | static_cast<uint32_t>(bin);
+@@ -711,7 +890,9 @@ __device__ __noinline__ void medium_exact_restart(
+ 
+     // ---- emission: ascending index order, no atomics ---------------------
+     //
+-    // selected(i) = ordered(i) > pivot || (ordered(i) == pivot && i >= tie_cut)
++    // selected(i) = ordered(i) > pivot ||
++    //               (ordered(i) == pivot && (tie_recent ? i >= tie_cut
++    //                                                   : i <= tie_cut))
+     //
+     // is a pure function of the element, so the output slot is a prefix sum
+     // over the row rather than an arrival rank.  Tiles run in ascending base
+@@ -726,8 +907,8 @@ __device__ __noinline__ void medium_exact_restart(
+       uint32_t flag = 0;
+       if (idx < length) {
+         const uint32_t ordered = convert_to_uint32_v2(scores[idx]);
+-        flag =
+-            (ordered > pivot || (ordered == pivot && idx >= tie_cut)) ? 1u : 0u;
++        const bool keep_tie = tie_recent ? (idx >= tie_cut) : (idx <= tie_cut);
++        flag = (ordered > pivot || (ordered == pivot && keep_tie)) ? 1u : 0u;
+       }
+       uint32_t rank = 0;
+       uint32_t total = 0;
+@@ -805,7 +986,8 @@ template <int TopK>
+ __device__ __noinline__ void histogram_256_topk(
+     const float* __restrict__ logits, int* __restrict__ output_indices,
+     int logits_offset, int seq_len, bool exact_medium,
+-    unsigned long long* __restrict__ counters) {
++    unsigned long long* __restrict__ counters, bool det_ties,
++    bool tie_recent) {
+   // No default arguments on purpose: a new call site must state whether it
+   // wants the exact path, rather than silently inheriting the broken one.
+   // All shared state lives in dynamic shared memory to avoid static
+@@ -973,8 +1155,14 @@ __device__ __noinline__ void histogram_256_topk(
+           atomicAdd(&counters[kCtrMediumExactFallback], 1ull);
+         }
+         __syncthreads();  // no thread may clobber medium_smem before this
++        // The restart takes the SAME effective direction as
++        // the buffered branch below, so crossing the 4,096-candidate capacity
++        // no longer flips the tie policy.  `det_ties == false` means the
++        // buffered branch is the racy atomicAdd rule with no direction at all,
++        // and the restart then keeps the medium path's shipped most-recent-wins.
+         medium_exact_restart<TopK>(logits + logits_offset, output_indices,
+-                                   static_cast<uint32_t>(seq_len), counters);
++                                   static_cast<uint32_t>(seq_len), counters,
++                                   effective_tie_recent(det_ties, tie_recent));
+         return;
+       }
+       __syncthreads();
+@@ -1017,6 +1205,9 @@ __device__ __noinline__ void histogram_256_topk(
+     }
+     __syncthreads();
+ 
++    // Read before any thread decrements shared_final_k; see the decode
++    // path's fin_total for the reason.
++    const int fin_total_m = shared_final_k;
+     for (int i = thread_id; i < num_buffered; i += kThreadsPerBlock) {
+       const int idx = buffered_indices[src_buffer][i];
+       const float logit_value = logits[idx + logits_offset];
+@@ -1027,9 +1218,35 @@ __device__ __noinline__ void histogram_256_topk(
+         output_indices[output_pos] = idx;
+       } else if (bin == threshold_bin) {
+         if (pass == 3) {
+-          const int slot = atomicAdd(&shared_final_k, -1);
+-          if (slot > 0) {
+-            output_indices[TopK - slot] = idx;
++          if (det_ties) {
++            // Same rule as the decode path: every candidate here is bit-equal,
++            // so rank by element index rather than by warp arrival order.
++            //
++            // NOTE the medium-path restart interaction: when exact_medium is on AND this row
++            // overflowed the candidate buffer, medium_exact_restart() has
++            // already returned and this branch is never reached.  Since the fix,
++            // that path is handed THIS same `tie_recent`, so the
++            // medium path has one tie direction either side of the capacity
++            // boundary.
++            int rank = 0;
++            for (int j = 0; j < num_buffered; ++j) {
++              const int jdx = buffered_indices[src_buffer][j];
++              const bool ahead = tie_recent ? (jdx > idx) : (jdx < idx);
++              if (!ahead) continue;
++              const uint32_t jf =
++                  convert_to_uint32_v2(logits[jdx + logits_offset]);
++              if (static_cast<int>((jf >> bit_offset) & 0xFF) == threshold_bin) {
++                ++rank;
++              }
++            }
++            if (rank < fin_total_m) {
++              output_indices[TopK - fin_total_m + rank] = idx;
++            }
++          } else {
++            const int slot = atomicAdd(&shared_final_k, -1);
++            if (slot > 0) {
++              output_indices[TopK - slot] = idx;
++            }
+           }
+         } else {
+           const int buffer_pos =
+@@ -1166,12 +1383,16 @@ __device__ __forceinline__ void wait_ge(int* ptr, int target_val,
+ //   * every CTA reads all 2*ctas_per_group counts and derives its own base by
+ //     an exclusive prefix over `cta_in_group`, in one fixed order, so all
+ //     CTAs agree without further communication;
+-//   * the tie cut keeps the HIGHEST global indices (most-recent-wins, the
+-//     `MERLIN_TIE_RECENT` policy, measured at +3.4 % tokens/step
+-//     over oldest-wins).  Chunks are handed out in ascending index order
++//   * the tie cut keeps the HIGHEST global indices under most-recent-wins --
++//     the `MERLIN_TIE_RECENT` policy, measured at +3.4 %
++//     tokens/step over oldest-wins, and the shipped default -- or the LOWEST
++//     under oldest-wins.  Chunks are handed out in ascending index order
+ //     (`my_chunk_start = cta_in_group * chunk_size`), so "the highest
+ //     `equal_needed` pivot-equal indices" is exactly "walk CTAs from the top
+-//     down", which the per-CTA equal counts already answer;
++//     down" and the oldest-wins rule is the same walk mirrored; the per-CTA
++//     equal counts already answer both.  The direction is the launch constant
++//     `effective_tie_recent(det_ties, tie_recent)`, shared with the medium
++//     path;
+ //   * emission is a prefix sum over ascending element index — no atomic
+ //     anywhere on the placement path — so the row is strictly ascending in
+ //     index and bit-reproducible.
+@@ -1198,7 +1419,7 @@ __device__ __noinline__ void radix_emit_deterministic(
+     uint32_t* local_histogram, uint32_t* suffix_sum, uint32_t* shared_ordered,
+     RadixRowState* state, uint32_t cta_in_group, uint32_t ctas_per_group,
+     int& barrier_phase, uint32_t radix_iter, uint32_t tx,
+-    unsigned long long* counters, int fault_inject_cta) {
++    unsigned long long* counters, int fault_inject_cta, bool tie_recent) {
+   constexpr uint32_t kWarpsPerBlock = kThreadsPerBlock / 32u;
+   // Staging for the published per-CTA counts.  The host gates the switch on
+   // 4 * ctas_per_group <= RADIX, so these regions never collide.
+@@ -1216,6 +1437,8 @@ __device__ __noinline__ void radix_emit_deterministic(
+   //   [0] gt count  [1] eq count  [2] gt_base  [3] eq_keep_base  [4] cut_rank
+   //   [5] group fault verdict  [6] this CTA's emission-bound violation
+   //   [7] group emission-bound verdict  [8] ties dropped on this row
++  //   [9] my_keep (the pivot-equal window width; with [4] it spells the cut
++  //       in BOTH tie directions -- see the tie_recent note above)
+   // ---- per-CTA counts, out of the resident chunk -------------------------
+   if (tx < 2u) suffix_sum[tx] = 0u;
+   if (tx == 6u) suffix_sum[6] = 0u;
+@@ -1301,18 +1524,38 @@ __device__ __noinline__ void radix_emit_deterministic(
+       gt_total += g;
+     }
+ 
+-    // Most-recent-wins: walk CTAs from the top down, handing each one as many
+-    // of the `equal_needed` slots as the CTAs above it left unclaimed.  keep[]
+-    // is written over eq[] in place (eq[c] is read before keep[c] is stored).
+-    uint32_t eq_above = 0u;
+-    for (int c = static_cast<int>(ctas_per_group) - 1; c >= 0; --c) {
+-      const uint32_t e = local_histogram[kEqStage + c];
+-      const uint32_t want =
+-          (eq_above >= equal_needed) ? 0u : (equal_needed - eq_above);
+-      local_histogram[kEqStage + c] = (want < e) ? want : e;
+-      eq_above += e;
++    // Tie-determinism + large-path integration: the walk direction IS the tie
++    // policy.  Most-recent-wins walks CTAs from the top down, handing each one
++    // as many of the `equal_needed` slots as the CTAs above it left unclaimed;
++    // oldest-wins is the same walk mirrored, from the bottom up.  Chunks are
++    // handed out in ascending index order (`my_chunk_start = cta_in_group *
++    // chunk_size`), so "the highest `equal_needed` pivot-equal indices" is
++    // exactly "the top CTAs first" and the lowest is exactly the reverse.
++    // `tie_recent` is the EFFECTIVE direction, resolved once on the host by
++    // `effective_tie_recent(det_ties, tie_recent)` -- the same value the
++    // medium restart takes and the same value the host's policy line prints,
++    // so the three paths cannot drift.  It is a launch constant and this walk
++    // is single-threaded, so the branch costs nothing that matters.  keep[] is
++    // written over eq[] in place (eq[c] is read before keep[c] is stored).
++    uint32_t eq_seen = 0u;
++    if (tie_recent) {
++      for (int c = static_cast<int>(ctas_per_group) - 1; c >= 0; --c) {
++        const uint32_t e = local_histogram[kEqStage + c];
++        const uint32_t want =
++            (eq_seen >= equal_needed) ? 0u : (equal_needed - eq_seen);
++        local_histogram[kEqStage + c] = (want < e) ? want : e;
++        eq_seen += e;
++      }
++    } else {
++      for (uint32_t c = 0; c < ctas_per_group; ++c) {
++        const uint32_t e = local_histogram[kEqStage + c];
++        const uint32_t want =
++            (eq_seen >= equal_needed) ? 0u : (equal_needed - eq_seen);
++        local_histogram[kEqStage + c] = (want < e) ? want : e;
++        eq_seen += e;
++      }
+     }
+-    const uint32_t eq_total = eq_above;
++    const uint32_t eq_total = eq_seen;
+ 
+     uint32_t eq_keep_base = 0u;
+     for (uint32_t c = 0; c < cta_in_group; ++c) {
+@@ -1354,9 +1597,15 @@ __device__ __noinline__ void radix_emit_deterministic(
+ 
+     suffix_sum[2] = gt_base;
+     suffix_sum[3] = eq_keep_base;
+-    // Keep the local pivot-equal elements whose ascending rank within this
+-    // chunk is >= cut_rank, i.e. the `my_keep` highest-indexed of them.
+-    suffix_sum[4] = (my_keep <= local_eq) ? (local_eq - my_keep) : 0u;
++    // The kept pivot-equal elements of this chunk are the `my_keep` whose
++    // ascending rank within the chunk lies in [cut_rank, cut_rank + my_keep).
++    // Most-recent-wins puts that window at the TOP of the chunk
++    // (cut_rank = local_eq - my_keep, so the upper bound is vacuous and the
++    // emission predicate is byte-for-byte the rule the large path shipped); oldest-wins
++    // puts it at the BOTTOM (cut_rank = 0, and the upper bound is what binds).
++    suffix_sum[4] =
++        tie_recent ? ((my_keep <= local_eq) ? (local_eq - my_keep) : 0u) : 0u;
++    suffix_sum[9] = my_keep;
+     suffix_sum[8] = (eq_total > equal_needed) ? (eq_total - equal_needed) : 0u;
+ 
+     // Publish this CTA's verdict.  Own word, so no pre-zeroing is needed.
+@@ -1396,6 +1645,7 @@ __device__ __noinline__ void radix_emit_deterministic(
+   const uint32_t gt_base = suffix_sum[2];
+   const uint32_t eq_keep_base = suffix_sum[3];
+   const uint32_t cut_rank = suffix_sum[4];
++  const uint32_t keep_width = suffix_sum[9];
+   const uint32_t row_fault = suffix_sum[5];
+ 
+   // ---- emission: rank by index, no atomics -------------------------------
+@@ -1459,11 +1709,20 @@ __device__ __noinline__ void radix_emit_deterministic(
+       const uint32_t tile_gt = warp_gt[32];
+       const uint32_t tile_eq = warp_eq[32];
+ 
+-      if (f_gt || (f_eq && eq_rank >= cut_rank)) {
+-        // Selected elements before this one, in ascending index order:
+-        // all `> pivot` ones, plus the pivot-equal ones past the cut.
+-        const uint32_t kept_eq_before =
++      if (f_gt || (f_eq && eq_rank >= cut_rank &&
++                   eq_rank - cut_rank < keep_width)) {
++        // Selected elements before this one, in ascending index order: all
++        // `> pivot` ones, plus the pivot-equal ones already inside the cut
++        // window.  The clamp to `keep_width` is what makes the expression work
++        // in BOTH directions: under most-recent-wins the window ends at the
++        // last pivot-equal element of the chunk, so `eq_rank - cut_rank` can
++        // never reach `keep_width` and the clamp is dead; under oldest-wins
++        // the window ends early and every pivot-equal element after it must
++        // stop contributing, or a later `> pivot` element is placed past the
++        // end of the row.
++        uint32_t kept_eq_before =
+             (eq_rank > cut_rank) ? (eq_rank - cut_rank) : 0u;
++        if (kept_eq_before > keep_width) kept_eq_before = keep_width;
+         const uint32_t slot = gt_base + eq_keep_base + gt_rank + kept_eq_before;
+         if (slot < static_cast<uint32_t>(TopK)) {
+           row_output[slot] = static_cast<int32_t>(my_chunk_start + i);
+@@ -1554,7 +1813,8 @@ __device__ void radix_topk(const float* __restrict__ row_input,
+                            RadixRowState* state, uint32_t cta_in_group,
+                            uint32_t ctas_per_group, int& barrier_phase,
+                            uint32_t radix_iter, uint32_t tx, bool det_large,
+-                           unsigned long long* counters, int fault_inject_cta) {
++                           unsigned long long* counters, int fault_inject_cta,
++                           bool tie_recent) {
+   const uint32_t my_chunk_end = (my_chunk_start + chunk_size < seq_len)
+                                     ? my_chunk_start + chunk_size
+                                     : seq_len;
+@@ -1715,7 +1975,7 @@ __device__ void radix_topk(const float* __restrict__ row_input,
+         row_output, ordered_pivot, shared_scalars[1], my_chunk_start,
+         actual_chunk_size, local_histogram, suffix_sum, shared_ordered, state,
+         cta_in_group, ctas_per_group, barrier_phase, radix_iter, tx, counters,
+-        fault_inject_cta);
++        fault_inject_cta, tie_recent);
+     return;
+   }
+ 
+@@ -1854,10 +2114,23 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 2)
+             row_output[i] = (i < seq_len) ? static_cast<int32_t>(i) : -1;
+           }
+         } else if (seq_len <= static_cast<uint32_t>(HIST2048_THRESHOLD)) {
+-          histogram_2048_topk<TopK>(row_input, row_output, seq_len);
++          // An overflowing decode row comes back here for
++          // the same exact restart the medium path takes.  The return is
++          // block-uniform and nothing has been emitted that the restart does
++          // not overwrite.  With MERLIN_TOPK_EXACT_DECODE off this is always
++          // false and the decode path is byte-identical to the medium-path restart's.
++          const bool decode_needs_exact = histogram_2048_topk<TopK>(
++              row_input, row_output, seq_len, params.det_ties,
++              params.tie_recent, params.exact_counters, params.exact_decode);
++          if (decode_needs_exact) {
++            medium_exact_restart<TopK>(
++                row_input, row_output, seq_len, params.exact_counters,
++                effective_tie_recent(params.det_ties, params.tie_recent));
++          }
+         } else {
+           histogram_256_topk<TopK>(row_input, row_output, 0, seq_len,
+-                                   params.exact_medium, params.exact_counters);
++                                   params.exact_medium, params.exact_counters,
++                                   params.det_ties, params.tie_recent);
+         }
+       }
+       continue;
+@@ -1868,7 +2141,8 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 2)
+         row_input, row_output, seq_len, my_chunk_start, chunk_size,
+         local_histogram, suffix_sum, shared_scalars, shared_ordered, state,
+         cta_in_group, ctas_per_group, barrier_phase, radix_iter, tx,
+-        params.det_large, params.exact_counters, params.fault_inject_cta);
++        params.det_large, params.exact_counters, params.fault_inject_cta,
++        effective_tie_recent(params.det_ties, params.tie_recent));
+     radix_iter++;
+   }
+ }
+diff --git a/csrc/libtorch_stable/topk.cu b/csrc/libtorch_stable/topk.cu
+index 07d166a9f9..2d2c81dc07 100644
+--- a/csrc/libtorch_stable/topk.cu
++++ b/csrc/libtorch_stable/topk.cu
+@@ -29,6 +29,41 @@ namespace {
+ // behaviour exactly (the counters still record, so the control arm reports the
+ // overflow incidence it is the control for).
+ // ---------------------------------------------------------------------------
++// -------------------------------------------------------------------------
++// MERLIN_TIE_DET: deterministic tie-break at the k-th cutoff in
++// persistent_topk. Resolved once per process, exactly like
++// exact_medium_enabled() below, so it is a launch constant that a cudagraph
++// bakes in at capture.
++//
++// Our own toggle rather than upstream's VLLM_BATCH_INVARIANT, which aborts
++// engine startup on GDN models (upstream #42960) and so can never reach this
++// kernel on Flash-Next. Default OFF -- promotion is a release decision.
++//
++// This std::getenv is the SINGLE source of truth; vllm/envs.py carries a raw
++// passthrough for validate_environ and the compile-factor hash only.
++// -------------------------------------------------------------------------
++// MERLIN_TIE_RECENT -- the DIRECTION of the deterministic tie-break above.
++// Measured at 12k tokens on the reference host: oldest-wins costs -7.9 % decode,
++// most-recent-wins is +1.5 %. Both deterministic. Also the direction
++// medium_exact_restart() already implements, so setting this alongside
++// MERLIN_TIE_DET makes the medium path agree with itself on overflowing
++// rows. Only read when MERLIN_TIE_DET is set. Default OFF.
++bool tie_recent_enabled() {
++  static const bool enabled = [] {
++    const char* raw = std::getenv("MERLIN_TIE_RECENT");
++    return (raw != nullptr && raw[0] != '\0') ? (std::atoi(raw) != 0) : false;
++  }();
++  return enabled;
++}
++
++bool det_ties_enabled() {
++  static const bool enabled = [] {
++    const char* raw = std::getenv("MERLIN_TIE_DET");
++    return (raw != nullptr && raw[0] != '\0') ? (std::atoi(raw) != 0) : false;
++  }();
++  return enabled;
++}
++
+ bool exact_medium_enabled() {
+   static const bool enabled = [] {
+     const char* raw = std::getenv("MERLIN_TOPK_EXACT_MEDIUM");
+@@ -55,6 +90,23 @@ bool det_large_enabled() {
+   return enabled;
+ }
+ 
++// MERLIN_TOPK_EXACT_DECODE: repair an overflowing decode
++// row with the same exact restart the medium path uses. Resolved once per
++// process like the others, so it is a launch constant a cudagraph bakes in.
++//
++// Default OFF, unlike MERLIN_TOPK_EXACT_MEDIUM. The medium path's overflow
++// incidence was measured (0.1-0.2 % of medium rows at 38-51K) before that
++// switch defaulted on; the decode path's has never been measured at all,
++// which is precisely what the [10] counter now exists to establish. Detection
++// is unconditional and free; the repair waits on a number.
++bool exact_decode_enabled() {
++  static const bool enabled = [] {
++    const char* raw = std::getenv("MERLIN_TOPK_EXACT_DECODE");
++    return (raw != nullptr && raw[0] != '\0') ? (std::atoi(raw) != 0) : false;
++  }();
++  return enabled;
++}
++
+ // ---------------------------------------------------------------------------
+ // MERLIN_TOPK_LARGE_FAULT_INJECT.  TEST ONLY.
+ //
+@@ -79,6 +131,50 @@ int large_fault_inject_cta() {
+   return cta;
+ }
+ 
++// ---------------------------------------------------------------------------
++// Say the effective tie policy out loud, once.
++//
++// "TIE_DET=1 TIE_RECENT=0" used to mean three different things on the three
++// paths, and nothing printed the difference.  One stderr line at the first
++// launch of the process naming the policy the kernel will actually apply on
++// EVERY path.  It is a plain fprintf on the host: no CUDA call, so it is safe
++// from a capturing thread, and the `static` initialiser makes it exactly once
++// per process regardless of how many workers share the log.
++//
++// The line covers all FIVE paths.  The large
++// path is no longer a fixed rule: `radix_emit_deterministic` takes the same
++// `effective_tie_recent()` value as the medium restart, so `large=` reports
++// the real direction when MERLIN_TOPK_DET_LARGE is on and the inherited
++// v2.0.1 atomic-arrival race when it is off.  The flag printed here is the
++// ENV value; a launch whose ctas_per_group overflows the staging row degrades
++// to atomic-arrival for that launch and leaves counter [4] at 0, which is the
++// separate warning below.
++// ---------------------------------------------------------------------------
++void report_tie_policy_once() {
++  static const bool reported = [] {
++    const bool det = det_ties_enabled();
++    const bool recent =
++        vllm::persistent::effective_tie_recent(det, tie_recent_enabled());
++    const char* dir = recent ? "most-recent-wins" : "oldest-wins";
++    std::fprintf(
++        stderr,
++        "[merlin] persistent_topk tie policy: MERLIN_TIE_DET=%d "
++        "MERLIN_TIE_RECENT=%d MERLIN_TOPK_EXACT_MEDIUM=%d "
++        "MERLIN_TOPK_EXACT_DECODE=%d MERLIN_TOPK_DET_LARGE=%d -> "
++        "decode-buffered=%s decode-restart=%s medium-buffered=%s "
++        "medium-restart=%s large=%s\n",
++        det ? 1 : 0, tie_recent_enabled() ? 1 : 0,
++        exact_medium_enabled() ? 1 : 0, exact_decode_enabled() ? 1 : 0,
++        det_large_enabled() ? 1 : 0, det ? dir : "atomic-arrival",
++        exact_decode_enabled() ? dir : "n/a (detect-only; counter [10])",
++        det ? dir : "atomic-arrival",
++        exact_medium_enabled() ? dir : "n/a (exact restart disabled)",
++        det_large_enabled() ? dir : "atomic-arrival (non-deterministic)");
++    return true;
++  }();
++  (void)reported;
++}
++
+ // Process-lifetime device counters, one block per device.  The kernel only
+ // ever atomicAdds into them, so the launch path needs no host sync and the
+ // values accumulate across cudagraph replays.
+@@ -421,6 +517,10 @@ void launch_persistent_topk(const torch::stable::Tensor& logits,
+                      params.fault_inject_cta);
+       }
+     }
++    params.det_ties = det_ties_enabled();
++    params.tie_recent = tie_recent_enabled();
++    params.exact_decode = exact_decode_enabled();
++    report_tie_policy_once();
+     // Allocate only off the capture path; in the ordinary engine lifecycle the
+     // eager warmup lands here first, long before capture.  The explicit,
+     // quiescent-phase entry point is the reader op.
+@@ -526,9 +626,10 @@ void persistent_topk(const torch::stable::Tensor& logits,
+ // device before any cudagraph capture.
+ //
+ // PROTOCOL VERSION 2 -- BREAKING.  `out` is an **int64**
+-// CUDA tensor with at least 10 elements; int32 is REJECTED, not silently
+-// accepted.  The device counters are 64-bit unsigned and are copied D2D
+-// without conversion, so the reader's element width must match the device's.
++// CUDA tensor with EXACTLY kNumTopKExactCounters (11) elements; int32, and any
++// other length, are REJECTED rather than silently accepted.  The device counters are 64-bit unsigned
++// and are copied D2D without conversion, so the reader's element width must
++// match the device's.
+ //
+ // Why the break rather than a reinterpreting reader: the counters were u32
+ // copied into a SIGNED int32 tensor.  At 65,536 columns with k=512 an
+@@ -543,11 +644,20 @@ void persistent_topk(const torch::stable::Tensor& logits,
+ // so the instrument costs the same, and a 64-bit slot cannot be driven to the
+ // signed boundary by any run this kernel will ever see.
+ //
++// The layout is the UNION of the tie-determinism and large-path slot
++// maps -- the large path's ten slots plus the decode restart's [10] decode_overflow, eleven in all,
++// with nothing renumbered.  The two switch flags are slots INSIDE the array at
++// [8] and [9], not two elements appended after it, so a probe sized to the
++// old ten- or five-element layout is rejected by the length check below rather
++// than being filled with the wrong meanings.  Ask the build for its own answer
++// with `torch.ops._C.persistent_topk_exact_counters_slots()`.
++//
+ // Everything that reads these counters must move together: the Python reader
+-// `vllm/models/qwen4_exp/nvidia/ops/topk_counters.py` now allocates int64, and
+-// the medium-path tests allocate int64.  An int32 caller gets a loud error rather
+-// than half a number.  The OPERATOR SCHEMA is unchanged (dtype is not part of
+-// it), so a stale caller fails at the check, not at the binding.
++// `vllm/models/qwen4_exp/nvidia/ops/topk_counters.py` allocates int64 and
++// eleven slots, and the medium- and large-path tests do too.  An int32 caller gets a loud
++// error rather than half a number.  The OPERATOR SCHEMA is unchanged (dtype
++// and length are not part of it), so a stale caller fails at the check, not at
++// the binding.
+ //
+ // Slots:
+ //   [0] medium-path rows entered           (denominator)
+@@ -558,8 +668,11 @@ void persistent_topk(const torch::stable::Tensor& logits,
+ //   [5] large-path rows whose pivot-equal group was cut at the k-th value
+ //   [6] large-path pivot-equal elements discarded by those cuts
+ //   [7] large-path invariant violations (must stay 0)
+-//   [8] 1 if MERLIN_TOPK_EXACT_MEDIUM is on, else 0
+-//   [9] 1 if MERLIN_TOPK_DET_LARGE is on, else 0
++//   [8] 1 if MERLIN_TOPK_EXACT_MEDIUM is on, else 0   (host-written)
++//   [9] 1 if MERLIN_TOPK_DET_LARGE is on, else 0      (host-written)
++//   [10] decode rows whose buffered candidates exceeded DBUF (3,708)
++//        before deterministic ranking -- MUST be read before any decode-path
++//        determinism claim
+ //
+ // COHERENCY -- stated precisely, because the earlier wording overclaimed.
+ // With `sync == 0` the snapshot is ordered ONLY against work already enqueued
+@@ -587,7 +700,8 @@ void persistent_topk_exact_counters(torch::stable::Tensor& out, int64_t reset,
+       out.scalar_type() == torch::headeronly::ScalarType::Long,
+       "out must be int64: the exact-restart counters are 64-bit as of the "
+       "large-path counter protocol change, and an int32 buffer would be filled "
+-      "from half of each counter. Allocate torch.zeros(10, dtype=torch.int64)."
++      "from half of each counter. Allocate "
++      "torch.zeros(persistent_topk_exact_counters_slots(), dtype=torch.int64)."
+       " (int32 was protocol version 1 and is deliberately rejected.)");
+   // Element count alone is not enough.  A CUDA scalar expanded
+   // to ten elements (stride 0) satisfies numel but owns one element's storage,
+@@ -598,9 +712,19 @@ void persistent_topk_exact_counters(torch::stable::Tensor& out, int64_t reset,
+   STD_TORCH_CHECK(out.is_contiguous(),
+                   "out must be contiguous (expanded or strided views would be "
+                   "written out of bounds or into the wrong elements)");
+-  STD_TORCH_CHECK(out.numel() >= vllm::persistent::kNumTopKExactCounters + 2,
+-                  "out must hold at least ",
+-                  vllm::persistent::kNumTopKExactCounters + 2, " elements");
++  // EXACTLY the build's slot count, not "at least".  `>=` accepted an
++  // 11-element buffer on the ten-slot large-path build and quietly left the extra
++  // element reading 0 -- a caller compiled against one layout got a plausible
++  // answer from a build with another, which is the failure mode the
++  // self-describing `..._slots` op exists to prevent.  Ask the build, size the
++  // buffer to what it says, and a mismatch is an error rather than a wrong
++  // number.
++  STD_TORCH_CHECK(out.numel() == vllm::persistent::kNumTopKExactCounters,
++                  "out must hold exactly ",
++                  vllm::persistent::kNumTopKExactCounters,
++                  " elements (this build's persistent_topk_exact_counters_"
++                  "slots(); the switch flags are slots inside the array, not "
++                  "appended after it), got ", out.numel());
+   STD_TORCH_CHECK(
+       reset == 0 || sync != 0,
+       "persistent_topk_exact_counters: reset requires sync != 0, otherwise the "
+@@ -645,15 +769,20 @@ void persistent_topk_exact_counters(torch::stable::Tensor& out, int64_t reset,
+   }
+ 
+   // Static storage: the source of an async H2D copy must outlive the copy.
+-  // Two flags: [kNumTopKExactCounters] = the medium-path switch,
+-  //            [kNumTopKExactCounters + 1] = the large-path switch.  The large
+-  // flag reports the ENV value, not the per-launch effective value: a launch
+-  // whose ctas_per_group overflowed the staging row still reports 1 here and
+-  // leaves counter [4] at 0, which is how that degradation is diagnosed.
++  // Written AFTER the device copy, which has already zeroed both slots: they
++  // are slots [8] and [9] INSIDE the array and the device never touches them.
++  // The large flag reports the ENV value, not the per-launch effective value:
++  // a launch whose ctas_per_group overflowed the staging row still reports 1
++  // here and leaves counter [4] at 0, which is how that degradation is
++  // diagnosed.  kSlotSwitchLarge == kSlotSwitchMedium + 1, so one copy does
++  // both.
++  static_assert(vllm::persistent::kSlotSwitchLarge ==
++                    vllm::persistent::kSlotSwitchMedium + 1,
++                "the two host-written flags must stay adjacent for this copy");
+   static const int64_t enabled[2] = {exact_medium_enabled() ? 1 : 0,
+                                      det_large_enabled() ? 1 : 0};
+   STD_TORCH_CHECK(
+-      cudaMemcpyAsync(dst + vllm::persistent::kNumTopKExactCounters, enabled,
++      cudaMemcpyAsync(dst + vllm::persistent::kSlotSwitchMedium, enabled,
+                       2 * sizeof(int64_t), cudaMemcpyHostToDevice,
+                       stream) == cudaSuccess,
+       "exact counter flag write failed");
+@@ -670,3 +799,19 @@ void persistent_topk_exact_counters(torch::stable::Tensor& out, int64_t reset,
+   STD_TORCH_CHECK(false, "persistent_topk is not supported on ROCm");
+ #endif
+ }
++
++// How many int32 slots THIS build's counter array carries.
++//
++// The Python reader used to guess from MERLIN_TOPK_COUNTER_SLOTS (default 5)
++// and name the slots by that length. The decode restart makes the array 11 and the large path makes
++// it 10, so a guess is now wrong on at least one branch, and a reader that
++// allocates the wrong length is rejected by the length check above -- the
++// instrument goes dark exactly when it starts mattering. Ask the build
++// instead. No CUDA call, no allocation, safe from anywhere.
++int64_t persistent_topk_exact_counters_slots() {
++#ifndef USE_ROCM
++  return static_cast<int64_t>(vllm::persistent::kNumTopKExactCounters);
++#else
++  return 0;
++#endif
++}
+diff --git a/csrc/libtorch_stable/torch_bindings.cpp b/csrc/libtorch_stable/torch_bindings.cpp
+index 44c5f95f8e..53f4577b0d 100644
+--- a/csrc/libtorch_stable/torch_bindings.cpp
++++ b/csrc/libtorch_stable/torch_bindings.cpp
+@@ -590,6 +590,7 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
+   // Read (and optionally reset) the medium-path exact-restart counters.
+   ops.def(
+       "persistent_topk_exact_counters(Tensor! out, int reset, int sync) -> ()");
++  ops.def("persistent_topk_exact_counters_slots() -> int");
+ 
+ #ifdef VLLM_ENABLE_COOPERATIVE_TOPK
+   ops.def(
+@@ -866,6 +867,8 @@ STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
+   ops.impl("persistent_topk", TORCH_BOX(&persistent_topk));
+   ops.impl("persistent_topk_exact_counters",
+            TORCH_BOX(&persistent_topk_exact_counters));
++  ops.impl("persistent_topk_exact_counters_slots",
++           TORCH_BOX(&persistent_topk_exact_counters_slots));
+ #ifdef VLLM_ENABLE_COOPERATIVE_TOPK
+   ops.impl("cooperative_topk", TORCH_BOX(&cooperative_topk));
+ #endif
+diff --git a/tests/kernels/test_top_k_per_row.py b/tests/kernels/test_top_k_per_row.py
+index 9c775b070f..fa6ee84f0b 100644
+--- a/tests/kernels/test_top_k_per_row.py
++++ b/tests/kernels/test_top_k_per_row.py
+@@ -1081,7 +1081,7 @@ def run_large_context_topk_test(
+             Torch: {torch_vals.sort(descending=True)[0][:10]}"""
+ 
+ 
+-@pytest.mark.skipif(not _has_device_capability(90), reason="This test requires SM90+")
++@pytest.mark.skipif(not _has_device_capability(90), reason="cooperative_topk is sm_90+ only")
+ @pytest.mark.parametrize("top_k", [512, 1024, 2048])
+ def test_cooperative_topk_cs2(top_k: int) -> None:
+     """The 64-row dispatch uses the two-CTA cooperative kernel.
+@@ -1861,8 +1861,13 @@ def test_sparse_indexer_topk_backend_resolution() -> None:
+ # ---------------------------------------------------------------------------
+ 
+ # Slot map of torch.ops._C.persistent_topk_exact_counters (see
+-# csrc/libtorch_stable/topk.cu).  The large path appended four counters and a
+-# second switch flag, so the medium-path "enabled" flag moved from [4] to [8].
++# csrc/libtorch_stable/topk.cu).  Eleven slots, the
++# union of the tie-determinism and large-path determinism layouts with nothing renumbered -- the large path appended four
++# large-path counters and a second switch flag (so the medium-path "enabled" flag
++# moved from [4] to [8]) and the tie-determinism change numbered its decode counter AROUND that
++# block at [10].  Slots 8-9 are `kSlotSwitchMedium` / `kSlotSwitchLarge` in
++# the kernel: host-written flags, not device counters.
++_EXACT_COUNTER_SLOTS = 11
+ _SLOT_MEDIUM_ROWS = 0
+ _SLOT_MEDIUM_OVERFLOW = 1
+ _SLOT_MEDIUM_FALLBACK = 2
+@@ -1873,7 +1878,7 @@ _SLOT_LARGE_TIES_DROPPED = 6
+ _SLOT_LARGE_FAULT = 7
+ _SLOT_EXACT_MEDIUM_ON = 8
+ _SLOT_DET_LARGE_ON = 9
+-_EXACT_COUNTER_SLOTS = 10
++_SLOT_DECODE_OVERFLOW = 10
+ 
+ 
+ def _read_exact_counters() -> list[int] | None:
+@@ -1882,6 +1887,7 @@ def _read_exact_counters() -> list[int] | None:
+     [0..3] medium:  rows, overflow, exact fallbacks, faults.
+     [4..7] large:   deterministic rows, tie cuts, elements cut, faults.
+     [8]    MERLIN_TOPK_EXACT_MEDIUM, [9] MERLIN_TOPK_DET_LARGE.
++    [10]   decode overflow.
+     """
+     op = getattr(torch.ops._C, "persistent_topk_exact_counters", None)
+     if op is None:
+@@ -2022,9 +2028,10 @@ def test_persistent_topk_medium_overflow_is_bit_reproducible() -> None:
+ 
+ 
+ @pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
++@pytest.mark.parametrize("want_recent", [True, False])
+ @torch.inference_mode()
+-def test_persistent_topk_medium_overflow_tie_keeps_highest_indices() -> None:
+-    """Most-recent-wins at the cutoff, with an analytically known answer.
++def test_persistent_topk_medium_overflow_tie_direction(want_recent: bool) -> None:
++    """The exact restart's tie cut, in BOTH directions, analytically known.
+ 
+     Random float32 values essentially never tie at the k-th place, so the
+     exactness tests above never exercise the tie rule at all -- they pass
+@@ -2037,14 +2044,39 @@ def test_persistent_topk_medium_overflow_tie_keeps_highest_indices() -> None:
+         index-radix tie rounds actually run,
+       * the cut spans several high-byte index buckets and lands mid-bucket.
+ 
+-    Under most-recent-wins the answer is forced: the top_k HIGHEST indices,
+-    emitted ascending. `torch.topk` cannot supply this expectation -- with all
++    Both directions are forced answers: the top_k HIGHEST indices under
++    most-recent-wins, the top_k LOWEST under oldest-wins, emitted ascending
++    either way. `torch.topk` cannot supply either expectation -- with all
+     values equal its index choice is arbitrary -- so the reference is computed
+     from the rule itself.
++
++    The direction is a launch constant resolved once per
++    process from `MERLIN_TIE_DET` / `MERLIN_TIE_RECENT`, so the arm that does
++    not match this worker's environment cannot be exercised here and skips
++    LOUDLY naming the environment that would run it. Both arms must be run,
++    in two fresh worker processes -- a green run of one arm is half the gate.
+     """
+     torch.set_default_device("cuda:0")
+     num_rows, seq_len, width, top_k = 4, 12345, 12352, 2048
+ 
++    # effective_tie_recent(det_ties, tie_recent) in persistent_topk.cuh, in
++    # Python. Keep the two in step: this is the reported policy, and the
++    # kernel's launcher prints the same resolution to stderr at first use.
++    det_ties = bool(int(os.environ.get("MERLIN_TIE_DET", "0") or "0"))
++    tie_recent = bool(int(os.environ.get("MERLIN_TIE_RECENT", "0") or "0"))
++    effective_recent = tie_recent if det_ties else True
++    if effective_recent != want_recent:
++        pytest.skip(
++            f"this worker resolves the tie direction to "
++            f"{'most-recent' if effective_recent else 'oldest'}-wins "
++            f"(MERLIN_TIE_DET={int(det_ties)} "
++            f"MERLIN_TIE_RECENT={int(tie_recent)}); run the "
++            f"{'most-recent' if want_recent else 'oldest'}-wins arm in a fresh "
++            f"process with "
++            + ("MERLIN_TIE_DET=0 (or =1 with MERLIN_TIE_RECENT=1)"
++               if want_recent else "MERLIN_TIE_DET=1 MERLIN_TIE_RECENT=0")
++        )
++
+     before = _read_exact_counters()
+     if before is None:
+         pytest.skip(
+@@ -2068,17 +2100,134 @@ def test_persistent_topk_medium_overflow_tie_keeps_highest_indices() -> None:
+     assert after[2] - before[2] == num_rows, "the exact restart did not run"
+     assert after[3] == before[3], "the exact fallback reported a fault"
+ 
+-    # The cut must genuinely exercise both tie rounds, or the test is weaker
+-    # than it looks: several high-byte buckets, and not on a bucket boundary.
+-    cut = seq_len - top_k
+-    assert (cut >> 8) != ((seq_len - 1) >> 8), "tie cut spans only one bucket"
+-    assert cut % 256 != 0, "tie cut sits on a bucket boundary"
++    # The cut must genuinely exercise both index-radix rounds, or the test is
++    # weaker than it looks. Each direction has its own cut index and its own
++    # strength, stated separately rather than asserted as if they were one.
++    if want_recent:
++        # Highest top_k indices: cut at seq_len - top_k, several high-byte
++        # buckets away from the top and landing mid-bucket.
++        lo, hi = seq_len - top_k, seq_len
++        cut = lo
++        assert (cut >> 8) != ((seq_len - 1) >> 8), "tie cut spans only one bucket"
++        assert cut % 256 != 0, "tie cut sits on a bucket boundary"
++    else:
++        # Lowest top_k indices: cut at top_k - 1. top_k is a whole number of
++        # 256-index buckets, so this one necessarily lands on the LAST slot of
++        # its bucket -- which makes round B walk all 256 low bins before it
++        # crosses, the opposite corner from the arm above.
++        lo, hi = 0, top_k
++        cut = hi - 1
++        assert (cut >> 8) != 0, "tie cut spans only one bucket"
++        assert cut % 256 == 255, "the oldest-wins cut should end its bucket"
++    expected = torch.arange(lo, hi, dtype=torch.int32, device="cuda")
++    rule = "most-recent-wins" if want_recent else "oldest-wins"
++    for row in range(num_rows):
++        assert torch.equal(indices[row], expected), (
++            f"row {row}: {rule} should select indices "
++            f"[{lo}, {hi}) in ascending order; got "
++            f"{indices[row][:4].tolist()}..{indices[row][-4:].tolist()}"
++        )
++
++
++# ---------------------------------------------------------------------------
++# DECODE candidate truncation, the adversarial class.
++#
++# The decode path buffers the coarse threshold bin's candidates into a
++# 3,708-slot shared buffer (`DBUF`) and refines only what it retained.
++# MERLIN_TIE_DET ranks the survivors deterministically; it cannot recall a
++# winner that was never buffered. The historical zero-overflow measurements
++# establish workload coverage, not a capacity proof.
++# ---------------------------------------------------------------------------
++
+ 
+-    expected = torch.arange(cut, seq_len, dtype=torch.int32, device="cuda")
++@pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
++@torch.inference_mode()
++def test_persistent_topk_decode_overflow_is_detected() -> None:
++    """The failing control for the decode-overflow counter.
++
++    The adversarial row: 8,192 elements that all land in ONE coarse
++    half-precision bin, so the coarse pass separates nothing and every element
++    becomes a buffered candidate -- 8,192 of them into 3,708 slots. Within
++    that bin three FP32 levels, all rounding to the same half:
++
++      * indices [0, 511)      the highest value      -> the 511 true leaders,
++      * index   seq_len - 1   the middle value       -> the 512th true winner,
++      * everything else       the lowest value.
++
++    Element order does the rest: the 512th winner sits at the END of the row,
++    so it is appended after capacity is gone and is dropped before any ranking
++    runs. The returned set then holds the 511 leaders plus an arbitrary
++    element of the bulk.
++
++    This test asserts the COUNTER, not the repair: it is the control that
++    fails on a build without the detection (there is no slot 10 to read, and
++    the op rejects the 11-element buffer), and it is what makes the decode
++    path's determinism claim conditional on a measured number rather than on
++    an unmeasured assumption. Exactness is asserted only when the repair is
++    actually enabled, since MERLIN_TOPK_EXACT_DECODE is a launch constant this
++    process cannot change.
++    """
++    torch.set_default_device("cuda:0")
++    num_rows, seq_len, top_k = 4, 8192, 512
++    leaders = top_k - 1  # 511; the 512th winner is the tail element
++
++    before = _read_exact_counters()
++    if before is None:
++        pytest.skip(
++            "QUALIFICATION FAILURE if seen on the branch build: no "
++            "persistent_topk_exact_counters op. A skip is not a pass."
++        )
++
++    # Three FP32 levels a few ULPs apart. Half-precision spacing near 1.5 is
++    # 2**-10, about 8,000x these gaps, so all three round to the same half and
++    # therefore to the same coarse bin -- asserted below rather than assumed.
++    base = np.float32(1.5)
++    mid = np.nextafter(np.nextafter(base, np.float32(np.inf)), np.float32(np.inf))
++    high = np.nextafter(np.nextafter(mid, np.float32(np.inf)), np.float32(np.inf))
++    assert base < mid < high
++    assert (
++        np.float16(base) == np.float16(mid) == np.float16(high)
++    ), "the three levels must share one half-precision bin or the row is not adversarial"
++
++    logits = torch.full((num_rows, seq_len), float(base), dtype=torch.float32)
++    logits[:, :leaders] = float(high)
++    logits[:, seq_len - 1] = float(mid)
++    lengths = torch.full((num_rows,), seq_len, dtype=torch.int32)
++    indices = torch.empty((num_rows, top_k), dtype=torch.int32)
++    _run_topk_backend("persistent_topk", logits, lengths, indices, top_k, seq_len)
++    torch.accelerator.synchronize()
++
++    after = _read_exact_counters()
++    fired = after[_SLOT_DECODE_OVERFLOW] - before[_SLOT_DECODE_OVERFLOW]
++    assert fired == num_rows, (
++        f"the decode candidate buffer overflowed on {num_rows} rows by "
++        f"construction (8,192 candidates into 3,708 slots) but the counter "
++        f"moved by {fired}; the truncation is happening unseen"
++    )
++
++    # Whatever the arm, the row must still be a well-formed selection.
++    for row in range(num_rows):
++        got = indices[row].tolist()
++        assert len(set(got)) == top_k, f"row {row}: duplicate indices"
++        assert all(0 <= i < seq_len for i in got), f"row {row}: index out of range"
++
++    if not bool(int(os.environ.get("MERLIN_TOPK_EXACT_DECODE", "0") or "0")):
++        pytest.skip(
++            "MERLIN_TOPK_EXACT_DECODE=0 (the default): detection asserted "
++            "above, the repair is not enabled in this process, so exactness "
++            "is NOT claimed for this row. Run this test again in a fresh "
++            "process with MERLIN_TOPK_EXACT_DECODE=1 for the repaired arm -- "
++            "a green detect-only run is half the gate."
++        )
++
++    # Repaired arm: the exact answer is forced and contains the tail winner.
++    expected = torch.tensor(
++        list(range(leaders)) + [seq_len - 1], dtype=torch.int32, device="cuda"
++    )
+     for row in range(num_rows):
+         assert torch.equal(indices[row], expected), (
+-            f"row {row}: most-recent-wins should select indices "
+-            f"[{cut}, {seq_len}) in ascending order; got "
++            f"row {row}: the exact decode restart should select "
++            f"[0, {leaders}) plus {seq_len - 1}; got "
+             f"{indices[row][:4].tolist()}..{indices[row][-4:].tolist()}"
+         )
+ 
+@@ -2111,6 +2260,16 @@ def test_persistent_topk_exact_counters_rejects_unsafe_output() -> None:
+     ok = torch.zeros(_EXACT_COUNTER_SLOTS, dtype=torch.int64, device="cuda")
+     op(ok, 0, 1)  # the control: this layout must be accepted
+ 
++    slots_op = getattr(torch.ops._C, "persistent_topk_exact_counters_slots", None)
++    assert slots_op is not None, (
++        "the build must describe its own counter layout; a guessed length is "
++        "how a stale probe reads the wrong slots"
++    )
++    assert int(slots_op()) == _EXACT_COUNTER_SLOTS, (
++        f"build reports {int(slots_op())} slots, test expects "
++        f"{_EXACT_COUNTER_SLOTS}"
++    )
++
+     wrong_dtype = torch.zeros(_EXACT_COUNTER_SLOTS, dtype=torch.int32, device="cuda")
+     with pytest.raises(Exception):
+         op(wrong_dtype, 0, 1)
+@@ -2131,6 +2290,20 @@ def test_persistent_topk_exact_counters_rejects_unsafe_output() -> None:
+     with pytest.raises(Exception):
+         op(too_small, 0, 1)
+ 
++    # Too LARGE is rejected too. The check used to be `>=`, so a buffer sized
++    # for one layout was accepted by a build with another and the surplus
++    # slots read 0 -- a plausible answer from the wrong protocol.
++    too_large = torch.zeros(_EXACT_COUNTER_SLOTS + 1, dtype=torch.int64, device="cuda")
++    with pytest.raises(Exception):
++        op(too_large, 0, 1)
++
++    # This case matters: a stale medium-path five-element probe must
++    # be REJECTED, not filled with the wrong meanings.  It is the same length
++    # check as above, asserted at the length a real stale caller would use.
++    medium_sized = torch.zeros(5, dtype=torch.int64, device="cuda")
++    with pytest.raises(Exception):
++        op(medium_sized, 0, 1)
++
+     with pytest.raises(Exception):
+         op(ok, 1, 0)  # reset without sync is not a complete handoff
+ 
+@@ -2159,24 +2332,49 @@ def test_topk_exact_counters_reader_log_line(monkeypatch) -> None:
+     monkeypatch.setenv("MERLIN_TOPK_COUNTER_SLOTS", str(_EXACT_COUNTER_SLOTS))
+     assert envs.MERLIN_TOPK_EXACT_COUNTERS_LOG == 1
+ 
++    # The build now exposes the slot count, so the env fallback above is
++    # dead on this branch -- assert the build is what answers, because a
++    # reader that guessed a stale length would be rejected by the op.
++    assert topk_counters.slot_count() == _EXACT_COUNTER_SLOTS, (
++        "the build and the test disagree about the counter layout"
++    )
+     counters = topk_counters.read()
++    # The dict is in SLOT order, which is NOT the line order: the line puts the
++    # five medium-path fields first (see `_LINE_ORDER`), the array puts the large path's
++    # large-path block at 4-7 and the two switch flags at 8-9. Asserting the
++    # first five dict keys against the medium-path names is what fails on any build
++    # carrying the large-path block, so assert the whole layout instead.
+     assert list(counters) == [
+         "rows",
+         "overflow",
+         "fallbacks",
+         "faults",
++        "rows_large",
++        "ties_cut",
++        "ties_dropped",
++        "faults_large",
+         "switch",
+-    ], f"unexpected slot names: {list(counters)}"
++        "switch_large",
++        "decode_overflow",
++    ], f"unexpected slot layout: {list(counters)}"
+     assert counters == dict(zip(counters, direct, strict=True)), (
+         "the reader disagrees with a direct op call"
+     )
+ 
+     line = topk_counters.log_line("PP0_TP0")
++    # The documented medium-path prefix is asserted verbatim -- the smoke keys on it
++    # -- and any later slot may follow as `name=<int>`.
+     assert re.fullmatch(
+         r"topk-exact-counters rank=PP0_TP0 rows=\d+ overflow=\d+ "
+-        r"fallbacks=\d+ faults=\d+ switch=\d+",
++        r"fallbacks=\d+ faults=\d+ switch=\d+(?: [a-z_0-9]+=\d+)*",
+         line,
+     ), f"log line does not match the documented format: {line!r}"
++    assert " decode_overflow=" in line, (
++        f"the decode-overflow counter is not in the line: {line!r}"
++    )
++    assert " switch_large=" in line, (
++        f"the large-path switch flag is not in the line: {line!r}"
++    )
+ 
+     # The cadence gate must also be able to emit -- a reader that never fires
+     # from maybe_log() is the same defect one level up.
+diff --git a/tests/test_envs.py b/tests/test_envs.py
+index 891954bb4b..4e8513ed4e 100644
+--- a/tests/test_envs.py
++++ b/tests/test_envs.py
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
+ import os
++import re
+ from pathlib import Path
+ from unittest.mock import patch
+ 
+@@ -603,6 +604,8 @@ class TestVllmMaxNSequences:
+ # rests on not changing the value between capture and replay in one process.
+ # These tests check the AOT side, which is the side this file can check.
+ #
++# The determinism toggles, and the gate that keeps unaudited knobs out.
++#
+ # Each row is (name, value to set, value the getter must then return). The
+ # expected value matters: a getter that ignored the environment would still
+ # satisfy a bare membership check, so every row proves the entry is live.
+@@ -646,17 +649,35 @@ _FORK_IGNORED = [
+     ("VLLM_E2_MAMBA_SLOT_OWNERSHIP", " RAISE ", "raise"),
+ ]
+ 
+-# Not in this repository at all: a reference-host-side patch stack. Named in
+-# the TODO block in envs.py and deliberately unregistered until someone reads
+-# their real read sites and classifies both identities.
+-_FORK_UNAUDITED = [
+-    "MERLIN_FULL_K",
+-    "MERLIN_QSA_SORT",
+-    "MERLIN_TIE_DET",
+-    "MERLIN_TIE_RECENT",
+-    "MERLIN_PIN_BSM",
++# Marker fence around the unaudited-knob block in envs.py. The gate below scans
++# BETWEEN these, never the whole file -- see its docstring for why.
++_UNAUDITED_START = "# --8<-- [start:unaudited-host-side-knobs]"
++_UNAUDITED_END = "# --8<-- [end:unaudited-host-side-knobs]"
++
++# All four are compile/capture factors and must be hashed. Three are raw
++# passthroughs of a value that C++ parses; MERLIN_QSA_SORT is parsed here.
++_TIEDET_HASHED = [
++    ("MERLIN_FULL_K", "1", "1"),
++    ("MERLIN_TIE_DET", "1", "1"),
++    ("MERLIN_TIE_RECENT", "1", "1"),
++    ("MERLIN_QSA_SORT", "1", True),
+ ]
+ 
++# The persistent_topk kernel switches. Raw passthroughs
++# of values C++ parses, hashed on the same conservative rule as the four above.
++# They are NOT in _TIEDET_HASHED because "unset reads falsy" says nothing useful
++# about them -- MERLIN_TOPK_EXACT_MEDIUM's C++ default is ON, so asserting it
++# under test_tiedet_toggle_defaults_off would be a test that cannot fail in the
++# direction that matters.
++_TIEDET_KERNEL_SWITCHES = [
++    ("MERLIN_TOPK_EXACT_MEDIUM", "0", "0"),
++    ("MERLIN_TOPK_EXACT_DECODE", "1", "1"),
++    ("MERLIN_TOPK_DET_LARGE", "1", "1"),
++]
++
++# Named in the envs.py fenced block, deliberately NOT registered.
++_TIEDET_UNAUDITED = ["MERLIN_PIN_BSM"]
++
+ 
+ def _fresh_env_value(name: str):
+     if hasattr(envs.__getattr__, "cache_clear"):
+@@ -678,6 +699,43 @@ def test_fork_knob_is_a_cache_factor(
+     assert factors[name] == expected
+ 
+ 
++def _unaudited_names(source: str) -> set[str]:
++    """The knob names listed between the two fence markers.
++
++    Identifiers, not a substring scan: `"MERLIN_FULL_K" in block` is true for a
++    fence whose prose merely mentions the name, which is the same class of
++    defect one level down. Raises if the fence is missing or inverted, so
++    deleting a marker fails the gate instead of silently emptying it.
++    """
++    start = source.find(_UNAUDITED_START)
++    end = source.find(_UNAUDITED_END)
++    assert start != -1, f"missing marker {_UNAUDITED_START!r} in envs.py"
++    assert end != -1, f"missing marker {_UNAUDITED_END!r} in envs.py"
++    assert start < end, "unaudited-knob markers are inverted in envs.py"
++    block = source[start + len(_UNAUDITED_START) : end]
++    return set(re.findall(r"\b[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+\b", block))
++
++
++def _envs_source() -> str:
++    return Path(envs.__file__).read_text(encoding="utf-8")
++
++
++@pytest.mark.parametrize(
++    ("name", "value", "expected"), _TIEDET_HASHED + _TIEDET_KERNEL_SWITCHES
++)
++def test_tiedet_toggle_is_a_cache_factor(
++    name: str, value: str, expected, monkeypatch: pytest.MonkeyPatch
++):
++    """A knob that can change a compiled or captured artifact must be hashed,
++    and the hashed value must follow the environment."""
++    assert name in environment_variables
++    monkeypatch.setenv(name, value)
++    assert _fresh_env_value(name) == expected
++    factors = envs.compile_factors()
++    assert name in factors
++    assert factors[name] == expected
++
++
+ @pytest.mark.parametrize(("name", "value", "expected"), _FORK_IGNORED)
+ def test_fork_runtime_knob_is_not_a_cache_factor(
+     name: str, value: str, expected, monkeypatch: pytest.MonkeyPatch
+@@ -691,41 +749,128 @@ def test_fork_runtime_knob_is_not_a_cache_factor(
+     assert name not in envs.compile_factors()
+ 
+ 
+-@pytest.mark.parametrize("name", _FORK_UNAUDITED)
++@pytest.mark.parametrize(("name", "value", "expected"), _TIEDET_HASHED)
++def test_tiedet_toggle_defaults_off(
++    name: str, value: str, expected, monkeypatch: pytest.MonkeyPatch
++):
++    """Promotion is a release decision. Unset, every toggle must read as off."""
++    monkeypatch.delenv(name, raising=False)
++    assert not _fresh_env_value(name)
++
++
++@pytest.mark.parametrize(
++    "name",
++    [n for n, _, _ in _TIEDET_HASHED + _TIEDET_KERNEL_SWITCHES] + _TIEDET_UNAUDITED,
++)
+ def test_unaudited_host_side_knob_stays_listed_until_it_is_classified(name: str):
+-    """The TODO block in envs.py is a gate, not a note.
++    """The fenced block in envs.py is a gate, not a note.
+ 
+     Registering one of these without classifying it -- which means deleting it
+     from that block once its AOT and capture identity are written down against
+     its real read site -- is the exact failure the fork's env rule
+     exists to prevent, so it fails here.
++
++    The scan is scoped to the fenced block, not to the whole file. Scanning the
++    whole file is the defect of an earlier version: a legitimately
++    registered knob NECESSARILY appears in envs.py -- as its declaration and as
++    its `environment_variables` key -- so `name in source` is True for every
++    registered knob and the `assert not listed` branch could never pass. The
++    gate could only ever be satisfied by leaving the knob unregistered, which
++    inverts what it was written to enforce.
+     """
+-    source = Path(envs.__file__).read_text(encoding="utf-8")
+-    # Scan ONLY the delimited block. Scanning the whole file can never pass
+-    # once a knob is legitimately registered, because the registry entry
+-    # contains the knob's own name -- the gate would block the very act it
+-    # exists to sequence.
+-    start = source.index("# --8<-- [start:fork-unaudited-knobs]")
+-    end = source.index("# --8<-- [end:fork-unaudited-knobs]")
+-    assert start < end, "the unaudited-knob block markers are inverted"
+-    block = source[start:end]
+-    listed = name in block
++    listed = name in _unaudited_names(_envs_source())
+     if name in environment_variables:
+         assert not listed, (
+-            f"{name} is registered but still named in the envs.py TODO block: "
+-            "classify its AOT and capture identity from its real read site and "
+-            "remove it from that block"
++            f"{name} is registered but still named in the envs.py unaudited "
++            "block: classify its AOT and capture identity from its real read "
++            "site and remove it from that block"
+         )
+     else:
+         assert listed, (
+-            f"{name} is neither registered nor named in the envs.py TODO block; "
+-            "every fork knob must be accounted for"
++            f"{name} is neither registered nor named in the envs.py unaudited "
++            "block; every fork knob must be accounted for"
+         )
+ 
+ 
++def test_unaudited_gate_discriminates_both_worlds():
++    """Control for the gate above: it must be able to FAIL.
++
++    A membership test that reports the same thing in the registered and the
++    unregistered world measures nothing -- which is precisely how the previous
++    whole-file version passed unnoticed. So assert the scan reports differently on
++    a source that lists a knob inside the fence and one that names it only
++    outside, and assert the real envs.py is in the state the gate claims.
++    """
++    listed = "\n".join(
++        [_UNAUDITED_START, "    #     MERLIN_EXAMPLE", _UNAUDITED_END, ""]
++    )
++    registered = "\n".join(
++        [
++            "    # MERLIN_EXAMPLE was classified and removed from the fence.",
++            _UNAUDITED_START,
++            _UNAUDITED_END,
++            "    MERLIN_EXAMPLE: str | None = None",
++            '    "MERLIN_EXAMPLE": lambda: os.getenv("MERLIN_EXAMPLE", None),',
++            "",
++        ]
++    )
++    assert "MERLIN_EXAMPLE" in _unaudited_names(listed)
++    assert "MERLIN_EXAMPLE" not in _unaudited_names(registered)
++    # The whole-file scan the defective version used cannot tell them apart,
++    # and neither can a substring scan of the fence.
++    assert "MERLIN_EXAMPLE" in listed and "MERLIN_EXAMPLE" in registered
++
++    # And the live file really is in both states at once, one knob each way.
++    names = _unaudited_names(_envs_source())
++    assert "MERLIN_FULL_K" in _envs_source()
++    assert "MERLIN_FULL_K" not in names
++    assert "MERLIN_PIN_BSM" in names
++
++    # A missing fence must fail loudly rather than scan nothing.
++    with pytest.raises(AssertionError):
++        _unaudited_names("no markers here")
++
++
++def test_exact_trap_is_a_build_define_not_an_env_var():
++    """MERLIN_TOPK_EXACT_TRAP must stay unregistered, for a stated reason.
++
++    The kernel switches must be registered. This
++    one is not a switch: persistent_topk.cuh consumes it with `#ifndef` at
++    build time and nothing anywhere calls getenv on it, so an envs.py entry
++    would advertise a runtime knob that does not exist. Pin both halves --
++    absent from the registry, and present in the header as a preprocessor
++    define -- so a later "tidy-up" that registers it has to argue with this.
++    """
++    assert "MERLIN_TOPK_EXACT_TRAP" not in environment_variables
++    header = (
++        Path(envs.__file__).parents[1]
++        / "csrc"
++        / "libtorch_stable"
++        / "persistent_topk.cuh"
++    )
++    if not header.is_file():  # source tree not beside an installed wheel
++        return
++    text = header.read_text(encoding="utf-8")
++    assert "#ifndef MERLIN_TOPK_EXACT_TRAP" in text
++    assert "getenv(\"MERLIN_TOPK_EXACT_TRAP\"" not in text
++
++
++def test_tiedet_toggles_are_not_ignored_factors():
++    """Negative control for the table above: a toggle silently added to
++    ignored_factors would keep every test green while dropping it from the
++    cache key."""
++    monkeypatch_free_factors = envs.compile_factors()
++    for name, _, _ in _TIEDET_HASHED + _TIEDET_KERNEL_SWITCHES:
++        assert name in environment_variables, name
++        assert name in monkeypatch_free_factors, name
++    for name in _TIEDET_UNAUDITED:
++        assert name not in environment_variables, name
++        assert name not in monkeypatch_free_factors, name
++
++
+ def test_fork_cache_factor_lists_are_disjoint_and_registered():
+     """Negative control for the two tables above."""
+-    hashed = {n for n, _, _ in _FORK_HASHED}
++    hashed = {n for n, _, _ in _FORK_HASHED} | {n for n, _, _ in _TIEDET_HASHED}
+     ignored = {n for n, _, _ in _FORK_IGNORED}
+     assert not hashed & ignored
+     for name in hashed | ignored:
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 5923dc5d90..960d92ba4f 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -455,32 +455,12 @@ if TYPE_CHECKING:
+     # an identity, it does not choose one. Ignored factor.
+     VLLM_E2_EXPECTED_CUDAGRAPH_MODE: str = ""
+     #
+-    # --8<-- [start:fork-unaudited-knobs]
+-    # --- TODO: knobs that are NOT in this tree at all ----------
+-    # The tie-determinism toggles and the BSM pin live in a separate
+-    # patch stack, not in v2.0.1 and not in this tree:
+-    #
+-    #     MERLIN_FULL_K  MERLIN_QSA_SORT  MERLIN_TIE_DET  MERLIN_TIE_RECENT
+-    #     MERLIN_PIN_BSM
+-    #
+-    # They are therefore UNAUDITED: nothing in this repository shows what they
+-    # change, and this file will not classify code it cannot read. The rule they
+-    # fall under is the standing one -- an os.environ (or std::getenv) knob that
+-    # changes a compiled or captured artifact is not in the cache key unless it
+-    # is registered here. From what is known of them (Marlin split-K, a
+-    # persistent_topk ordering change and a cutoff tie-break) they are very
+-    # likely capture factors and possibly AOT factors, which is exactly why a
+-    # guess is not good enough.
+-    #
+-    # WHEN THE PATCHES LAND, for each name: register it below, label both
+-    # identities from its actual read site, hash it unless exclusion is proven,
+-    # and delete it from this block. tests/test_envs.py holds a test that fails
+-    # if a name is registered while still listed here, so the classification
+-    # cannot be skipped silently. That test reads ONLY the delimited block
+-    # below/above -- scanning the whole file could never pass, because a
+-    # registry entry necessarily contains its own name.
+-    # ----------------------------------------------------------------------
+-    # --8<-- [end:fork-unaudited-knobs]
++    # The unaudited-knob fence that stood here listed the
++    # tie-determinism toggles as not-yet-in-tree. They landed with the
++    # v2.2 kernel port: the four are registered and
++    # classified in the "determinism toggles" block below, and the
++    # one knob still unclassified sits in that block's own fence, which
++    # tests/test_envs.py reads as a set of identifiers.
+     VLLM_LOG_MODEL_INSPECTION: bool = False
+     VLLM_DEBUG_MFU_METRICS: bool = False
+     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
+@@ -507,6 +487,112 @@ if TYPE_CHECKING:
+     VLLM_NIC_SELECTION_VARS: str = ""
+     VLLM_ENABLE_HPC_OPS: bool = False
+     MERLIN_TOPK_EXACT_COUNTERS_LOG: int = 0
++    #
++    # --- determinism toggles -----------------------------------------
++    # The three nondeterminism mechanisms (FULL_K, QSA_SORT, TIE_DET/TIE_RECENT).
++    # Every one of them is
++    # OFF by default: promotion is the maintainer's decision.
++    #
++    # Why these are registered at all: validate_environ() only inspects names
++    # beginning with VLLM_, so a MERLIN_ name never trips the unknown-variable
++    # warning. Registration here exists for ONE reason -- compile_factors() can
++    # only hash names it knows, and compile_factors() is a deny-list, so
++    # registering a name hashes it unless ignored_factors says otherwise. All
++    # four are deliberately absent from ignored_factors.
++    #
++    # CAPTURE: yes, all four. Each resolves once per process and the resolved
++    # value then reaches the GPU as a kernel launch argument, a launch
++    # configuration, or an extra op in the traced sequence -- so a cudagraph
++    # bakes in whatever was live at capture time. Flipping one between boots
++    # changes the captured graph, which is exactly what a cache key is for.
++    # AOT: not established for the three CUDA toggles (the Marlin and topk
++    # kernels are compiled into the extension at build time, not by the AOT
++    # compiler); established for MERLIN_QSA_SORT, which adds torch ops to the
++    # traced graph. Hashed conservatively throughout, the same rule
++    # already applied to MERLIN_TOPK_EXACT_MEDIUM.
++    #
++    # NOT A PYTHON READ SITE (FULL_K / TIE_DET / TIE_RECENT): each is resolved
++    # once by a std::getenv in C++ -- merlin_full_k() in
++    # csrc/libtorch_stable/moe/marlin_moe_wna16/ops.cu and merlin_det_ties() /
++    # merlin_tie_recent() in csrc/libtorch_stable/topk.cu -- and that is the
++    # single source of truth. The entries below are raw passthroughs so nothing
++    # can mistake them for a second parser; do not use them to decide
++    # behaviour. A raw passthrough hashes "0" and "00" differently even though
++    # the C++ treats them alike: over-invalidation, which is the safe direction.
++    #
++    # Marlin MoE split-K reduction order; the CUDA half of unmerged upstream
++    # PR #46639 (`use_full_k`).
++    MERLIN_FULL_K: str | None = None
++    # persistent_topk tie-break at the k-th cutoff, and its direction.
++    MERLIN_TIE_DET: str | None = None
++    MERLIN_TIE_RECENT: str | None = None
++    #
++    # A REAL Python read site, unlike the three above: parsed here and read
++    # once at import by models/qwen4_exp/nvidia/ops/qsa_indexer.py, which adds
++    # a torch.sort + two torch.where ops to the QSA selection path.
++    MERLIN_QSA_SORT: bool = False
++    #
++    # --- persistent_topk kernel switches ------------------------------
++    # Same classification as the three raw passthroughs above and registered
++    # for the same single reason: compile_factors() is a deny-list, so a name
++    # it does not know cannot be hashed, and a Ray deployment that propagates
++    # registered variables can otherwise drop an explicitly-disabled switch
++    # and leave a worker on the default. Each is resolved ONCE per process by
++    # a std::getenv in csrc/libtorch_stable/topk.cu -- that is the single
++    # source of truth -- and the resolved value reaches the GPU as a kernel
++    # launch argument, so a cudagraph bakes in whatever was live at capture.
++    # CAPTURE: yes, all three. AOT: not established (these kernels are built
++    # into the extension, not by the AOT compiler); hashed conservatively
++    # anyway, same rule as above. None is in ignored_factors.
++    #
++    # Raw passthroughs, so "unset" reads as None here. That is NOT the same as
++    # "off" for the C++: MERLIN_TOPK_EXACT_MEDIUM defaults ON. Read the getter
++    # in topk.cu, not this default, for the shipped behaviour.
++    #
++    # Take the exact restart on an overflowing MEDIUM row:
++    # MERLIN_TOPK_EXACT_MEDIUM. Declared ONCE, in the cross-change knob
++    # block above (same raw passthrough, same hashing); the 0.30 tree already
++    # carried that entry, so it is not repeated here.
++    # The same restart on an overflowing DECODE row.
++    MERLIN_TOPK_EXACT_DECODE: str | None = None
++    # Deterministic placement and tie membership on the LARGE path.
++    # Registered here ahead of its code, exactly as the four toggles above
++    # were, so the full tree is complete; its read site is
++    # det_large_enabled() in topk.cu on the large path. Setting it without that
++    # code does nothing, which is why it is a passthrough and not a parsed
++    # bool that would imply this tree can act on it.
++    MERLIN_TOPK_DET_LARGE: str | None = None
++    #
++    # NOT REGISTERED, deliberately: MERLIN_TOPK_EXACT_TRAP. It is a
++    # preprocessor define consumed by `#ifndef` in persistent_topk.cuh at
++    # BUILD time (-D), not a process environment variable -- nothing in the
++    # tree calls getenv on it. Registering it would advertise a runtime knob
++    # that does not exist. Its default (trap ON) is an open maintainer decision,
++    # not something to settle by
++    # quietly making it settable.
++    #
++    # --- UNAUDITED: reference-host knobs with no read site in this tree ----------
++    # A knob named inside the fence below is one this repository cannot
++    # classify, because the code that reads it is not in it. Registering one
++    # without first deleting it from the fence -- which means writing down its
++    # AOT and capture identity against its real read site -- is the exact
++    # failure the fork's env rule exists to prevent, and
++    # tests/test_envs.py::test_unaudited_host_side_knob_stays_listed_until_it_is_classified
++    # fails on it.
++    #
++    # The fence holds NOTHING BUT the names, one per line. Prose belongs out
++    # here: the gate reads the fence as a set of identifiers, and a knob name
++    # mentioned in passing inside it would otherwise read as a listing.
++    #
++    # The one entry, MERLIN_PIN_BSM, pins Marlin's block_size_m to 64 (Python,
++    # no rebuild). It is an ALTERNATIVE to the split-K toggle above, not a
++    # complement: on its own it fixed only the 74/102-token cells and left
++    # 1050 upward broken, while use_full_k fixed all of them with block_size_m
++    # still varying. The tie-determinism change promotes use_full_k and keeps this one off, so its
++    # read site was never brought across and it stays unclassified.
++    # --8<-- [start:unaudited-host-side-knobs]
++    #     MERLIN_PIN_BSM
++    # --8<-- [end:unaudited-host-side-knobs]
+ 
+ 
+ def get_default_cache_root():
+@@ -2467,6 +2553,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     "MERLIN_TOPK_EXACT_COUNTERS_LOG": lambda: int(
+         os.getenv("MERLIN_TOPK_EXACT_COUNTERS_LOG", "0")
+     ),
++    # Determinism toggles. See the declaration block above for the AOT /
++    # capture classification and for why three of these are raw passthroughs.
++    # All four are absent from ignored_factors on purpose, so all four are
++    # hashed into the compile cache key.
++    "MERLIN_FULL_K": lambda: os.getenv("MERLIN_FULL_K", None),
++    "MERLIN_TIE_DET": lambda: os.getenv("MERLIN_TIE_DET", None),
++    "MERLIN_TIE_RECENT": lambda: os.getenv("MERLIN_TIE_RECENT", None),
++    "MERLIN_QSA_SORT": lambda: bool(int(os.getenv("MERLIN_QSA_SORT", "0"))),
++    # persistent_topk kernel switches. Raw passthroughs
++    # of values C++ parses; see the declaration block above.
++    # MERLIN_TOPK_EXACT_MEDIUM is registered once, earlier in this dict.
++    "MERLIN_TOPK_EXACT_DECODE": lambda: os.getenv("MERLIN_TOPK_EXACT_DECODE", None),
++    "MERLIN_TOPK_DET_LARGE": lambda: os.getenv("MERLIN_TOPK_DET_LARGE", None),
+ }
+ 
+ 
+diff --git a/vllm/models/qwen4_exp/nvidia/ops/qsa_indexer.py b/vllm/models/qwen4_exp/nvidia/ops/qsa_indexer.py
+index a46f915793..555e445386 100644
+--- a/vllm/models/qwen4_exp/nvidia/ops/qsa_indexer.py
++++ b/vllm/models/qwen4_exp/nvidia/ops/qsa_indexer.py
+@@ -23,6 +23,46 @@ _TOPK_WORKSPACE_BYTES = 1024 * 1024
+ _DECODE_BLOCK_N = 64
+ 
+ 
++# ---------------------------------------------------------------------------
++# MERLIN_QSA_SORT: canonicalise the ORDER of the selected block indices.
++#
++# persistent_topk assigns output slots by atomicAdd, so two identical requests
++# get the same selected SET in a different ORDER (measured on the reference host: matching
++# sorted hashes, differing raw hashes). Sparse attention then accumulates over
++# those blocks in whatever order it was handed, and fp32 addition is not
++# associative, so the arithmetic moves. Sorting is semantically a no-op -- the
++# same blocks are attended either way -- and makes the accumulation order
++# canonical.
++#
++# Padding (negative sentinels) is pushed to the END so the valid prefix is
++# preserved: `_expand_qsa_indices_kernel` truncates by POSITION
++# (`complete_blocks = min(visible_blocks, BLOCK_TOPK)`), and position is never
++# compared against a score anywhere in the chain, so there is no relevance-rank
++# contract for the sort to break.
++#
++# Branch-free and sync-free on purpose. `.any()` / `.item()` raise
++# cudaErrorStreamCaptureUnsupported inside graph capture; that cost one boot
++# on the reference host and is why this version has no Python-visible branch on data.
++#
++# Resolved once at import so it is a launch constant: a cudagraph captures the
++# op sequence that was live at capture time. Default OFF -- promotion is a release
++# decision, which is the maintainer's.
++# ---------------------------------------------------------------------------
++_QSA_SORT = envs.MERLIN_QSA_SORT
++
++
++def _qsa_canonicalise(block_indices: torch.Tensor) -> None:
++    """Sort selected block indices ascending, padding last. In place, shape preserved."""
++    if not _QSA_SORT:
++        return
++    big = torch.iinfo(block_indices.dtype).max
++    tmp = torch.where(
++        block_indices < 0, torch.full_like(block_indices, big), block_indices
++    )
++    tmp = torch.sort(tmp, dim=-1).values
++    block_indices.copy_(torch.where(tmp == big, torch.full_like(tmp, -1), tmp))
++
++
+ @triton.jit
+ def _qsa_mqa_paged_uniform_kernel(
+     q_ptr,
+@@ -565,6 +605,7 @@ def _topk(
+         block_topk,
+         logits.shape[1],
+     )
++    _qsa_canonicalise(block_indices)
+ 
+ 
+ def qsa_select_paged_decode(
+diff --git a/vllm/models/qwen4_exp/nvidia/ops/topk_counters.py b/vllm/models/qwen4_exp/nvidia/ops/topk_counters.py
+index 08ffab8638..d7db4d7965 100644
+--- a/vllm/models/qwen4_exp/nvidia/ops/topk_counters.py
++++ b/vllm/models/qwen4_exp/nvidia/ops/topk_counters.py
+@@ -17,22 +17,40 @@ of each counter. An older build whose op still demands int32 will therefore
+ raise here; that is the intended signal, not a regression to paper over.
+ 
+ SLOT LAYOUT is build-dependent, so nothing here hard-codes five. `slot_count()`
+-asks the build first (a `..._slots` op, should a later build expose one) and
+-otherwise reads `MERLIN_TOPK_COUNTER_SLOTS` (default 5); names come from a
+-table keyed by that length:
++asks the build first -- the tie-determinism change added the `..._slots` op this was written to look
++for, so on a build that has it the env variable is never consulted -- and
++otherwise reads `MERLIN_TOPK_COUNTER_SLOTS` (default 5). The op demands
++EXACTLY that many elements, so a guessed length is an error, not a short read;
++names come from a table keyed by that length:
+ 
+   5  rows overflow fallbacks faults switch
+   10  rows overflow fallbacks faults rows_large ties_cut ties_dropped
+              faults_large switch switch_large
++  11  the ten above, plus decode_overflow
+ 
+ An unknown length degrades to `slot<i>` names rather than mislabelling.
+ 
++WHY 11 AND NOT 10. The tie-determinism change numbered its one new counter around the large-path block
++instead of after the medium-path one, so the integration renumbers nothing: slots 4-7 are
++the large-path counters, 8-9 the two switch flags, 10 the decode overflow.
++On the integrated build every one of the eleven is live; on a single-branch
++build the other branch's slots are structurally zero and the line still
++reports them by name -- they are the slots they will hold, not a
++mislabelling. `decode_overflow` is the number that has to be read before any
++claim that the DECODE path is deterministic: it counts rows whose buffered
++candidates exceeded the 3,708-slot capacity before the tie ranking ran, which
++ranking cannot repair.
++
+ HOW THE SMOKE READS IT. Set `MERLIN_TOPK_EXACT_COUNTERS_LOG=<seconds>` on the
+ engine; each GPU worker then emits, at most that often and once more at
+ shutdown, one line into the ordinary engine log:
+ 
+     topk-exact-counters rank=PP0_TP1 rows=... overflow=... fallbacks=...
+-    faults=... switch=...
++    faults=... switch=... [rows_large=... ... decode_overflow=...]
++
++The first five fields are the medium-path line and keep their order on every build;
++any further slot is appended after them, so an 11-slot build reads as the medium-path
++line plus the four large-path fields, `switch_large` and `decode_overflow`.
+ 
+ Counts are cumulative per worker process, so the smoke takes the LATEST line
+ per rank -- `grep topk-exact-counters <engine log> | ...` keyed on the `rank=`
+@@ -73,7 +91,14 @@ _LARGEDET_NAMES = (
+     "switch",
+     "switch_large",
+ )
+-_SLOT_NAMES: dict[int, tuple[str, ...]] = {5: _MEDIUM_NAMES, 10: _LARGEDET_NAMES}
++# The decode-overflow counter comes after the large-path block; see the module
++# docstring for why it is slot 10 and not slot 4.
++_TIEDET_NAMES = _LARGEDET_NAMES + ("decode_overflow",)
++_SLOT_NAMES: dict[int, tuple[str, ...]] = {
++    5: _MEDIUM_NAMES,
++    10: _LARGEDET_NAMES,
++    11: _TIEDET_NAMES,
++}
+ 
+ # The medium-path line contract. Any further name is appended after these, in slot
+ # order, so a 10-slot build still starts with exactly the medium-path line.
+@@ -92,7 +117,13 @@ def _get_op(name: str):
+ 
+ 
+ def slot_count() -> int:
+-    """How many int64 slots this build's counter array carries."""
++    """How many int64 slots this build's counter array carries.
++
++    The build is asked first and the environment is only a fallback for builds
++    older than the slot-count op: a guessed length that does not match the extension is
++    rejected by the op's own length check, so the instrument would go dark
++    exactly when the layout changed -- which is when it matters most.
++    """
+     query = _get_op(_OP_NAME + "_slots")
+     if query is not None:
+         return int(query())

@@ -1,0 +1,200 @@
+From a8913793c79aff7d2558de0765ea0b2143c9d1be Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Wed, 23 Sep 2026 09:45:20 -0400
+Subject: [PATCH 48/58] ple: the pull registry refuses unbound or clashing
+ names; test fixes
+
+A schema walk fails on any pointer-like int parameter of a custom op on the
+PLE path. The FULL_K test child calls the Marlin MoE GEMM by keyword against
+its v0.30.0 signature.
+---
+ tests/kernels/moe/merlin_full_k_child.py      | 28 +++++++--
+ .../ple_offload/test_transport_bounded_io.py  | 17 ++++--
+ tests/v1/test_ple_pull_compile_profile.py     | 61 +++++++++++++++++++
+ .../layers/ple_offload_layer.py               | 16 ++++-
+ 4 files changed, 111 insertions(+), 11 deletions(-)
+
+diff --git a/tests/kernels/moe/merlin_full_k_child.py b/tests/kernels/moe/merlin_full_k_child.py
+index 3a42008be3..d8cc365786 100644
+--- a/tests/kernels/moe/merlin_full_k_child.py
++++ b/tests/kernels/moe/merlin_full_k_child.py
+@@ -56,6 +56,11 @@ def main(out_path: str) -> None:
+     qtype = scalar_types.uint4b8
+     K, GROUP, BLOCK = 2048, 128, 16
+     TN = 128  # thread_n of the explicit config
++    import inspect
++
++    _sig = inspect.signature(ops.moe_wna16_marlin_gemm)
++    GEMM_PARAMS = list(_sig.parameters)
++    GEMM_DEFAULTED = {k for k, v in _sig.parameters.items() if v.default is not inspect.Parameter.empty}
+     configs = {"explicit": (128, 128, 1), "auto": (-1, -1, -1)}
+ 
+     gen = torch.Generator(device="cpu").manual_seed(46639)
+@@ -63,7 +68,8 @@ def main(out_path: str) -> None:
+ 
+     def weights(n: int):
+         w = (torch.randn(K, n, generator=gen) / 10).to(dtype).to(dev)
+-        _, q, s, _, _, _ = marlin_quantize(w, qtype, GROUP, False)
++        # 0.28 returns 6 items (4th positional = act_order); 0.30 returns 3 (#54809)
++        _, q, s = marlin_quantize(w, qtype, GROUP)[:3]
+         return q.unsqueeze(0).contiguous(), s.unsqueeze(0).contiguous()
+ 
+     def gemm(m: int, n: int, q, s, cfg):
+@@ -73,14 +79,24 @@ def main(out_path: str) -> None:
+         topk_w = torch.ones((m, 1), dtype=torch.float32, device=dev)
+         sorted_ids, expert_ids, ntpp = moe_align_block_size(topk_ids, BLOCK, 1)
+         ws = marlin_make_workspace_new(dev, 4)
+-        out = ops.moe_wna16_marlin_gemm(
+-            a, None, q, None, s, None, None, None, None, None, ws,
+-            sorted_ids, expert_ids, ntpp, topk_w,
++        # Keyword call against the op's REAL signature: upstream #54809 (in vLLM
++        # 0.30) removed act-order (g_idx, perm, is_k_full) from this op, so the
++        # same child runs on the 0.28.1rc1 fork and on the 0.30 fork.
++        kw = dict(
++            input=a, output=None, b_qweight=q, b_bias=None, b_scales=s,
++            a_scales=None, global_scale=None, b_qzeros=None, workspace=ws,
++            sorted_token_ids=sorted_ids, expert_ids=expert_ids,
++            num_tokens_past_padded=ntpp, topk_weights=topk_w,
+             moe_block_size=BLOCK, top_k=1, mul_topk_weights=False,
+-            b_q_type=qtype, size_m=m, size_n=n, size_k=K, is_k_full=True,
++            b_q_type=qtype, size_m=m, size_n=n, size_k=K,
+             use_atomic_add=False, use_fp32_reduce=True, is_zp_float=False,
+             thread_k=tk, thread_n=tn, blocks_per_sm=bps,
+-        )  # fmt: skip
++        )
++        if "is_k_full" in GEMM_PARAMS:
++            kw.update(g_idx=None, perm=None, is_k_full=True)
++        missing = sorted(set(GEMM_PARAMS) - set(kw) - GEMM_DEFAULTED)
++        assert not missing, f"moe_wna16_marlin_gemm needs {missing}: child out of date"
++        out = ops.moe_wna16_marlin_gemm(**kw)
+         torch.cuda.synchronize()
+         tiles = int(ntpp.item()) // BLOCK * (n // TN)
+         return out.float().cpu(), tiles
+diff --git a/tests/v1/ple_offload/test_transport_bounded_io.py b/tests/v1/ple_offload/test_transport_bounded_io.py
+index 5a2aa199e9..78a9db0fd0 100644
+--- a/tests/v1/ple_offload/test_transport_bounded_io.py
++++ b/tests/v1/ple_offload/test_transport_bounded_io.py
+@@ -273,14 +273,23 @@ def test_real_wait_copy_geometry_rejected_before_graph_publication(
+     gpu_output_buffer = torch.empty(12, 4, dtype=torch.float32)
+     hidden_states = torch.empty(12, 1, dtype=torch.float32)
+ 
++    # Go through the op's real entry point, which resolves
++    # the live pointers by layer name from the per-process registry.
++    from types import SimpleNamespace
++
++    monkeypatch.setitem(
++        ple_layer_module._PULL_LAYERS,
++        "ple",
++        SimpleNamespace(
++            _sem=SimpleNamespace(flag_ptr=1), _host_output_ptr=2, _host_row_bytes=16
++        ),
++    )
++
+     def capture_then_publish() -> None:
+         with manager.capture_ple_copy_geometry(desc):
+-            ple_layer_module._ple_offload_wait_copy_raw(
++            ple_layer_module._ple_offload_wait_copy_impl(
+                 gpu_output_buffer,
+                 hidden_states,
+-                1,
+-                2,
+-                16,
+                 12,
+                 "ple",
+             )
+diff --git a/tests/v1/test_ple_pull_compile_profile.py b/tests/v1/test_ple_pull_compile_profile.py
+index d5c47a99e2..0f3ab580fa 100644
+--- a/tests/v1/test_ple_pull_compile_profile.py
++++ b/tests/v1/test_ple_pull_compile_profile.py
+@@ -534,3 +534,64 @@ def test_wait_copy_resolves_live_pointers_by_layer_name(monkeypatch) -> None:
+ 
+     with pytest.raises(RuntimeError, match="no armed pull layer"):
+         m._ple_offload_wait_copy_impl(buf, buf, 3, "missing")
++
++
++def test_pull_registry_refuses_unbound_and_clashing_names(monkeypatch) -> None:
++    """setup_cross_process_offload must not register under
++    the default '<unbound>' name nor let a second layer overwrite a first one's
++    entry (the op would resolve the wrong pointers). Re-arming the SAME layer
++    is allowed."""
++    import pytest
++    import torch
++
++    m = _import_ple_offload_layer(monkeypatch)
++    monkeypatch.setattr(m, "_PULL_LAYERS", {})
++
++    class _L(m.PleOffloadLayer):
++        def forward_impl(self, hidden_states, input_ids, *a, **k):  # pragma: no cover
++            return hidden_states
++
++    def armed(name):
++        layer = _L.__new__(_L)
++        torch.nn.Module.__init__(layer)
++        layer._ple_offload_name = name
++        return layer
++
++    sem = object()
++    buf = torch.empty(2, 2)
++    with pytest.raises(RuntimeError, match="no _ple_offload_name"):
++        armed("<unbound>").setup_cross_process_offload(buf, sem, host_output_ptr=1, host_row_bytes=8)
++    a = armed("L1")
++    a.setup_cross_process_offload(buf, sem, host_output_ptr=1, host_row_bytes=8)
++    a.setup_cross_process_offload(buf, sem, host_output_ptr=2, host_row_bytes=8)  # re-arm ok
++    assert m._PULL_LAYERS["L1"] is a
++    with pytest.raises(RuntimeError, match="two layers armed"):
++        armed("L1").setup_cross_process_offload(buf, sem, host_output_ptr=3, host_row_bytes=8)
++
++
++def test_nvidia_qwen4exp_ops_carry_no_pointer_like_int_params() -> None:
++    """A schema walk -- no custom op registered by the
++    NVIDIA qwen4_exp / PLE offload path may take an int parameter named like a
++    pointer/address (the AOT cache bakes Python ints as constants)."""
++    import ast
++    import pathlib
++
++    root = pathlib.Path(__file__).resolve().parents[2] / "vllm"
++    files = [root / "model_executor/layers/ple_offload_layer.py",
++             *sorted((root / "models/qwen4_exp/nvidia").rglob("*.py")),
++             *sorted((root / "v1/ple_offload").rglob("*.py"))]
++    bad = []
++    for f in files:
++        tree = ast.parse(f.read_text(encoding="utf-8"))
++        funcs = {n.name: n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
++        for node in ast.walk(tree):
++            if isinstance(node, ast.Call) and getattr(node.func, "id", "") == "direct_register_custom_op":
++                kw = {k.arg: k.value for k in node.keywords}
++                fn = getattr(kw.get("op_func"), "id", None)
++                if fn not in funcs:
++                    continue
++                for a in funcs[fn].args.args:
++                    ann = ast.unparse(a.annotation) if a.annotation is not None else ""
++                    if ann == "int" and any(t in a.arg for t in ("ptr", "addr", "pointer")):
++                        bad.append(f"{f.name}:{fn}({a.arg})")
++    assert not bad, f"pointer-like int op params (AOT-baking hazard): {bad}"
+diff --git a/vllm/model_executor/layers/ple_offload_layer.py b/vllm/model_executor/layers/ple_offload_layer.py
+index ff581b205a..cc8bd73bfe 100644
+--- a/vllm/model_executor/layers/ple_offload_layer.py
++++ b/vllm/model_executor/layers/ple_offload_layer.py
+@@ -428,7 +428,21 @@ class PleOffloadLayer(nn.Module, ABC):
+         self._host_output_ptr = host_output_ptr
+         self._host_row_bytes = int(host_row_bytes)
+         if host_output_ptr is not None:
+-            _PULL_LAYERS[self._ple_offload_name] = self
++            # Hardening: the registry key is the name the
++            # traced graph carries, so it must be a real, unique layer name.
++            name = self._ple_offload_name
++            if name == "<unbound>":
++                raise RuntimeError(
++                    "PLE pull: setup_cross_process_offload on a layer with no "
++                    "_ple_offload_name; the op would resolve nothing by name"
++                )
++            prior = _PULL_LAYERS.get(name)
++            if prior is not None and prior is not self:
++                raise RuntimeError(
++                    f"PLE pull: two layers armed under the name {name!r}; the op "
++                    "would resolve the wrong layer's pointers"
++                )
++            _PULL_LAYERS[name] = self
+ 
+     def forward(
+         self,

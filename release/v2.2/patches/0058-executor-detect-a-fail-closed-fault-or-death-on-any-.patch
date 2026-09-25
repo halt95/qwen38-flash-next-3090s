@@ -1,0 +1,2097 @@
+From 9c27ca9a0657338852c7d3e59561d424fc036fde Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 07:58:38 -0400
+Subject: [PATCH 58/58] executor: detect a fail-closed fault or death on any
+ rank
+
+A fault on a non-zero TP rank could hang the engine: the worker's sentinel pipe
+was inherited by a helper process and stayed open, so the monitor never saw
+the exit. Earlier releases carry the same monitor and fail-closed exit path.
+
+- Worker exit is detected by pidfd, with the sentinel as fallback, before and
+  after READY and for every worker through the whole initialisation window.
+- A per-worker fault pipe: ple_fail_closed writes one byte before os._exit and
+  the monitor starts the failure ladder at once; the fd stays registered
+  through worker teardown.
+- worker_main marks inherited pipes close-on-exec.
+- Any unexpected busy-loop failure exits 1; the termination ladder uses
+  time.monotonic(); forced-exit paths no longer wait on logging.
+- Tests on real fork/spawn workers for rank 0 and rank 1, with and without an
+  fd-inheriting helper.
+---
+ .../test_engine_core_teardown_signal.py       |  35 ++
+ tests/v1/executor/test_executor.py            |   2 +
+ .../test_multiproc_failed_worker_ladder.py    |  56 ++-
+ .../executor/test_multiproc_fatal_any_rank.py | 343 +++++++++++++++
+ .../test_multiproc_monitor_any_rank.py        | 226 ++++++++++
+ .../test_multiproc_monitor_combined.py        | 147 +++++++
+ .../test_multiproc_ready_and_inherit.py       | 355 +++++++++++++++
+ .../test_multiproc_worker_exit_after_drain.py |  28 +-
+ vllm/v1/engine/core.py                        |  53 ++-
+ vllm/v1/executor/multiproc_executor.py        | 410 ++++++++++++++----
+ vllm/v1/ple_offload/connector.py              |   3 +-
+ vllm/v1/ple_offload/fatal.py                  |  35 ++
+ 12 files changed, 1587 insertions(+), 106 deletions(-)
+ create mode 100644 tests/v1/executor/test_multiproc_fatal_any_rank.py
+ create mode 100644 tests/v1/executor/test_multiproc_monitor_any_rank.py
+ create mode 100644 tests/v1/executor/test_multiproc_monitor_combined.py
+ create mode 100644 tests/v1/executor/test_multiproc_ready_and_inherit.py
+
+diff --git a/tests/v1/engine/test_engine_core_teardown_signal.py b/tests/v1/engine/test_engine_core_teardown_signal.py
+index 94a5255908..822c735aaa 100644
+--- a/tests/v1/engine/test_engine_core_teardown_signal.py
++++ b/tests/v1/engine/test_engine_core_teardown_signal.py
+@@ -35,6 +35,9 @@ def _child_run(conn, mode: str = "once") -> None:
+ 
+     from vllm.v1.engine import core
+ 
++    blocked_log = mode.endswith("-blocked-log")
++    if blocked_log:
++        mode = mode[: -len("-blocked-log")]
+     if mode == "once-hang":
+         core._TEARDOWN_SIGNAL_BOUND_S = 1.0
+ 
+@@ -48,6 +51,17 @@ def _child_run(conn, mode: str = "once") -> None:
+ 
+     core.logger.addHandler(_Capture(level=logging.WARNING))
+ 
++    class _Blocking(logging.Handler):
++        """A stderr pipe nobody drains: the forced-exit lines never return."""
++
++        def emit(self, record):
++            message = record.getMessage()
++            if "second late signal" in message or "still running" in message:
++                time.sleep(3600)
++
++    if blocked_log:
++        core.logger.addHandler(_Blocking(level=logging.WARNING))
++
+     class _FakeEngineCore:
+         def __init__(self, *args, **kwargs):
+             import queue
+@@ -184,6 +198,27 @@ def test_second_late_signal_ends_a_hung_teardown():
+     assert "teardown-done" not in events, events
+ 
+ 
++def test_second_late_signal_is_not_held_by_a_blocked_log():
++    # An earlier second-signal path logged BEFORE restoring the default
++    # disposition and re-delivering; a blocked handler / full pipe held it.
++    alive, exitcode, elapsed, events = _run_hanging_teardown(
++        "twice-hang-blocked-log", 15
++    )
++    assert "second-signal" in events, events
++    assert not alive, f"a blocked log held the second-signal exit ({elapsed:.1f}s)"
++    assert exitcode == -signal.SIGTERM, exitcode
++
++
++def test_teardown_watchdog_is_not_held_by_a_blocked_log():
++    # An earlier watchdog logged and flushed before os._exit(1).
++    alive, exitcode, elapsed, events = _run_hanging_teardown(
++        "once-hang-blocked-log", 15
++    )
++    assert "teardown-start" in events, events
++    assert not alive, f"a blocked log held the watchdog exit ({elapsed:.1f}s)"
++    assert exitcode == 1, exitcode
++
++
+ def test_teardown_watchdog_bounds_a_single_deferred_signal():
+     # One deferred SIGTERM, then teardown hangs: the watchdog ends the process
+     # (exit code 1) once _TEARDOWN_SIGNAL_BOUND_S (1 s here) has passed.
+diff --git a/tests/v1/executor/test_executor.py b/tests/v1/executor/test_executor.py
+index a21a8dafd3..8e5d9fe8e1 100644
+--- a/tests/v1/executor/test_executor.py
++++ b/tests/v1/executor/test_executor.py
+@@ -82,6 +82,8 @@ def test_multiproc_executor_worker_termination_timeout(
+     monkeypatch.setenv("VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS", str(timeout))
+     clock = _FakeClock()
+     monkeypatch.setattr(multiproc_executor_module.time, "time", clock.time)
++    # The ladder times its waits with time.monotonic().
++    monkeypatch.setattr(multiproc_executor_module.time, "monotonic", clock.time)
+     monkeypatch.setattr(multiproc_executor_module.time, "sleep", clock.sleep)
+     executor = MultiprocExecutor.__new__(MultiprocExecutor)
+     proc = _FakeProcess(clock, exits_at=exits_at)
+diff --git a/tests/v1/executor/test_multiproc_failed_worker_ladder.py b/tests/v1/executor/test_multiproc_failed_worker_ladder.py
+index 9c591132f4..c67d593b34 100644
+--- a/tests/v1/executor/test_multiproc_failed_worker_ladder.py
++++ b/tests/v1/executor/test_multiproc_failed_worker_ladder.py
+@@ -133,6 +133,35 @@ def test_failure_shutdown_lets_a_draining_survivor_finish():
+     assert _DRAINING_S - 0.3 <= elapsed < 3.0, elapsed
+ 
+ 
++def test_failure_ladder_ignores_a_wall_clock_step(monkeypatch):
++    """An earlier ladder timed its graces with time.time().
++
++    A wall-clock step forward (NTP, maintainer) mid-ladder made every wait
++    expire at once, so a survivor still inside its FINAL DRAIN was SIGTERMed.
++    """
++    import vllm.v1.executor.multiproc_executor as executor_module
++
++    real_time = time.time
++    calls = {"n": 0}
++
++    def stepping_time():
++        # Steps forward an hour between any two reads.
++        calls["n"] += 1
++        return real_time() + 3600.0 * calls["n"]
++
++    monkeypatch.setattr(
++        executor_module,
++        "time",
++        SimpleNamespace(time=stepping_time, monotonic=time.monotonic, sleep=time.sleep),
++    )
++    elapsed, codes = _shutdown([(_DRAINING, 1), (_PARKED, 0)], failed=True)
++    assert codes[0] == 0, (
++        f"a wall-clock step cut the draining survivor (exit {codes[0]})"
++    )
++    assert codes[1] is not None
++    assert _DRAINING_S - 0.3 <= elapsed < 3.0, elapsed
++
++
+ def test_failure_shutdown_ends_a_survivor_stuck_in_its_shutdown():
+     # Started its shutdown (state 1), then blocked on the dead rank: ignores
+     # SIGTERM like a rank inside a device synchronize, never exits by itself.
+@@ -195,18 +224,21 @@ def test_worker_main_publishes_shutdown_started_then_done(monkeypatch):
+     )
+     monkeypatch.setattr(executor_module.signal, "signal", lambda *a, **k: None)
+     ready_reader, ready_writer = multiprocessing.Pipe(duplex=False)
+-    executor_module.WorkerProc.worker_main(
+-        vllm_config=SimpleNamespace(
+-            parallel_config=SimpleNamespace(
+-                assigned_physical_gpu_ids=None, numa_bind=False
+-            )
+-        ),
+-        ready_pipe=ready_writer,
+-        death_pipe=None,
+-        shutdown_state=state,
+-        inherited_fds=[],
+-        expected_parent_pid=os.getpid(),
+-    )
++    # An unexpected busy-loop failure ends in exit code 1 after the teardown.
++    with pytest.raises(SystemExit) as exited:
++        executor_module.WorkerProc.worker_main(
++            vllm_config=SimpleNamespace(
++                parallel_config=SimpleNamespace(
++                    assigned_physical_gpu_ids=None, numa_bind=False
++                )
++            ),
++            ready_pipe=ready_writer,
++            death_pipe=None,
++            shutdown_state=state,
++            inherited_fds=[],
++            expected_parent_pid=os.getpid(),
++        )
++    assert exited.value.code == 1
+     ready_reader.close()
+     assert seen == [("busy", 0), ("drain", 1)], seen
+     assert state.value == 2
+diff --git a/tests/v1/executor/test_multiproc_fatal_any_rank.py b/tests/v1/executor/test_multiproc_fatal_any_rank.py
+new file mode 100644
+index 0000000000..bf1a0ff99f
+--- /dev/null
++++ b/tests/v1/executor/test_multiproc_fatal_any_rank.py
+@@ -0,0 +1,343 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""A fail-closed fault on ANY rank reaches the executor before the process is gone.
++
++Rank-1 fault test (earlier build, TP2xPP2): the PLE
++test fault cut=exc_in_release fired on PP0_TP1 (rank 1). ple_fail_closed wrote
++its line and traceback and os._exit(1)ed. The engine then sat in
++mq.dequeue for 300 s ("No available shared memory broadcast block found in 60
++seconds" x4) and was killed by the harness; "Worker proc ... died
++unexpectedly" never appeared. The rank showed Z in ps but was never reaped.
++
++The executor's monitor (start_worker_monitor, stock upstream code) waits on
++the workers' process sentinels only. A sentinel closes when the kernel has
++torn down the WHOLE thread group -- for a worker holding a CUDA context that
++is seconds after os._exit (F1/F2/F3/F5 on rank 0 in the same series: 8.0 s
++between the fatal line and the monitor's log line), and when a thread of the
++dying rank waits in-kernel on a live peer it does not close while the peer
++lives. The fault test's rank 1 became reapable only after rank 0's own 300 s progress
++deadline killed rank 0 (rank 3's gloo recv from rank 1 broke at +2.0 s,
++two seconds after rank 0's fatal at +0.0 s). The same leader-Z /
++thread-in-exit state was sampled on the reference host for the PLE offload child
++(test_multiproc_ple_exit_without_reap.py).
++
++The fix: a per-worker fault pipe. ple_fail_closed writes one byte on it
++right before os._exit; the monitor waits on it next to the sentinels and
++starts the failure ladder at once, which ends the peers -- and that is what
++frees the stuck teardown.
++
++The stuck-teardown state is modelled here without a GPU: the worker's leader
++thread leaves alone (raw SYS_exit) while another thread keeps the thread
++group alive, so its sentinel stays open and it is not reapable -- exactly
++what the executor saw in the rank-1 fault test.
++
++Failing controls on the earlier build: test_fatal_on_any_rank_wakes_the_
++monitor_before_its_teardown (the monitor stays blocked) and
++test_worker_main_registers_the_fault_pipe (nothing registers it).
++"""
++
++import ctypes
++import multiprocessing
++import os
++import platform
++import signal
++import sys
++import threading
++import time
++from types import SimpleNamespace
++
++import pytest
++
++pytestmark = [
++    pytest.mark.skip_global_cleanup,
++    pytest.mark.skipif(
++        sys.platform != "linux" or platform.machine() not in ("x86_64", "aarch64"),
++        reason="needs Linux process sentinels and a raw SYS_exit number",
++    ),
++]
++
++_SYS_EXIT = {"x86_64": 60, "aarch64": 93}.get(platform.machine(), -1)
++_LINGER_S = 30.0
++_MONITOR_WAIT_S = 5.0
++
++
++def _leader_exit(code: int) -> None:
++    """Only the calling thread leaves; the thread group (and its fds) stay."""
++    ctypes.CDLL(None).syscall(_SYS_EXIT, code)
++
++
++def _worker(mode: str, fault_pipe, linger_s: float) -> None:
++    from vllm.v1.ple_offload import fatal
++
++    # Absent on the earlier build: that is the failing control, not an error.
++    register = getattr(fatal, "set_fatal_notify_fd", None)
++    if register is not None and fault_pipe is not None:
++        register(fault_pipe.fileno())
++    if mode == "idle":
++        time.sleep(600)
++    # Non-daemon: keeps the thread group alive after the leader leaves.
++    threading.Thread(target=time.sleep, args=(linger_s,)).start()
++    if mode == "fatal-stuck":
++        # ple_fail_closed ends with os._exit(1); here that exit is the
++        # leader-only one, so the process stays unreapable like the fault test's rank 1.
++        os._exit = _leader_exit  # type: ignore[assignment]
++        fatal.ple_fail_closed(
++            where="release_outputs",
++            rank=1,
++            layer="language_model.model.layers.1.ple.ple_embedding",
++            sequence=52,
++            error=RuntimeError("PLE test fault: exc_in_release"),
++        )
++    if mode == "orderly-close":
++        fault_pipe.close()
++        time.sleep(linger_s)
++    os._exit(1 if mode == "crash" else 0)
++
++
++class _Executor:
++    """The surface start_worker_monitor's closure uses."""
++
++    def __init__(self, workers):
++        self.workers = workers
++        self.is_failed = False
++        self.shutting_down = False
++        self.shutdown_calls = 0
++        self.callback_calls = 0
++        self.failure_callback = self._callback
++
++    def _callback(self):
++        self.callback_calls += 1
++
++    def shutdown(self):
++        self.shutdown_calls += 1
++
++
++def _spawn(mode: str, rank: int, linger_s: float = _LINGER_S):
++    ctx = multiprocessing.get_context("spawn")
++    fault_reader, fault_writer = ctx.Pipe(duplex=False)
++    proc = ctx.Process(
++        target=_worker,
++        args=(mode, fault_writer, linger_s),
++        name=f"VllmWorker-{rank}",
++        daemon=True,
++    )
++    proc.start()
++    fault_writer.close()
++    return SimpleNamespace(
++        proc=proc,
++        rank=rank,
++        fault_reader=fault_reader,
++        death_writer=None,
++        worker_response_mq=None,
++        shutdown_state=None,
++    )
++
++
++def _start_monitor(executor) -> threading.Thread:
++    from vllm.v1.executor.multiproc_executor import MultiprocExecutor
++
++    thread = threading.Thread(
++        target=MultiprocExecutor.start_worker_monitor,
++        args=(executor,),
++        kwargs={"inline": True},
++        daemon=True,
++        name="MultiprocWorkerMonitor-test",
++    )
++    thread.start()
++    return thread
++
++
++@pytest.fixture
++def workers():
++    spawned = []
++    yield spawned
++    for w in spawned:
++        # SIGKILL ends the lingering thread too; then the group is reapable.
++        if w.proc.is_alive():
++            os.kill(w.proc.pid, signal.SIGKILL)
++        w.proc.join(10)
++        w.fault_reader.close()
++
++
++def test_fatal_on_any_rank_wakes_the_monitor_before_its_teardown(workers):
++    """Rank-1 fault: rank 1 fails closed, stays unreapable; the monitor must not wait."""
++    workers.append(_spawn("idle", 0))
++    workers.append(_spawn("fatal-stuck", 1))
++    executor = _Executor(workers)
++    thread = _start_monitor(executor)
++    thread.join(_MONITOR_WAIT_S)
++    assert not thread.is_alive(), (
++        f"monitor still blocked {_MONITOR_WAIT_S} s after a fail-closed fault on "
++        "rank 1 whose process teardown has not finished (leader gone, thread "
++        "group alive, sentinel open): this is the rank-1 fault hang"
++    )
++    # It returned while the rank was still not reapable -- the point.
++    assert workers[1].proc.is_alive()
++    assert executor.is_failed
++    assert executor.shutdown_calls == 1
++    assert executor.callback_calls == 1
++    assert executor.failure_callback is None
++
++
++def test_plain_death_is_still_detected_by_the_sentinel(workers):
++    workers.append(_spawn("idle", 0))
++    workers.append(_spawn("crash", 1, linger_s=0.0))
++    executor = _Executor(workers)
++    thread = _start_monitor(executor)
++    thread.join(_MONITOR_WAIT_S)
++    assert not thread.is_alive()
++    assert executor.is_failed
++    assert executor.shutdown_calls == 1
++    assert workers[1].proc.exitcode == 1
++
++
++def test_orderly_close_of_the_fault_pipe_is_not_a_fault(workers):
++    """EOF on the fault pipe (worker_main's finally) must not start the ladder."""
++    orderly_s = 1.5
++    workers.append(_spawn("orderly-close", 0, linger_s=orderly_s))
++    workers.append(_spawn("idle", 1))
++    executor = _Executor(workers)
++    thread = _start_monitor(executor)
++    thread.join(orderly_s / 2)
++    assert thread.is_alive(), "monitor treated the closed fault pipe as a fault"
++    assert executor.shutdown_calls == 0
++    thread.join(_MONITOR_WAIT_S)
++    assert not thread.is_alive(), "sentinel death not seen after the fault-pipe EOF"
++    assert executor.is_failed
++    assert workers[0].proc.exitcode == 0
++
++
++def test_worker_main_registers_the_fault_pipe(monkeypatch):
++    """worker_main hands the fault pipe to the fatal module, and unregisters it."""
++    import vllm.v1.executor.multiproc_executor as executor_module
++    from vllm.v1.ple_offload import fatal
++
++    seen = {}
++
++    class _Inner:
++        def shutdown(self):
++            pass
++
++    def fake_init(self, *args, **kwargs):
++        self.rank = 1
++        self.worker = _Inner()
++        self.rpc_broadcast_mq = None
++        self.worker_response_mq = SimpleNamespace(
++            export_handle=lambda: None,
++            wait_until_ready=lambda: None,
++            shutdown=lambda: None,
++        )
++        self.peer_response_handles = []
++
++    def busy_loop(self):
++        seen["registered_fd"] = getattr(fatal, "_FATAL_NOTIFY_FD", None)
++        raise ValueError("boom")
++
++    monkeypatch.setattr(executor_module.WorkerProc, "__init__", fake_init)
++    monkeypatch.setattr(executor_module.WorkerProc, "worker_busy_loop", busy_loop)
++    monkeypatch.setattr(executor_module, "destroy_model_parallel", lambda: None)
++    monkeypatch.setattr(
++        executor_module, "destroy_distributed_environment", lambda: None
++    )
++    monkeypatch.setattr(executor_module, "maybe_init_worker_tracer", lambda **k: None)
++    monkeypatch.setattr(executor_module, "set_worker_net_device", lambda *a, **k: None)
++    monkeypatch.setattr(
++        executor_module, "_install_worker_parent_death_signal", lambda pid: None
++    )
++    monkeypatch.setattr(executor_module.signal, "signal", lambda *a, **k: None)
++    ready_reader, ready_writer = multiprocessing.Pipe(duplex=False)
++    fault_reader, fault_writer = multiprocessing.Pipe(duplex=False)
++    fault_fd = fault_writer.fileno()
++    # An unexpected busy-loop failure ends in exit code 1 after the teardown
++    # (any-rank fix).
++    with pytest.raises(SystemExit) as exited:
++        executor_module.WorkerProc.worker_main(
++            vllm_config=SimpleNamespace(
++                parallel_config=SimpleNamespace(
++                    assigned_physical_gpu_ids=None, numa_bind=False
++                )
++            ),
++            ready_pipe=ready_writer,
++            death_pipe=None,
++            fault_pipe=fault_writer,
++            shutdown_state=None,
++            inherited_fds=[],
++            expected_parent_pid=os.getpid(),
++        )
++    assert exited.value.code == 1
++    ready_reader.close()
++    assert seen.get("registered_fd") == fault_fd, seen
++    assert getattr(fatal, "_FATAL_NOTIFY_FD", "unset") is None
++    # Closed on the way out: EOF, which the monitor does not count as a fault.
++    assert fault_reader.poll(1.0), "worker_main left its fault pipe open"
++    with pytest.raises(EOFError):
++        fault_reader.recv_bytes()
++    fault_reader.close()
++
++
++def test_fail_closed_during_teardown_still_sends_the_fault_byte(monkeypatch):
++    """The fault fd stays registered through worker teardown.
++
++    worker_main's finally unregistered and closed the fault pipe BEFORE
++    worker.shutdown(); a PLE fail-closed inside that teardown (the drain waits
++    on the PLE transport) could not send its byte and the hang window reopened.
++    """
++    import vllm.v1.executor.multiproc_executor as executor_module
++    from vllm.v1.ple_offload import fatal
++
++    class _Inner:
++        def shutdown(self):
++            # ple_fail_closed's notify, from inside the teardown.
++            fatal.notify_parent_fatal()
++
++    def fake_init(self, *args, **kwargs):
++        self.rank = 1
++        self.worker = _Inner()
++        self.rpc_broadcast_mq = None
++        self.worker_response_mq = SimpleNamespace(
++            export_handle=lambda: None,
++            wait_until_ready=lambda: None,
++            shutdown=lambda: None,
++        )
++        self.peer_response_handles = []
++
++    def busy_loop(self):
++        raise ValueError("boom")
++
++    monkeypatch.setattr(executor_module.WorkerProc, "__init__", fake_init)
++    monkeypatch.setattr(executor_module.WorkerProc, "worker_busy_loop", busy_loop)
++    monkeypatch.setattr(executor_module, "destroy_model_parallel", lambda: None)
++    monkeypatch.setattr(
++        executor_module, "destroy_distributed_environment", lambda: None
++    )
++    monkeypatch.setattr(executor_module, "maybe_init_worker_tracer", lambda **k: None)
++    monkeypatch.setattr(executor_module, "set_worker_net_device", lambda *a, **k: None)
++    monkeypatch.setattr(
++        executor_module, "_install_worker_parent_death_signal", lambda pid: None
++    )
++    monkeypatch.setattr(executor_module.signal, "signal", lambda *a, **k: None)
++    ready_reader, ready_writer = multiprocessing.Pipe(duplex=False)
++    fault_reader, fault_writer = multiprocessing.Pipe(duplex=False)
++    with pytest.raises(SystemExit):
++        executor_module.WorkerProc.worker_main(
++            vllm_config=SimpleNamespace(
++                parallel_config=SimpleNamespace(
++                    assigned_physical_gpu_ids=None, numa_bind=False
++                )
++            ),
++            ready_pipe=ready_writer,
++            death_pipe=None,
++            fault_pipe=fault_writer,
++            shutdown_state=None,
++            inherited_fds=[],
++            expected_parent_pid=os.getpid(),
++        )
++    ready_reader.close()
++    assert fault_reader.poll(1.0), "no byte and no EOF on the fault pipe"
++    data = os.read(fault_reader.fileno(), 1)
++    fault_reader.close()
++    assert data == b"F", (
++        f"a fail-closed inside worker teardown sent {data!r}: the fault fd was "
++        "already unregistered/closed"
++    )
++    assert getattr(fatal, "_FATAL_NOTIFY_FD", "unset") is None
+diff --git a/tests/v1/executor/test_multiproc_monitor_any_rank.py b/tests/v1/executor/test_multiproc_monitor_any_rank.py
+new file mode 100644
+index 0000000000..d03366afbf
+--- /dev/null
++++ b/tests/v1/executor/test_multiproc_monitor_any_rank.py
+@@ -0,0 +1,226 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""The worker monitor must see ANY rank's exit, even with an fd inheritor.
++
++The rank-1 fault test (an earlier build): the PLE fault killed PP0_TP1 (rank 1) in
++release_outputs. The worker sat as a zombie, GPU 1 emptied, but the executor
++never logged "died unexpectedly" and EngineCore hung in the RPC broadcast
++("No available shared memory broadcast block"). The monitor waited on
++proc.sentinel, a pipe whose write end the worker holds -- and the worker's
++torch_shm_manager child (started by the PLE host-buffer registration under the
++"file_system" sharing strategy) inherited that write end and outlived it,
++kept alive by rank 0's PLE child mapping rank 1's buffers. Rank-0 faults only
++looked detected because rank 0's death took the PLE child, and so the
++managers, down with it.
++
++The inheritor here is a forked grandchild that sleeps; it holds every fd the
++worker had, the sentinel's write end included.
++"""
++
++import contextlib
++import inspect
++import multiprocessing
++import os
++import signal
++import sys
++import threading
++import time
++from types import SimpleNamespace
++
++import pytest
++
++pytestmark = [
++    pytest.mark.skip_global_cleanup,
++    pytest.mark.skipif(sys.platform != "linux", reason="fork + pidfd"),
++]
++
++# A healthy worker detects a death within this bound on the earlier build's rank-0 path
++# (sentinel fires at exit); a pidfd fires at the exit itself.
++_DETECT_BOUND_S = 5.0
++_INHERITOR_LIFETIME_S = 60.0
++
++
++def _healthy_worker():
++    time.sleep(600)
++
++
++def _dying_worker(inheritor_pid, spawn_inheritor):
++    if spawn_inheritor:
++        pid = os.fork()
++        if pid == 0:
++            # Stand-in for torch_shm_manager: holds the inherited fds.
++            time.sleep(_INHERITOR_LIFETIME_S)
++            os._exit(0)
++        inheritor_pid.value = pid
++    time.sleep(0.5)
++    # Stand-in for ple_fail_closed: no cleanup, straight out.
++    os._exit(1)
++
++
++def _executor(procs):
++    from vllm.v1.executor.multiproc_executor import MultiprocExecutor
++
++    executor = object.__new__(MultiprocExecutor)
++    executor.workers = [
++        SimpleNamespace(
++            proc=p,
++            rank=rank,
++            death_writer=None,
++            worker_response_mq=None,
++            shutdown_state=None,
++        )
++        for rank, p in enumerate(procs)
++    ]
++    executor.is_failed = False
++    executor.rpc_broadcast_mq = None
++    executor.response_mqs = []
++    failed = threading.Event()
++    executor.failure_callback = failed.set
++    return executor, failed
++
++
++@pytest.mark.parametrize("spawn_inheritor", [False, True])
++@pytest.mark.parametrize("dying_rank", [0, 1])
++def test_worker_exit_detected_on_any_rank(dying_rank, spawn_inheritor):
++    ctx = multiprocessing.get_context("fork")
++    inheritor_pid = ctx.Value("i", 0)
++    procs = []
++    for rank in range(2):
++        if rank == dying_rank:
++            proc = ctx.Process(
++                target=_dying_worker,
++                args=(inheritor_pid, spawn_inheritor),
++                name=f"VllmWorker-{rank}",
++                daemon=True,
++            )
++        else:
++            proc = ctx.Process(
++                target=_healthy_worker, name=f"VllmWorker-{rank}", daemon=True
++            )
++        proc.start()
++        procs.append(proc)
++
++    executor, failed = _executor(procs)
++    try:
++        start = time.monotonic()
++        executor.start_worker_monitor()
++        detected = failed.wait(_DETECT_BOUND_S + 5.0)
++        elapsed = time.monotonic() - start
++        assert detected, (
++            f"rank {dying_rank} exited (inheritor={spawn_inheritor}) but the "
++            f"monitor never reported it within {_DETECT_BOUND_S + 5.0:.0f} s; "
++            f"dying proc alive per waitpid: {procs[dying_rank].is_alive()}"
++        )
++        assert elapsed <= _DETECT_BOUND_S, elapsed
++        assert executor.is_failed
++        assert procs[dying_rank].exitcode == 1
++        # The failure ladder ended the healthy survivor too.
++        assert not any(p.is_alive() for p in procs)
++    finally:
++        for p in procs:
++            if p.is_alive():
++                p.kill()
++            p.join(timeout=5)
++        if inheritor_pid.value:
++            with contextlib.suppress(ProcessLookupError):
++                os.kill(inheritor_pid.value, signal.SIGKILL)
++
++
++def test_exit_waitables_close_opened_pidfds_when_a_later_proc_fails(monkeypatch):
++    """_worker_exit_waitables is exception-safe."""
++    import vllm.v1.executor.multiproc_executor as executor_module
++
++    opened: list[int] = []
++    real_open = os.pidfd_open
++
++    def recording_open(pid):
++        fd = real_open(pid)
++        opened.append(fd)
++        return fd
++
++    class _Broken:
++        pid = None  # no pidfd: falls back to the sentinel, which raises
++
++        @property
++        def sentinel(self):
++            raise ValueError("process not started")
++
++    class _Self:
++        pid = os.getpid()
++        sentinel = -1
++
++    monkeypatch.setattr(executor_module.os, "pidfd_open", recording_open)
++    with pytest.raises(ValueError):
++        executor_module._worker_exit_waitables([_Self(), _Self(), _Broken()])
++    assert len(opened) == 2, opened
++    leaked = []
++    for fd in opened:
++        try:
++            os.fstat(fd)
++            leaked.append(fd)
++        except OSError:
++            pass
++    for fd in leaked:
++        os.close(fd)
++    assert not leaked, f"pidfds left open after the failure: {leaked}"
++
++
++def test_exit_waitables_close_the_pidfd_of_the_failing_iteration(monkeypatch):
++    """A failure between opening a pidfd and recording it.
++
++    An exception is injected (via a trace function) on the line that records
++    the (waitable, proc, pidfd) tuple, after the pidfd for that proc was
++    opened; that pidfd must be closed too, not only the earlier ones.
++    """
++    import vllm.v1.executor.multiproc_executor as executor_module
++
++    opened: list[int] = []
++    real_open = os.pidfd_open
++
++    def recording_open(pid):
++        fd = real_open(pid)
++        opened.append(fd)
++        return fd
++
++    class _Self:
++        pid = os.getpid()
++        sentinel = -1
++
++    monkeypatch.setattr(executor_module.os, "pidfd_open", recording_open)
++    code = executor_module._worker_exit_waitables.__code__
++    append_lines = {
++        code.co_firstlineno + i
++        for i, line in enumerate(
++            inspect.getsource(executor_module._worker_exit_waitables).splitlines()
++        )
++        if "waitables.append(" in line
++    }
++    assert len(append_lines) == 1, append_lines
++
++    class _Injected(Exception):
++        pass
++
++    def tracer(frame, event, arg):
++        if frame.f_code is not code:
++            return None
++
++        def local(frame, event, arg):
++            if event == "line" and frame.f_lineno in append_lines and opened:
++                raise _Injected
++            return local
++
++        return local
++
++    sys.settrace(tracer)
++    try:
++        with pytest.raises(_Injected):
++            executor_module._worker_exit_waitables([_Self()])
++    finally:
++        sys.settrace(None)
++    assert len(opened) == 1, opened
++    try:
++        os.fstat(opened[0])
++    except OSError:
++        return
++    os.close(opened[0])
++    pytest.fail("the pidfd opened in the failing iteration was left open")
+diff --git a/tests/v1/executor/test_multiproc_monitor_combined.py b/tests/v1/executor/test_multiproc_monitor_combined.py
+new file mode 100644
+index 0000000000..d06af4e4fa
+--- /dev/null
++++ b/tests/v1/executor/test_multiproc_monitor_combined.py
+@@ -0,0 +1,147 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""The worker monitor's two wake sources together: fault byte + process exit.
++
++The rank-1 fault hang had two root causes. First fix: the sentinel's
++write end was inherited by the worker's torch_shm_manager child, so the exit
++never showed on it (fix: wait on a pidfd). Second fix: the dying
++rank's kernel teardown waits on a live peer, so no exit-based signal fires
++(fix: the fail-closed path writes one byte on a fault pipe before os._exit).
++The merged monitor must take whichever arrives first and must not count a
++fault pipe's EOF as a fault. Each case below fails on one of the two parents.
++"""
++
++import contextlib
++import multiprocessing
++import os
++import signal
++import sys
++import threading
++import time
++from types import SimpleNamespace
++
++import pytest
++
++pytestmark = [
++    pytest.mark.skip_global_cleanup,
++    pytest.mark.skipif(sys.platform != "linux", reason="fork + pidfd"),
++]
++
++_BOUND_S = 2.0
++
++
++def _healthy(fault_writer):
++    time.sleep(600)
++
++
++def _fault_byte_then_stuck(fault_writer):
++    # ple_fail_closed's notify, then a teardown that does not finish (the
++    # process stays alive, so neither its pidfd nor its sentinel fires).
++    os.write(fault_writer.fileno(), b"F")
++    time.sleep(600)
++
++
++def _silent_death_with_inheritor(fault_writer, inheritor_pid):
++    # A non-fail-closed death (no byte) whose fd-holding grandchild keeps the
++    # sentinel AND the fault pipe's write end open (no EOF either).
++    pid = os.fork()
++    if pid == 0:
++        time.sleep(60)
++        os._exit(0)
++    inheritor_pid.value = pid
++    time.sleep(0.3)
++    os._exit(1)
++
++
++def _orderly_eof_then_exit(fault_writer):
++    # worker_main's finally closes the fault pipe (EOF, no byte) and the
++    # process exits: a death, not a reported fault.
++    fault_writer.close()
++    time.sleep(0.3)
++    os._exit(0)
++
++
++def _run(dying_target, extra_args=()):
++    import vllm.v1.executor.multiproc_executor as executor_module
++    from vllm.v1.executor.multiproc_executor import MultiprocExecutor
++
++    ctx = multiprocessing.get_context("fork")
++    procs, handles = [], []
++    for rank in range(2):
++        fault_reader, fault_writer = ctx.Pipe(duplex=False)
++        target = dying_target if rank == 1 else _healthy
++        args = (fault_writer, *extra_args) if rank == 1 else (fault_writer,)
++        proc = ctx.Process(
++            target=target, args=args, name=f"VllmWorker-{rank}", daemon=True
++        )
++        proc.start()
++        fault_writer.close()
++        procs.append(proc)
++        handles.append(
++            SimpleNamespace(
++                proc=proc,
++                rank=rank,
++                death_writer=None,
++                worker_response_mq=None,
++                shutdown_state=None,
++                fault_reader=fault_reader,
++            )
++        )
++    executor = object.__new__(MultiprocExecutor)
++    executor.workers = handles
++    executor.is_failed = False
++    executor.rpc_broadcast_mq = None
++    executor.response_mqs = []
++    failed = threading.Event()
++    executor.failure_callback = failed.set
++
++    messages: list[str] = []
++    real_error = executor_module.logger.error
++
++    def capture(msg, *args, **kwargs):
++        messages.append(msg % args if args else msg)
++        return real_error(msg, *args, **kwargs)
++
++    executor_module.logger.error = capture
++    try:
++        start = time.monotonic()
++        executor.start_worker_monitor()
++        detected = failed.wait(_BOUND_S + 8.0)
++        elapsed = time.monotonic() - start
++    finally:
++        executor_module.logger.error = real_error
++        for p in procs:
++            if p.is_alive():
++                p.kill()
++            p.join(5)
++    return detected, elapsed, messages
++
++
++def test_fault_byte_wins_while_the_process_is_still_alive():
++    detected, elapsed, messages = _run(_fault_byte_then_stuck)
++    assert detected, "fault byte written, process alive: monitor never woke"
++    assert elapsed <= _BOUND_S, elapsed
++    assert any("VllmWorker-1 reported a fatal fault" in m for m in messages), messages
++
++
++def test_silent_death_with_an_fd_inheritor_is_seen_by_its_exit():
++    inheritor_pid = multiprocessing.get_context("fork").Value("i", 0)
++    try:
++        detected, elapsed, messages = _run(
++            _silent_death_with_inheritor, (inheritor_pid,)
++        )
++    finally:
++        if inheritor_pid.value:
++            with contextlib.suppress(ProcessLookupError):
++                os.kill(inheritor_pid.value, signal.SIGKILL)
++    assert detected, "worker exited (no fault byte, inherited fds): not seen"
++    assert elapsed <= _BOUND_S + 1.0, elapsed
++    assert any("VllmWorker-1 died unexpectedly" in m for m in messages), messages
++
++
++def test_fault_pipe_eof_is_not_a_fault():
++    detected, elapsed, messages = _run(_orderly_eof_then_exit)
++    assert detected, "worker exited after closing its fault pipe: not seen"
++    assert elapsed <= _BOUND_S + 1.0, elapsed
++    assert any("VllmWorker-1 died unexpectedly" in m for m in messages), messages
++    assert not any("reported a fatal fault" in m for m in messages), messages
+diff --git a/tests/v1/executor/test_multiproc_ready_and_inherit.py b/tests/v1/executor/test_multiproc_ready_and_inherit.py
+new file mode 100644
+index 0000000000..2ef20cd789
+--- /dev/null
++++ b/tests/v1/executor/test_multiproc_ready_and_inherit.py
+@@ -0,0 +1,355 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Pre-READY worker death, and the inherited-pipe leak behind the rank-1 fault hang.
++
++The rank-1 fault test: a PLE-owning worker's torch_shm_manager child (fork and
++program load, from the PLE host-buffer registration) inherited the worker's
++end of the sentinel pipe and outlived it, so the executor never saw rank 1
++die. The same inheritance covers the READY pipe: a worker dying between the
++registration and READY left WorkerProc.wait_for_ready waiting for an EOF that
++never came.
++"""
++
++import contextlib
++import multiprocessing
++import multiprocessing.connection
++import os
++import signal
++import subprocess
++import sys
++import threading
++import time
++
++import pytest
++
++pytestmark = [
++    pytest.mark.skip_global_cleanup,
++    pytest.mark.skipif(sys.platform != "linux", reason="fork + pidfd"),
++]
++
++_BOUND_S = 5.0
++
++
++def _die_before_ready(inheritor_pid):
++    # Stand-in for torch_shm_manager: a forked child holding every fd,
++    # the READY pipe's write end included.
++    pid = os.fork()
++    if pid == 0:
++        time.sleep(60)
++        os._exit(0)
++    inheritor_pid.value = pid
++    time.sleep(0.3)
++    os._exit(1)  # died during init, READY never sent
++
++
++def test_wait_for_ready_sees_a_worker_die_before_ready():
++    from vllm.v1.executor.multiproc_executor import (
++        UnreadyWorkerProcHandle,
++        WorkerProc,
++    )
++
++    ctx = multiprocessing.get_context("fork")
++    inheritor_pid = ctx.Value("i", 0)
++    ready_reader, ready_writer = ctx.Pipe(duplex=False)
++    proc = ctx.Process(
++        target=_die_before_ready, args=(inheritor_pid,), name="VllmWorker-1"
++    )
++    proc.start()
++    ready_writer.close()
++    handle = UnreadyWorkerProcHandle(proc, 1, ready_reader)
++
++    outcome: dict = {}
++
++    def run():
++        try:
++            WorkerProc.wait_for_ready([handle])
++            outcome["result"] = "returned"
++        except BaseException as exc:  # noqa: BLE001
++            outcome["result"] = exc
++
++    waiter = threading.Thread(target=run, daemon=True)
++    try:
++        start = time.monotonic()
++        waiter.start()
++        waiter.join(_BOUND_S + 5.0)
++        elapsed = time.monotonic() - start
++        assert not waiter.is_alive(), (
++            "wait_for_ready still waiting for READY from a worker that exited "
++            f"{elapsed:.1f} s ago (an inheritor holds the pipe's write end)"
++        )
++        assert isinstance(outcome.get("result"), Exception), outcome
++        assert "initialization failed" in str(outcome["result"])
++        assert elapsed <= _BOUND_S, elapsed
++    finally:
++        if inheritor_pid.value:
++            with contextlib.suppress(ProcessLookupError):
++                os.kill(inheritor_pid.value, signal.SIGKILL)
++        waiter.join(10)
++        proc.join(5)
++
++
++def _spawned_worker_starts_a_helper(helper_pid):
++    from vllm.v1.executor import multiproc_executor
++
++    # The worker_main step under test; absent on unfixed code.
++    guard = getattr(
++        multiproc_executor, "_make_inherited_pipes_close_on_exec", lambda: None
++    )
++    guard()
++    # Stand-in for torch_shm_manager: a helper program started with no fd
++    # closing, as libshm does. It outlives every bound below (killed in the
++    # test's cleanup), so a fired sentinel cannot be the helper's own exit.
++    helper = subprocess.Popen(["sleep", "3600"], close_fds=False)
++    helper_pid.value = helper.pid
++    os._exit(1)
++
++
++def _proc_state(pid):
++    """/proc/<pid>/stat state letter, or None if the pid is gone."""
++    try:
++        with open(f"/proc/{pid}/stat") as f:
++            stat = f.read()
++    except OSError:
++        return None
++    return stat[stat.rindex(")") + 2 :].split()[0]
++
++
++def _running(pid):
++    state = _proc_state(pid)
++    return state is not None and state not in ("Z", "X")
++
++
++def test_running_check_rejects_a_zombie():
++    """os.kill(pid, 0) cannot tell a zombie from a live process; _running can."""
++    pid = os.fork()
++    if pid == 0:
++        os._exit(0)
++    try:
++        deadline = time.monotonic() + 5
++        while _proc_state(pid) != "Z" and time.monotonic() < deadline:
++            time.sleep(0.01)
++        assert _proc_state(pid) == "Z"
++        os.kill(pid, 0)  # succeeds on the zombie: the old check passed here
++        assert not _running(pid)
++    finally:
++        os.waitpid(pid, 0)
++    assert _running(os.getpid())
++
++
++# The worker exits right after publishing the helper's pid; its sentinel must
++# fire within this bound while the helper is provably still alive.
++_SENTINEL_BOUND_S = 2.0
++
++
++def test_started_helper_does_not_inherit_the_sentinel():
++    ctx = multiprocessing.get_context("spawn")
++    helper_pid = ctx.Value("i", 0)
++    proc = ctx.Process(
++        target=_spawned_worker_starts_a_helper, args=(helper_pid,), daemon=True
++    )
++    proc.start()
++    try:
++        # Spawn + import can take a while; the bound starts at the helper's
++        # start (the worker exits right after it).
++        deadline = time.monotonic() + 120
++        while not helper_pid.value and time.monotonic() < deadline:
++            time.sleep(0.05)
++        assert helper_pid.value, "the helper never started"
++        fired = multiprocessing.connection.wait(
++            [proc.sentinel], timeout=_SENTINEL_BOUND_S
++        )
++        # The helper must still be RUNNING (not gone, and not a zombie --
++        # os.kill(pid, 0) succeeds on a zombie too).
++        assert _running(helper_pid.value), (
++            f"helper {helper_pid.value} is not running: "
++            f"state={_proc_state(helper_pid.value)}"
++        )
++        assert fired, (
++            f"the worker exited but its sentinel did not fire within "
++            f"{_SENTINEL_BOUND_S} s while the helper it started is alive: the "
++            "helper inherited the sentinel pipe's write end"
++        )
++        proc.join(5)
++        assert proc.exitcode == 1
++    finally:
++        if proc.is_alive():
++            proc.kill()
++        if helper_pid.value:
++            with contextlib.suppress(ProcessLookupError):
++                os.kill(helper_pid.value, signal.SIGKILL)
++
++
++def test_guard_marks_inherited_pipes_only():
++    from vllm.v1.executor import multiproc_executor
++
++    guard = multiproc_executor._make_inherited_pipes_close_on_exec
++    stdio = {}
++    for fd in (0, 1, 2):
++        with contextlib.suppress(OSError):
++            stdio[fd] = os.get_inheritable(fd)
++    reader, writer = os.pipe()
++    try:
++        os.set_inheritable(reader, True)
++        os.set_inheritable(writer, True)
++        guard()
++        assert not os.get_inheritable(reader)
++        assert not os.get_inheritable(writer)
++        for fd, before in stdio.items():
++            assert os.get_inheritable(fd) == before, fd
++    finally:
++        os.close(reader)
++        os.close(writer)
++
++
++# ---- Pre-READY waiting keeps the sentinel fallback and the fault pipe
++
++_PRE_READY_BOUND_S = 3.0
++
++
++def _exits_with_ready_writer_held_by_a_helper(ready_writer, helper_pid):
++    # A helper program inherits ONLY the READY pipe's write end (fork's
++    # sentinel end is close-on-exec), so the READY pipe never EOFs while the
++    # sentinel does fire at the exit.
++    helper = subprocess.Popen(["sleep", "60"], pass_fds=(ready_writer.fileno(),))
++    helper_pid.value = helper.pid
++    os._exit(1)
++
++
++def _fault_byte_before_ready(fault_writer):
++    # ple_fail_closed's notify during init; the process then stays alive
++    # (its teardown is pinned), so no exit signal fires either.
++    os.write(fault_writer.fileno(), b"F")
++    time.sleep(60)
++
++
++def _wait_for_ready_in_thread(handles):
++    from vllm.v1.executor.multiproc_executor import WorkerProc
++
++    outcome: dict = {}
++
++    def run():
++        try:
++            WorkerProc.wait_for_ready(handles)
++            outcome["result"] = "returned"
++        except BaseException as exc:  # noqa: BLE001
++            outcome["result"] = exc
++
++    waiter = threading.Thread(target=run, daemon=True)
++    start = time.monotonic()
++    waiter.start()
++    waiter.join(_PRE_READY_BOUND_S)
++    return waiter, outcome, time.monotonic() - start
++
++
++def test_pre_ready_death_is_seen_by_the_sentinel_when_no_pidfd(monkeypatch):
++    import vllm.v1.executor.multiproc_executor as executor_module
++    from vllm.v1.executor.multiproc_executor import UnreadyWorkerProcHandle
++
++    def no_pidfd(pid):
++        raise OSError(38, "pidfd_open unavailable")
++
++    monkeypatch.setattr(executor_module.os, "pidfd_open", no_pidfd, raising=False)
++    ctx = multiprocessing.get_context("fork")
++    helper_pid = ctx.Value("i", 0)
++    ready_reader, ready_writer = ctx.Pipe(duplex=False)
++    proc = ctx.Process(
++        target=_exits_with_ready_writer_held_by_a_helper,
++        args=(ready_writer, helper_pid),
++        name="VllmWorker-1",
++    )
++    proc.start()
++    ready_writer.close()
++    handle = UnreadyWorkerProcHandle(proc, 1, ready_reader)
++    try:
++        waiter, outcome, elapsed = _wait_for_ready_in_thread([handle])
++        assert not waiter.is_alive(), (
++            f"no pidfd: wait_for_ready dropped the sentinel fallback and is "
++            f"still waiting {elapsed:.1f} s after the worker exited"
++        )
++        assert isinstance(outcome.get("result"), Exception), outcome
++    finally:
++        if helper_pid.value:
++            with contextlib.suppress(ProcessLookupError):
++                os.kill(helper_pid.value, signal.SIGKILL)
++        proc.join(5)
++
++
++def test_pre_ready_fault_byte_fails_initialization():
++    from vllm.v1.executor.multiproc_executor import UnreadyWorkerProcHandle
++
++    ctx = multiprocessing.get_context("fork")
++    ready_reader, ready_writer = ctx.Pipe(duplex=False)
++    fault_reader, fault_writer = ctx.Pipe(duplex=False)
++    proc = ctx.Process(
++        target=_fault_byte_before_ready, args=(fault_writer,), name="VllmWorker-1"
++    )
++    proc.start()
++    handle = UnreadyWorkerProcHandle(proc, 1, ready_reader, None, None, fault_reader)
++    try:
++        waiter, outcome, elapsed = _wait_for_ready_in_thread([handle])
++        assert not waiter.is_alive(), (
++            "a fault byte arrived before READY but wait_for_ready is still "
++            f"waiting after {elapsed:.1f} s"
++        )
++        assert isinstance(outcome.get("result"), Exception), outcome
++    finally:
++        proc.kill()
++        proc.join(5)
++        # unblock a still-waiting pre-fix thread
++        ready_writer.close()
++        fault_writer.close()
++
++
++# ---- A READY worker that faults or dies while a sibling initialises
++
++
++def _ready_then_fault(ready_writer, fault_writer):
++    ready_writer.send({"status": "READY"})
++    time.sleep(0.2)
++    os.write(fault_writer.fileno(), b"F")  # fail-closed after READY
++    time.sleep(60)  # teardown pinned: no exit signal
++
++
++def _never_ready(ready_writer):
++    time.sleep(60)  # still initialising
++
++
++def test_ready_worker_fault_while_sibling_initialises_fails_init(monkeypatch):
++    from vllm.v1.executor.multiproc_executor import (
++        UnreadyWorkerProcHandle,
++        WorkerProc,
++    )
++
++    # READY handling beyond the status check needs real MQ handles; the
++    # response contents are not what this test is about.
++    monkeypatch.setattr(
++        WorkerProc,
++        "wait_for_response_handle_ready",
++        staticmethod(lambda response, handle: handle),
++    )
++    ctx = multiprocessing.get_context("fork")
++    ra, wa = ctx.Pipe(duplex=False)
++    fa, fwa = ctx.Pipe(duplex=False)
++    rb, wb = ctx.Pipe(duplex=False)
++    fb, fwb = ctx.Pipe(duplex=False)
++    pa = ctx.Process(target=_ready_then_fault, args=(wa, fwa), name="VllmWorker-0")
++    pb = ctx.Process(target=_never_ready, args=(wb,), name="VllmWorker-1")
++    pa.start()
++    pb.start()
++    handles = [
++        UnreadyWorkerProcHandle(pa, 0, ra, None, None, fa),
++        UnreadyWorkerProcHandle(pb, 1, rb, None, None, fb),
++    ]
++    try:
++        waiter, outcome, elapsed = _wait_for_ready_in_thread(handles)
++        assert not waiter.is_alive(), (
++            "worker 0 was READY and then reported a fatal fault while worker 1 "
++            f"was still initialising; wait_for_ready still waiting at {elapsed:.1f} s"
++        )
++        assert isinstance(outcome.get("result"), Exception), outcome
++    finally:
++        for p in (pa, pb):
++            p.kill()
++            p.join(5)
++        for w in (wa, fwa, wb, fwb):
++            w.close()
+diff --git a/tests/v1/executor/test_multiproc_worker_exit_after_drain.py b/tests/v1/executor/test_multiproc_worker_exit_after_drain.py
+index 7694a62225..2881193259 100644
+--- a/tests/v1/executor/test_multiproc_worker_exit_after_drain.py
++++ b/tests/v1/executor/test_multiproc_worker_exit_after_drain.py
+@@ -225,13 +225,18 @@ def test_orderly_shutdown_exits_right_after_drain(monkeypatch):
+ 
+ 
+ def test_unexpected_busy_loop_failure_keeps_full_teardown(monkeypatch):
+-    # Not an orderly shutdown (no shutdown request): unchanged behaviour --
+-    # full WorkerProc.shutdown incl. distributed destroy, then a normal return.
++    # Not an orderly shutdown: full WorkerProc.shutdown incl. distributed
++    # destroy, then exit 1. An earlier build returned normally (process exit
++    # 0) whenever shutdown_requested was not yet set at the classification --
++    # which a death-pipe EOF landing just after the check makes a race.
+     events, exit_code, _ = _run_worker_main_in_process(
+         monkeypatch, busy_loop_error=ValueError("boom"), slow_destroy_s=0.0
+     )
+     names = [name for name, _ in events]
+-    assert exit_code is None, names
++    assert exit_code == 1, (
++        f"an unexpected busy-loop failure exited {exit_code!r}, not 1: {names}"
++    )
++    assert "os._exit" not in names, f"took the orderly exit path: {names}"
+     assert names.count("drain") == 1, names
+     assert "destroy_model_parallel" in names, names
+     assert "destroy_distributed_environment" in names, names
+@@ -454,3 +459,20 @@ def test_ladder_bounds_a_worker_stuck_in_its_busy_loop(monkeypatch):
+     assert any("sending SIGKILL" in w for w in warnings), warnings
+     assert proc.exitcode == -9, proc.exitcode
+     assert elapsed <= grace_s + 4 + 2, f"ladder took {elapsed:.1f}s"
++
++
++def test_worker_main_runs_the_inherited_pipe_guard(monkeypatch):
++    # Rank-1 fault: worker_main marks its inherited pipes close-on-exec before
++    # anything can start torch_shm_manager (see
++    # test_multiproc_ready_and_inherit.py for the helper itself).
++    import vllm.v1.executor.multiproc_executor as executor_module
++
++    called = []
++    monkeypatch.setattr(
++        executor_module,
++        "_make_inherited_pipes_close_on_exec",
++        lambda: called.append(True),
++        raising=False,
++    )
++    _run_worker_main_in_process(monkeypatch)
++    assert called, "worker_main never ran the inherited-pipe guard"
+diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
+index 72da32ebc5..dec44e120a 100644
+--- a/vllm/v1/engine/core.py
++++ b/vllm/v1/engine/core.py
+@@ -110,6 +110,24 @@ _R = TypeVar("_R")  # Return type for collective_rpc
+ _TEARDOWN_SIGNAL_BOUND_S = 30.0
+ 
+ 
++# How long the guard's forced-exit paths wait for their diagnostic line. The
++# line is written from a helper thread; a blocked handler, a held logging lock
++# or a full stderr pipe costs at most this, never the exit.
++_TEARDOWN_EXIT_LOG_BOUND_S = 0.5
++
++
++def _log_bounded(emit: Callable[[], None], bound_s: float) -> None:
++    """Run ``emit`` (logging, flushes) on a daemon thread; wait <= bound_s."""
++    try:
++        thread = threading.Thread(
++            target=emit, daemon=True, name="EngineCoreTeardownLog"
++        )
++        thread.start()
++        thread.join(bound_s)
++    except BaseException:  # noqa: BLE001 -- the caller's exit must still run
++        pass
++
++
+ class _TeardownSignalGuard:
+     """EngineCore teardown: defer ONE late SIGTERM/SIGINT, bounded.
+ 
+@@ -148,25 +166,34 @@ class _TeardownSignalGuard:
+             )
+             self._watchdog.start()
+             return
+-        logger.warning(
+-            "[shutdown] EngineCore: second late signal (%s) during resource "
+-            "teardown; not deferring again",
+-            name,
+-        )
++        # Default disposition first, so a third signal also ends the process
++        # while the (bounded) diagnostic line is written.
+         signal.signal(signum, signal.SIG_DFL)
++        _log_bounded(
++            lambda: logger.warning(
++                "[shutdown] EngineCore: second late signal (%s) during "
++                "resource teardown; not deferring again",
++                name,
++            ),
++            _TEARDOWN_EXIT_LOG_BOUND_S,
++        )
+         os.kill(os.getpid(), signum)
+ 
+     def _expire(self) -> None:
+         if self._done.wait(self.bound_s):
+             return
+-        logger.error(
+-            "[shutdown] EngineCore: resource teardown still running %.0f s "
+-            "after a deferred signal; exiting (code 1)",
+-            self.bound_s,
+-        )
+-        for stream in (sys.stdout, sys.stderr):
+-            with suppress(Exception):
+-                stream.flush()
++
++        def emit() -> None:
++            logger.error(
++                "[shutdown] EngineCore: resource teardown still running %.0f s "
++                "after a deferred signal; exiting (code 1)",
++                self.bound_s,
++            )
++            for stream in (sys.stdout, sys.stderr):
++                with suppress(Exception):
++                    stream.flush()
++
++        _log_bounded(emit, _TEARDOWN_EXIT_LOG_BOUND_S)
+         os._exit(1)
+ 
+     def disarm(self) -> None:
+diff --git a/vllm/v1/executor/multiproc_executor.py b/vllm/v1/executor/multiproc_executor.py
+index 0c5af34707..d7beb9a525 100644
+--- a/vllm/v1/executor/multiproc_executor.py
++++ b/vllm/v1/executor/multiproc_executor.py
+@@ -5,6 +5,7 @@ import os
+ import pickle
+ import queue
+ import signal
++import stat
+ import sys
+ import threading
+ import time
+@@ -71,6 +72,7 @@ from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
+ from vllm.v1.executor.abstract import Executor, FailureCallback
+ from vllm.v1.executor.vllm_net_devices import set_worker_net_device
+ from vllm.v1.outputs import AsyncModelRunnerOutput, DraftTokenIds, ModelRunnerOutput
++from vllm.v1.ple_offload.fatal import set_fatal_notify_fd
+ from vllm.v1.worker.worker_base import WorkerWrapperBase
+ 
+ logger = init_logger(__name__)
+@@ -97,13 +99,16 @@ def _install_worker_parent_death_signal(expected_parent_pid: int) -> None:
+         ctypes.c_ulong,
+     ]
+     prctl.restype = ctypes.c_int
+-    if prctl(
+-        _PR_SET_PDEATHSIG,
+-        int(_WORKER_PARENT_DEATH_SIGNAL),
+-        0,
+-        0,
+-        0,
+-    ) != 0:
++    if (
++        prctl(
++            _PR_SET_PDEATHSIG,
++            int(_WORKER_PARENT_DEATH_SIGNAL),
++            0,
++            0,
++            0,
++        )
++        != 0
++    ):
+         error_number = ctypes.get_errno()
+         raise OSError(error_number, os.strerror(error_number))
+ 
+@@ -173,6 +178,86 @@ def _exit_worker_process(exit_code: int) -> None:
+     os._exit(exit_code)
+ 
+ 
++def _worker_exit_waitables(
++    procs: Sequence[BaseProcess],
++) -> list[tuple[Any, BaseProcess, int | None]]:
++    """What the worker monitor waits on to learn that a worker process exited.
++
++    A pidfd (Linux >= 5.3) where possible: it becomes readable when the process
++    itself exits. proc.sentinel is only the read end of a pipe whose write end
++    the worker holds, so it reports the exit of the LAST process holding that
++    write end -- and anything the worker fork+execs inherits it. Every PLE-
++    owning worker does: registering its host buffers under the "file_system"
++    sharing strategy starts a torch_shm_manager child, which keeps the write
++    end, and which lives while any client -- rank 0's PLE child, for a TP1
++    worker's buffers -- still maps them. In a rank-1 fault test PP0_TP1 died
++    in release_outputs, sat as a zombie, its sentinel never fired and the
++    engine hung; rank 0's death only looked detected because its PLE child
++    (and so both managers) died with it, ~8 s later.
++
++    Returns (waitable, proc, pidfd-to-close-or-None) per process, falling back
++    to the sentinel where no pidfd can be opened.
++    """
++    pidfd_open = getattr(os, "pidfd_open", None)
++    waitables: list[tuple[Any, BaseProcess, int | None]] = []
++    try:
++        for proc in procs:
++            pidfd: int | None = None
++            pid = getattr(proc, "pid", None)
++            if pidfd_open is not None and pid is not None:
++                try:
++                    pidfd = pidfd_open(pid)
++                except OSError:
++                    # ESRCH (already reaped) or no pidfd support: the sentinel.
++                    pidfd = None
++            try:
++                waitable = pidfd if pidfd is not None else proc.sentinel
++                waitables.append((waitable, proc, pidfd))
++            except BaseException:
++                # Not yet in `waitables`: the outer handler would miss it.
++                if pidfd is not None:
++                    os.close(pidfd)
++                raise
++    except BaseException:
++        # Nothing is handed out on failure: close what was opened.
++        for _, _, opened in waitables:
++            if opened is not None:
++                with suppress(OSError):
++                    os.close(opened)
++        raise
++    return waitables
++
++
++def _make_inherited_pipes_close_on_exec() -> None:
++    """Keep this worker's inherited pipe fds out of the programs it execs.
++
++    Under the spawn start method multiprocessing hands the worker its end of
++    the sentinel pipe (and the ready / death pipes) as INHERITABLE fds, so any
++    program the worker fork+execs keeps them open: the torch_shm_manager that
++    the PLE host-buffer registration starts did, and outlived the worker, so
++    neither the sentinel nor the ready pipe reported its death (rank-1 fault injection).
++    Nothing this process execs needs them -- multiprocessing children get
++    their fds passed explicitly, subprocess closes them by default -- so mark
++    every inherited pipe above stderr close-on-exec. The executor's pidfd
++    wait is the primary detection; this only stops the leak at its source.
++    """
++    if not sys.platform.startswith("linux"):
++        return
++    try:
++        fds = [int(name) for name in os.listdir("/proc/self/fd")]
++    except (OSError, ValueError):
++        return
++    for fd in fds:
++        if fd <= 2:
++            continue
++        try:
++            if stat.S_ISFIFO(os.fstat(fd).st_mode) and os.get_inheritable(fd):
++                os.set_inheritable(fd, False)
++        except OSError:
++            # The listing's own directory fd, or one closed since.
++            continue
++
++
+ class FutureWrapper(Future):
+     def __init__(
+         self,
+@@ -304,6 +389,7 @@ class MultiprocExecutor(Executor):
+                 if inherited_fds is not None:
+                     inherited_fds.append(unready_worker_handle.death_writer.fileno())
+                     inherited_fds.append(unready_worker_handle.ready_pipe.fileno())
++                    inherited_fds.append(unready_worker_handle.fault_reader.fileno())
+ 
+             # Workers must be created before wait_for_ready to avoid
+             # deadlock, since worker.init_device() does a device sync.
+@@ -400,22 +486,78 @@ class MultiprocExecutor(Executor):
+         # Monitors worker process liveness. If any die unexpectedly,
+         # logs an error, shuts down the executor and invokes the failure
+         # callback to inform the engine.
++        #
++        # Two wake sources per worker:
++        #  - its exit: a pidfd, readable when the process itself has exited
++        #    (fallback: proc.sentinel, which a fork+exec'd child holding the
++        #    write end -- torch_shm_manager from the PLE registration -- keeps
++        #    silent; see _worker_exit_waitables);
++        #  - its fault pipe: one byte from the fail-closed path right before
++        #    os._exit, so the failure ladder starts -- and ends the peers --
++        #    without waiting for the process teardown, which can itself wait
++        #    on a live peer. A worker closing its end on the way out (EOF, no
++        #    byte) is not a fault; its exit follows.
++        # In a rank-1 fault test a fault on PP0_TP1 was never detected and the
++        # engine hung on the response queue for 300 s.
++        # Opened here, before the thread starts, so a worker that dies early
++        # is still a zombie (pidfds work on zombies) rather than reaped.
++        exit_waitables = _worker_exit_waitables([h.proc for h in workers])
++
+         def monitor_workers():
+-            sentinels = [h.proc.sentinel for h in workers]
+-            died = multiprocessing.connection.wait(sentinels)
++            exit_to_handle = {
++                w: h for (w, _, _), h in zip(exit_waitables, workers)
++            }
++            fault_to_handle = {
++                h.fault_reader: h
++                for h in workers
++                if getattr(h, "fault_reader", None) is not None
++            }
++            waiting: list[Any] = list(exit_to_handle) + list(fault_to_handle)
++            handle = None
++            reported_fatal = False
++            try:
++                while handle is None:
++                    ready = multiprocessing.connection.wait(waiting)
++                    for obj in ready:
++                        if obj in exit_to_handle:
++                            handle = exit_to_handle[obj]
++                            break
++                        try:
++                            data = os.read(obj.fileno(), 1)
++                        except OSError:
++                            data = b""
++                        if data:
++                            handle = fault_to_handle[obj]
++                            reported_fatal = True
++                            break
++                        waiting.remove(obj)
++            finally:
++                for _, _, pidfd in exit_waitables:
++                    if pidfd is not None:
++                        with suppress(OSError):
++                            os.close(pidfd)
+             _self = self_ref()
+             if not _self or getattr(_self, "shutting_down", False):
+                 logger.debug("MultiprocWorkerMonitor: shutdown already initiated")
+                 return
+             _self.is_failed = True
+-            proc = next(h.proc for h in workers if h.proc.sentinel == died[0])
+-            logger.error(
+-                "Worker proc %s died unexpectedly (exit code: %s), "
+-                "shutting down executor. executor_shutdown_monotonic=%.9f",
+-                proc.name,
+-                proc.exitcode,
+-                time.monotonic(),
+-            )
++            proc = handle.proc
++            if reported_fatal:
++                logger.error(
++                    "Worker proc %s reported a fatal fault (fail-closed) and is "
++                    "exiting; shutting down executor without waiting for its "
++                    "process teardown. executor_shutdown_monotonic=%.9f",
++                    proc.name,
++                    time.monotonic(),
++                )
++            else:
++                logger.error(
++                    "Worker proc %s died unexpectedly (exit code: %s), "
++                    "shutting down executor. executor_shutdown_monotonic=%.9f",
++                    proc.name,
++                    proc.exitcode,
++                    time.monotonic(),
++                )
+             _self.shutdown()
+             callback = _self.failure_callback
+             if callback is not None:
+@@ -423,9 +565,16 @@ class MultiprocExecutor(Executor):
+                 callback()
+ 
+         if not inline:
+-            Thread(
+-                target=monitor_workers, daemon=True, name="MultiprocWorkerMonitor"
+-            ).start()
++            try:
++                Thread(
++                    target=monitor_workers, daemon=True, name="MultiprocWorkerMonitor"
++                ).start()
++            except BaseException:
++                for _, _, pidfd in exit_waitables:
++                    if pidfd is not None:
++                        with suppress(OSError):
++                            os.close(pidfd)
++                raise
+             return
+ 
+         monitor_workers()
+@@ -586,8 +735,9 @@ class MultiprocExecutor(Executor):
+                 # If we are in late stage shutdown, the interpreter may replace
+                 # `time` with `None`.
+                 return all(not proc.is_alive() for proc in procs)
+-            start_time = time.time()
+-            while time.time() - start_time < timeout:
++            # Monotonic: a wall-clock step must not cut or stretch the grace.
++            start_time = time.monotonic()
++            while time.monotonic() - start_time < timeout:
+                 if all(not proc.is_alive() for proc in procs):
+                     return True
+                 time.sleep(0.1)
+@@ -602,7 +752,7 @@ class MultiprocExecutor(Executor):
+             initial_count,
+         )
+         if after_failure and time:
+-            start = time.time()
++            start = time.monotonic()
+             states = list(shutdown_states or [None] * len(worker_procs))
+ 
+             def parked() -> list[BaseProcess]:
+@@ -634,7 +784,7 @@ class MultiprocExecutor(Executor):
+                             p.kill()
+             # Workers that started their shutdown get a BOUNDED grace, counted
+             # from the start of this ladder, then SIGTERM, then SIGKILL.
+-            grace_s = max(0.0, _FAILED_DRAIN_GRACE_S - (time.time() - start))
++            grace_s = max(0.0, _FAILED_DRAIN_GRACE_S - (time.monotonic() - start))
+             term_wait_s = _FAILED_WORKER_WAIT_S
+         if wait_for_termination(active_procs(), timeout=grace_s):
+             logger.info_once("[shutdown] Executor: all workers exited gracefully")
+@@ -735,6 +885,7 @@ class UnreadyWorkerProcHandle:
+     ready_pipe: Connection
+     death_writer: Connection | None = None
+     shutdown_state: Any = None
++    fault_reader: Connection | None = None
+ 
+ 
+ @dataclass
+@@ -750,6 +901,8 @@ class WorkerProcHandle:
+     death_writer: Connection | None = None
+     # Shared byte: _SHUTDOWN_NOT_STARTED / _STARTED / _DONE (worker writes).
+     shutdown_state: Any = None
++    # Read end of the worker's fault pipe (see start_worker_monitor).
++    fault_reader: Connection | None = None
+ 
+     @classmethod
+     def from_unready_handle(
+@@ -765,6 +918,7 @@ class WorkerProcHandle:
+             peer_worker_response_mqs=peer_worker_response_mqs,
+             death_writer=unready_handle.death_writer,
+             shutdown_state=unready_handle.shutdown_state,
++            fault_reader=unready_handle.fault_reader,
+         )
+ 
+ 
+@@ -903,11 +1057,16 @@ class WorkerProc:
+         ready_reader, ready_writer = context.Pipe(duplex=False)
+         # Death pipe to let child detect parent process exit
+         death_reader, death_writer = context.Pipe(duplex=False)
++        # Fault pipe: the worker's fail-closed path writes one byte before
++        # os._exit; the executor's monitor waits on it next to the sentinel.
++        fault_reader, fault_writer = context.Pipe(duplex=False)
+         # One shared byte: has this worker started / finished its shutdown?
+         shutdown_state = context.RawValue("b", _SHUTDOWN_NOT_STARTED)
+         if inherited_fds is not None:
+             inherited_fds = inherited_fds.copy()
+-            inherited_fds.extend((ready_reader.fileno(), death_writer.fileno()))
++            inherited_fds.extend(
++                (ready_reader.fileno(), death_writer.fileno(), fault_reader.fileno())
++            )
+         process_kwargs = {
+             "expected_parent_pid": os.getpid(),
+             "vllm_config": vllm_config,
+@@ -917,6 +1076,7 @@ class WorkerProc:
+             "input_shm_handle": input_shm_handle,
+             "ready_pipe": ready_writer,
+             "death_pipe": death_reader,
++            "fault_pipe": fault_writer,
+             "shutdown_state": shutdown_state,
+             "shared_worker_lock": shared_worker_lock,
+             "is_driver_worker": is_driver_worker,
+@@ -940,10 +1100,11 @@ class WorkerProc:
+         # Close child ends of pipes here in the parent
+         ready_writer.close()
+         death_reader.close()
++        fault_writer.close()
+         # Keep death_writer open in parent - when parent exits,
+         # death_reader in child will get EOFError
+         return UnreadyWorkerProcHandle(
+-            proc, rank, ready_reader, death_writer, shutdown_state
++            proc, rank, ready_reader, death_writer, shutdown_state, fault_reader
+         )
+ 
+     @staticmethod
+@@ -980,10 +1141,59 @@ class WorkerProc:
+         ready_proc_handles: list[WorkerProcHandle | None] = [None] * len(
+             unready_proc_handles
+         )
+-        while pipes:
+-            ready = multiprocessing.connection.wait(pipes.keys())
+-            for pipe in ready:
+-                assert isinstance(pipe, Connection)
++        # A worker that dies before READY need not close its ready pipe: a
++        # child it fork+exec'd (torch_shm_manager, started by the PLE
++        # registration) can hold the write end, so no EOF ever comes. Wait on
++        # each pending worker's exit (pidfd, else its sentinel -- see
++        # _worker_exit_waitables) and on its fault pipe (one byte from the
++        # fail-closed path; EOF is not a fault), as the post-READY monitor does.
++        exit_waitables = _worker_exit_waitables(
++            [h.proc for h in unready_proc_handles]
++        )
++        exits = {
++            w: handle
++            for (w, _, _), handle in zip(exit_waitables, unready_proc_handles)
++        }
++        faults = {
++            handle.fault_reader: handle
++            for handle in unready_proc_handles
++            if getattr(handle, "fault_reader", None) is not None
++        }
++        try:
++            while pipes:
++                waiting: list[Any] = [*pipes.keys()]
++                # EVERY worker's exit and fault pipe, READY or not: the live
++                # monitor starts only after all are READY, so a READY worker
++                # that faults or dies while a sibling initialises must fail
++                # initialization here.
++                waiting += list(exits)
++                waiting += list(faults)
++                ready = multiprocessing.connection.wait(waiting)
++                WorkerProc._receive_ready(
++                    ready, pipes, exits, faults, ready_proc_handles, e
++                )
++        finally:
++            for _, _, pidfd in exit_waitables:
++                if pidfd is not None:
++                    with suppress(OSError):
++                        os.close(pidfd)
++
++        return cast(list[WorkerProcHandle], ready_proc_handles)
++
++    @staticmethod
++    def _receive_ready(
++        ready: list[Any],
++        pipes: dict[Connection, UnreadyWorkerProcHandle],
++        exits: dict[Any, UnreadyWorkerProcHandle],
++        faults: dict[Any, UnreadyWorkerProcHandle],
++        ready_proc_handles: list[WorkerProcHandle | None],
++        e: Exception,
++    ) -> None:
++        # Ready pipes first: a READY sent before an exit or fault still counts.
++        ordered = sorted(ready, key=lambda obj: 0 if obj in pipes else 1)
++        for obj in ordered:
++            if obj in pipes:
++                pipe = obj
+                 try:
+                     # Wait until the WorkerProc is ready.
+                     unready_proc_handle = pipes.pop(pipe)
+@@ -992,18 +1202,50 @@ class WorkerProc:
+                         raise e
+ 
+                     idx = unready_proc_handle.rank % len(ready_proc_handles)
+-                    ready_proc_handles[idx] = WorkerProc.wait_for_response_handle_ready(
+-                        response, unready_proc_handle
++                    ready_proc_handles[idx] = (
++                        WorkerProc.wait_for_response_handle_ready(
++                            response, unready_proc_handle
++                        )
+                     )
+                 except EOFError:
+                     e.__suppress_context__ = True
+                     raise e from None
+-
+                 finally:
+                     # Close connection.
+                     pipe.close()
+-
+-        return cast(list[WorkerProcHandle], ready_proc_handles)
++                continue
++            handle = exits.get(obj) if obj in exits else faults.get(obj)
++            if handle is None:
++                continue
++            pending = handle.ready_pipe in pipes
++            if pending and handle.ready_pipe.poll(0):
++                continue  # its READY is queued: read it next round
++            phase = (
++                "before READY"
++                if pending
++                else "after READY, while other workers were initializing"
++            )
++            if obj in exits:
++                logger.error(
++                    "Worker proc %s exited (code %s) %s",
++                    handle.proc.name,
++                    handle.proc.exitcode,
++                    phase,
++                )
++                raise e
++            try:
++                data = os.read(obj.fileno(), 1)
++            except OSError:
++                data = b""
++            if data:
++                logger.error(
++                    "Worker proc %s reported a fatal fault (fail-closed) %s",
++                    handle.proc.name,
++                    phase,
++                )
++                raise e
++            # EOF on the fault pipe is not a fault; its exit follows.
++            del faults[obj]
+ 
+     def shutdown(self, *, destroy_distributed: bool = True):
+         if not destroy_distributed:
+@@ -1096,11 +1338,21 @@ class WorkerProc:
+         # requested (death pipe EOF or SIGTERM/SIGINT): the process then exits
+         # straight after WorkerProc.shutdown (see _exit_worker_process).
+         orderly_shutdown = False
+-        # Set when a READY worker's busy loop FAILED while a shutdown request
+-        # was pending: full teardown, then exit code 1 (never the exit-0 path).
+-        failed_during_shutdown = False
++        # Set when a READY worker's busy loop FAILED (anything but its own
++        # shutdown-request cancellation): full teardown, then exit code 1.
++        # Never keyed to shutdown_requested -- the death-pipe monitor can set
++        # it just after the check, which made a failure exit 0.
++        busy_loop_failed = False
+         ready_writer = kwargs.pop("ready_pipe")
+         death_pipe = kwargs.pop("death_pipe", None)
++        # Fault pipe: registered for the PLE fail-closed path
++        # (ple_offload.fatal.notify_parent_fatal); kept open for the life of
++        # the process so the byte written right before os._exit reaches the
++        # executor's monitor. Closed only on the orderly way out (EOF, which
++        # the monitor does not count as a fault).
++        fault_pipe = kwargs.pop("fault_pipe", None)
++        if fault_pipe is not None:
++            set_fatal_notify_fd(fault_pipe.fileno())
+         shutdown_state = kwargs.pop("shutdown_state", None)
+ 
+         def mark_shutdown(value: int) -> None:
+@@ -1116,6 +1368,8 @@ class WorkerProc:
+                 os.close(fd)
+             except Exception as e:
+                 logger.warning("Error closing inherited connection: %s: %s", type(e), e)
++        # Before anything below can fork+exec a helper (torch_shm_manager).
++        _make_inherited_pipes_close_on_exec()
+ 
+         try:
+             # Initialize tracer
+@@ -1169,13 +1423,14 @@ class WorkerProc:
+                     "[shutdown] WorkerProc: exiting after shutdown request"
+                 )
+                 orderly_shutdown = True
+-            elif shutdown_requested.is_set():
+-                # A real failure that raced a shutdown request: keep it a
+-                # failure -- full teardown, then a non-zero exit.
+-                logger.exception("WorkerProc failed during shutdown.")
+-                failed_during_shutdown = True
+             else:
+-                logger.exception("WorkerProc failed.")
++                # A real failure, whether or not a shutdown request is pending
++                # (yet): full teardown, then a non-zero exit.
++                if shutdown_requested.is_set():
++                    logger.exception("WorkerProc failed during shutdown.")
++                else:
++                    logger.exception("WorkerProc failed.")
++                busy_loop_failed = True
+ 
+             # The parent sends a SIGTERM to all worker processes if
+             # any worker dies. Set this value so we don't re-throw
+@@ -1200,36 +1455,43 @@ class WorkerProc:
+                 ready_writer.close()
+             if death_pipe is not None:
+                 death_pipe.close()
+-            # Clean up once worker exits busy loop
+-            if worker is not None:
+-                # Tells the executor's ladder this rank is draining, not parked
+-                # in a collective (see _ensure_worker_termination).
+-                mark_shutdown(_SHUTDOWN_STARTED)
+-                if orderly_shutdown:
+-                    # Everything that must happen before exit (FINAL DRAIN,
+-                    # instrumentation flushes, PLE cleanup) is in
+-                    # worker.shutdown(); then exit instead of paying the NCCL
+-                    # destroy + finalization past the executor's grace.
+-                    exit_code = 0
+-                    try:
+-                        worker.shutdown(destroy_distributed=False)
+-                    except BaseException:
+-                        logger.exception("WorkerProc shutdown failed")
+-                        exit_code = 1
++            # The fault fd stays registered through the whole teardown: a PLE
++            # fail-closed inside worker.shutdown() must still reach the
++            # executor. Unregistered after it; on the orderly
++            # os._exit path the process exit closes it.
++            try:
++                # Clean up once worker exits busy loop
++                if worker is not None:
++                    # Tells the executor's ladder this rank is draining, not parked
++                    # in a collective (see _ensure_worker_termination).
++                    mark_shutdown(_SHUTDOWN_STARTED)
++                    if orderly_shutdown:
++                        # Everything that must happen before exit (FINAL DRAIN,
++                        # instrumentation flushes, PLE cleanup) is in
++                        # worker.shutdown(); then exit instead of paying the NCCL
++                        # destroy + finalization past the executor's grace.
++                        exit_code = 0
++                        try:
++                            worker.shutdown(destroy_distributed=False)
++                        except BaseException:
++                            logger.exception("WorkerProc shutdown failed")
++                            exit_code = 1
++                        mark_shutdown(_SHUTDOWN_DONE)
++                        _exit_worker_process(exit_code)
++                    worker.shutdown()
+                     mark_shutdown(_SHUTDOWN_DONE)
+-                    _exit_worker_process(exit_code)
+-                worker.shutdown()
+-                mark_shutdown(_SHUTDOWN_DONE)
+-                if failed_during_shutdown:
+-                    sys.exit(1)
++                    if busy_loop_failed:
++                        sys.exit(1)
++            finally:
++                if fault_pipe is not None:
++                    set_fatal_notify_fd(None)
++                    fault_pipe.close()
+ 
+     class ResponseStatus(Enum):
+         SUCCESS = auto()
+         FAILURE = auto()
+ 
+-    def _fail_ple_rpc_if_pending(
+-        self, where: str, error: BaseException
+-    ) -> None:
++    def _fail_ple_rpc_if_pending(self, where: str, error: BaseException) -> None:
+         """Fail closed if RPC recovery would abandon queued PLE GPU work."""
+         owners = (self.worker, getattr(self.worker, "worker", None))
+         for owner in owners:
+@@ -1242,9 +1504,7 @@ class WorkerProc:
+             try:
+                 pending = connector.has_pending_completions
+             except BaseException as state_error:
+-                connector._fail_closed(
+-                    f"{where}:pending-state", state_error
+-                )
++                connector._fail_closed(f"{where}:pending-state", state_error)
+             if pending:
+                 connector._fail_closed(where, error)
+             return
+@@ -1259,9 +1519,7 @@ class WorkerProc:
+                 output = output.get_output()
+             except Exception as e:
+                 logger.exception("Error getting async model runner output")
+-                self._fail_ple_rpc_if_pending(
+-                    "async-output-copy", e
+-                )
++                self._fail_ple_rpc_if_pending("async-output-copy", e)
+                 output = e
+ 
+         if isinstance(output, Exception):
+@@ -1334,9 +1592,7 @@ class WorkerProc:
+             if output_rank is None or self.rank == output_rank:
+                 self.handle_output(output)
+         except Exception as e:
+-            self._fail_ple_rpc_if_pending(
+-                f"worker-rpc:{method}", e
+-            )
++            self._fail_ple_rpc_if_pending(f"worker-rpc:{method}", e)
+             # Notes have been introduced in python 3.11
+             if hasattr(e, "add_note"):
+                 e.add_note(traceback.format_exc())
+diff --git a/vllm/v1/ple_offload/connector.py b/vllm/v1/ple_offload/connector.py
+index 2cf05bb449..6aa4e046f4 100644
+--- a/vllm/v1/ple_offload/connector.py
++++ b/vllm/v1/ple_offload/connector.py
+@@ -25,7 +25,7 @@ from vllm.model_executor.layers.ple_offload_layer import (
+     flag_check_is_authoritative,
+     stale_offload_flags,
+ )
+-from vllm.v1.ple_offload.fatal import ple_fail_closed
++from vllm.v1.ple_offload.fatal import notify_parent_fatal, ple_fail_closed
+ from vllm.v1.ple_offload.progress import PleProgressMonitor
+ from vllm.v1.ple_offload.protocol import (
+     PleOffloadRegistration,
+@@ -469,6 +469,7 @@ class PleOffloadConnector:
+                 self._process_request(request, socket)
+         except Exception:
+             logger.exception("PLE request thread failed")
++            notify_parent_fatal()
+             os._exit(1)
+         finally:
+             self._request_thread_ready.set()
+diff --git a/vllm/v1/ple_offload/fatal.py b/vllm/v1/ple_offload/fatal.py
+index a96515f25d..32831aa6b4 100644
+--- a/vllm/v1/ple_offload/fatal.py
++++ b/vllm/v1/ple_offload/fatal.py
+@@ -44,6 +44,40 @@ _TYPE_MODULE = type.__dict__["__module__"].__get__
+ _MAX_CHAIN = 16
+ _MAX_ARG_CHARS = 1024
+ 
++# Write end of the per-worker fault pipe (WorkerProc.make_worker_process); the
++# executor's worker monitor waits on the read end next to the process
++# sentinels. None outside a worker process (tests, the offload child).
++_FATAL_NOTIFY_FD: int | None = None
++
++
++def set_fatal_notify_fd(fd: int | None) -> None:
++    """Register the fault pipe worker_main received from the executor."""
++    global _FATAL_NOTIFY_FD
++    _FATAL_NOTIFY_FD = fd
++
++
++def notify_parent_fatal() -> None:
++    """Tell the executor this worker is dying, before the process is gone.
++
++    The executor's only other signal is the process sentinel, which the kernel
++    closes when the LAST task of the worker leaves -- after the address-space
++    teardown, not at os._exit. On a rank whose GPU work is paired with a live
++    peer that teardown can wait for the peer's exit (in a rank-1 fault test, a
++    fail-closed fault on PP0_TP1 left its leader Z and unreapable for 300 s
++    while rank 0 waited on it in turn; the engine hung on the response
++    queue). One byte here wakes the monitor at once so the failure ladder ends
++    the peers, which is what frees the teardown. Nonblocking, never raises:
++    the caller os._exits right after, whatever happens here.
++    """
++    fd = _FATAL_NOTIFY_FD
++    if fd is None:
++        return
++    try:
++        os.set_blocking(fd, False)
++        os.write(fd, b"F")
++    except BaseException:
++        pass
++
+ 
+ def _safe_type_label(cls: type) -> str:
+     """``module.qualname`` of ``cls`` without running class-defined code."""
+@@ -240,6 +274,7 @@ def ple_fail_closed(
+             # runs a Python __exit__ between here and os._exit below; a bare
+             # except keeps that window empty.
+             pass
++    notify_parent_fatal()
+     os._exit(1)
+ 
+ 

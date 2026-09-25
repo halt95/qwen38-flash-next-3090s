@@ -1,0 +1,551 @@
+From bae6e58214b04f9f7d5606c2eb618144f1c0d50b Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Wed, 23 Sep 2026 11:11:01 -0400
+Subject: [PATCH 53/58] e2_guards: draft identity and draft PLE guard report
+ the drafter's own state
+
+---
+ tests/v1/test_ple_pull_compile_profile.py | 234 ++++++++++++++++++++++
+ vllm/v1/e2_guards.py                      |  37 +++-
+ vllm/v1/worker/e2_identity.py             | 150 ++++++++++++--
+ vllm/v1/worker/gpu_worker.py              |  11 +-
+ 4 files changed, 411 insertions(+), 21 deletions(-)
+
+diff --git a/tests/v1/test_ple_pull_compile_profile.py b/tests/v1/test_ple_pull_compile_profile.py
+index d19ec5385f..97f4e604af 100644
+--- a/tests/v1/test_ple_pull_compile_profile.py
++++ b/tests/v1/test_ple_pull_compile_profile.py
+@@ -11,6 +11,7 @@ reading is shown to accept what the fork's guard rejects.
+ 
+ import ast
+ import os
++import re
+ from pathlib import Path
+ from types import SimpleNamespace
+ 
+@@ -610,3 +611,236 @@ def test_nvidia_qwen4exp_ops_carry_no_pointer_like_int_params() -> None:
+                     ):
+                         bad.append(f"{f.name}:{fn}({a.arg})")
+     assert not bad, f"pointer-like int op params (AOT-baking hazard): {bad}"
++
++
++# ------------------------------------------ the e2-identity draft line
++
++#: The startup smoke's anchored parser for the identity line.
++_IDENTITY_LINE = re.compile(
++    r"e2-identity\[(?P<tag>PP\d+_TP\d+)\]: ple_backend=(?P<backend>\S+) "
++    r"ple_method=(?P<method>\S+) ple_weight_dtype=(?P<dtype>\S+) "
++    r"breakable=(?P<brk>ON|OFF) "
++    r"compile_mode=(?P<cmode>\S+) cudagraph_mode=(?P<gmode>\S+) "
++    r"role=(?P<role>target|draft)\s*$"
++)
++
++
++def _compiled_draft(live: bool):
++    """A draft model whose only compile wrapper is live (or not)."""
++    import torch.nn as nn
++
++    from vllm.compilation.wrapper import TorchCompileWithNoGuardsWrapper
++
++    class _Wrapped(nn.Module, TorchCompileWithNoGuardsWrapper):
++        def __init__(self) -> None:
++            nn.Module.__init__(self)
++
++    inner = _Wrapped()
++    inner.do_not_compile = not live
++    inner.compilation_config = SimpleNamespace(mode=CompilationMode.VLLM_COMPILE)
++    outer = nn.Module()
++    outer.model = inner
++    return outer
++
++
++def _shared_config():
++    """The ONE engine CompilationConfig, as the drafter's holder carries it."""
++    return SimpleNamespace(
++        compilation_config=SimpleNamespace(
++            mode=CompilationMode.VLLM_COMPILE,
++            cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
++        )
++    )
++
++
++def _resolved_speculator(model, prefill, decode):
++    """V2 autoregressive / MTP speculator after init_cudagraph_manager."""
++    return SimpleNamespace(
++        model=model,
++        vllm_config=_shared_config(),
++        prefill_cudagraph_manager=(
++            None if prefill is None else SimpleNamespace(cudagraph_mode=prefill)
++        ),
++        decode_cudagraph_manager=(
++            None if decode is None else SimpleNamespace(cudagraph_mode=decode)
++        ),
++    )
++
++
++def _logged_identity(monkeypatch, fn, *args) -> list[str]:
++    from vllm.v1.worker import e2_identity
++
++    lines: list[str] = []
++    monkeypatch.setattr(e2_identity, "_rank_tag", lambda: "PP1_TP0")
++    monkeypatch.setattr(
++        e2_identity.logger, "info", lambda fmt, *a: lines.append(fmt % a)
++    )
++    monkeypatch.setattr(
++        e2_identity.logger, "warning", lambda fmt, *a: lines.append("WARN " + fmt % a)
++    )
++    fn(*args)
++    return lines
++
++
++def test_draft_identity_reports_the_drafters_resolved_graph_state(monkeypatch) -> None:
++    """The draft line read compile/cudagraph from the target's
++    shared VllmConfig (FULL_AND_PIECEWISE), while the V2 MTP speculator runs
++    prefill FULL_AND_PIECEWISE + decode FULL_DECODE_ONLY (the modes
++    e2-guard[runtime] logs). It must report the managers and the live wrapper,
++    in the smoke-anchored format."""
++    from vllm.v1.worker import e2_identity
++
++    runner = SimpleNamespace(
++        speculator=_resolved_speculator(
++            _compiled_draft(live=True),
++            CUDAGraphMode.FULL_AND_PIECEWISE,
++            CUDAGraphMode.FULL_DECODE_ONLY,
++        )
++    )
++    lines = _logged_identity(monkeypatch, e2_identity.log_draft_identity, runner)
++    assert len(lines) == 1, lines
++    m = _IDENTITY_LINE.search(lines[0])
++    assert m, lines[0]
++    assert m["role"] == "draft" and m["tag"] == "PP1_TP0"
++    assert m["cmode"] == "VLLM_COMPILE"
++    assert m["gmode"] == "prefill:FULL_AND_PIECEWISE,decode:FULL_DECODE_ONLY"
++    assert m["backend"] == m["method"] == m["dtype"] == "none"
++
++
++def test_draft_identity_compile_mode_is_the_live_wrapper(monkeypatch) -> None:
++    """Same shared config (VLLM_COMPILE); only the draft wrapper's liveness
++    differs -- the line must follow the wrapper, not the config."""
++    from vllm.v1.worker import e2_identity
++
++    runner = SimpleNamespace(
++        speculator=_resolved_speculator(
++            _compiled_draft(live=False),
++            CUDAGraphMode.FULL_AND_PIECEWISE,
++            CUDAGraphMode.FULL_DECODE_ONLY,
++        )
++    )
++    (line,) = _logged_identity(monkeypatch, e2_identity.log_draft_identity, runner)
++    m = _IDENTITY_LINE.search(line)
++    assert m and m["cmode"] == "NONE", line
++
++
++@pytest.mark.parametrize("shape", ["single", "unbuilt", "v1"])
++def test_draft_identity_other_speculator_shapes(monkeypatch, shape) -> None:
++    """Single-manager speculator -> bare mode; manager not built -> unresolved;
++    V1 drafter -> its dispatcher's mode. All still parse."""
++    from vllm.v1.worker import e2_identity
++
++    if shape == "single":
++        holder = SimpleNamespace(
++            model=_compiled_draft(live=True),
++            vllm_config=_shared_config(),
++            cudagraph_manager=SimpleNamespace(
++                cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY
++            ),
++        )
++        runner, want = SimpleNamespace(speculator=holder), "FULL_DECODE_ONLY"
++    elif shape == "unbuilt":
++        holder = _resolved_speculator(_compiled_draft(live=True), None, None)
++        runner = SimpleNamespace(speculator=holder)
++        want = "prefill:unresolved,decode:unresolved"
++    else:
++        holder = SimpleNamespace(
++            model=_compiled_draft(live=True),
++            vllm_config=_shared_config(),
++            cudagraph_dispatcher=SimpleNamespace(
++                keys_initialized=True, cudagraph_mode=CUDAGraphMode.PIECEWISE
++            ),
++        )
++        runner, want = SimpleNamespace(drafter=holder), "PIECEWISE"
++    (line,) = _logged_identity(monkeypatch, e2_identity.log_draft_identity, runner)
++    m = _IDENTITY_LINE.search(line)
++    assert m and m["role"] == "draft" and m["gmode"] == want, line
++
++
++def test_target_line_at_load_draft_line_after_kv_init(monkeypatch) -> None:
++    """Load time logs the target line only (config level, unchanged); the
++    draft line is logged by log_draft_identity, which the worker calls after
++    initialize_kv_cache, where the drafter's managers are resolved."""
++    from vllm.v1.worker import e2_identity
++
++    runner = SimpleNamespace(
++        get_model=lambda: None,
++        speculator=_resolved_speculator(
++            _compiled_draft(live=True),
++            CUDAGraphMode.FULL_AND_PIECEWISE,
++            CUDAGraphMode.FULL_DECODE_ONLY,
++        ),
++    )
++    lines = _logged_identity(
++        monkeypatch, e2_identity.log_launch_identity, runner, _shared_config()
++    )
++    assert len(lines) == 1, lines
++    m = _IDENTITY_LINE.search(lines[0])
++    assert m and m["role"] == "target", lines
++    assert (m["cmode"], m["gmode"]) == ("VLLM_COMPILE", "FULL_AND_PIECEWISE")
++    # No drafter on this rank (not the last PP stage): no draft line, no warning.
++    assert (
++        _logged_identity(monkeypatch, e2_identity.log_draft_identity, SimpleNamespace())
++        == []
++    )
++    # The worker wiring: log_draft_identity follows initialize_kv_cache.
++    src = (REPO / "vllm/v1/worker/gpu_worker.py").read_text(encoding="utf-8")
++    body = src[src.index("def initialize_from_config") :]
++    body = body[: body.index("\n    def ", 1)]
++    assert "log_draft_identity(self.model_runner)" in body
++    assert body.index("initialize_kv_cache(") < body.index(
++        "log_draft_identity(self.model_runner)"
++    )
++
++
++# ------------------------------------------ draft-role PLE layer ids
++
++
++def _ple_config(ids, *, num_hidden_layers=4, mtp_layers=1):
++    def text():
++        return SimpleNamespace(
++            ple_layer_ids=list(ids),
++            num_hidden_layers=num_hidden_layers,
++            mtp_num_hidden_layers=mtp_layers,
++        )
++
++    return SimpleNamespace(
++        engram_config=SimpleNamespace(cpu_offload=False),
++        model_config=SimpleNamespace(hf_text_config=text()),
++        speculative_config=SimpleNamespace(
++            draft_model_config=SimpleNamespace(hf_text_config=text())
++        ),
++    )
++
++
++def _ple_guard_ids(monkeypatch, config, role) -> str:
++    lines: list[str] = []
++    monkeypatch.setattr(
++        e2_guards.logger, "info", lambda fmt, *args: lines.append(fmt % args)
++    )
++    assert_ple_mode(config, role=role)
++    (line,) = lines
++    return line.rsplit("ple_layer_ids=", 1)[1]
++
++
++def test_draft_ple_guard_reports_the_drafters_own_ple_layers(monkeypatch) -> None:
++    """The reference host logged ple_layer_ids=[2] on the DRAFT guard
++    line -- the target's ids, read from the target's model_config. The MTP
++    drafter's layers (num_hidden_layers + i) carry no PLE block, so the draft
++    line must say []; the target line keeps [2]."""
++    monkeypatch.setenv(PULL_TRANSPORT_ENV, "1")
++    _clear_envs_cache()
++    cfg = _ple_config([2])
++    assert _ple_guard_ids(monkeypatch, cfg, "target") == "[2]."
++    assert _ple_guard_ids(monkeypatch, cfg, "draft") == "[]."
++
++
++def test_draft_ple_ids_follow_the_mtp_layer_range(monkeypatch) -> None:
++    """Discrimination: an id that DOES name an MTP layer (num_hidden_layers+1)
++    is reported on the draft line -- the rule is the drafter's own layers, not
++    'always empty'. (Qwen4ExpTextConfig rejects such ids; this is a stand-in.)"""
++    monkeypatch.setenv(PULL_TRANSPORT_ENV, "1")
++    _clear_envs_cache()
++    cfg = _ple_config([2, 5], num_hidden_layers=4, mtp_layers=1)
++    assert _ple_guard_ids(monkeypatch, cfg, "draft") == "[5]."
++    assert _ple_guard_ids(monkeypatch, cfg, "target") == "[2, 5]."
+diff --git a/vllm/v1/e2_guards.py b/vllm/v1/e2_guards.py
+index 7624ae1d96..947dadab0d 100644
+--- a/vllm/v1/e2_guards.py
++++ b/vllm/v1/e2_guards.py
+@@ -484,6 +484,38 @@ def resolve_ple_mode(vllm_config) -> str:
+     return PLE_MODE_UVA if cpu_offload else PLE_MODE_DEVICE
+ 
+ 
++def _role_ple_layer_ids(vllm_config, role: str) -> list[int]:
++    """The 1-based PLE layer ids the role's own decoder layers carry.
++
++    ``role="target"``: ``model_config.hf_text_config.ple_layer_ids``.
++    ``role="draft"``: the drafter is constructed with the target's VllmConfig
++    (the trap an earlier commit fixed for the architectures), so the target's
++    model_config names the TARGET's PLE layers. The drafter's decoder layers
++    are ``num_hidden_layers + i`` for ``i < mtp_num_hidden_layers``
++    (``Qwen4ExpMultiTokenPredictor``), and a layer builds a PLE block only if
++    ``layer_idx + 1`` is in ``ple_layer_ids`` (``Qwen4ExpDecoderLayer``). The
++    draft line reports exactly that intersection, read from
++    ``speculative_config.draft_model_config`` -- empty for this checkpoint,
++    whose ids must name backbone layers (``Qwen4ExpTextConfig``).
++    """
++    model_config = getattr(vllm_config, "model_config", None)
++    if role == "draft":
++        spec = getattr(vllm_config, "speculative_config", None)
++        draft_config = getattr(spec, "draft_model_config", None)
++        if draft_config is not None:
++            model_config = draft_config
++    text_config = getattr(model_config, "hf_text_config", None)
++    ids = list(getattr(text_config, "ple_layer_ids", None) or [])
++    if role != "draft":
++        return ids
++    num_hidden_layers = getattr(text_config, "num_hidden_layers", None)
++    if num_hidden_layers is None:
++        return ids
++    num_mtp = int(getattr(text_config, "mtp_num_hidden_layers", 1))
++    own = range(int(num_hidden_layers) + 1, int(num_hidden_layers) + num_mtp + 1)
++    return [layer_id for layer_id in ids if layer_id in own]
++
++
+ def assert_ple_mode(vllm_config, *, role: str = "target") -> str:
+     """Startup guard: resolve, assert and log the effective PLE mode.
+ 
+@@ -492,11 +524,10 @@ def assert_ple_mode(vllm_config, *, role: str = "target") -> str:
+     target's EngramConfig and the same process environment, so a mixed
+     configuration fails there too). NOT disabled by VLLM_E2_ALLOW_BREAKABLE:
+     that opt-out is about graph identity, not about owning the PLE table twice.
++    The logged ``ple_layer_ids`` are the role's own (:func:`_role_ple_layer_ids`).
+     """
+     mode = resolve_ple_mode(vllm_config)
+-    model_config = getattr(vllm_config, "model_config", None)
+-    text_config = getattr(model_config, "hf_text_config", None)
+-    ple_layer_ids = list(getattr(text_config, "ple_layer_ids", None) or [])
++    ple_layer_ids = _role_ple_layer_ids(vllm_config, role)
+     engram_config = getattr(vllm_config, "engram_config", None)
+     logger.info(
+         "e2-guard[%s]: ple_mode=%s pull_transport=%d engram_cpu_offload=%s "
+diff --git a/vllm/v1/worker/e2_identity.py b/vllm/v1/worker/e2_identity.py
+index e457b09d74..e2a9527dc7 100644
+--- a/vllm/v1/worker/e2_identity.py
++++ b/vllm/v1/worker/e2_identity.py
+@@ -9,8 +9,10 @@ GPU worker rank logs one line per model role it holds::
+     ple_weight_dtype=<dtype> breakable=<ON|OFF> compile_mode=<mode>
+     cudagraph_mode=<mode> role=<target|draft>
+ 
+-(one line in the log). ``role=draft`` is logged only where a draft model is
+-loaded (the last PP stage). Every value is read from the live objects:
++(one line in the log). ``role=target`` is logged after model loading;
++``role=draft`` is logged only where a draft model is loaded (the last PP
++stage), once the drafter's graph modes are resolved (after the KV cache is
++initialised -- see below). Every value is read from the live objects:
+ 
+ * ``ple_backend``: the class of each PLE layer's ``ple_embedding`` module, and
+   the transport that serves its rows on this rank, read from the placeholder's
+@@ -25,8 +27,28 @@ loaded (the last PP stage). Every value is read from the live objects:
+   (``get_offload_output_dtype``).
+ * ``breakable``: ``is_breakable_cudagraph_enabled()``, the switch the capture
+   path itself reads.
+-* ``compile_mode`` / ``cudagraph_mode``: the role's ``CompilationConfig``
+-  (config level, i.e. before KV-cache-time capture-mode resolution).
++* ``compile_mode`` / ``cudagraph_mode`` for ``role=target``: the engine's
++  ``CompilationConfig`` (config level, i.e. before KV-cache-time capture-mode
++  resolution).
++* ``compile_mode`` / ``cudagraph_mode`` for ``role=draft``: the DRAFTER's own
++  resolved state, not the config. The drafter is built with the target's
++  VllmConfig and there is one ``CompilationConfig`` in the engine, so the
++  config fields name the target's profile (the trap an earlier commit fixed for
++  the draft guard's architectures). What the drafter actually runs is:
++
++  - ``compile_mode``: the mode of the draft model's live
++    ``@support_torch_compile`` wrapper(s) (``do_not_compile`` false -- the
++    property the capture path tests, ``gpu/cudagraph_utils.py``
++    ``has_compiled_submodule``); ``NONE`` when no wrapper is live.
++  - ``cudagraph_mode``: the mode each speculator cudagraph manager holds after
++    ``init_cudagraph_manager`` (V2 runner): ``prefill:<m>,decode:<m>`` for the
++    autoregressive / MTP speculator, the bare mode for a single-manager
++    speculator; for a V1 drafter, its dispatcher's mode. These are the values
++    ``e2-guard[runtime]`` checks before capture. ``unresolved`` if a manager
++    does not exist yet.
++
++  Hence the draft line is logged from ``Worker.initialize_from_config`` after
++  ``initialize_kv_cache``, not at load time.
+ 
+ A role with no PLE layer reports ``none`` for the three PLE fields; several
+ distinct values on one rank are joined with ``,``.
+@@ -102,46 +124,142 @@ def _rank_tag() -> str:
+ 
+ 
+ def _draft(model_runner: Any) -> tuple[nn.Module | None, Any]:
+-    """The loaded draft model and its config (V2 speculator or V1 drafter)."""
++    """The loaded draft model and its holder (V2 speculator or V1 drafter)."""
+     for name in ("speculator", "drafter"):
+         holder = getattr(model_runner, name, None)
+         model = getattr(holder, "model", None)
+         if isinstance(model, nn.Module):
+-            return model, getattr(holder, "vllm_config", None)
++            return model, holder
+     return None, None
+ 
+ 
++#: Written where a draft graph mode has no resolved source yet.
++UNRESOLVED = "unresolved"
++#: Speculator cudagraph-manager attributes (the set ``e2-guard[runtime]``
++#: reads), with the phase label each carries on the draft line.
++_DRAFT_MANAGER_PHASES = (
++    ("prefill_cudagraph_manager", "prefill"),
++    ("decode_cudagraph_manager", "decode"),
++    ("cudagraph_manager", None),
++)
++
++
++def _draft_compile_mode(model: nn.Module) -> str:
++    """Compile mode of the draft model's live ``@support_torch_compile`` wrappers.
++
++    ``NONE`` when no wrapper is live: the drafter then runs eager, whatever
++    the shared ``CompilationConfig.mode`` says.
++    """
++    from vllm.compilation.wrapper import TorchCompileWithNoGuardsWrapper
++
++    modes = {
++        _enum_name(getattr(getattr(m, "compilation_config", None), "mode", None))
++        for m in model.modules()
++        if isinstance(m, TorchCompileWithNoGuardsWrapper)
++        and not getattr(m, "do_not_compile", True)
++    }
++    return _join(modes) if modes else "NONE"
++
++
++def _draft_cudagraph_mode(holder: Any) -> str:
++    """The drafter's resolved cudagraph mode(s), read from its managers."""
++    parts = []
++    for attr, phase in _DRAFT_MANAGER_PHASES:
++        if not hasattr(holder, attr):
++            continue
++        manager = getattr(holder, attr)
++        mode = (
++            UNRESOLVED
++            if manager is None
++            else _enum_name(getattr(manager, "cudagraph_mode", None))
++        )
++        parts.append(mode if phase is None else f"{phase}:{mode}")
++    if parts:
++        return ",".join(parts)
++    # V1 drafter: one dispatcher, keyed in _check_and_update_cudagraph_mode.
++    dispatcher = getattr(holder, "cudagraph_dispatcher", None)
++    if dispatcher is not None and getattr(dispatcher, "keys_initialized", False):
++        return _enum_name(getattr(dispatcher, "cudagraph_mode", None))
++    return UNRESOLVED
++
++
+ def identity_line(
+-    tag: str, model: nn.Module | None, vllm_config: Any, role: str
++    tag: str,
++    model: nn.Module | None,
++    vllm_config: Any,
++    role: str,
++    *,
++    compile_mode: str | None = None,
++    cudagraph_mode: str | None = None,
+ ) -> str:
++    """One identity line. ``compile_mode`` / ``cudagraph_mode`` override the
++    config-level values (the draft role passes its resolved state)."""
+     from vllm.compilation.breakable_cudagraph import is_breakable_cudagraph_enabled
+ 
+     embeddings = _ple_embeddings(model)
+     backends = {f"{type(e).__name__}@{_transport(e)}" for e in embeddings}
+     compilation = getattr(vllm_config, "compilation_config", None)
++    if compile_mode is None:
++        compile_mode = _enum_name(getattr(compilation, "mode", None))
++    if cudagraph_mode is None:
++        cudagraph_mode = _enum_name(getattr(compilation, "cudagraph_mode", None))
+     return (
+         f"e2-identity[{tag}]: "
+         f"ple_backend={_join(backends)} "
+         f"ple_method={_join({_method(e) for e in embeddings})} "
+         f"ple_weight_dtype={_join({_weight_dtype(e) for e in embeddings})} "
+         f"breakable={'ON' if is_breakable_cudagraph_enabled() else 'OFF'} "
+-        f"compile_mode={_enum_name(getattr(compilation, 'mode', None))} "
+-        f"cudagraph_mode={_enum_name(getattr(compilation, 'cudagraph_mode', None))} "
++        f"compile_mode={compile_mode} "
++        f"cudagraph_mode={cudagraph_mode} "
+         f"role={role}"
+     )
+ 
+ 
++def draft_identity_line(tag: str, draft_model: nn.Module, holder: Any) -> str:
++    """The ``role=draft`` line: PLE fields from the draft modules, graph fields
++    from the drafter's resolved state (never the shared CompilationConfig)."""
++    return identity_line(
++        tag,
++        draft_model,
++        getattr(holder, "vllm_config", None),
++        "draft",
++        compile_mode=_draft_compile_mode(draft_model),
++        cudagraph_mode=_draft_cudagraph_mode(holder),
++    )
++
++
+ def log_launch_identity(model_runner: Any, vllm_config: Any) -> None:
+-    """Log the identity line(s) for this rank. Never raises."""
++    """Log this rank's ``role=target`` line after model load. Never raises.
++
++    The ``role=draft`` line comes later, from :func:`log_draft_identity`, once
++    the drafter's graph modes exist.
++    """
++    tag = "PP?_TP?"
++    try:
++        tag = _rank_tag()
++        logger.info(
++            "%s", identity_line(tag, model_runner.get_model(), vllm_config, "target")
++        )
++    except Exception as error:  # log-only: identity must never break a boot
++        logger.warning(
++            "e2-identity[%s]: unavailable (%s: %s)", tag, type(error).__name__, error
++        )
++
++
++def log_draft_identity(model_runner: Any) -> None:
++    """Log this rank's ``role=draft`` line, if it holds a drafter. Never raises.
++
++    Call after ``initialize_kv_cache``: that is where the V2 runner resolves
++    the target's mode and ``init_cudagraph_manager`` derives the drafter's
++    (and where the V1 runner keys the drafter's dispatcher).
++    """
+     tag = "PP?_TP?"
+     try:
++        draft_model, holder = _draft(model_runner)
++        if draft_model is None:
++            return
+         tag = _rank_tag()
+-        roles = [("target", model_runner.get_model(), vllm_config)]
+-        draft_model, draft_config = _draft(model_runner)
+-        if draft_model is not None:
+-            roles.append(("draft", draft_model, draft_config or vllm_config))
+-        for role, model, config in roles:
+-            logger.info("%s", identity_line(tag, model, config, role))
++        logger.info("%s", draft_identity_line(tag, draft_model, holder))
+     except Exception as error:  # log-only: identity must never break a boot
+         logger.warning(
+             "e2-identity[%s]: unavailable (%s: %s)", tag, type(error).__name__, error
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index 4edfb76d32..8cb9d18d2e 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -673,8 +673,9 @@ class Worker(WorkerBase):
+             model_runner = cast("GPUModelRunnerV2", self.model_runner)
+             model_runner._setup_ple_offload(self.parallel_config._ple_offload_ipc_path)
+ 
+-        # Log-only: this rank's PLE / capture identity for target and drafter,
+-        # read after the offload placeholders are armed (v1/worker/e2_identity.py).
++        # Log-only: this rank's PLE / capture identity for the target, read
++        # after the offload placeholders are armed (v1/worker/e2_identity.py).
++        # The drafter's line follows initialize_kv_cache (initialize_from_config).
+         from vllm.v1.worker.e2_identity import log_launch_identity
+ 
+         log_launch_identity(self.model_runner, self.vllm_config)
+@@ -935,6 +936,12 @@ class Worker(WorkerBase):
+             ),
+         )
+ 
++        # Log-only: the drafter's identity line, now that initialize_kv_cache
++        # has resolved its cudagraph managers (v1/worker/e2_identity.py).
++        from vllm.v1.worker.e2_identity import log_draft_identity
++
++        log_draft_identity(self.model_runner)
++
+         if self.model_config.enable_return_routed_experts:
+             self.model_runner.init_routed_experts_capturer()
+ 

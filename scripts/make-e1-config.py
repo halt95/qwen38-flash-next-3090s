@@ -11,7 +11,7 @@ the key as a targeted text edit (the rest of the file is byte-preserved), re-par
 key landed where the engine reads it, writes a new file and renames it into place -- so a hard-linked
 config.json is un-linked rather than mutated in place -- and keeps a backup.
 
-    python scripts/make-e1-config.py /path/to/Qwen3.8-Flash-Next-W4A16-Merlin
+    python3 scripts/make-e1-config.py /path/to/Qwen3.8-Flash-Next-W4A16-Merlin
 """
 import json, os, re, shutil, sys
 KEY, VAL = "ple_embedding_dtype", "float8_e4m3fn"
