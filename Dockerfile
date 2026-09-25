@@ -4,7 +4,7 @@
 # scripts/serve-v2.2.sh through scripts/docker-entrypoint.sh.
 #
 #   docker build -t qwen38-flash-next-3090s:v2.2.0 .
-#   docker run --gpus all --shm-size=8g --ulimit memlock=-1 -p 8000:8000 \
+#   docker run --gpus all --stop-timeout 70 --shm-size=8g --ulimit memlock=-1 -p 8000:8000 \
 #     -v /path/to/Qwen3.8-Flash-Next-W4A16-Merlin:/models/Qwen3.8-Flash-Next-W4A16-Merlin \
 #     -v flash-next-cache-v2.2:/cache qwen38-flash-next-3090s:v2.2.0
 #

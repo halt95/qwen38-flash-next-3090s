@@ -21,3 +21,6 @@ src-ref
 *.bak-*
 # Proxmox LXC recipes: they drive pct/systemctl on a PVE host and are meaningless inside an image
 lxc
+# a checkpoint downloaded into the clone must not be sent to the Docker daemon as build context (115 GiB)
+Qwen3.8-Flash-Next-W4A16-Merlin*
+*.safetensors

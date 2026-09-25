@@ -171,10 +171,16 @@ Modified (68):
   vllm/v1/worker/utils.py
   vllm/v1/worker/worker_base.py
 
-Some of these changes are ports of upstream vLLM pull requests, applied ahead of or on top of the base; they keep
-their authors' credit and licence and are named in the commit messages: #46994 (MTP under pipeline parallelism, minus
-its ROCm MLA file), #48532, #50021, #54442 and #56802 (structured output under pipeline parallelism, upstream issue
-#54437), #54793, #54795, #55506, #55557 and #57050.
+Some of these changes are ports of upstream vLLM pull requests, applied ahead of or on top of the base, under their
+Apache-2.0 licence. In the v2.2.0 series they are committed under the maintainer's name, named by PR number in the
+commit messages, and credited to their authors here: #46994 (eastwood-c; MTP under pipeline parallelism, minus its
+ROCm MLA file), #48532 (woosebastian), #50021 (amittell), #54442 (ArcheyChen) and #56802 (Prudctual) (structured
+output under pipeline parallelism, upstream issue #54437), #54793 and #54795 (saichowdary007), #55506 (Karl0007),
+#55557 (semerandre) and #57050 (wzhao18). The v2.0.1 series (release/v2/patches) keeps the upstream authors as the
+patch authors of the five upstream commits it carries.
+
+This file lists the v2.2.0 delta only. The modified-file list for v2.0.1 (reading aids in release/v2/) is in NOTICE
+at tag v2.0.1; the v1 patches in patches/ name the files they change.
 
 Model weights are not part of this distribution. Qwen3.8-Flash-Next and its quantised derivatives
 (Intel AutoRound experts, RadixArk FP8 PLE table, our in-place packing) carry the Qwen Community License 1.0

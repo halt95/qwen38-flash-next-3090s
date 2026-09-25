@@ -106,7 +106,9 @@ the selector leaves the lane alone.
 
 **NVLink.** You do not have to order the GPUs yourself. If two bridged cards are not adjacent in your list, the
 selector reorders the list so that each bridged pair becomes a tensor-parallel pair, and prints `order reordered`.
-This needs `AUTO_TOPO=1`; with the selector off (the default), your order is used as given.
+This needs `AUTO_TOPO=1`; with the selector off (the default), your order is used as given. The pairing is derived
+from the topology NVML reports and covered by unit tests on a synthetic bridged topology; it has not been run on
+NVLink-bridged hardware.
 
 ## NUMA binding
 
@@ -135,6 +137,10 @@ AUTO_TOPO=1 SERVE_PRINT_ENV_AND_EXIT=1 scripts/serve-v2.2.sh /path/to/checkpoint
 ```
 
 Without `AUTO_TOPO=1` the same command prints the fixed settings and does not run the selector.
+
+In the container: `MODEL_DIR=/path/to/Qwen3.8-Flash-Next-W4A16-Merlin docker compose run --rm -e AUTO_TOPO=1 -e
+SERVE_PRINT_ENV_AND_EXIT=1 flash-next`. The image does not include `numactl`, so `AUTO_TOPO_BIND=1` is always
+skipped there.
 
 This runs serve's usual checks and the selector, prints the final values and the exact launch prefix, and exits
 without starting vLLM. It still writes a diagnostics file.

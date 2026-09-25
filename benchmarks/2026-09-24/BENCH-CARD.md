@@ -29,10 +29,14 @@ median event interval (ITL) together with tokens per event, not tokens/s alone.
 | 261,120 | on | 175.1 | 176.2 | 0.994 | 19.54 / 19.33 | 3.32 / 3.28 |
 | 261,120 | off | 121.8 | 125.2 | 0.973 | 19.55 / 19.15 | 2.35 / 2.37 |
 
-Per-step time is 0.9 to 2.5 % higher in every cell. That is a combined difference of the determinism path and the
-0.30 base; on one tree, the switches alone cost 1.2–2.2 % median step time at 65K–262K. Throughput lands at
+Per-step time is 0.9 to 2.5 % higher in every cell. That is a combined difference of the determinism path, the 0.30
+base and the instrumentation: the v2.2.0 column ran with the guard reader in `warn` and both logging counters on, the
+v2 gate with the readers off, and in the v2 campaign those readers cost ~0.3–0.5 ms per step (README, "Benchmarks").
+On one tree, the switches alone cost 1.2–2.2 % median step time at 65K–262K. Throughput lands at
 0.973–1.040 of v2; tokens per event are equal or higher in six of the eight cells. One v2.2.0 boot against a
-five-boot median; no confidence interval is claimed.
+five-boot median; no confidence interval is claimed. An earlier qualification run of a release candidate with the
+same kernels read its 261K decode cell at 152.5 t/s (174.4 on the v2.0.x build in the same run; n=3, recorded as
+inconclusive); section 3 explains why single-prompt decode at depth is a content draw.
 
 ## 2. Aggregate throughput, accuracy and quality
 
@@ -42,7 +46,16 @@ five-boot median; no confidence interval is claimed.
 | N=1 aggregate | 118.9 t/s | 118.1 t/s |
 | GSM8K-200, thinking off | 198/200 | 198/200 |
 | MTP mean acceptance length | 3.31 | — |
-| divergence from the BF16 teacher (24 held-out prompts; lower is closer) | 0.0338 (1 boot) | v2 gate: 0.0365–0.0378 (5 boots) |
+| divergence from the BF16 teacher (24 held-out prompts; lower is closer; defined below) | 0.0338 (1 boot) | v2 gate: 0.0365–0.0378 (5 boots) |
+
+**Divergence from the BF16 teacher.** The teacher is a reference run of this same checkpoint with a BF16 KV cache,
+eager and without speculative decoding, captured once on 24 held-out prompts. A served boot is scored teacher-forced
+on the teacher's own continuations: the mean absolute difference in per-token log-probability over all 1,476
+positions of the 24 prompts, averaged over the boot's captures; lower is closer. It measures what the serving
+configuration adds (FP8 KV cache, compiled graphs, parallel layout, engine patches), not the loss from quantising the
+original model. The v2.2.0 value is one boot of the release candidate and passed the check's preset ceiling (0.0388).
+It is not a gain: the rebase is meant to be numerically equivalent, and one boot is not comparable with the spread of
+the gate's five boots.
 
 On the final v2.2.0 tree, with the reference host's serve environment above (counters on): N=8 531.5 t/s,
 N=1 117.8 t/s, GSM8K-200 198/200.

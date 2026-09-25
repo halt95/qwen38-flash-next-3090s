@@ -2,9 +2,11 @@
 # Create a Proxmox VE LXC container for Flash-Next v2.2.0, modelled on the reference host: a PRIVILEGED Debian 13
 # container with the four cards passed through as devices. Run ON THE PROXMOX HOST as root:
 #
-#   CTID=201 MODELS=/tank/models CACHE=/tank/flash-next-cache lxc/pve-create.sh
+#   CTID=201 MODELS=/path/to/models CACHE=/path/to/flash-next-cache lxc/pve-create.sh
 #
-# Then: pct start $CTID; pct push $CTID lxc/provision.sh /root/provision.sh;
+# Then: install -m 0755 lxc/nvidia-prestart.sh /var/lib/vz/snippets/nvidia-prestart.sh;
+#       pct set $CTID --hookscript local:snippets/nvidia-prestart.sh;
+#       pct start $CTID; pct push $CTID lxc/provision.sh /root/provision.sh;
 #       pct exec $CTID -- env NVIDIA_RUN=/models/NVIDIA-Linux-x86_64-<host version>.run bash /root/provision.sh
 #
 # Needs Proxmox VE 8.1 or later (`pct set --devN` device passthrough) and a PVE whose appliance index lists the
@@ -33,16 +35,17 @@ NVIDIA_DEVS="${NVIDIA_DEVS:-/dev/nvidia0 /dev/nvidia1 /dev/nvidia2 /dev/nvidia3 
 # The device nodes must already exist ON THE HOST: the kernel module stays there and only its userspace goes inside
 # the container. `nvidia-modprobe -u -c0` creates /dev/nvidia0 and nvidiactl but NOT the uvm nodes; running
 # `nvidia-smi -L` once as root creates the full set and is the simplest reliable preparation. If the cards are bound
-# to vfio-pci for a VM, unbind them first. None of this survives a host reboot by itself: the reference host drives
-# it from a Proxmox pre-start hookscript, which also refuses to start the CT while the GPU VM is running.
+# to vfio-pci for a VM, unbind them first. None of this survives a host reboot by itself: attach a Proxmox pre-start
+# hookscript that runs `nvidia-smi -L` (lxc/nvidia-prestart.sh).
 for d in $NVIDIA_DEVS; do [ -e "$d" ] || {
   echo "missing $d on the host."
   echo "  Load the NVIDIA kernel driver and create its device nodes on the HOST first:  nvidia-smi -L"
   echo "  (that creates /dev/nvidia* including the uvm nodes; nvidia-modprobe -u -c0 alone does not)"
   echo "  If the cards are bound to vfio-pci for a VM, unbind them from vfio-pci first."
-  echo "  To survive host reboots, drive this from a Proxmox pre-start hookscript (README, LXC section)."
+  echo "  To survive host reboots, attach lxc/nvidia-prestart.sh as the CT's pre-start hookscript (README, LXC section)."
   exit 1; }; done
 mkdir -p "$CACHE"
+[ -f "$MODELS/Qwen3.8-Flash-Next-W4A16-Merlin/config.json" ] || echo "note: $MODELS/Qwen3.8-Flash-Next-W4A16-Merlin/config.json not found; download the checkpoint there before provision.sh (it checks for it)"
 # (|| true: under pipefail awk's early exit can fail the pipeline; an empty result is handled below)
 tpl="$(pveam list local | awk -v t="$TEMPLATE" '$1 ~ t {print $1; exit}' || true)"
 if [ -z "$tpl" ]; then
@@ -60,4 +63,5 @@ pct create "$CTID" "$tpl" \
 i=0
 for d in $NVIDIA_DEVS; do pct set "$CTID" --dev$i "$d"; i=$((i + 1)); done
 echo "created CT $CTID: $CORES cores, $((MEMORY_MB / 1024)) GB, $i NVIDIA device nodes, /models=$MODELS, /cache=$CACHE, unprivileged=$UNPRIVILEGED"
+echo "reboot-safe device nodes: install -m 0755 $(dirname "$0")/nvidia-prestart.sh /var/lib/vz/snippets/nvidia-prestart.sh && pct set $CTID --hookscript local:snippets/nvidia-prestart.sh"
 echo "next: pct start $CTID && pct push $CTID $(dirname "$0")/provision.sh /root/provision.sh && pct exec $CTID -- env NVIDIA_RUN=/models/NVIDIA-Linux-x86_64-<host version>.run bash /root/provision.sh"

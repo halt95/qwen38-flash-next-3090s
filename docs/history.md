@@ -5,16 +5,18 @@ README's [What changed in v2.2.0](../README.md#what-changed-in-v220).
 
 ## The releases in brief (v2.2.0, v2.0.1, v2)
 
-**v2.2.0** (2026-09-24) moves the same shape onto stock vLLM 0.30.0 and is a reliability release, at parity with v2:
+**v2.2.0** (2026-09-25) moves the same shape onto vLLM 0.30.0 (the public `v0.30.0`
+tag plus 58 commits) and is a reliability release, at parity with v2:
 [greedy repeatability, any-rank fault detection and faster shutdown](../README.md#what-changed-in-v220). **v2.0.1** (2026-09-18) is
 the v2 shape plus one engine fix, [structured output under concurrency](#what-changed-in-v201). **v2**
 (2026-09-17) keeps everything the [v1 release](#v1-the-tp4-lane) established (calibrated FP8 KV for the
 sparse-attention layers, full cudagraphs, three-token speculative decoding) and changes the shape: **tensor
 parallel 2 × pipeline parallel 2** with expert parallel, the FP8 n-gram table served to the GPUs over a
-**host-mapped, fail-closed pull transport**, and, the piece that is entirely ours, **the token-embedding tables
-of both the target model and the MTP drafter moved out of VRAM into pinned host memory**, read by a device-mapped
+**host-mapped, fail-closed pull transport**, and, the piece that is entirely ours, **the engine's token-embedding copies
+for both the target model and the MTP drafter moved out of VRAM into pinned host memory**, read by a device-mapped
 lookup that runs inside the captured cudagraph. The KV pool goes from 342,912 tokens (1.31 full-context requests) to
-**806,792 tokens: three 262K sessions resident at once**, thinking-on single-stream decode at parity with the TP4 lane
+**806,792 tokens: three ~256K-token sessions measured resident at once** (three full 262,144-token contexts fit by
+arithmetic), thinking-on single-stream decode at parity with the TP4 lane
 (thinking-off at 4K measured 5 % below it in the v2 gate; a later re-test put it at parity, see Known behaviours),
 prefill 10–26 % faster. The v2-versus-v1 table below comes from the pre-registered two-arm gate that qualified v2
 ([`benchmarks/2026-09-17/BENCH-CARD.md`](../benchmarks/2026-09-17/BENCH-CARD.md)); v2.0.1 was requalified against those
@@ -26,7 +28,7 @@ campaign's close records, which are not published.
 | | **v2** | v1 TP4 build (same gate, same box; † see the note under the table) |
 |---|---|---|
 | shape | TP2 × PP2 + expert parallel, MTP K=3 | TP4 + EP, MTP K=3 |
-| KV pool, FP8 tokens, whole box | **806,792** (3.08 × a full-context request; three 262K sessions resident, measured) | 342,912 (1.31 ×) |
+| KV pool, FP8 tokens, whole box | **806,792** (3.08 × a full-context request; three ~256K-token sessions resident, measured at a peak of about 95 % of the pool) | 342,912 (1.31 ×) |
 | context per request | 262,144 | 262,144 |
 | concurrent sequences admitted (`--max-num-seqs`, configured; the shapes listed were measured resident) | **8** (3 × 262K, 1 × 262K + 3 × 131K, 5 × 131K, 8 × 65K, 8 × 32K) | 2 |
 | decode, single stream, thinking on, 4K / 32K / 131K / 261K prompt | **162 / 166 / 169 / 176** tok/s (medians of 5 boots) | 163 / 165 / 172 / 170† |
@@ -35,7 +37,7 @@ campaign's close records, which are not published.
 | MTP tokens per step, thinking on, same depths | 3.02 / 3.07 / 3.13 / 3.28 | 3.00 / 3.04 / 3.17 / 3.24† |
 | prefill, 10K / 100K / 261K prompt | **4,944 / 5,282 / 5,122** tok/s | 4,498 / 4,194 / — |
 | time to first token, cold, 4K / 32K / 131K / 261K | 0.91 / 6.19 / 24.77 / 50.68 s | 0.97 / 7.16 / 31.94 / — s |
-| quality vs the BF16 teacher (24 held-out prompts, 5 boots; lower is closer) | 0.0365–0.0378 | 0.0378–0.0385 |
+| quality vs the BF16 teacher (mean absolute per-token log-probability difference, teacher-forced, against this checkpoint served with a BF16 KV cache; 24 held-out prompts, 5 boots; lower is closer; [definition](../README.md#benchmarks)) | 0.0365–0.0378 | 0.0378–0.0385 |
 | tool-call structure (150 cases) / exact recall (160 cases) | 130/150 / 160/160 | reference quant 125/150 / 160/160 (parity band, ≥ ref − 2) |
 | vision | on, 2 images per request | on |
 
@@ -91,11 +93,21 @@ The v2.0.1 files, still in this repository (the v2.2.0 files are in the README's
 | path | what |
 |---|---|
 | `upstream/PIN-v2` | base commit, bundle prerequisites, tag commit and tree hash, precompiled-wheel identity and hash, artefact tarball hash |
-| `release/v2/patches/0001..0076` | the full series over `e2-base`, for reading (patch subjects carry the campaign's internal task and review labels; they are not renamed because the files are hashed); the history has merge commits, so `git am` cannot replay it (it stops at patch 43). These copies are byte-identical to the reference package and verify against `SHA256SUMS.v2.0.1`; contributors whose work upstream authored keep their own attribution. The bundle remains the source of truth |
+| `release/v2/patches/0001..0076` | the full series over `e2-base`, for reading (subjects and bodies carry internal working notes; see the note below the table); the history has merge commits, so `git am` cannot replay it (it stops at patch 43). These copies are byte-identical to the reference package and verify against `SHA256SUMS.v2.0.1`; contributors whose work upstream authored keep their own attribution. The bundle remains the source of truth |
 | `release/v2/v2.0.1-combined.diff` | one `git diff e2-base..v2.0.1` (112 files, text only, 777 KiB): `git apply` it on `e2-base` (the release asset `e2-base-src.tar.gz`, sha256 `fcd14214f64faaa4175d62f6a51ca39c7bc09d15bf75c190d4dfcc88846b927f`) and you have the tagged source; checked to apply cleanly and to give the tag's tree hash. The way to reproduce the tree from the patches directory without the bundle (`build-v2.sh` itself uses the bundle) |
 | `release/v2/requirements-pinned.txt`, `build-artifacts.list`, `SHA256SUMS.v2.0.1`, `PACKAGE-MANIFEST.md` | the environment pins, the 22 build products, the hashes of the release assets, the combined diff and the reference patch series (`cd release/v2 && sha256sum -c --ignore-missing SHA256SUMS.v2.0.1` verifies 78 of 81 from a checkout; the other three are the release assets), the file manifest |
 | `scripts/build-v2.sh` | fetch the three prerequisite commits from GitHub + the bundle (release asset), check out `v2.0.1`, assert commit and tree, fresh venv from the pins, compiled ops from the wheel or the tarball, metadata-only install. One prerequisite is a PR-branch head (#53899); if it ever disappears upstream the bundle alone cannot be applied — a full bundle is the fallback |
 | `scripts/serve-v2.sh` | the served entry with every variable exported; port, host, names (default `flash-next-v2 flash-next flash-mtp flash-next-mtp`), PLE home, sidecar and cache dir configurable |
+
+**A note on the v2.0.1 reading aids.** The v2.0.1 patch files (`release/v2/patches/`) and the v2.0.1 combined diff
+(`release/v2/v2.0.1-combined.diff`) contain internal working notes from the private development process: host names,
+reviewer and tool-lane names, references to operator rulings, and scratch paths, in patch subjects, commit message
+bodies and code comments. They are kept byte-identical because their hashes are published (`SHA256SUMS.v2.0.1`,
+`PACKAGE-MANIFEST.md`) and the same text is in the commits of the v2.0.1 bundle. The v2.2.0 series (`release/v2.2/`) was cleaned of such notes before publication (README, "Published source
+versus the qualified tree").
+
+Reproduction of v2 on the reference host from the bundle (maintainer-reported): commit and tree equal to
+the tagged worktree, package hashes verified, fresh venv, one qualification boot 17/17 rows.
 
 The v2.0.1 route, unchanged:
 

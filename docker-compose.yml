@@ -33,9 +33,11 @@ services:
       # PLE_HOME: "0"                     # GPU index the PLE offload is homed on (the offload process holds no CUDA context)
       # VLLM_API_KEY: "<key>"             # clients then send Authorization: Bearer <key>
       # CUDA_VISIBLE_DEVICES: "0,1,2,3"
+      # AUTO_TOPO: "1"                   # opt-in topology selector (docs/topology-selector.md); the image has no numactl, so binding is skipped
     volumes:
       - "${MODEL_DIR:?set MODEL_DIR to the Qwen3.8-Flash-Next-W4A16-Merlin directory}:/models/Qwen3.8-Flash-Next-W4A16-Merlin"
       - flash-next-cache-v2.2:/cache
     restart: unless-stopped
+    stop_grace_period: 70s     # serve passes --shutdown-timeout 60; Docker's 10 s default would kill a draining server
 volumes:
   flash-next-cache-v2.2: {}
