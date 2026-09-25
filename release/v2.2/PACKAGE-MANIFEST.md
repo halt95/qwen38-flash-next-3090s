@@ -37,6 +37,7 @@ cannot hash itself.
 | `docs/topology-selector.md` | `dcdd87dac7c458bbdfb2f2472876cdf0654ce268c3f8f54b0c592eb4084c2dad` |
 | `docs/history.md` | `e92f17a12752584ab468a82e2a5d43693304319c205c34fc2152120cecd57007` |
 | `docs/images/flashnext-v2.2-layout.png` | `f76b34f6710c9ab58bce62dbcede8c1cb63e31246060e989369405cd8a6503c3` |
+| `docs/images/flashnext-v2.2-summary.png` | `261eb63722cff9dabf82eafa9053832477bb7d7f027ff688400f26dc4299019f` |
 | `docs/images/flashnext-nvlink-pairing.png` | `f0e5c901d853ec2396db29082d6b2d6edaeeac20dd6463e351c7bfb4e9cd13fc` |
 | `Dockerfile` | `c8085e6bdde56fbc22bef042326ea2cb1fb0d4ef929a04d1ce1d3c875f1e5085` |
 | `docker-compose.yml` | `c0da1cee7f8c5c0cec1ac7d9abdb1909c271f2a39ba2d8ba82f7d64a04d19afe` |
