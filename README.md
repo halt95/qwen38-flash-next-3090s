@@ -32,8 +32,6 @@ Earlier releases (v2, v2.0.1, the v1 TP4 lane): [docs/history.md](docs/history.m
 - **Opt-in topology selector** (`AUTO_TOPO=1`) for hosts that do not look like the reference one, including NVLink
   pairs ([Multi-GPU hosts and topology](#multi-gpu-hosts-and-topology-opt-in)).
 
-![Bar chart of single-stream decode, v2.2.0 against v2, at 4,096 / 32,768 / 131,072 / 261,120 prompt tokens: thinking on 160.0 vs 162.2, 165.6 vs 166.3, 168.9 vs 169.4, 175.1 vs 176.2 tokens/s; thinking off 119.7 vs 118.2, 127.9 vs 123.0, 121.3 vs 123.3, 121.8 vs 125.2 tokens/s; 0.973 to 1.040 of v2 in every cell](docs/images/flashnext-v2.2-vs-v2.png)
-
 Single-stream decode, v2.2.0 against the v2 gate medians: 0.973–1.040 of v2 in every cell ([Benchmarks](#benchmarks)).
 
 Release: [v2.2.0 on GitHub](https://github.com/halt95/qwen38-flash-next-3090s/releases/tag/v2.2.0). Full notes:

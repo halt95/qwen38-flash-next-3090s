@@ -26,7 +26,7 @@ cannot hash itself.
 
 | file | sha256 |
 |---|---|
-| `README.md` | `54fabd42caca5a19f908cebedb0168932cded600c9535b5374c3ce788fe7d327` |
+| `README.md` | `64b478845778b1b22de3f08952ef90049ec88ee1966fed9301f6c17c4d40ad86` |
 | `NOTICE` | `21a08f7f6b053c9caf3385edf94706e782cc36ed9c926468ba393006ba2afc69` |
 | `LICENSE` | `cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30` |
 | `LICENSE.qwen-community-1.0` | `465dcafcac7d3542a0cfc150fc550e0b7228c22ee68c8f1f81db942e7c658cb4` |
@@ -37,7 +37,6 @@ cannot hash itself.
 | `docs/topology-selector.md` | `dcdd87dac7c458bbdfb2f2472876cdf0654ce268c3f8f54b0c592eb4084c2dad` |
 | `docs/history.md` | `e92f17a12752584ab468a82e2a5d43693304319c205c34fc2152120cecd57007` |
 | `docs/images/flashnext-v2.2-layout.png` | `f76b34f6710c9ab58bce62dbcede8c1cb63e31246060e989369405cd8a6503c3` |
-| `docs/images/flashnext-v2.2-vs-v2.png` | `92dd9032e23a5808df2b0a264aa9a934f7db93bb9f54cd30f6680f35dff7570f` |
 | `docs/images/flashnext-nvlink-pairing.png` | `f0e5c901d853ec2396db29082d6b2d6edaeeac20dd6463e351c7bfb4e9cd13fc` |
 | `Dockerfile` | `c8085e6bdde56fbc22bef042326ea2cb1fb0d4ef929a04d1ce1d3c875f1e5085` |
 | `docker-compose.yml` | `c0da1cee7f8c5c0cec1ac7d9abdb1909c271f2a39ba2d8ba82f7d64a04d19afe` |
