@@ -1,0 +1,82 @@
+From 838fa9a0d11633b1b91397039fc76333622a7e8d Mon Sep 17 00:00:00 2001
+From: Brandon Nuttall <brandon_nuttall@outlook.com>
+Date: Sat, 3 Oct 2026 08:59:29 +0200
+Subject: [PATCH 59/59] qwen4_exp: mix LocalArgmaxMixin into the MTP draft head
+
+Qwen4ExpMTP picks each MTP draft token by materialising full-vocab logits,
+even though the repo already provides the O(2 * tp_size) path for exactly
+this case: LocalArgmaxMixin builds the argmax from per-rank (value, index)
+pairs instead of all-gathering a vocab-sized tensor.
+
+The mixin needs only self.logits_processor and self.lm_head, both already
+present on this class, and it is the established idiom for draft heads
+(Qwen3_5MTP, the llama/qwen3 Eagle drafters, deepseek_eagle3). Wiring it in
+is what makes use_local_argmax_reduction usable with this model: without
+get_top_tokens the speculative-config validator refuses to start, so draft
+steps keep paying a full head read per speculative step.
+
+Measured on this host's eight serving GPUs (7x RTX 3090 + 1x RTX 3090 Ti,
+TP2 x PP4, MTP K=3, 8 slots saturated, bench.py, two runs each): 8-way
+aggregate decode 268-312 -> 325-346 tok/s (+10-20%), per-stream 60.5-63.5 ->
+64.7-72.0 tok/s (+7-13%), event rate 101-114 -> 121-130/s. Single-stream is
+unchanged-to-better at 16K context; short-context (4K) single-stream decode
+lands ~8-10% lower (acceptance 2.46 vs 2.67), so the flag stays opt-in. The
+repo's reference shape is four cards; this change is shape-independent (it
+only makes the existing reduction usable), but the numbers are from the
+eight-GPU instance.
+
+Applied to both platform implementations (nvidia, amd) to keep them in step.
+No functional change unless the flag is enabled.
+Signed-off-by: Brandon Nuttall <brandon_nuttall@outlook.com>
+---
+ vllm/models/qwen4_exp/amd/mtp.py    | 4 ++--
+ vllm/models/qwen4_exp/nvidia/mtp.py | 4 ++--
+ 2 files changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/vllm/models/qwen4_exp/amd/mtp.py b/vllm/models/qwen4_exp/amd/mtp.py
+index 40ee6a6..f9637ae 100644
+--- a/vllm/models/qwen4_exp/amd/mtp.py
++++ b/vllm/models/qwen4_exp/amd/mtp.py
+@@ -33,7 +33,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
+     VocabParallelEmbedding,
+ )
+ from vllm.model_executor.model_loader.utils import configure_quant_config
+-from vllm.model_executor.models.interfaces import SupportsPP
++from vllm.model_executor.models.interfaces import LocalArgmaxMixin, SupportsPP
+ from vllm.model_executor.models.qwen3_5 import Qwen3_5Model
+ from vllm.model_executor.models.utils import (
+     AutoWeightsLoader,
+@@ -383,7 +383,7 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
+         "hidden_states": 0,
+     }
+ )
+-class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
++class Qwen4ExpMTP(LocalArgmaxMixin, nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
+     packed_modules_mapping = {
+         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+         "gate_up_proj": ["gate_proj", "up_proj"],
+diff --git a/vllm/models/qwen4_exp/nvidia/mtp.py b/vllm/models/qwen4_exp/nvidia/mtp.py
+index 5640474..7f468a2 100644
+--- a/vllm/models/qwen4_exp/nvidia/mtp.py
++++ b/vllm/models/qwen4_exp/nvidia/mtp.py
+@@ -35,7 +35,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
+     should_use_host_embed_table,
+ )
+ from vllm.model_executor.model_loader.utils import configure_quant_config
+-from vllm.model_executor.models.interfaces import SupportsPP
++from vllm.model_executor.models.interfaces import LocalArgmaxMixin, SupportsPP
+ from vllm.model_executor.models.qwen3_5 import Qwen3_5Model
+ from vllm.model_executor.models.utils import (
+     AutoWeightsLoader,
+@@ -408,7 +408,7 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
+         "hidden_states": 0,
+     }
+ )
+-class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
++class Qwen4ExpMTP(LocalArgmaxMixin, nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
+     packed_modules_mapping = {
+         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+         "gate_up_proj": ["gate_proj", "up_proj"],
+-- 
+2.53.0
+
