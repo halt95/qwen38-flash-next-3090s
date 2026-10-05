@@ -82,7 +82,8 @@ totals overstate capacity: each session also holds fixed Gated-DeltaNet state bl
 
 ![ctx_pp vs ctx_tg over context depth, with step time, v2.2.0 medians as the dashed line](flashnext-v2.5.0-ctx-pp-tg-itl.png)
 
-The final build, the reference host's serve environment above (counters on); prefill on one boot, decode on a second.
+The final build, the reference host's serve environment above (counters on); prefill on one boot, decode on a second,
+the 261K cells on a third (2026-10-05, with v2.2.0's 261K comparator measured the same day).
 Same driver, cells and prompts as the v2.2.0 chart, whose medians are the dashed line.
 
 - **ctx_pp** is cold prefill: 3 sends per depth, each with a unique nonce at the start of the first user turn, and
@@ -101,12 +102,14 @@ Same driver, cells and prompts as the v2.2.0 chart, whose medians are the dashed
 | 100K | 5,507 [5,496–5,512] | +3.1 % | 148.2 [144.3–152.9] | 152.9 / 144.3 / 148.2 | 19.41 [19.27–19.60] | 2.93 / 2.81 / 2.86 |
 | 150K | 5,417 [5,412–5,424] | +3.0 % | 150.3 [143.7–178.1] | 150.3 / 143.7 / 178.1 | 19.82 [19.82–19.99] | 2.96 / 2.83 / 3.53 |
 | 200K | 5,339 [5,338–5,342] | +3.1 % | 161.8 [151.0–179.7] | 151.0 / 161.8 / 179.7 | 19.71 [19.61–20.02] | 2.96 / 3.15 / 3.57 |
+| 261K | 5,258 [5,250–5,272] | +2.7 % | 152.6 [143.8–160.7] | 152.6 / 160.7 / 143.8 | 19.93 [19.83–19.94] | 3.02 / 3.16 / 2.84 |
 
-**Cold prefill is 2.5–3.5 % above the v2.2.0 card** at every depth (not same-day; the gate's own prefill harness
-against v2.2.0 boots of 2026-10-04 gives +2.4 to +3.0 % at 10K and 100K). **Read the decode column through the step-time column.**
-Step time is 19.4–19.8 ms from 10K to 200K, 0.2–0.6 ms above v2.2.0 at each depth; the ctx_tg spread tracks how
-many drafted tokens each text accepts (2.81–3.66 per event). One boot per release, so a single depth's decode difference
-against v2.2.0 is a content draw; section 1's repeat boots are the measure of the decode cost.
+**Cold prefill is 2.5–3.5 % above v2.2.0** at every depth (10K–200K against the v2.2.0 card, 261K same-day; the
+gate's own prefill harness against v2.2.0 boots of 2026-10-04 gives +2.4 to +3.0 % at 10K and 100K). **Read the decode
+column through the step-time column.** Step time is 19.4–19.9 ms from 10K to 261K, 0.2–0.6 ms above v2.2.0 at each
+depth; the ctx_tg spread tracks how many drafted tokens each text accepts (2.81–3.66 per event). One boot per series,
+so a single depth's decode difference against v2.2.0 is a content draw; section 1's repeat boots are the measure of
+the decode cost.
 
 ## 5. How the release candidate's prefill cost was recovered
 
