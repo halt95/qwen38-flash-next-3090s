@@ -24,7 +24,7 @@ scripts, and container and Proxmox LXC recipes. The whole KV cache stays in VRAM
   resident at once.
 - **Built for agents.** Follow-up turns resume from cache: in one conversation the next turn starts in **0.96 s**; with
   8 agents at once, 92.5 % of follow-up tokens come from cache and the median follow-up starts in 1.61 s.
-- **Fast.** About 160–175 tok/s single-stream (thinking on, MTP speculative decoding), 534 tok/s across 8 concurrent
+- **Fast.** About 158–174 tok/s single-stream (thinking on, MTP speculative decoding), 534 tok/s across 8 concurrent
   requests, and 5,200–5,500 tok/s prefill from 10K to 261K tokens.
 - **Quality kept.** Every release is gated against the BF16 model: divergence 0.0334, the 262K needle found exactly,
   GSM8K 198/200, structured output 80/80.
@@ -59,8 +59,8 @@ BUNDLE=./v2.5.1-from-upstream-v0.30.0.bundle ARTIFACTS=./build-artifacts-sm86-py
 TREE=./vllm-v2.5 VENV=./venv-v2.5 CACHE_ROOT=./.vllm-cache-v2.5 scripts/serve-v2.5.sh ~/models/Flash-Next-Merlin
 ```
 
-`hf` is the Hugging Face CLI (`pipx install huggingface_hub`). The first start compiles kernels (about 6 minutes);
-later starts take 2–3 minutes. The server is ready when the log shows `Application startup complete` and
+`hf` is the Hugging Face CLI (`pipx install huggingface_hub`). Startup takes about 5–6 minutes the first time (it compiles
+kernels) and about 2–3 minutes after. The server is ready when the log shows `Application startup complete` and
 `GPU KV cache size: 924,993 tokens`. It listens on `127.0.0.1:8000`; `HOST=0.0.0.0` opens it to the network, and then
 set `VLLM_API_KEY` as well. More checks: [Check it's working](docs/reference.md#check-its-working); if something goes
 wrong: [Troubleshooting](docs/reference.md#troubleshooting).
@@ -110,7 +110,7 @@ v2.5.0 was not published, so this is everything since v2.2.0, v2.5.0's changes i
 
 - Agent follow-up turns resume from cache on a 64-token grid, and a conversation's cached prefix is kept until its
   next turn: a follow-up starts in 0.96 s (v2.2.0: 1.56 s), and with 8 deep conversations 92.5 % of follow-up tokens
-  come from cache (v2.2.0: 7.5 % on the same shape of load).
+  come from cache (v2.2.0: 7.5 %, at temperature 0.6, sessions growing to 80K).
 - The KV pool grows from 806,792 to 924,993 tokens (+15 %) on the same weights.
 - Cold prefill is 1.0–2.8 % faster than v2.2.0; single-stream decode is about 3 % slower.
 - Combining marks tokenize as intended (transformers 5.18.0), and a prompt can carry up to 42 images.

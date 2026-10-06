@@ -30,7 +30,7 @@ cannot hash itself.
 
 | file | sha256 |
 |---|---|
-| `README.md` | `d49ab05222ef8903485b61407603a69d9104f7d806f03797c04b33964e64fdc8` |
+| `README.md` | `e316b6f3a12b80f65f6ff79a7f268fe99bc34d06839fe038b7da06e275a17483` |
 | `NOTICE` | `62ed7fc368cb68b8ca8d79be7a88569629de527b3a771ad9614c58b555c7fa89` |
 | `LICENSE` | `cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30` |
 | `LICENSE.qwen-community-1.0` | `465dcafcac7d3542a0cfc150fc550e0b7228c22ee68c8f1f81db942e7c658cb4` |
@@ -40,8 +40,8 @@ cannot hash itself.
 | `scripts/topo_select.py` | `5ec2af2f8fdf179e2b7ab2ec8d29a0633e5570fa780c5c51c5bb11b159329ffc` |
 | `docs/topology-selector.md` | `b67592ffa0dad04774413ee610acb3a51d7c71741235690ffd7d32dd428965f5` |
 | `docs/history.md` | `7028e63f96f627987ce2e26ced5dcad5e1636347857e6841775f728bdbe85e95` |
-| `CHANGELOG.md` | `75d9415970f55f8f6eb94f670d0520e73f9ca85ec87eb940f06ede35f4c79aab` |
-| `docs/reference.md` | `9fe142dc628f9de1e143d807b88a72cc21a5a26c35c9022a21c714e2eb41095c` |
+| `CHANGELOG.md` | `111424a806eb6504d49a8c720df0a6ac37895d239eeb4923f4de52776152e921` |
+| `docs/reference.md` | `22e6249e93d6cfdb2b2a11748eb4b71b3ddfcaeb90382c8cefc42830a5fe8154` |
 | `docs/images/flashnext-v2.2-layout.png` | `f76b34f6710c9ab58bce62dbcede8c1cb63e31246060e989369405cd8a6503c3` |
 | `docs/images/flashnext-nvlink-pairing.png` | `f0e5c901d853ec2396db29082d6b2d6edaeeac20dd6463e351c7bfb4e9cd13fc` |
 | `Dockerfile` | `01c8a4d31d0589ac08cda3ac4690ec505e6e196e4e6b68189c6f55e3bcb6fa7c` |
@@ -58,9 +58,9 @@ cannot hash itself.
 | `release/v2.5/build-artifacts.list` | `2befac68d349aea26e0b35f59f4d04eda6c652ae7037f48fab8920c33ab5e432` |
 | `benchmarks/2026-09-24/BENCH-CARD.md` | `02971fb8710be0156428d75230f8158ad858bba3ca260c69cf4509e8f1faea00` |
 | `benchmarks/2026-09-24/flashnext-v2.2.0-ctx-pp-tg-itl.png` | `a954b5af737868a398162b2890b9bd5f2715cce73939a496c381bc652921c723` |
-| `benchmarks/2026-10-05/BENCH-CARD_OLD.md` | `d93ada886dde70bad5b9761fd5513b32cd80a84b1bbf097ef377efbeb906b01e` |
+| `benchmarks/2026-10-05/BENCH-CARD_OLD.md` | `ad6b617beef31c0e459d8a163cf23c493ff1e1914530007ecd13d5dcefe20e56` |
 | `benchmarks/2026-10-05/flashnext-v2.5.0-ctx-pp-tg-itl_OLD.png` | `ee90d9efdfc99750a380c5f36c8b2daeaa4bbcfad5872c69d4f28bbb200451d1` |
-| `benchmarks/2026-10-06/BENCH-CARD.md` | `e495dcbfcad8a5c520be811cbf60637cb93f785a09aa439be8a7736bb3aa2fe0` |
+| `benchmarks/2026-10-06/BENCH-CARD.md` | `cd187ea6fd4f46e5c8c0e9cd384a10806bf79a4a9bf5f2003145db89d941b7da` |
 | `benchmarks/2026-10-06/flashnext-v2.5.1-ctx-pp-tg-itl.png` | `4832f93602fc2c16638901fa11aede507009d6299e0c7b920c2d679944b45061` |
 | `docs/images/flashnext-v2.5-layout.png` | `99b55769952494bd852b1c19248353a44d30893399a17dbcb0674114f4b5ccbe` |
 | `docs/images/flashnext-v2.5-summary.png` | `80dc42e4f15e6014178e036f3f46cd727d5536feba38597fd63c43f294d99545` |

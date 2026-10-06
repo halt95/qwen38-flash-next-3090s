@@ -48,7 +48,8 @@ the v2.2.0 and v2.5.0 comparator boots, read −1.12 % against the reference (th
 +1.58 %) and +1.8 % against the v2.5.0 final build's mean; switching the reader off did not flatter the two boots
 above. v2.5.1 changes the prefix cache and the scheduler, not the decode path.
 Per-cell confidence intervals with 2 boots are wide and are not shown. Tokens per event match; the event interval is
-0.6–0.7 ms longer, as on v2.5.0: RecoverSSM's speculative verify runs the Triton GDN decode kernel and replays the
+0.6–0.7 ms longer, as on v2.5.0: RecoverSSM (the GDN state recovery for MTP speculative decoding, upstream #58863,
+enabled by `--use-replayssm`) is in use, and its speculative verify runs the Triton GDN decode kernel and replays the
 state on every step.
 
 ## 2. Aggregate throughput, multi-turn cache, accuracy and quality
@@ -208,7 +209,3 @@ Greedy repeatability at depth was not re-run for v2.5.1 (the decode path is v2.5
   8-conversation load) while serving; 0 request errors. One of those boots logged the API server's output handler raising
   `EngineDeadError` during the scripted drained shutdown, after every request had finished and all four workers had
   exited cleanly.
-- Two other checkpoints of this model served on v2.5.1 each gave a 924,993-token pool, exact 131,072- and 262,144-token needles, structured output 80/80 and
-  78/80, GSM8K-200 198/200 and 196/200, cold prefill of 5,225 / 5,463 and 5,232 / 5,495 tok/s at 10K / 100K,
-  one-conversation follow-ups at 0.96 s and 0.97 s median, cache validity 20/20, and on the 8-conversation load
-  93.2 % reuse at a 1.29 s and 1.43 s median follow-up time to first token (3 full re-prefills each, 0 errors).

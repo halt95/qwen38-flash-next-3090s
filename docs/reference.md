@@ -129,7 +129,7 @@ git clone --branch v2.5.1 https://github.com/halt95/qwen38-flash-next-3090s.git 
 docker build -t qwen38-flash-next-3090s:v2.5.1 .      # fetches the v2.5.1 bundle + v2.2.0 build-artifacts asset; installs the first-serve toolchain
 hf download halt95/Qwen3.8-Flash-Next-W4A16-Merlin --local-dir /path/to/Qwen3.8-Flash-Next-W4A16-Merlin   # 115 GiB; outside the clone (see below)
 MODEL_DIR=/path/to/Qwen3.8-Flash-Next-W4A16-Merlin docker compose up -d
-docker compose logs -f flash-next      # wait for "Application startup complete" (first start ~6 min)
+docker compose logs -f flash-next      # wait for "Application startup complete" (about 5–6 min the first time, about 2–3 min after)
 curl -s localhost:8000/v1/chat/completions -H 'Content-Type: application/json'   -d '{"model":"flash-next","messages":[{"role":"user","content":"hello"}],"max_tokens":512}'
 ```
 
@@ -139,9 +139,9 @@ also works. Download the checkpoint outside the clone, or keep it out of the Doc
 excludes a `Qwen3.8-Flash-Next-W4A16-Merlin*` directory). How to tell the server is healthy:
 [Check it's working](#check-its-working).
 
-The first start compiles the cudagraphs (about 6 minutes) into the `flash-next-cache-v2.5` volume, and the first request
+The first start compiles the cudagraphs (about 5–6 minutes) into the `flash-next-cache-v2.5` volume, and the first request
 compiles FlashInfer's kernels into the same volume (the image sets `FLASHINFER_WORKSPACE_BASE` and `TRITON_CACHE_DIR`
-under `/cache`); later starts take about three minutes. Thinking is on by default, so a short `max_tokens` can end
+under `/cache`); later starts take about 2–3 minutes. Thinking is on by default, so a short `max_tokens` can end
 inside the reasoning with empty `content`; send `"chat_template_kwargs":{"enable_thinking":false}` to turn it off per
 request. The endpoint has no API key and the compose file publishes port 8000 on every interface: if the host is
 reachable from other machines, set `VLLM_API_KEY` in its `environment` (clients then send
@@ -188,7 +188,7 @@ must support CUDA 13.0 or newer (the 580 series or later). `provision.sh` checks
 The same check applies to all three routes (container, Proxmox LXC, bare metal):
 
 ```bash
-# 1. the log shows "Application startup complete" (first boot ~6 min on a fresh compile cache, later boots ~3 min)
+# 1. the log shows "Application startup complete" (about 5–6 min the first time on a fresh compile cache, about 2–3 min after)
 # 2. the log's KV line reads "GPU KV cache size: 924,993 tokens" with the default serve command (the pool is pinned in bytes, so any other
 #    number means the serve command or the build is not the shipped one)
 # 3. a real generation answers (add -H "Authorization: Bearer <key>" if you set VLLM_API_KEY):
@@ -498,7 +498,7 @@ in the gate.
   different T=0 outputs: the six FLA gated-delta-rule chunk kernels (prefill only) carry their own Triton autotune, and
   their near-tied picks are cached per compile directory (14 to 18 of 24 picks differed between two fresh caches). If
   byte-identical repeats matter, keep one `VLLM_CACHE_ROOT` per deployment. Inductor's own reduction autotuning is a
-  second candidate source; which kernels account for the difference is not fully attributed, so a v2.2.x fix will be
+  second candidate source; which kernels account for the difference is not fully attributed, so a future fix will be
   validated by fresh-cache equality, not assumed from pinning one of them. Any numeric change (layout, kernel build,
   version) can also flip near-tied choices: TP2 × PP2 and TP4 gave byte-identical output for 0 of 22 prompts, differing
   in phrasing, not correctness, and MTP acceptance moves with the text by a few percent per prompt.
@@ -508,11 +508,7 @@ in the gate.
 
 ## What ships next
 
-v2.5.x: the host-RAM KV tier, and making greedy output repeat across fresh compiles (the FLA chunk kernels' and
-Inductor's autotuning, validated by fresh-cache equality). Still open from v2: the finished-session prefix-cache
-loss (the hybrid KV manager's free path under concurrent decode; not re-tested on v2.5.1), the empty-completion racing
-pair (stream-fence / cloned-relay / all-gather interventions and a consumption-time generation check, plus upstream
-#43650 and #53919), and the packers / converter / deep-context harness that produce the checkpoint.
+The next release focuses on single-stream decode and capacity.
 
 ## Credit
 
