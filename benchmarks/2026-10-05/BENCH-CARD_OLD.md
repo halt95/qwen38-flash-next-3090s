@@ -82,7 +82,7 @@ totals overstate capacity: each session also holds fixed Gated-DeltaNet state bl
 
 ## 4. Prefill and decode over context depth (the chart)
 
-![ctx_pp vs ctx_tg over context depth, with step time, v2.2.0 medians as the dashed line](flashnext-v2.5.0-ctx-pp-tg-itl.png)
+![ctx_pp vs ctx_tg over context depth, with step time, v2.2.0 medians as the dashed line](flashnext-v2.5.0-ctx-pp-tg-itl_OLD.png)
 
 The final build, the reference host's serve environment above (counters on); prefill on one boot, decode on a second,
 the 261K cells on a third (2026-10-05, with v2.2.0's 261K comparator measured the same day).
