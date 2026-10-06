@@ -30,7 +30,7 @@ cannot hash itself.
 
 | file | sha256 |
 |---|---|
-| `README.md` | `e316b6f3a12b80f65f6ff79a7f268fe99bc34d06839fe038b7da06e275a17483` |
+| `README.md` | `7e3a0781d143010a52987a09d2dec56ca613b5a292d027f446e992ec500974bf` |
 | `NOTICE` | `62ed7fc368cb68b8ca8d79be7a88569629de527b3a771ad9614c58b555c7fa89` |
 | `LICENSE` | `cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30` |
 | `LICENSE.qwen-community-1.0` | `465dcafcac7d3542a0cfc150fc550e0b7228c22ee68c8f1f81db942e7c658cb4` |

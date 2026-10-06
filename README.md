@@ -25,7 +25,7 @@ scripts, and container and Proxmox LXC recipes. The whole KV cache stays in VRAM
 - **Built for agents.** Follow-up turns resume from cache: in one conversation the next turn starts in **0.96 s**; with
   8 agents at once, 92.5 % of follow-up tokens come from cache and the median follow-up starts in 1.61 s.
 - **Fast.** About 158–174 tok/s single-stream (thinking on, MTP speculative decoding), 534 tok/s across 8 concurrent
-  requests, and 5,200–5,500 tok/s prefill from 10K to 261K tokens.
+  requests, and 5,200–5,530 tok/s prefill from 10K to 261K tokens.
 - **Quality kept.** Every release is gated against the BF16 model: divergence 0.0334, the 262K needle found exactly,
   GSM8K 198/200, structured output 80/80.
 - **Vision and tools.** Up to 42 images per request, Qwen3 tool calling and reasoning parsers.
