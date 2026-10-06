@@ -1,3 +1,5 @@
+OLD
+
 # v2.5.0 card — 2026-10-05 (against v2.2.0: decode ladder, multi-turn cache, capacity, depth chart)
 
 > **Provenance.** Maintainer measurements on the reference host (4× RTX 3090, 220 W, PCIe P2P, no NVLink; driver
