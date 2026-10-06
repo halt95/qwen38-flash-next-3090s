@@ -1,0 +1,1014 @@
+From 902b83fb28a11ab9b34bcfa1c0ccdc4355ad4311 Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 21:15:44 -0400
+Subject: [PATCH 80/97] recoverssm: allow pipeline parallelism for Qwen4Exp on
+ the V2 runner
+
+Upstream RecoverSSM commits a step in the same step's postprocess, hence PP=1. Under pipeline parallelism a
+non-last rank learns a step's accepted counts only when the PP broadcast arrives pp_size steps later, while later
+builds overwrite the persistent commit inputs. The commit is now deferred with its own copy of those inputs, and
+the PP=1 check is lifted for Qwen4Exp on Model Runner V2. Config and CPU tests cover the deferral.
+---
+ tests/config/test_recoverssm_config.py        |  13 +-
+ tests/config/test_recoverssm_pp_config.py     |  55 +++
+ .../worker/gpu/test_recoverssm_pp_deferral.py | 408 ++++++++++++++++++
+ vllm/config/vllm.py                           |  22 +-
+ vllm/v1/attention/backends/gdn_recoverssm.py  |  34 +-
+ vllm/v1/attention/backends/ple_recoverssm.py  |  23 +-
+ .../attention/backends/recoverssm_metadata.py |  41 +-
+ vllm/v1/worker/gpu/cudagraph_utils.py         |   4 +
+ vllm/v1/worker/gpu/model_runner.py            |  11 +
+ vllm/v1/worker/gpu/model_states/interface.py  |  13 +
+ .../worker/gpu/model_states/mamba_hybrid.py   |  14 +
+ vllm/v1/worker/gpu/model_states/recoverssm.py |  68 +++
+ vllm/v1/worker/gpu/pp_utils.py                |  31 +-
+ 13 files changed, 727 insertions(+), 10 deletions(-)
+ create mode 100644 tests/config/test_recoverssm_pp_config.py
+ create mode 100644 tests/v1/worker/gpu/test_recoverssm_pp_deferral.py
+
+diff --git a/tests/config/test_recoverssm_config.py b/tests/config/test_recoverssm_config.py
+index 27e26d917a..2fba7ebca0 100644
+--- a/tests/config/test_recoverssm_config.py
++++ b/tests/config/test_recoverssm_config.py
+@@ -83,19 +83,26 @@ def test_derived_drafter_keeps_the_choice_and_runs_the_checks():
+     drafter = _config(DRAFTER, cache_config=target.cache_config)
+     _validator()(drafter)
+     assert target.cache_config.use_recoverssm is True
+-    bad = _config(
++    # Fork: PP > 1 is lifted for Qwen4Exp on Model Runner V2; the
++    # drafter's derived config runs the same check and passes it.
++    pp2 = _config(
+         DRAFTER,
+         cache_config=target.cache_config,
+         parallel_config__pipeline_parallel_size=2,
+     )
+-    with pytest.raises(ValueError, match="pipeline_parallel_size"):
++    _validator()(pp2)
++    bad = _config(
++        DRAFTER,
++        cache_config=target.cache_config,
++        mamba_config__backend="flashinfer",
++    )
++    with pytest.raises(ValueError, match="mamba-backend triton"):
+         _validator()(bad)
+ 
+ 
+ @pytest.mark.parametrize(
+     ("override", "value", "match"),
+     [
+-        ("parallel_config__pipeline_parallel_size", 2, "pipeline_parallel_size"),
+         ("mamba_config__enable_stochastic_rounding", True, "stochastic"),
+         ("mamba_config__backend", "flashinfer", "mamba-backend triton"),
+         ("use_v2_model_runner", False, "V2_MODEL_RUNNER"),
+diff --git a/tests/config/test_recoverssm_pp_config.py b/tests/config/test_recoverssm_pp_config.py
+new file mode 100644
+index 0000000000..95117f9882
+--- /dev/null
++++ b/tests/config/test_recoverssm_pp_config.py
+@@ -0,0 +1,55 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""The RecoverSSM pipeline-parallel lift at the config level.
++
++Upstream (#58863) rejects RecoverSSM for pipeline_parallel_size > 1. The fork
++lifts that for Qwen4Exp GDN/PLE on Model Runner V2, where non-last PP ranks
++defer the commit with a snapshot of its inputs. Kimi-K3 KDA keeps the PP=1
++check (its metadata has no snapshot), and Model Runner V1 has no deferral.
++
++Failing control: on the unlifted port (upstream check), test_pp2_qwen4exp_v2_*
++raises "RecoverSSM currently requires pipeline_parallel_size=1".
++"""
++
++import pytest
++
++from tests.config.test_recoverssm_config import _config, _validator
++
++TARGET = "Qwen4ExpForConditionalGeneration"
++
++
++@pytest.mark.parametrize("pp", [2, 4])
++@pytest.mark.parametrize(
++    "arch", ["Qwen4ExpForConditionalGeneration", "Qwen4ExpForCausalLM", "Qwen4ExpMTP"]
++)
++def test_pp2_qwen4exp_v2_is_accepted(arch, pp):
++    cfg = _config(arch, parallel_config__pipeline_parallel_size=pp)
++    _validator()(cfg)
++    assert cfg.cache_config.use_recoverssm is True
++
++
++def test_pp2_kda_keeps_the_pp1_requirement():
++    cfg = _config(
++        "KimiK3ForConditionalGeneration", parallel_config__pipeline_parallel_size=2
++    )
++    with pytest.raises(ValueError, match="only for Qwen4Exp"):
++        _validator()(cfg)
++
++
++def test_pp2_v1_runner_is_rejected():
++    # none mode, so the align-mode V2 check does not fire first
++    cfg = _config(TARGET, parallel_config__pipeline_parallel_size=2)
++    cfg.cache_config.mamba_cache_mode = "none"
++    cfg.use_v2_model_runner = False
++    with pytest.raises(ValueError, match="pipeline_parallel_size > 1 requires"):
++        _validator()(cfg)
++
++
++def test_pp2_still_runs_the_other_checks():
++    cfg = _config(
++        TARGET,
++        parallel_config__pipeline_parallel_size=2,
++        mamba_config__backend="flashinfer",
++    )
++    with pytest.raises(ValueError, match="mamba-backend triton"):
++        _validator()(cfg)
+diff --git a/tests/v1/worker/gpu/test_recoverssm_pp_deferral.py b/tests/v1/worker/gpu/test_recoverssm_pp_deferral.py
+new file mode 100644
+index 0000000000..9420aaa770
+--- /dev/null
++++ b/tests/v1/worker/gpu/test_recoverssm_pp_deferral.py
+@@ -0,0 +1,408 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""The RecoverSSM commit under pipeline parallelism (CPU, no GPU).
++
++A non-last PP rank verifies a speculative window at step T but receives the
++accepted counts only when the PP broadcast of step T is consumed, pp_size steps
++later (``PPHandler.get_prev_sampled_outputs`` in ``update_pp_decode_requests``).
++Upstream #58863 keeps one recorded step (``RecoverSSMState._step``) and commits
++it in the same step's postprocess, so it requires pipeline_parallel_size=1:
++under PP the deferred postprocess of step T would commit the metadata of the
++most recent step instead, and that metadata's spec state indices, query offsets
++and batch-order block table are persistent buffers the next build overwrites.
++
++The fork detaches the step in ``sample_tokens`` (a snapshot whose commit inputs
++are clones), keeps it on step T's pending PP entry, restores it right before
++step T's deferred postprocess, and masks rows whose request was freed in
++between (their blocks may already belong to another request).
++
++Every scenario here has a failing control that flips: the upstream single-slot
++flow and a snapshot that aliases the persistent buffers both commit the wrong
++step; a deferred commit without the freed-row mask commits into a freed slot;
++a teardown without the PP purge keeps the profiling KV cache alive.
++"""
++
++import ast
++import gc
++import inspect
++import textwrap
++import weakref
++from collections import deque
++from dataclasses import dataclass, fields
++from types import SimpleNamespace
++
++import numpy as np
++import pytest
++import torch
++
++from vllm.v1.attention.backends import gdn_recoverssm as gdn_mod
++from vllm.v1.attention.backends.gdn_recoverssm import (
++    GDNRecoverSSMCommitMetadata,
++    GDNRecoverSSMMetadata,
++)
++from vllm.v1.attention.backends.ple_recoverssm import (
++    PleRecoverSSMCommitMetadata,
++    PleRecoverSSMMetadata,
++)
++from vllm.v1.worker.gpu import pp_utils as pp_utils_mod
++from vllm.v1.worker.gpu.model_states.recoverssm import RecoverSSMState
++
++MAX_REQS = 8
++SPEC_LEN = 4  # 1 + K, K = 3 (prod)
++
++
++class _RecordingContext:
++    """Stands in for GDNRecoverSSMCommitContext: records what each commit
++    reads, at commit time (clones, like the kernels reading device memory)."""
++
++    def __init__(self) -> None:
++        self.commits: list[dict] = []
++
++    def commit(self, num_accepted_tokens, state_indices, query_start_loc, **kw):
++        req = kw.get("request_indices")
++        rows = (
++            list(range(state_indices.shape[0]))
++            if req is None
++            else [int(r) for r in req.tolist()]
++        )
++        self.commits.append(
++            dict(
++                state_indices=state_indices.tolist(),
++                query_start_loc=query_start_loc.tolist(),
++                num_accepted=[
++                    int(num_accepted_tokens[r])
++                    if r < num_accepted_tokens.shape[0]
++                    else None
++                    for r in rows
++                ],
++                block_table=None
++                if kw.get("block_table") is None
++                else kw["block_table"].clone(),
++            )
++        )
++
++
++class _Buffers:
++    """The builder's persistent, graph-staged buffers (one set per builder)."""
++
++    def __init__(self) -> None:
++        self.spec_state_indices = torch.full((MAX_REQS, SPEC_LEN), -1, dtype=torch.int32)
++        self.spec_query_start_loc = torch.zeros(MAX_REQS + 1, dtype=torch.int32)
++        self.block_table = torch.zeros(MAX_REQS, 6, dtype=torch.int32)
++
++
++def _gdn_meta(buf: _Buffers, slots, ctx, *, align=False) -> GDNRecoverSSMMetadata:
++    """Build step metadata the way GDNRecoverSSMMetadataBuilder.build does: the
++    commit points at views of the persistent buffers, written in place."""
++    n = len(slots)
++    buf.spec_state_indices[:n, 0] = torch.tensor(slots, dtype=torch.int32)
++    buf.spec_query_start_loc[: n + 1] = torch.arange(
++        0, (n + 1) * SPEC_LEN, SPEC_LEN, dtype=torch.int32
++    )
++    for i, s in enumerate(slots):
++        buf.block_table[i] = s * 10 + torch.arange(6, dtype=torch.int32)
++    commit = GDNRecoverSSMCommitMetadata(
++        state_indices=buf.spec_state_indices[:, :1],
++        query_start_loc=buf.spec_query_start_loc,
++        request_indices=None,
++        block_table=buf.block_table[:n] if align else None,
++        num_computed_tokens=torch.full((n,), 100, dtype=torch.int32)
++        if align
++        else None,
++        block_size=64 if align else None,
++    )
++    required = dict(
++        num_prefills=0,
++        num_prefill_tokens=0,
++        num_decodes=0,
++        num_decode_tokens=0,
++        num_spec_decodes=n,
++        num_spec_decode_tokens=n * SPEC_LEN,
++        num_actual_tokens=n * SPEC_LEN,
++    )
++    kwargs = {
++        f.name: required.get(f.name)
++        for f in fields(GDNRecoverSSMMetadata)
++        if f.init and f.name not in ("recoverssm_commit", "recoverssm_context")
++    }
++    return GDNRecoverSSMMetadata(
++        **kwargs, recoverssm_commit=commit, recoverssm_context=ctx
++    )
++
++
++def _record(state: RecoverSSMState, meta) -> None:
++    group = SimpleNamespace(layer_names=["model.layers.0.linear_attn"])
++    state.record_step(
++        {"model.layers.0.linear_attn": meta}, [[group]], for_capture=False
++    )
++
++
++def _handler() -> pp_utils_mod.PPHandler:
++    h = object.__new__(pp_utils_mod.PPHandler)
++    h.is_last_rank = False
++    h.device = torch.device("cpu")
++    h.main_stream = SimpleNamespace(wait_event=lambda event: None)
++    h.req_idx_gen_np = np.zeros(MAX_REQS, dtype=np.int32)
++    h.queue = deque([None, None])  # pp_size = 2, pre-seeded like __init__
++    return h
++
++
++def _receive(h: pp_utils_mod.PPHandler, idx_mapping, num_sampled) -> None:
++    """What PPHandler.receive leaves in the queue (minus the NCCL broadcast)."""
++    idx_np = np.asarray(idx_mapping, dtype=np.int64)
++    n = len(idx_mapping)
++    h.queue[-1] = pp_utils_mod.PendingRecv(
++        event=object(),
++        sampled_tokens=torch.zeros(n, SPEC_LEN, dtype=torch.int64),
++        num_sampled=torch.tensor(num_sampled, dtype=torch.int32),
++        num_rejected=torch.zeros(n, dtype=torch.int32),
++        idx_mapping=torch.tensor(idx_mapping, dtype=torch.int32),
++        idx_mapping_np=idx_np,
++        need_sampled_mask=np.ones(n, dtype=bool),
++        gen_at_receive_np=h.req_idx_gen_np[idx_np].copy(),
++    )
++
++
++@pytest.fixture
++def h2d(monkeypatch):
++    monkeypatch.setattr(
++        pp_utils_mod,
++        "async_tensor_h2d",
++        lambda a, device=None, dtype=None, out=None: torch.as_tensor(
++            np.asarray(a), dtype=torch.int32
++        ),
++    )
++
++
++def _run_two_microbatches(mode: str, *, free_slot: int | None = None):
++    """Non-last rank, pp_size 2: micro-batch A at step T (req slots 0, 1 with
++    state blocks 3, 5), micro-batch B at T+1 (req slots 2, 4, 6 with blocks 7,
++    9, 11), then step T+2 consumes A's broadcast. Returns the commit A got.
++
++    mode: "fork" (detach/attach/restore), "upstream" (#58863 single slot) or
++    "alias" (fork flow, but the snapshot aliases the persistent buffers)."""
++    ctx = _RecordingContext()
++    buf = _Buffers()  # one builder: both micro-batches share its buffers
++    state = RecoverSSMState()
++    h = _handler()
++
++    def sample_tokens(idx_mapping, num_sampled):
++        _receive(h, idx_mapping, num_sampled)
++        if mode != "upstream":
++            h.attach_deferred_state(state.detach_step())
++
++    # step T: micro-batch A (execute_model first consumes a pre-seeded None)
++    assert h.get_prev_sampled_outputs() is None
++    _record(state, _gdn_meta(buf, [3, 5], ctx))
++    sample_tokens([0, 1], [2, 4])
++    # step T+1: micro-batch B; its build overwrites the builder's buffers
++    assert h.get_prev_sampled_outputs() is None
++    _record(state, _gdn_meta(buf, [7, 9, 11], ctx))
++    sample_tokens([2, 4, 6], [1, 1, 1])
++    if free_slot is not None:
++        h.on_req_idx_freed(free_slot)  # A's request freed before T+2
++    # step T+2: update_pp_decode_requests consumes A's entry
++    out = h.get_prev_sampled_outputs()
++    assert out is not None
++    deferred = out.pop("deferred_state")
++    if mode != "upstream":
++        state.restore_step(deferred)
++    state.commit_step(
++        out["num_sampled"],
++        out["idx_mapping"],
++        state_indices=None,
++        num_accepted_tokens=torch.ones(MAX_REQS, dtype=torch.int32),
++    )
++    assert ctx.commits, "no commit ran"
++    return ctx.commits[-1]
++
++
++A_COMMIT = dict(state_indices=[3, 5], num_accepted=[2, 4])
++
++
++def test_deferred_commit_commits_its_own_step(h2d):
++    got = _run_two_microbatches("fork")
++    assert got["state_indices"] == A_COMMIT["state_indices"]
++    assert got["num_accepted"] == A_COMMIT["num_accepted"]
++    assert got["query_start_loc"] == [0, 4, 8]
++
++
++def test_control_upstream_single_slot_commits_the_wrong_step(h2d):
++    # #58863 as-is under PP: step T's counts land on micro-batch B's blocks.
++    got = _run_two_microbatches("upstream")
++    assert got["state_indices"] != A_COMMIT["state_indices"]
++    assert got["state_indices"] == [7, 9, 11]
++
++
++def test_control_aliasing_snapshot_commits_the_wrong_blocks(h2d, monkeypatch):
++    # Detaching without cloning keeps views of the builder's persistent
++    # buffers: the next micro-batch's build rewrites them before the commit.
++    monkeypatch.setattr(
++        GDNRecoverSSMMetadata, "snapshot_for_deferred_commit", lambda self: self
++    )
++    got = _run_two_microbatches("alias")
++    assert got["state_indices"] != A_COMMIT["state_indices"]
++
++
++def test_freed_row_commits_nothing(h2d):
++    # Request slot 1 (block 5) freed between verify and commit: count 0 makes
++    # the commit plan skip it (commit_len 0), slot 0 still commits.
++    got = _run_two_microbatches("fork", free_slot=1)
++    assert got["state_indices"] == A_COMMIT["state_indices"]
++    assert got["num_accepted"] == [2, 0]
++
++
++def test_control_unmasked_deferred_commit_writes_a_freed_slot(h2d, monkeypatch):
++    real = RecoverSSMState.restore_step
++
++    def restore_without_mask(self, deferred):
++        real(self, deferred)
++        self._step_is_deferred = False  # what a commit without the mask sees
++
++    monkeypatch.setattr(RecoverSSMState, "restore_step", restore_without_mask)
++    got = _run_two_microbatches("fork", free_slot=1)
++    assert got["num_accepted"] == [2, 4]  # block 5 would be written
++
++
++def test_snapshot_clones_every_commit_input_gdn_align():
++    ctx = _RecordingContext()
++    buf = _Buffers()
++    meta = _gdn_meta(buf, [3, 5], ctx, align=True)
++    snap = meta.snapshot_for_deferred_commit()
++    before = (
++        snap.recoverssm_commit.state_indices.clone(),
++        snap.recoverssm_commit.query_start_loc.clone(),
++        snap.recoverssm_commit.block_table.clone(),
++    )
++    _gdn_meta(buf, [7, 9], ctx, align=True)  # next build rewrites the buffers
++    c = snap.recoverssm_commit
++    assert torch.equal(c.state_indices, before[0])
++    assert torch.equal(c.query_start_loc, before[1])
++    assert torch.equal(c.block_table, before[2])
++    # control: the live metadata's views did change
++    assert not torch.equal(meta.recoverssm_commit.state_indices[:2], before[0])
++    assert not torch.equal(meta.recoverssm_commit.block_table, before[2])
++    for t in (c.state_indices, c.query_start_loc, c.block_table):
++        assert all(t.data_ptr() != b.data_ptr() for b in vars(buf).values())
++
++
++def test_snapshot_ple():
++    sidx = torch.tensor([3, 5, -1, -1], dtype=torch.int32)
++    qsl = torch.tensor([0, 4, 8, 8, 8], dtype=torch.int32)
++    commit = PleRecoverSSMCommitMetadata(
++        state_indices=sidx,
++        query_start_loc=qsl,
++        request_indices=None,
++        block_table=None,
++        num_computed_tokens=None,
++        block_size=None,
++    )
++    names = [
++        f.name
++        for f in fields(PleRecoverSSMMetadata)
++        if f.init and f.name not in ("recoverssm_commit", "recoverssm_context")
++    ]
++    meta = PleRecoverSSMMetadata(
++        **{n: None for n in names},
++        recoverssm_commit=commit,
++        recoverssm_context=_RecordingContext(),
++    )
++    meta.num_spec_decodes = 2
++    snap = meta.snapshot_for_deferred_commit()
++    sidx.fill_(9)
++    qsl.fill_(0)
++    assert snap.recoverssm_commit.state_indices.tolist() == [3, 5]
++    assert snap.recoverssm_commit.query_start_loc.tolist() == [0, 4, 8]
++
++
++def test_attach_without_a_pending_entry_raises():
++    h = _handler()
++    h.queue[-1] = None  # receive() skipped the broadcast for this step
++    with pytest.raises(RuntimeError, match="without sampled outputs"):
++        h.attach_deferred_state(object())
++    h.attach_deferred_state(None)  # nothing to keep: fine
++
++
++def test_restored_step_without_counts_raises():
++    state = RecoverSSMState()
++    ctx = _RecordingContext()
++    _record(state, _gdn_meta(_Buffers(), [3], ctx))
++    state.restore_step(state.detach_step())
++    with pytest.raises(RuntimeError, match="without sampled counts"):
++        state.commit_step(
++            0, torch.zeros(1, dtype=torch.int32), state_indices=None,
++            num_accepted_tokens=torch.ones(1, dtype=torch.int32),
++        )
++
++
++def test_detach_of_a_step_without_spec_rows_is_none():
++    state = RecoverSSMState()
++    meta = _gdn_meta(_Buffers(), [3], _RecordingContext())
++    meta.recoverssm_commit = None
++    _record(state, meta)
++    assert state.detach_step() is None
++
++
++@dataclass
++class _Holder:
++    kv: torch.Tensor
++
++
++def test_teardown_drops_the_deferred_states_and_their_kv_cache():
++    """Profiling-state leak guard (the ~26 GiB on H200 class, #58863 commit 4):
++    a deferred step on a pending PP entry references the KV cache through its
++    commit context; the teardown must release it."""
++    h = _handler()
++    kv = torch.zeros(1024)
++    ref = weakref.ref(kv)
++    _receive(h, [0], [1])
++    h.attach_deferred_state(_Holder(kv))
++    del kv
++    gc.collect()
++    assert ref() is not None  # control: held by the pending entry
++    assert h.drop_deferred_states() == 1
++    gc.collect()
++    assert ref() is None
++    assert h.queue[-1] is not None  # the sampled-token entry itself stays
++
++
++def test_teardown_calls_the_pp_purge():
++    from vllm.v1.worker.gpu import cudagraph_utils
++
++    src = inspect.getsource(cudagraph_utils._teardown_profiling_state)
++    assert "drop_deferred_states()" in src
++    assert "recoverssm.reset()" in src
++
++
++def test_context_binding_guard():
++    good = torch.zeros(4)
++    ctx = SimpleNamespace(checkpoints=(good,))
++    gdn_mod._check_context_binding(ctx, [good])
++    with pytest.raises(RuntimeError, match="stale context"):
++        gdn_mod._check_context_binding(ctx, [torch.zeros(4)])
++
++
++def _calls_in(fn) -> list[str]:
++    tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
++    names = []
++    for node in ast.walk(tree):
++        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
++            names.append((node.lineno, node.col_offset, node.func.attr))
++    return [n for _, _, n in sorted(names)]
++
++
++def test_runner_wiring_order():
++    """The runner detaches after receive() and before the immediate prefill-
++    chunk postprocess (which would otherwise drop the step), and restores
++    before the deferred postprocess."""
++    from vllm.v1.worker.gpu.model_runner import GPUModelRunner
++
++    calls = _calls_in(GPUModelRunner.sample_tokens)
++    i_recv = calls.index("receive")
++    i_attach = calls.index("attach_deferred_state")
++    i_detach = calls.index("detach_deferred_state")
++    i_post = calls.index("postprocess_state")
++    assert i_recv < i_attach and i_recv < i_detach < i_post and i_attach < i_post
++
++    calls = _calls_in(GPUModelRunner.update_pp_decode_requests)
++    assert calls.index("restore_deferred_state") < calls.index("postprocess_sampled")
+diff --git a/vllm/config/vllm.py b/vllm/config/vllm.py
+index f215ab3cc7..d07579ea42 100644
+--- a/vllm/config/vllm.py
++++ b/vllm/config/vllm.py
+@@ -3272,9 +3272,25 @@ class VllmConfig:
+                     "RecoverSSM with align mode requires VLLM_USE_V2_MODEL_RUNNER=1"
+                 )
+             if self.parallel_config.pipeline_parallel_size > 1:
+-                raise ValueError(
+-                    "RecoverSSM currently requires pipeline_parallel_size=1"
+-                )
++                # Non-last PP ranks get the accepted counts pp_size steps after
++                # their verify. Model Runner V2 defers the commit with a
++                # snapshot of its inputs (RecoverSSMState.detach_step) and
++                # masks freed rows; only the Qwen4Exp GDN/PLE metadata
++                # implement that snapshot (Kimi-K3 KDA does not).
++                if (
++                    self.model_config is None
++                    or self.model_config.architecture
++                    not in _QWEN4EXP_RECOVERSSM_ARCHS
++                ):
++                    raise ValueError(
++                        "RecoverSSM with pipeline_parallel_size > 1 is supported "
++                        "only for Qwen4Exp GDN/PLE"
++                    )
++                if not self.use_v2_model_runner:
++                    raise ValueError(
++                        "RecoverSSM with pipeline_parallel_size > 1 requires "
++                        "VLLM_USE_V2_MODEL_RUNNER=1"
++                    )
+             if self.mamba_config.backend != MambaBackendEnum.TRITON:
+                 raise ValueError("RecoverSSM requires --mamba-backend triton")
+         elif self.cache_config.mamba_cache_mode == "all":
+diff --git a/vllm/v1/attention/backends/gdn_recoverssm.py b/vllm/v1/attention/backends/gdn_recoverssm.py
+index 8b6349a772..e1c12ac6a3 100644
+--- a/vllm/v1/attention/backends/gdn_recoverssm.py
++++ b/vllm/v1/attention/backends/gdn_recoverssm.py
+@@ -8,7 +8,7 @@ column, num_accepted_tokens is always 1 (the checkpoint and the compacted conv w
+ already hold the accepted state), and the metadata carries what the post-sampling commit
+ needs. Mirrors the Kimi-K3 KDA builder's RecoverSSM handling."""
+ 
+-from dataclasses import dataclass, field, fields
++from dataclasses import dataclass, field, fields, replace
+ from typing import Any
+ 
+ import torch
+@@ -23,6 +23,7 @@ from vllm.v1.attention.backends.gdn_attn import (
+ from vllm.v1.attention.backends.recoverssm_metadata import (
+     RecoverSSMMetadata,
+     RecoverSSMPostprocessMetadata,
++    clone_commit_tensors,
+     recoverssm_request_indices,
+     recoverssm_spec_rows,
+ )
+@@ -74,6 +75,32 @@ class GDNRecoverSSMMetadata(GDNAttentionMetadata, RecoverSSMMetadata):
+             block_size=c.block_size,
+         )
+ 
++    def snapshot_for_deferred_commit(self) -> "GDNRecoverSSMMetadata":
++        c = self.recoverssm_commit
++        if c is None:
++            return self
++        return replace(
++            self,
++            recoverssm_commit=clone_commit_tensors(c, self.num_spec_decodes),
++        )
++
++
++def _check_context_binding(context: Any, checkpoints: list[torch.Tensor]) -> None:
++    """A cached commit context must point at the layers' live KV cache.
++
++    The context stores raw base addresses of every layer's conv, state and
++    replay tensors. One that outlived its cache (the profiling KV cache is
++    torn down and re-allocated before serving) would keep that cache alive
++    and, worse, commit into freed memory. Builders are re-created with the
++    real cache, so a mismatch is a lifecycle bug: fail loudly."""
++    bound = [t.data_ptr() for t in context.checkpoints]
++    live = [t.data_ptr() for t in checkpoints]
++    if bound != live:
++        raise RuntimeError(
++            "GDN RecoverSSM commit context is bound to a different KV cache than "
++            "its layers (stale context after a KV cache re-allocation)"
++        )
++
+ 
+ class GDNRecoverSSMMetadataBuilder(GDNAttentionMetadataBuilder):
+     # Uniform spec-decode batches replay as FULL graphs: the base builder stages the
+@@ -91,6 +118,11 @@ class GDNRecoverSSMMetadataBuilder(GDNAttentionMetadataBuilder):
+         self._capturing = False
+ 
+     def _get_context(self):
++        if self._context is not None:
++            fc = self.vllm_config.compilation_config.static_forward_context
++            _check_context_binding(
++                self._context, [fc[name].kv_cache[1] for name in self.layer_names]
++            )
+         if self._context is None:
+             from vllm.model_executor.layers.mamba.gdn.recoverssm_gdn import (
+                 GDNRecoverSSMCommitContext,
+diff --git a/vllm/v1/attention/backends/ple_recoverssm.py b/vllm/v1/attention/backends/ple_recoverssm.py
+index 9b43a6fd92..9e44ad8595 100644
+--- a/vllm/v1/attention/backends/ple_recoverssm.py
++++ b/vllm/v1/attention/backends/ple_recoverssm.py
+@@ -9,7 +9,7 @@ every active decode row takes the spec path, the conv reads at offset 0, and aft
+ sampling the accepted window is compacted to the front (the shared RecoverSSM compaction
+ kernel; in align mode it also writes the block-boundary window)."""
+ 
+-from dataclasses import dataclass, field, fields
++from dataclasses import dataclass, field, fields, replace
+ from typing import Any
+ 
+ import torch
+@@ -25,6 +25,7 @@ from vllm.v1.attention.backend import AttentionCGSupport
+ from vllm.v1.attention.backends.recoverssm_metadata import (
+     RecoverSSMMetadata,
+     RecoverSSMPostprocessMetadata,
++    clone_commit_tensors,
+     recoverssm_request_indices,
+     recoverssm_spec_rows,
+ )
+@@ -228,6 +229,15 @@ class PleRecoverSSMMetadata(PleShortConvAttentionMetadata, RecoverSSMMetadata):
+             block_size=c.block_size,
+         )
+ 
++    def snapshot_for_deferred_commit(self) -> "PleRecoverSSMMetadata":
++        c = self.recoverssm_commit
++        if c is None:
++            return self
++        return replace(
++            self,
++            recoverssm_commit=clone_commit_tensors(c, self.num_spec_decodes),
++        )
++
+ 
+ class PleRecoverSSMMetadataBuilder(PleShortConvAttentionMetadataBuilder):
+     # Same as the GDN RecoverSSM builder: uniform spec-decode batches replay as FULL
+@@ -245,6 +255,17 @@ class PleRecoverSSMMetadataBuilder(PleShortConvAttentionMetadataBuilder):
+         self._capturing = False
+ 
+     def _get_ctx(self):
++        if self._ctx is not None:
++            fc = self.vllm_config.compilation_config.static_forward_context
++            live = [fc[name].kv_cache[0].data_ptr() for name in self.layer_names]
++            if [s.data_ptr() for s in self._ctx.conv_states] != live:
++                # Same lifecycle guard as the GDN builder: never commit into a
++                # KV cache that was torn down (profiling) and re-allocated.
++                raise RuntimeError(
++                    "PLE RecoverSSM commit context is bound to a different KV "
++                    "cache than its layers (stale context after a KV cache "
++                    "re-allocation)"
++                )
+         if self._ctx is None:
+             fc = self.vllm_config.compilation_config.static_forward_context
+             convs = [fc[name].kv_cache[0] for name in self.layer_names]
+diff --git a/vllm/v1/attention/backends/recoverssm_metadata.py b/vllm/v1/attention/backends/recoverssm_metadata.py
+index b1339e9523..135b3eba4c 100644
+--- a/vllm/v1/attention/backends/recoverssm_metadata.py
++++ b/vllm/v1/attention/backends/recoverssm_metadata.py
+@@ -2,7 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
+ import abc
+-from dataclasses import dataclass
++from dataclasses import dataclass, replace
+ 
+ import torch
+ 
+@@ -25,6 +25,25 @@ class RecoverSSMMetadata(abc.ABC):
+     ) -> RecoverSSMPostprocessMetadata | None:
+         raise NotImplementedError
+ 
++    def has_recoverssm_commit(self) -> bool:
++        """Whether this step's metadata carries a commit (any spec row)."""
++        return getattr(self, "recoverssm_commit", None) is not None
++
++    def snapshot_for_deferred_commit(self) -> "RecoverSSMMetadata":
++        """A copy whose commit inputs no longer alias per-step buffers.
++
++        Under pipeline parallelism a non-last rank learns the accepted counts
++        pp_size steps after its verify (the PP sampled-token broadcast), and
++        the steps in between rebuild the builders' persistent, graph-staged
++        buffers (spec state indices, query offsets, the batch-order block
++        table). The deferred commit must read this step's values, so they are
++        cloned here, on the current stream, before the next build overwrites
++        them. Implementations that do not support the PP deferral raise."""
++        raise NotImplementedError(
++            f"{type(self).__name__} does not support the pipeline-parallel "
++            "RecoverSSM commit deferral"
++        )
++
+ 
+ def recoverssm_spec_rows(
+     is_prefilling_cpu: torch.Tensor,
+@@ -62,3 +81,23 @@ def recoverssm_request_indices(
+     if num_spec_decodes == 0 or int(rows[-1]) == num_spec_decodes - 1:
+         return None
+     return rows.to(torch.int32).to(device, non_blocking=True)
++
++
++def clone_commit_tensors(commit, num_spec_decodes: int):
++    """Clone the commit inputs a deferred (PP) commit reads, trimmed to the real
++    spec rows. Works for every RecoverSSM commit dataclass with the fields
++    state_indices, query_start_loc, request_indices, block_table and
++    num_computed_tokens."""
++    n = num_spec_decodes
++
++    def c(t: torch.Tensor | None) -> torch.Tensor | None:
++        return None if t is None else t.clone()
++
++    return replace(
++        commit,
++        state_indices=commit.state_indices[:n].clone(),
++        query_start_loc=commit.query_start_loc[: n + 1].clone(),
++        request_indices=c(commit.request_indices),
++        block_table=c(commit.block_table),
++        num_computed_tokens=c(commit.num_computed_tokens),
++    )
+diff --git a/vllm/v1/worker/gpu/cudagraph_utils.py b/vllm/v1/worker/gpu/cudagraph_utils.py
+index b28286a251..924acee252 100644
+--- a/vllm/v1/worker/gpu/cudagraph_utils.py
++++ b/vllm/v1/worker/gpu/cudagraph_utils.py
+@@ -1119,6 +1119,10 @@ def _teardown_profiling_state(runner: "GPUModelRunner") -> None:
+     # profiling KV cache.
+     if (recoverssm := getattr(runner.model_state, "recoverssm", None)) is not None:
+         recoverssm.reset()
++    # Under PP the non-last ranks keep detached RecoverSSM steps on the pending
++    # PP entries; they reference the profiling KV cache just the same.
++    if (pp_handler := getattr(runner, "pp_handler", None)) is not None:
++        pp_handler.drop_deferred_states()
+     # Invalidate the align-mode Mamba group metadata cached from the
+     # profiling KVCacheConfig: the real (e.g. PP-projected) config may
+     # place Mamba layers into a different group layout, so it must be
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 246fe4c632..1876f4b347 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -1202,6 +1202,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 self.req_states.draft_tokens
+             )
+             if outputs is not None:
++                # Restore the step's deferred model state (RecoverSSM commits)
++                # so this postprocess commits the step that sampled them.
++                self.model_state.restore_deferred_state(
++                    outputs.pop("deferred_state", None)
++                )
+                 self.postprocess_sampled(**outputs)
+ 
+     def add_requests(self, scheduler_output: SchedulerOutput) -> None:
+@@ -2306,6 +2311,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             ):
+                 raise RuntimeError("PLE test fault: exc_async_output")
+             all_decode_next = self.pp_handler.receive(input_batch)
++            # The accepted counts of this step arrive pp_size steps later; keep
++            # the state their postprocess needs with this step's pending entry
++            # (before the immediate prefill-chunk postprocess below).
++            self.pp_handler.attach_deferred_state(
++                self.model_state.detach_deferred_state()
++            )
+             # Optimistically update num_computed_tokens for entire batch here.
+             # Will be adjusted for rejections if necessary in update_requests.
+             self.postprocess_num_computed_tokens(input_batch)
+diff --git a/vllm/v1/worker/gpu/model_states/interface.py b/vllm/v1/worker/gpu/model_states/interface.py
+index 8ce5121222..6f41111bd9 100644
+--- a/vllm/v1/worker/gpu/model_states/interface.py
++++ b/vllm/v1/worker/gpu/model_states/interface.py
+@@ -163,6 +163,19 @@ class ModelState(ABC):
+     ) -> None:
+         return None
+ 
++    def detach_deferred_state(self) -> Any:
++        """Non-last PP rank, after this step's forward: hand over any state the
++        step's postprocess needs once its sampled tokens arrive (pp_size steps
++        later). The PP handler keeps it with the step's pending entry. None by
++        default (nothing deferred)."""
++        return None
++
++    def restore_deferred_state(self, state: Any) -> None:
++        """Counterpart of `detach_deferred_state`, called right before the
++        deferred postprocess of the step that detached `state`."""
++        if state is not None:
++            raise RuntimeError(f"{type(self).__name__} cannot restore {state!r}")
++
+     @abstractmethod
+     def prepare_inputs_embeds(
+         self,
+diff --git a/vllm/v1/worker/gpu/model_states/mamba_hybrid.py b/vllm/v1/worker/gpu/model_states/mamba_hybrid.py
+index de0e1ce58b..b31a0ce5c8 100644
+--- a/vllm/v1/worker/gpu/model_states/mamba_hybrid.py
++++ b/vllm/v1/worker/gpu/model_states/mamba_hybrid.py
+@@ -359,6 +359,20 @@ class MambaHybridModelState(DefaultModelState):
+             )
+         return attn_metadata
+ 
++    def detach_deferred_state(self) -> Any:
++        # Non-last PP rank: the RecoverSSM commit of this step has to wait for
++        # the accepted counts of the PP broadcast; snapshot its inputs now.
++        if self.recoverssm is None:
++            return None
++        return self.recoverssm.detach_step()
++
++    def restore_deferred_state(self, state: Any) -> None:
++        if state is None:
++            return
++        if self.recoverssm is None:
++            raise RuntimeError("deferred RecoverSSM state without RecoverSSM")
++        self.recoverssm.restore_step(state)
++
+     def postprocess_state(
+         self,
+         idx_mapping: torch.Tensor,
+diff --git a/vllm/v1/worker/gpu/model_states/recoverssm.py b/vllm/v1/worker/gpu/model_states/recoverssm.py
+index 3cfbecea26..2aafa25972 100644
+--- a/vllm/v1/worker/gpu/model_states/recoverssm.py
++++ b/vllm/v1/worker/gpu/model_states/recoverssm.py
+@@ -1,25 +1,77 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
++from dataclasses import dataclass
+ from typing import Any
+ 
+ import torch
+ 
++from vllm.logger import init_logger
+ from vllm.triton_utils import tl, triton
+ from vllm.v1.attention.backends.recoverssm_metadata import RecoverSSMMetadata
+ from vllm.v1.worker.utils import AttentionGroup
+ 
++logger = init_logger(__name__)
++
++
++@dataclass(frozen=True)
++class DeferredRecoverSSMStep:
++    """One verify step's RecoverSSM commits, detached on a non-last PP rank.
++
++    The rank verified the window at step T but receives the accepted counts
++    only when the PP broadcast of step T is consumed (pp_size steps later).
++    The metadata is a snapshot (`snapshot_for_deferred_commit`), so the steps
++    in between cannot overwrite its commit inputs. It rides on the PP
++    handler's pending entry for step T and is restored right before that
++    entry's postprocess."""
++
++    metadata: tuple[RecoverSSMMetadata, ...]
++
+ 
+ class RecoverSSMState:
+     """Coordinates RecoverSSM metadata between attention and postprocessing."""
+ 
+     def __init__(self) -> None:
+         self._step: tuple[RecoverSSMMetadata, ...] | None = None
++        # True while `_step` is a restored PP-deferred step: its commit must
++        # skip rows whose request was freed since the verify (their state
++        # blocks may already belong to another request).
++        self._step_is_deferred = False
+ 
+     def reset(self) -> None:
+         """Drop the recorded step. Its metadata holds the commit contexts, which
+         reference the KV cache tensors they were built for."""
+         self._step = None
++        self._step_is_deferred = False
++
++    def detach_step(self) -> DeferredRecoverSSMStep | None:
++        """Take this step's commits for a deferred (non-last PP rank) commit.
++
++        Returns None when the step has nothing to commit (no spec rows)."""
++        step = self._step
++        self._step = None
++        self._step_is_deferred = False
++        if step is None:
++            return None
++        live = tuple(m for m in step if m.has_recoverssm_commit())
++        if not live:
++            return None
++        return DeferredRecoverSSMStep(
++            tuple(m.snapshot_for_deferred_commit() for m in live)
++        )
++
++    def restore_step(self, deferred: DeferredRecoverSSMStep | None) -> None:
++        """Make a detached step the one the next `commit_step` commits."""
++        if self._step is not None:
++            # Every non-last-rank step detaches its record in sample_tokens, so
++            # only a capture-time record (for_capture=False under PIECEWISE)
++            # can be here; it has no sampled tokens and is never committed.
++            logger.warning_once(
++                "RecoverSSM: dropping a recorded step that was never committed "
++                "(expected only after a PIECEWISE capture)"
++            )
++        self._step = None if deferred is None else deferred.metadata
++        self._step_is_deferred = deferred is not None
+ 
+     def record_step(
+         self,
+@@ -49,10 +101,26 @@ class RecoverSSMState:
+         num_accepted_tokens: torch.Tensor,
+     ) -> None:
+         step = self._step
++        deferred = self._step_is_deferred
+         self._step = None
++        self._step_is_deferred = False
+         if isinstance(num_sampled, int) or step is None:
++            if deferred and step is not None:
++                raise RuntimeError(
++                    "RecoverSSM: a deferred PP commit was restored without "
++                    "sampled counts"
++                )
+             return
+ 
++        if deferred:
++            # Under PP the consume filter marks freed/non-sampling rows with -1
++            # in idx_mapping. A zero count makes the commit plan skip the row
++            # (commit_len 0): no state, boundary or conv write into blocks the
++            # request no longer owns.
++            num_sampled = torch.where(
++                idx_mapping >= 0, num_sampled, torch.zeros_like(num_sampled)
++            )
++
+         for metadata in step:
+             postprocess_meta = metadata.commit_recoverssm_state(num_sampled)
+             if postprocess_meta is None:
+diff --git a/vllm/v1/worker/gpu/pp_utils.py b/vllm/v1/worker/gpu/pp_utils.py
+index ab1b991d1a..0a543427fa 100644
+--- a/vllm/v1/worker/gpu/pp_utils.py
++++ b/vllm/v1/worker/gpu/pp_utils.py
+@@ -3,7 +3,7 @@
+ """Pipeline Parallelism utils for V2 Model Runner."""
+ 
+ from collections import deque
+-from dataclasses import dataclass
++from dataclasses import dataclass, replace
+ 
+ import numpy as np
+ import torch
+@@ -32,6 +32,9 @@ class PendingRecv:
+     # detect requests aborted since then.
+     gen_at_receive_np: np.ndarray  # [num_reqs]
+     draft_tokens: torch.Tensor | None = None  # [num_reqs, num_speculative_steps]
++    # Model-state data the step's postprocess needs once the sampled tokens
++    # arrive (RecoverSSM: the snapshot of the step's deferred commits).
++    deferred_state: object | None = None
+ 
+ 
+ def compute_need_sampled_mask(input_batch: InputBatch) -> np.ndarray | None:
+@@ -158,8 +161,34 @@ class PPHandler:
+             num_sampled=slot.num_sampled,
+             num_rejected=slot.num_rejected,
+             idx_mapping=idx_mapping,
++            deferred_state=slot.deferred_state,
+         )
+ 
++    def attach_deferred_state(self, state: object | None) -> None:
++        """Attach model-state data to the entry `receive` just reserved for this
++        step. Called right after `receive` in the same step."""
++        assert not self.is_last_rank
++        if state is None:
++            return
++        slot = self.queue[-1]
++        if slot is None:
++            # receive() skipped the broadcast: no row of this step samples, so
++            # no row can have a speculative window to commit.
++            raise RuntimeError(
++                "deferred model state for a step without sampled outputs"
++            )
++        self.queue[-1] = replace(slot, deferred_state=state)
++
++    def drop_deferred_states(self) -> int:
++        """Release every pending entry's deferred state (profiling teardown: the
++        state references the KV cache it was built for). Returns the count."""
++        dropped = 0
++        for i, slot in enumerate(self.queue):
++            if slot is not None and slot.deferred_state is not None:
++                self.queue[i] = replace(slot, deferred_state=None)
++                dropped += 1
++        return dropped
++
+     def broadcast_drafts(
+         self, draft_tokens: torch.Tensor, input_batch: InputBatch
+     ) -> None:

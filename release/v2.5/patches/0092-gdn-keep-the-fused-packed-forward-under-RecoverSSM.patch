@@ -1,0 +1,150 @@
+From 2ac9b65ac7418d3bbf0728c165151eceeeedf3e8 Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Mon, 5 Oct 2026 06:36:02 -0400
+Subject: [PATCH 92/97] gdn: keep the fused packed forward under RecoverSSM
+
+RecoverSSM's verify needs the Triton decode kernel for its speculative rows, and the previous code met that by turning
+off the fused CUDA decode for the whole layer. That also turned off the fused packed forward, which carries every
+prefill chunk, so prefill ran the unfused path. The decode kernel stays Triton and the packed recurrent decode stays
+off; the fused packed forward stays on. A small helper makes the choice, with CPU tests for each combination.
+---
+ tests/kernels/mamba/test_gdn_decode_paths.py  | 73 +++++++++++++++++++
+ .../layers/mamba/gdn/qwen_gdn_linear_attn.py  | 36 +++++++--
+ 2 files changed, 103 insertions(+), 6 deletions(-)
+ create mode 100644 tests/kernels/mamba/test_gdn_decode_paths.py
+
+diff --git a/tests/kernels/mamba/test_gdn_decode_paths.py b/tests/kernels/mamba/test_gdn_decode_paths.py
+new file mode 100644
+index 0000000000..a442ef6cc1
+--- /dev/null
++++ b/tests/kernels/mamba/test_gdn_decode_paths.py
+@@ -0,0 +1,73 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""GDN decode-path selection with and without RecoverSSM (CPU only).
++
++RecoverSSM needs the Triton decode kernel for its spec rows, but must not turn
++off the fused packed forward, which carries prefill and verify alike.
++"""
++
++import types
++from typing import cast
++from unittest.mock import MagicMock, patch
++
++import pytest
++import torch
++
++from vllm.model_executor.layers.mamba.gdn import qwen_gdn_linear_attn as mod
++from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
++    QwenGatedDeltaNetAttention,
++)
++from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
++
++PREFIX = "model.layers.0.linear_attn"
++
++
++@pytest.mark.parametrize(
++    "kernel,recoverssm,packed,expected",
++    [
++        pytest.param("cuda", True, True, ("triton", True, False), id="recoverssm-cuda"),
++        pytest.param("triton", True, True, ("triton", False, False), id="recoverssm-triton"),
++        pytest.param("cuda", False, True, ("cuda", True, True), id="cuda"),
++        pytest.param("triton", False, False, ("triton", False, False), id="triton"),
++        pytest.param("CPU", False, False, ("CPU", False, False), id="cpu"),
++    ],
++)
++def test_decode_paths(kernel, recoverssm, packed, expected) -> None:
++    assert QwenGatedDeltaNetAttention._decode_paths(kernel, recoverssm, packed) == expected
++
++
++def test_recoverssm_keeps_fused_forward_off_the_fused_mtp_kernel() -> None:
++    """With the Triton decode kernel (RecoverSSM), a spec-decode batch on the fused
++    packed forward goes through _forward_core and the gated norm, never through
++    the fused CUDA MTP decode."""
++    layer = types.SimpleNamespace(
++        prefix=PREFIX,
++        gdn_decode_kernel="triton",
++        num_k_heads=2,
++        num_v_heads=4,
++        kv_cache=(None, torch.empty(1, dtype=torch.float32)),
++    )
++    for name in ("_forward_core_fused_norm", "_can_use_fused_gdn_mtp_decode"):
++        setattr(layer, name, types.MethodType(getattr(QwenGatedDeltaNetAttention, name), layer))
++    layer._forward_core = MagicMock()
++    layer._rms_norm_gated_cuda = MagicMock()
++    layer._forward_core_decode_spec_fused_norm = MagicMock()
++    layer._warmup_prefill_kernels = MagicMock()
++    meta = MagicMock(spec=GDNAttentionMetadata)
++    meta.spec_sequence_masks = object()
++    meta.num_decodes = 0
++    meta.num_spec_decodes = 2
++    meta.num_prefills = 0
++    meta.num_actual_tokens = 8
++    meta.spec_state_indices_tensor = torch.zeros(2, 4, dtype=torch.int32)
++    ctx = types.SimpleNamespace(attn_metadata={PREFIX: meta})
++    t = torch.zeros(8, 4, 2)
++    with patch.object(mod, "get_forward_context", return_value=ctx):
++        QwenGatedDeltaNetAttention._forward_core_fused_norm(
++            cast(QwenGatedDeltaNetAttention, layer),
++            mixed_qkv=torch.zeros(8, 16), b=torch.zeros(8, 4), a=torch.zeros(8, 4),
++            output_gate=t, core_attn_out=t,
++        )
++    layer._forward_core_decode_spec_fused_norm.assert_not_called()
++    layer._forward_core.assert_called_once()
++    layer._rms_norm_gated_cuda.assert_called_once()
+diff --git a/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py b/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+index 80b1344e59..cc7ba1cddd 100644
+--- a/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
++++ b/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+@@ -555,14 +555,17 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+         elif current_platform.is_cpu():
+             self.gdn_decode_kernel = "CPU"
+ 
+-        self.enable_fused_gdn_decode = self.gdn_decode_kernel == "cuda"
+-        # RecoverSSM verify replaces the per-draft snapshot path (Triton decode
+-        # only)
+         self.use_gdn_recoverssm = self._uses_gdn_recoverssm()
++        (
++            self.gdn_decode_kernel,
++            self.enable_fused_gdn_decode,
++            self.enable_packed_recurrent_decode,
++        ) = self._decode_paths(
++            self.gdn_decode_kernel,
++            self.use_gdn_recoverssm,
++            self.enable_packed_recurrent_decode,
++        )
+         if self.use_gdn_recoverssm:
+-            self.gdn_decode_kernel = "triton"
+-            self.enable_fused_gdn_decode = False
+-            self.enable_packed_recurrent_decode = False
+             logger.info_once(
+                 "GDN RecoverSSM speculative verify active (spec_query_len %d)",
+                 self.num_spec + 1,
+@@ -574,6 +577,27 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+             raise ValueError(f"Duplicate layer name: {prefix}")
+         compilation_config.static_forward_context[prefix] = self
+ 
++    @staticmethod
++    def _decode_paths(
++        gdn_decode_kernel: str,
++        use_recoverssm: bool,
++        packed_recurrent_decode: bool,
++    ) -> tuple[str, bool, bool]:
++        """(decode kernel, fused packed forward, packed recurrent decode).
++
++        The fused packed forward is on whenever the CUDA decode kernel is
++        eligible. RecoverSSM's verify replaces the per-draft snapshot path and
++        needs the Triton decode kernel for its spec rows, so with RecoverSSM the
++        decode kernel is Triton and the packed recurrent decode is off. The
++        fused packed forward stays on: it calls _forward_core for prefill and
++        verify rows alike and only fuses the input split and the gated norm.
++        Turning it off sends every prefill chunk down the unfused path.
++        """
++        enable_fused_forward = gdn_decode_kernel == "cuda"
++        if use_recoverssm:
++            return "triton", enable_fused_forward, False
++        return gdn_decode_kernel, enable_fused_forward, packed_recurrent_decode
++
+     def _fused_gdn_decode_unsupported_reason(
+         self, vllm_config: VllmConfig
+     ) -> str | None:

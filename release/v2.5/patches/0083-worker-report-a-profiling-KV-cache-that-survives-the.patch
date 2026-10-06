@@ -1,0 +1,157 @@
+From 2e0ab24fde046df359f03ce853ea4c26cf45ba5b Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 21:29:59 -0400
+Subject: [PATCH 83/97] worker: report a profiling KV cache that survives the
+ teardown
+
+_teardown_profiling_state measures the storage behind the profiling KV caches on entry and the allocated memory
+before and after each release, and logs any profiling KV cache that is still alive afterwards.
+---
+ .../worker/gpu/test_recoverssm_pp_deferral.py | 77 +++++++++++++++++++
+ vllm/v1/worker/gpu/cudagraph_utils.py         | 40 ++++++++++
+ 2 files changed, 117 insertions(+)
+
+diff --git a/tests/v1/worker/gpu/test_recoverssm_pp_deferral.py b/tests/v1/worker/gpu/test_recoverssm_pp_deferral.py
+index 9420aaa770..7fa3162243 100644
+--- a/tests/v1/worker/gpu/test_recoverssm_pp_deferral.py
++++ b/tests/v1/worker/gpu/test_recoverssm_pp_deferral.py
+@@ -406,3 +406,80 @@ def test_runner_wiring_order():
+ 
+     calls = _calls_in(GPUModelRunner.update_pp_decode_requests)
+     assert calls.index("restore_deferred_state") < calls.index("postprocess_sampled")
++
++
++def test_still_held_lower_bound():
++    from vllm.v1.worker.gpu.cudagraph_utils import _profiling_kv_still_held
++
++    mib = 1 << 20
++    assert _profiling_kv_still_held(300 * mib, 1000 * mib, 700 * mib) == 0
++    assert _profiling_kv_still_held(300 * mib, 1000 * mib, 1000 * mib) == 300 * mib
++    assert _profiling_kv_still_held(300 * mib, 1000 * mib, 900 * mib) == 200 * mib
++    # other frees count against the cache first: never a false alarm
++    assert _profiling_kv_still_held(300 * mib, 1000 * mib, 100 * mib) == 0
++
++
++def _fake_runner(kv, pp_handler):
++    model_state = SimpleNamespace(
++        _mamba_ctx=object(),
++        recoverssm=RecoverSSMState(),
++        _mamba_group_ids=[1],
++        _mamba_spec=object(),
++        supports_mm_inputs=False,
++    )
++    return SimpleNamespace(
++        model_state=model_state,
++        pp_handler=pp_handler,
++        kv_caches=[kv],
++        attn_groups=[[object()]],
++        kv_cache_config=object(),
++        cudagraph_manager=object(),
++        compilation_config=SimpleNamespace(static_forward_context={}),
++        model=None,
++        cache_config=SimpleNamespace(num_gpu_blocks=8),
++        lora_config=None,
++        maybe_remove_all_loras=lambda cfg: None,
++    )
++
++
++@pytest.mark.parametrize("case", ["clean", "stray_holder", "no_pp_purge"])
++def test_teardown_reports_a_held_profiling_kv_cache(monkeypatch, case):
++    """End to end on the real _teardown_profiling_state with a fake runner and
++    a fake allocator whose allocated bytes include the KV cache while anything
++    still references it. The PP-queue deferred step is released by the purge;
++    a stray holder, or the same deferred step without the purge (controls),
++    is reported."""
++    from vllm.v1.worker.gpu import cudagraph_utils as cu
++
++    kv_bytes = 350 << 20
++    kv = torch.zeros(4)
++    ref = weakref.ref(kv)
++    monkeypatch.setattr(cu, "_profiling_kv_cache_bytes", lambda caches: kv_bytes)
++    monkeypatch.setattr(
++        torch.cuda,
++        "memory_allocated",
++        lambda *a, **k: (1 << 30) + (kv_bytes if ref() is not None else 0),
++    )
++    monkeypatch.setattr(torch.accelerator, "synchronize", lambda *a, **k: None)
++    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda *a, **k: None)
++    monkeypatch.setattr(cu, "release_hisparse_profiling_cache", lambda fc: None)
++    warnings: list[str] = []
++    monkeypatch.setattr(
++        cu.logger, "warning", lambda msg, *a: warnings.append(msg % a)
++    )
++
++    h = _handler()
++    _receive(h, [0], [1])
++    h.attach_deferred_state(_Holder(kv))  # what a deferred RecoverSSM step holds
++    stray = [_Holder(kv)] if case == "stray_holder" else []
++    if case == "no_pp_purge":
++        monkeypatch.setattr(h, "drop_deferred_states", lambda: 0)
++    runner = _fake_runner(kv, h)
++    del kv
++    cu._teardown_profiling_state(runner)
++    if case != "clean":
++        assert len(warnings) == 1 and "350.0 MiB" in warnings[0], warnings
++    else:
++        assert warnings == []
++        assert ref() is None
++    del stray
+diff --git a/vllm/v1/worker/gpu/cudagraph_utils.py b/vllm/v1/worker/gpu/cudagraph_utils.py
+index 924acee252..1cdceb388b 100644
+--- a/vllm/v1/worker/gpu/cudagraph_utils.py
++++ b/vllm/v1/worker/gpu/cudagraph_utils.py
+@@ -1108,10 +1108,35 @@ def _init_minimal_kv_cache_for_profiling(runner: "GPUModelRunner") -> None:
+     runner.cache_config.num_gpu_blocks = minimal_config.num_blocks
+ 
+ 
++def _profiling_kv_cache_bytes(kv_caches: Iterable[Any]) -> int:
++    """Bytes of the distinct CUDA storages behind the runner's KV cache views."""
++    storages: dict[int, int] = {}
++    for cache in kv_caches:
++        for t in cache if isinstance(cache, (list, tuple)) else (cache,):
++            if isinstance(t, torch.Tensor) and t.is_cuda:
++                st = t.untyped_storage()
++                storages[st.data_ptr()] = st.nbytes()
++    return sum(storages.values())
++
++
++def _profiling_kv_still_held(
++    kv_bytes: int, allocated_before: int, allocated_after: int
++) -> int:
++    """Lower bound on the profiling KV cache bytes still allocated after the
++    teardown: whatever the teardown freed counts against the cache first, so a
++    positive result means something still references the cache (the RecoverSSM
++    commit-context class of leak, ~26 GiB on H200; against a sub-GiB per-card
++    per-card cushion even a small one matters). One-sided: never a false alarm,
++    may miss a leak masked by other frees."""
++    return max(kv_bytes - max(allocated_before - allocated_after, 0), 0)
++
++
+ def _teardown_profiling_state(runner: "GPUModelRunner") -> None:
+     """Release the profiling KV cache and captured graphs while keeping model
+     weights, so the real ``initialize_kv_cache`` starts from a clean slate."""
+     torch.accelerator.synchronize()
++    kv_bytes = _profiling_kv_cache_bytes(getattr(runner, "kv_caches", ()))
++    allocated_before = torch.cuda.memory_allocated() if kv_bytes else 0
+     if hasattr(runner.model_state, "_mamba_ctx"):
+         runner.model_state._mamba_ctx = None
+     # A PIECEWISE profiling capture records its RecoverSSM step (only FULL
+@@ -1154,3 +1179,18 @@ def _teardown_profiling_state(runner: "GPUModelRunner") -> None:
+     runner.maybe_remove_all_loras(runner.lora_config)
+     gc.collect()
+     torch.accelerator.empty_cache()
++    if kv_bytes:
++        # last, after every release above (one-sided check)
++        gc.collect()
++        torch.accelerator.synchronize()
++        held = _profiling_kv_still_held(
++            kv_bytes, allocated_before, torch.cuda.memory_allocated()
++        )
++        if held > (1 << 20):
++            logger.warning(
++                "Profiling teardown: at least %.1f MiB of the %.1f MiB profiling KV "
++                "cache is still allocated; something still references it (it will "
++                "be missing from the real KV cache / free-memory cushion)",
++                held / (1 << 20),
++                kv_bytes / (1 << 20),
++            )

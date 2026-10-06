@@ -1,0 +1,248 @@
+From 07c1927b5596d2a9f91b4f565b64634298a6f3de Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 21:19:19 -0400
+Subject: [PATCH 81/97] recoverssm, tests: kernel-level test of the PP-deferred
+ commit
+
+Runs the real Triton verify and commit kernels (CUDA, or CPU under TRITON_INTERPRET=1): verify A, verify B, then
+commit A deferred. Committed states and conv windows equal the PP=1 order bit for bit, in none and align mode.
+---
+ .../test_recoverssm_pp_deferral_kernels.py    | 229 ++++++++++++++++++
+ 1 file changed, 229 insertions(+)
+ create mode 100644 tests/kernels/mamba/test_recoverssm_pp_deferral_kernels.py
+
+diff --git a/tests/kernels/mamba/test_recoverssm_pp_deferral_kernels.py b/tests/kernels/mamba/test_recoverssm_pp_deferral_kernels.py
+new file mode 100644
+index 0000000000..96dd8d78b2
+--- /dev/null
++++ b/tests/kernels/mamba/test_recoverssm_pp_deferral_kernels.py
+@@ -0,0 +1,229 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""The PP-deferred RecoverSSM commit with the real Triton kernels.
++
++A non-last PP rank verifies micro-batch A, then verifies micro-batch B (whose
++build rewrites the builder's persistent buffers), and only then commits A with
++A's accepted counts. The committed states must equal the PP=1 order (verify A,
++commit A) bit for bit; a row freed in between must not be written.
++
++Runs on CUDA, or on CPU under the Triton interpreter
++(``CUDA_VISIBLE_DEVICES= TRITON_INTERPRET=1``), which is how a GPU-less host runs it.
++
++Failing controls (they flip): a snapshot that aliases the persistent buffers
++commits A's counts into B's blocks; a deferred commit without the freed-row
++mask writes the freed block.
++"""
++
++import os
++from dataclasses import fields
++
++import pytest
++import torch
++
++from vllm.model_executor.layers.mamba.gdn.recoverssm_gdn import (
++    GDNRecoverSSMCommitContext,
++    gdn_recoverssm_verify,
++)
++from vllm.v1.attention.backends.gdn_recoverssm import (
++    GDNRecoverSSMCommitMetadata,
++    GDNRecoverSSMMetadata,
++)
++from vllm.v1.worker.gpu.model_states.recoverssm import (
++    DeferredRecoverSSMStep,
++    RecoverSSMState,
++)
++
++if torch.cuda.is_available():
++    DEV = "cuda"
++elif os.environ.get("TRITON_INTERPRET") == "1":
++    DEV = "cpu"
++else:
++    pytest.skip("needs CUDA or TRITON_INTERPRET=1", allow_module_level=True)
++
++H, HV, K, V, T = 2, 4, 32, 32, 4  # T = 1 + K_spec (K_spec = 3, prod)
++NB, CONV_DIM, MAX_REQS, BLOCK = 16, 8, 8, 8
++A_BLOCKS, B_BLOCKS = [2, 5], [7, 9, 11]
++A_ACC = [2, 3]
++
++
++class _Pool:
++    def __init__(self, seed: int = 0) -> None:
++        g = torch.Generator(device="cpu").manual_seed(seed)
++        r = lambda *s: torch.randn(*s, generator=g)  # noqa: E731
++        self.ckpt = (r(NB, HV, V, K) * 0.05).float().to(DEV)
++        self.replay = torch.zeros(NB, HV, T, V + K + 1, device=DEV)
++        self.conv = (r(NB, CONV_DIM, 3 + T - 1)).to(torch.bfloat16).to(DEV)
++        self.A_log = (torch.rand(HV, generator=g) * 2 - 1).float().to(DEV)
++        self.dt_bias = (r(HV) * 0.5).bfloat16().to(DEV)
++        self._g = g
++
++    def window(self, n: int) -> dict:
++        r = lambda *s: torch.randn(*s, generator=self._g)  # noqa: E731
++        tot = n * T
++        return dict(
++            a=r(tot, HV).bfloat16().to(DEV),
++            b=r(tot, HV).bfloat16().to(DEV),
++            q=r(1, tot, H, K).bfloat16().to(DEV),
++            k=r(1, tot, H, K).bfloat16().to(DEV),
++            v=r(1, tot, HV, V).bfloat16().to(DEV),
++        )
++
++    def context(self) -> GDNRecoverSSMCommitContext:
++        return GDNRecoverSSMCommitContext.from_tensors(
++            [self.conv], [self.ckpt], [self.replay], spec_query_len=T,
++            max_num_reqs=MAX_REQS,
++        )
++
++
++class _Buffers:
++    """The builder's persistent, graph-staged buffers."""
++
++    def __init__(self) -> None:
++        self.sidx = torch.full((MAX_REQS, T), -1, dtype=torch.int32, device=DEV)
++        self.qsl = torch.zeros(MAX_REQS + 1, dtype=torch.int32, device=DEV)
++        self.bt = torch.zeros(MAX_REQS, 4, dtype=torch.int32, device=DEV)
++
++
++def _build(buf, blocks, ctx, *, align) -> GDNRecoverSSMMetadata:
++    n = len(blocks)
++    buf.sidx[:n, 0] = torch.tensor(blocks, dtype=torch.int32, device=DEV)
++    buf.qsl[: n + 1] = torch.arange(0, (n + 1) * T, T, dtype=torch.int32, device=DEV)
++    for i, b in enumerate(blocks):
++        # align, 6 computed tokens: column 0 = block b holds tokens 0..7 and the
++        # running state (the checkpoint), column 1 = block b + 1 (tokens 8..15).
++        # Accepting 2 ends exactly on the boundary (final stays in b); accepting
++        # 3 crosses it: final -> b + 1, boundary state -> b, the source slot
++        # (the fold-ordering case of #58863 commit 6).
++        buf.bt[i] = torch.tensor([b, b + 1, 0, 0], dtype=torch.int32, device=DEV)
++    commit = GDNRecoverSSMCommitMetadata(
++        state_indices=buf.sidx[:, :1],
++        query_start_loc=buf.qsl,
++        request_indices=None,
++        block_table=buf.bt[:n] if align else None,
++        # 6 computed tokens: a window accepting >= 2 crosses the boundary at 8
++        num_computed_tokens=torch.full((n,), 6, dtype=torch.int32, device=DEV)
++        if align
++        else None,
++        block_size=BLOCK if align else None,
++    )
++    req = dict(
++        num_prefills=0, num_prefill_tokens=0, num_decodes=0, num_decode_tokens=0,
++        num_spec_decodes=n, num_spec_decode_tokens=n * T, num_actual_tokens=n * T,
++    )
++    kw = {
++        f.name: req.get(f.name)
++        for f in fields(GDNRecoverSSMMetadata)
++        if f.init and f.name not in ("recoverssm_commit", "recoverssm_context")
++    }
++    return GDNRecoverSSMMetadata(**kw, recoverssm_commit=commit, recoverssm_context=ctx)
++
++
++def _verify(pool: _Pool, buf: _Buffers, n: int, w: dict) -> None:
++    gdn_recoverssm_verify(
++        pool.A_log, w["a"], w["b"], pool.dt_bias, w["q"], w["k"], w["v"],
++        checkpoint_state=pool.ckpt, replay_cache=pool.replay,
++        query_start_loc=buf.qsl[: n + 1], state_indices=buf.sidx[:n, 0],
++        spec_query_len=T,
++    )
++
++
++def _record(state, meta):
++    from types import SimpleNamespace
++
++    g = SimpleNamespace(layer_names=["l0"])
++    state.record_step({"l0": meta}, [[g]], for_capture=False)
++
++
++def _commit(state, idx_mapping):
++    acc = torch.tensor(A_ACC, dtype=torch.int32, device=DEV)
++    state.commit_step(
++        acc,
++        torch.tensor(idx_mapping, dtype=torch.int32, device=DEV),
++        state_indices=torch.zeros(MAX_REQS, dtype=torch.int32, device=DEV),
++        num_accepted_tokens=torch.ones(MAX_REQS, dtype=torch.int32, device=DEV),
++    )
++
++
++def _pp1_reference(align: bool) -> _Pool:
++    pool, buf, state = _Pool(), _Buffers(), RecoverSSMState()
++    wa = pool.window(2)
++    _record(state, _build(buf, A_BLOCKS, pool.context(), align=align))
++    _verify(pool, buf, 2, wa)
++    _commit(state, [0, 1])
++    return pool
++
++
++def _pp2(align: bool, *, alias=False, idx_mapping=(0, 1), mask=True):
++    pool, buf, state = _Pool(), _Buffers(), RecoverSSMState()
++    wa = pool.window(2)
++    wb = pool.window(3)
++    ctx = pool.context()
++    # step T: verify A, detach its commit (sample_tokens on a non-last rank)
++    meta_a = _build(buf, A_BLOCKS, ctx, align=align)
++    _record(state, meta_a)
++    _verify(pool, buf, 2, wa)
++    deferred = state.detach_step()
++    assert deferred is not None
++    if alias:  # control: a detach that keeps the live views (no snapshot)
++        deferred = DeferredRecoverSSMStep((meta_a,))
++    # step T+1: micro-batch B's build rewrites the buffers, B verifies
++    _record(state, _build(buf, B_BLOCKS, ctx, align=align))
++    _verify(pool, buf, 3, wb)
++    state.detach_step()  # B goes to its own pending entry
++    before = (pool.ckpt.clone(), pool.conv.clone())
++    # step T+2: A's broadcast consumed -> restore, then the deferred commit
++    state.restore_step(deferred)
++    if not mask:
++        state._step_is_deferred = False
++    _commit(state, list(idx_mapping))
++    return pool, before
++
++
++def _blocks_for(align: bool, blocks):
++    # every block a row's commit may write (see _build)
++    if not align:
++        return list(blocks)
++    return list(blocks) + [b + 1 for b in blocks]
++
++
++@pytest.mark.parametrize("align", [False, True])
++def test_deferred_commit_is_bit_identical_to_pp1(align):
++    ref = _pp1_reference(align)
++    pool, before = _pp2(align)
++    touched = _blocks_for(align, A_BLOCKS)
++    for b in touched:
++        assert torch.equal(pool.ckpt[b], ref.ckpt[b]), b
++        assert torch.equal(pool.conv[b], ref.conv[b]), b
++    others = [b for b in range(NB) if b not in touched]
++    assert torch.equal(pool.ckpt[others], before[0][others])
++    # and A's blocks did change (the commit really ran)
++    assert any(not torch.equal(pool.ckpt[b], before[0][b]) for b in A_BLOCKS)
++
++
++@pytest.mark.parametrize("align", [False, True])
++def test_control_aliasing_snapshot_breaks_it(align):
++    ref = _pp1_reference(align)
++    pool, _ = _pp2(align, alias=True)
++    assert any(
++        not torch.equal(pool.ckpt[b], ref.ckpt[b]) for b in _blocks_for(align, A_BLOCKS)
++    )
++
++
++@pytest.mark.parametrize("align", [False, True])
++def test_freed_row_is_not_written(align):
++    ref = _pp1_reference(align)
++    pool, before = _pp2(align, idx_mapping=(0, -1))
++    live = _blocks_for(align, A_BLOCKS[:1])
++    freed = _blocks_for(align, A_BLOCKS[1:])
++    for b in live:
++        assert torch.equal(pool.ckpt[b], ref.ckpt[b])
++    for b in freed:
++        assert torch.equal(pool.ckpt[b], before[0][b]), b
++        assert torch.equal(pool.conv[b], before[1][b]), b
++
++
++@pytest.mark.parametrize("align", [False, True])
++def test_control_unmasked_commit_writes_the_freed_block(align):
++    pool, before = _pp2(align, idx_mapping=(0, -1), mask=False)
++    assert not torch.equal(pool.ckpt[A_BLOCKS[1]], before[0][A_BLOCKS[1]])

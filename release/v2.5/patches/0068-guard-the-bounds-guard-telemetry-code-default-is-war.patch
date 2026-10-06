@@ -1,0 +1,222 @@
+From 263bd02e3344175daa8686d1da04e262c6bc43a2 Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 05:05:23 -0400
+Subject: [PATCH 68/97] guard: the bounds-guard telemetry code default is warn
+
+VLLM_E2_GUARD_MODE now defaults to warn in code, matching what the shipped launchers set; v2 through v2.2.0
+defaulted to off. The comment above it, the MODES docstring, the vllm/envs.py default and its annotation follow.
+tests/v1/worker/gpu/test_guard_default_mode.py checks that code, comment and envs.py agree, from the sources, so
+it runs without CUDA, and fails on the earlier source.
+---
+ .../v1/worker/gpu/test_guard_default_mode.py  | 86 +++++++++++++++++++
+ .../test_guard_telemetry_defaults_drain.py    | 10 +--
+ vllm/envs.py                                  |  4 +-
+ vllm/v1/worker/guard_telemetry.py             | 22 ++---
+ 4 files changed, 105 insertions(+), 17 deletions(-)
+ create mode 100644 tests/v1/worker/gpu/test_guard_default_mode.py
+
+diff --git a/tests/v1/worker/gpu/test_guard_default_mode.py b/tests/v1/worker/gpu/test_guard_default_mode.py
+new file mode 100644
+index 0000000000..4dc451683d
+--- /dev/null
++++ b/tests/v1/worker/gpu/test_guard_default_mode.py
+@@ -0,0 +1,86 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""The guard's CODE default is warn (since v2.5), and the code, its comment and
++vllm/envs.py agree.
++
++Source-level pins: they parse the files instead of importing them, so they run on a machine with no
++CUDA, no zmq and no working vllm import. The behavioural check at the end imports the
++module only when that works.
++"""
++
++import ast
++import importlib
++import os
++import re
++import sys
++
++import pytest
++
++_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), *([".."] * 4)))
++_GT = os.path.join(_ROOT, "vllm", "v1", "worker", "guard_telemetry.py")
++_ENVS = os.path.join(_ROOT, "vllm", "envs.py")
++
++
++def _read(path):
++    with open(path, encoding="utf-8") as fh:
++        return fh.read()
++
++
++def _getenv_defaults(src, name):
++    """every default literal passed to os.environ.get / os.getenv for `name`"""
++    out = []
++    for node in ast.walk(ast.parse(src)):
++        if not isinstance(node, ast.Call) or len(node.args) < 2:
++            continue
++        fn = ast.unparse(node.func)
++        if fn not in ("os.environ.get", "os.getenv"):
++            continue
++        a0, a1 = node.args[0], node.args[1]
++        if isinstance(a0, ast.Constant) and a0.value == name and isinstance(a1, ast.Constant):
++            out.append(a1.value)
++    return out
++
++
++def test_code_default_is_warn():
++    d = _getenv_defaults(_read(_GT), "VLLM_E2_GUARD_MODE")
++    assert d == ["warn"], d
++
++
++def test_envs_default_is_warn_everywhere():
++    src = _read(_ENVS)
++    assert _getenv_defaults(src, "VLLM_E2_GUARD_MODE") == ["warn"]
++    assert re.search(r'VLLM_E2_GUARD_MODE: str = "warn"', src)
++    assert 'VLLM_E2_GUARD_MODE: str = "off"' not in src
++
++
++def test_comment_and_docstring_agree_with_the_default():
++    src = _read(_GT)
++    line = next(ln for ln in src.splitlines() if ln.startswith("_MODE = os.environ.get("))
++    i = src.splitlines().index(line)
++    above = "\n".join(src.splitlines()[max(0, i - 8) : i])
++    assert "Release defaults" in above and "warn, 0.05 s" in above
++    assert "v2.5" in above
++    # the MODES block must name warn as the default and must not call off the default
++    assert re.search(r"warn\s+\(DEFAULT since v2\.5", src)
++    assert not re.search(r"off\s+\(DEFAULT", src)
++    # the interval default stays 0.05 (the comment says so)
++    assert _getenv_defaults(src, "VLLM_E2_GUARD_INTERVAL") == ["0.05"]
++
++
++def test_failing_control_the_old_default_would_be_caught():
++    """the pin must fail on the earlier source (default off)"""
++    old = _read(_GT).replace('"VLLM_E2_GUARD_MODE", "warn"', '"VLLM_E2_GUARD_MODE", "off"')
++    assert old != _read(_GT)
++    assert _getenv_defaults(old, "VLLM_E2_GUARD_MODE") == ["off"]
++    assert _getenv_defaults(old, "VLLM_E2_GUARD_MODE") != ["warn"]
++
++
++def test_module_default_with_env_absent(monkeypatch):
++    monkeypatch.delenv("VLLM_E2_GUARD_MODE", raising=False)
++    monkeypatch.delenv("VLLM_E2_GUARD_INTERVAL", raising=False)
++    sys.modules.pop("vllm.v1.worker.guard_telemetry", None)
++    try:
++        gt = importlib.import_module("vllm.v1.worker.guard_telemetry")
++    except Exception as e:  # noqa: BLE001  (no CUDA / zmq on this host: the source pins above stand in)
++        pytest.skip(f"vllm.v1.worker.guard_telemetry not importable here: {e!r}")
++    assert gt._MODE == "warn"
+diff --git a/tests/v1/worker/gpu/test_guard_telemetry_defaults_drain.py b/tests/v1/worker/gpu/test_guard_telemetry_defaults_drain.py
+index 606292e2aa..32a99c1143 100644
+--- a/tests/v1/worker/gpu/test_guard_telemetry_defaults_drain.py
++++ b/tests/v1/worker/gpu/test_guard_telemetry_defaults_drain.py
+@@ -2,8 +2,8 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """Bounds-guard instrumentation: release defaults, reader loss and the final drain.
+ 
+-1. Release defaults are off / 0.05 with both variables absent (earlier
+-   builds defaulted to warn), and a
++1. Release defaults are warn / 0.05 with both variables absent (v2 through
++   v2.2.0 defaulted to off), and a
+    non-finite or non-positive interval is rejected at import.
+ 2. A reader that loses a device arms the stop (the fatal-site contract is
+    otherwise silently void).
+@@ -32,7 +32,7 @@ def _fresh(monkeypatch, **env):
+ 
+ def test_release_defaults_with_env_absent(monkeypatch):
+     gt = _fresh(monkeypatch)
+-    assert gt._MODE == "off"  # v2: default off
++    assert gt._MODE == "warn"  # code default warn since v2.5
+     assert pytest.approx(0.05) == gt._INTERVAL
+ 
+ 
+@@ -45,7 +45,7 @@ def test_bad_interval_rejected_at_import(monkeypatch, bad):
+ def test_reader_loss_arms_the_stop(monkeypatch):
+     gt = _fresh(
+         monkeypatch, VLLM_E2_GUARD_MODE="warn"
+-    )  # the reader exists only when opted in (default off)
++    )  # explicit, so the test does not depend on the default
+     device = torch.device("cuda:0")
+     gt.prealloc(device)
+     gt.reset_for_test()
+@@ -65,7 +65,7 @@ def test_reader_loss_arms_the_stop(monkeypatch):
+ def test_drain_reports_last_step_hit_and_raises_for_fatal_site(monkeypatch):
+     gt = _fresh(
+         monkeypatch, VLLM_E2_GUARD_MODE="warn"
+-    )  # warn mode (opt-in): a plain site must NOT raise
++    )  # warn mode: a plain site must NOT raise
+     device = torch.device("cuda:0")
+     gt.prealloc(device)
+     gt.reset_for_test()
+diff --git a/vllm/envs.py b/vllm/envs.py
+index f13f442064..4356854f8d 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -399,7 +399,7 @@ if TYPE_CHECKING:
+     # Guard telemetry: mode raise|warn|off and the reader poll interval in
+     # seconds. counter() returns a real tensor in every mode, so the Triton
+     # arguments and the captured graph do not depend on either.
+-    VLLM_E2_GUARD_MODE: str = "off"
++    VLLM_E2_GUARD_MODE: str = "warn"
+     VLLM_E2_GUARD_INTERVAL: str = "0.05"
+     # Debug allocator telemetry (poll seconds + output directory) and the
+     # scheduler allocation log path.
+@@ -2426,7 +2426,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     ).strip(),
+     "VLLM_QSA_KV_SCALES": lambda: os.getenv("VLLM_QSA_KV_SCALES", "").strip(),
+     "VLLM_E2_GUARD_MODE": lambda: (
+-        os.getenv("VLLM_E2_GUARD_MODE", "off").strip().lower()
++        os.getenv("VLLM_E2_GUARD_MODE", "warn").strip().lower()
+     ),
+     "VLLM_E2_GUARD_INTERVAL": lambda: os.getenv("VLLM_E2_GUARD_INTERVAL", "0.05"),
+     "VLLM_E2_MEMSTATS": lambda: os.getenv("VLLM_E2_MEMSTATS", "0"),
+diff --git a/vllm/v1/worker/guard_telemetry.py b/vllm/v1/worker/guard_telemetry.py
+index 63c450f14d..b02a7c3d43 100644
+--- a/vllm/v1/worker/guard_telemetry.py
++++ b/vllm/v1/worker/guard_telemetry.py
+@@ -40,13 +40,13 @@ MODES -- VLLM_E2_GUARD_MODE:
+          serving product than a loud stop. Read check_pending below before
+          using it -- the raise is late and it is local to one rank.
+          Targeted repro boots.
+-  warn   log only -- EXCEPT for the sites in _ALWAYS_FATAL_SITES, which arm
+-         the raise whatever the mode says, because their masked value has
+-         already been written somewhere durable. USE THIS FOR LONG STRESS
+-         BOOTS.
+-  off    (DEFAULT since v2: the reader thread
+-         and the QSA clip reader cost ~0.3 ms per decode step on TP2xPP2; opt in
+-         with VLLM_E2_GUARD_MODE=warn for diagnosis)
++  warn   (DEFAULT since v2.5) log only -- EXCEPT for the sites in
++         _ALWAYS_FATAL_SITES, which arm the raise whatever the mode says,
++         because their masked value has already been written somewhere durable.
++         USE THIS FOR LONG STRESS BOOTS.
++  off    (the default in v2 through v2.2.0: the reader thread and the QSA clip
++         reader cost ~0.3 ms per decode step on TP2xPP2; set
++         VLLM_E2_GUARD_MODE=off to skip the reader)
+          no reader thread. The kernels still mask and still count; nothing is
+          read -- INCLUDING the sites in _ALWAYS_FATAL_SITES. Use only when you
+          have decided you do not want the evidence.
+@@ -218,10 +218,12 @@ SITE_NAMES = {
+ }
+ 
+ 
+-# Release defaults: off, 0.05 s.
++# Release defaults: warn, 0.05 s.
+ # Earlier revisions shipped raise / 0.5 while every qualification boot set both
+ # variables explicitly, so the defaults were never the thing being tested.
+-_MODE = os.environ.get("VLLM_E2_GUARD_MODE", "off").strip().lower()
++# v2 through v2.2.0 shipped the code default off; v2.5 puts
++# it back to warn so the code default, this comment and the shipped launchers agree.
++_MODE = os.environ.get("VLLM_E2_GUARD_MODE", "warn").strip().lower()
+ if _MODE not in ("raise", "warn", "off"):
+     # fail closed: a set-but-broken gate must not silently disarm the instrument
+     raise ValueError(f"VLLM_E2_GUARD_MODE must be raise|warn|off, got {_MODE!r}")
+@@ -491,7 +493,7 @@ def start_reader() -> None:
+     host, and a device-to-host copy from a second thread while a capture is
+     active is exactly the call class cudaStreamCaptureModeGlobal -- the default
+     for torch.cuda.graph -- rejects. The QSA clip-counter reader survives it in
+-    practice, but that one is maintainer-gated and this one can be enabled by any user, so
++    practice, but that one is opt-in and this one is on by default, so
+     the precedent is evidence, not proof. Starting after capture deletes the
+     question rather than arguing it.
+ 

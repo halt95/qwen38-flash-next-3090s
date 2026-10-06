@@ -1,0 +1,123 @@
+From eeef544c6543446d2ac794905faf514b49e7a9a2 Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Sun, 4 Oct 2026 09:07:17 -0400
+Subject: [PATCH 89/97] ple: VLLM_E2_PLE_PULL_TRANSPORT defaults to on when
+ unset
+
+With the switch unset, the PLE took upstream's UVA backend, whose Triton lookup kernel needs fp8e4nv, which sm_86
+does not have, so a launcher without the switch failed at profile_run. Unset now means on, the shipped value;
+0 still selects upstream's path.
+---
+ tests/v1/test_e2_ple_mode.py             | 27 +++++++++++++++++++-----
+ vllm/envs.py                             |  7 ++++--
+ vllm/models/qwen4_exp/nvidia/ple_pull.py |  5 +++--
+ 3 files changed, 30 insertions(+), 9 deletions(-)
+
+diff --git a/tests/v1/test_e2_ple_mode.py b/tests/v1/test_e2_ple_mode.py
+index 40177717b1..a614a0c192 100644
+--- a/tests/v1/test_e2_ple_mode.py
++++ b/tests/v1/test_e2_ple_mode.py
+@@ -76,7 +76,8 @@ def _config(cpu_offload: bool | None, ple_layer_ids=(2,)):
+ 
+ 
+ @pytest.mark.parametrize(
+-    ("raw", "expected"), [(None, False), ("0", False), ("1", True)]
++    # Fork (v2.5): unset = ON (the shipped transport); "0" selects upstream.
++    ("raw", "expected"), [(None, True), ("0", False), ("1", True)]
+ )
+ def test_switch_accepts_exactly_unset_0_1(monkeypatch, raw, expected) -> None:
+     _set(monkeypatch, PULL_TRANSPORT_ENV, raw)
+@@ -109,6 +110,19 @@ def test_switch_rejection_control_a_lax_parser_accepts_true(monkeypatch) -> None
+     assert envs._e2_strict_switch(PULL_TRANSPORT_ENV) is True
+ 
+ 
++def test_switch_unset_defaults_on_and_zero_still_selects_upstream(monkeypatch) -> None:
++    """Fork (v2.5, knob-absent boot): unset = the shipped pull transport, because the
++    upstream UVA path compiles an fp8e4nv kernel sm_86 cannot build. "0" keeps
++    selecting upstream explicitly; spellings stay strict."""
++    monkeypatch.delenv(PULL_TRANSPORT_ENV, raising=False)
++    assert envs.VLLM_E2_PLE_PULL_TRANSPORT is True
++    monkeypatch.setenv(PULL_TRANSPORT_ENV, "0")
++    assert envs.VLLM_E2_PLE_PULL_TRANSPORT is False
++    monkeypatch.setenv(PULL_TRANSPORT_ENV, "true")
++    with pytest.raises(ValueError):
++        envs.VLLM_E2_PLE_PULL_TRANSPORT
++
++
+ def test_switch_is_registered_and_hashed(monkeypatch) -> None:
+     """Registered, live, and NOT in compile_factors' deny-list.
+ 
+@@ -152,7 +166,7 @@ def test_old_name_other_values_with_pull_on_are_refused(monkeypatch, old) -> Non
+         check_upstream_uva_env_against_pull()
+ 
+ 
+-@pytest.mark.parametrize("pull", [None, "0"])
++@pytest.mark.parametrize("pull", ["0"])  # v2.5: unset is pull ON
+ def test_old_name_control_pull_off_leaves_it_to_upstream(monkeypatch, pull) -> None:
+     """Failing control: the SAME VLLM_PLE_CPU_OFFLOAD=1 passes with pull off."""
+     _set(monkeypatch, PULL_TRANSPORT_ENV, pull)
+@@ -165,6 +179,7 @@ def test_old_name_control_pull_off_leaves_it_to_upstream(monkeypatch, pull) -> N
+ 
+ @pytest.mark.parametrize("upstream_default", [True, False])
+ def test_default_is_upstream_verbatim_with_pull_off(monkeypatch, upstream_default):
++    _set(monkeypatch, PULL_TRANSPORT_ENV, "0")  # v2.5: unset is pull ON
+     assert pull_transport_cpu_offload_default(upstream_default) is upstream_default
+ 
+ 
+@@ -186,10 +201,12 @@ def test_default_with_pull_on_still_refuses_the_old_name(monkeypatch):
+ @pytest.mark.parametrize(
+     ("pull", "cpu_offload", "mode"),
+     [
+-        (None, None, PLE_MODE_NONE),
+-        (None, True, PLE_MODE_UVA),
+-        (None, False, PLE_MODE_DEVICE),
++        # v2.5: unset = pull ON; the upstream modes need an explicit "0".
++        (None, None, PLE_MODE_PULL),
++        (None, False, PLE_MODE_PULL),
++        ("0", None, PLE_MODE_NONE),
+         ("0", True, PLE_MODE_UVA),
++        ("0", False, PLE_MODE_DEVICE),
+         ("1", False, PLE_MODE_PULL),
+         ("1", None, PLE_MODE_PULL),
+     ],
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 7401ed7ff3..9fe769a097 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -389,7 +389,10 @@ if TYPE_CHECKING:
+     # UVA backend is refused (vllm/v1/e2_guards.py). Off: the tree is upstream.
+     # AOT: yes (different module class and forward). CAPTURE: yes (the captured
+     # graph contains the wait/copy ops instead of a table lookup). Hashed.
+-    VLLM_E2_PLE_PULL_TRANSPORT: bool = False
++    # UNSET = ON (since v2.5), the shipped value: upstream's UVA backend (the off
++    # path) compiles an fp8e4nv Triton kernel that sm_86 cannot build, so a launcher
++    # without this switch failed at profile_run. "0" still selects upstream's path.
++    VLLM_E2_PLE_PULL_TRANSPORT: bool = True
+     #
+     # RUNTIME-ONLY (registered for validate_environ + a single cached read):
+     # Static K/V scale sidecar: fill_()ed into existing fp32 device buffers
+@@ -2437,7 +2440,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     "MERLIN_TOPK_EXACT_MEDIUM": lambda: os.getenv("MERLIN_TOPK_EXACT_MEDIUM", None),
+     # PLE pull transport switch; strict "0"/"1" (see the TYPE_CHECKING block).
+     "VLLM_E2_PLE_PULL_TRANSPORT": lambda: _e2_strict_switch(
+-        "VLLM_E2_PLE_PULL_TRANSPORT"
++        "VLLM_E2_PLE_PULL_TRANSPORT", default=True
+     ),
+     # Runtime only; all of the following are in compile_factors.ignored_factors.
+     "VLLM_E2_ALLOW_BREAKABLE": lambda: os.getenv("VLLM_E2_ALLOW_BREAKABLE", "") == "1",
+diff --git a/vllm/models/qwen4_exp/nvidia/ple_pull.py b/vllm/models/qwen4_exp/nvidia/ple_pull.py
+index f52000c8d9..25d9640b0c 100644
+--- a/vllm/models/qwen4_exp/nvidia/ple_pull.py
++++ b/vllm/models/qwen4_exp/nvidia/ple_pull.py
+@@ -15,8 +15,9 @@ class: ``Qwen4ExpNGramEmbeddingPull`` inherits it and ``PleOffloadLayer``.
+   table is upstream's ``Qwen4ExpPLEDeviceEmbedding`` allocated on CPU;
+   ``forward_impl`` computes n-gram IDs and gathers raw (FP8) rows.
+ 
+-Selected only when ``VLLM_E2_PLE_PULL_TRANSPORT=1``; with the switch off this
+-module is never imported by the model and the tree is upstream.
++Selected when ``VLLM_E2_PLE_PULL_TRANSPORT`` is ``1`` or unset (the fork default
++since v2.5); with ``=0`` this module is never imported by the model and the
++tree is upstream.
+ 
+ Supported table formats: FP8 (global scale) and unquantized -- the two
+ ``Qwen4ExpPLEEmbeddingMethod`` families v0.30.0 itself supports. The E2 NVFP4

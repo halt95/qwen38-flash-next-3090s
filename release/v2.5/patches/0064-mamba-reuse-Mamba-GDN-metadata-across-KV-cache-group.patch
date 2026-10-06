@@ -1,0 +1,359 @@
+From 198c261b6c3a07925dd4687cb237f55aa982776b Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Mon, 28 Sep 2026 06:36:58 +0200
+Subject: [PATCH 64/97] mamba: reuse Mamba/GDN metadata across KV cache groups
+ (port of upstream #58762)
+
+Port of the upstream vLLM change #58762 (Apache-2.0). Mamba/GDN attention metadata is built once and reused by groups that share it.
+Test-only conflicts with upstream changes not in v0.30.0 were resolved by taking only this change's tests.
+---
+ tests/models/kimi_k3/test_kda_metadata.py     |   1 +
+ .../v1/attention/test_gdn_metadata_builder.py |  63 +++++++++
+ vllm/v1/attention/backends/gdn_attn.py        | 124 +++++++++++++++---
+ vllm/v1/worker/gpu/attn_utils.py              |  18 ++-
+ 4 files changed, 186 insertions(+), 20 deletions(-)
+
+diff --git a/tests/models/kimi_k3/test_kda_metadata.py b/tests/models/kimi_k3/test_kda_metadata.py
+index c3f423804a..8ff7aff4c3 100644
+--- a/tests/models/kimi_k3/test_kda_metadata.py
++++ b/tests/models/kimi_k3/test_kda_metadata.py
+@@ -49,6 +49,7 @@ PRUNED_METADATA_FIELDS = {
+     "prefill_state_indices",
+     "prefill_has_initial_state",
+     "spec_sequence_masks",
++    "spec_sequence_masks_cpu",
+     "flashinfer_prefill_query_start_loc",
+     "flashinfer_prefill_seq_order",
+ }
+diff --git a/tests/v1/attention/test_gdn_metadata_builder.py b/tests/v1/attention/test_gdn_metadata_builder.py
+index b4d3acf07c..44dee49a4e 100644
+--- a/tests/v1/attention/test_gdn_metadata_builder.py
++++ b/tests/v1/attention/test_gdn_metadata_builder.py
+@@ -21,6 +21,7 @@ from vllm.v1.attention.backends.gdn_attn import (
+     GDNAttentionMetadata,
+     GDNAttentionMetadataBuilder,
+ )
++from vllm.v1.attention.backends.utils import mamba_get_block_table_tensor
+ from vllm.v1.kv_cache_interface import MambaSpec
+ 
+ BLOCK_SIZE = 16
+@@ -75,6 +76,17 @@ GDN_BUILD_TEST_CASES = {
+         expected_num_prefill_tokens=0,
+         expected_num_spec_decodes=0,
+     ),
++    # No speculative config, decode alongside prefill
++    "regular_decode_with_prefill": GDNBuildTestCase(
++        seq_lens=[40, 100],
++        query_lens=[1, 50],
++        num_decode_draft_tokens=None,
++        num_speculative_tokens=0,
++        expected_num_decodes=1,
++        expected_num_prefills=1,
++        expected_num_prefill_tokens=50,
++        expected_num_spec_decodes=0,
++    ),
+     # Multi-token prefill alongside spec decode — no decode to reclassify
+     "spec_decode_with_real_prefill": GDNBuildTestCase(
+         seq_lens=[100, 20],
+@@ -155,9 +167,12 @@ def _build(
+     builder: GDNAttentionMetadataBuilder,
+     batch_spec: BatchSpec,
+     num_decode_draft_tokens: list[int] | None = None,
++    block_table: torch.Tensor | None = None,
+ ) -> GDNAttentionMetadata:
+     """Build GDN attention metadata, optionally with spec-decode kwargs."""
+     common = create_common_attn_metadata(batch_spec, BLOCK_SIZE, DEVICE)
++    if block_table is not None:
++        common = common.replace(block_table_tensor=block_table)
+     kwargs: dict = {}
+     if num_decode_draft_tokens is not None:
+         kwargs["num_decode_draft_tokens_cpu"] = torch.tensor(
+@@ -184,6 +199,54 @@ def test_gdn_build_classification(test_case: GDNBuildTestCase):
+     assert meta.num_spec_decodes == test_case.expected_num_spec_decodes
+ 
+ 
++@pytest.mark.parametrize("mamba_cache_mode", ["none", "align"])
++@pytest.mark.parametrize("full_cuda_graph", [False, True])
++@pytest.mark.parametrize(
++    "test_case", GDN_BUILD_TEST_CASES.values(), ids=GDN_BUILD_TEST_CASES.keys()
++)
++def test_update_block_table_matches_build(
++    test_case: GDNBuildTestCase, full_cuda_graph: bool, mamba_cache_mode: str
++):
++    """update_block_table() on another group's metadata matches build()."""
++    batch = BatchSpec(seq_lens=test_case.seq_lens, query_lens=test_case.query_lens)
++    src, dst, ref = (
++        _create_gdn_builder(test_case.num_speculative_tokens, full_cuda_graph)
++        for _ in range(3)
++    )
++    for builder in (src, dst, ref):
++        builder.vllm_config.cache_config.mamba_cache_mode = mamba_cache_mode
++    common = create_common_attn_metadata(batch, BLOCK_SIZE, DEVICE)
++    if mamba_cache_mode == "align":
++        # MRV2 precomputes these for every Mamba group each step.
++        dst.mamba_aligned_state_indices = ref.mamba_aligned_state_indices = (
++            mamba_get_block_table_tensor(
++                common.block_table_tensor, common.seq_lens, ref.kv_cache_spec, "align"
++            )
++        )
++    draft_tokens = test_case.num_decode_draft_tokens
++    expected = _build(ref, batch, draft_tokens, common.block_table_tensor)
++    source = _build(src, batch, draft_tokens)
++    fields = (
++        "spec_state_indices_tensor",
++        "non_spec_state_indices_tensor",
++        "prefill_state_indices",
++    )
++    source_indices = [getattr(source, f) for f in fields]
++    source_indices = [t if t is None else t.clone() for t in source_indices]
++    meta = dst.update_block_table(
++        source, common.block_table_tensor, common.slot_mapping
++    )
++
++    for field, source_index in zip(fields, source_indices):
++        actual = getattr(meta, field)
++        torch.testing.assert_close(actual, getattr(expected, field))
++        # The source group's indices are untouched.
++        torch.testing.assert_close(getattr(source, field), source_index)
++        # FULL graph state indices land in this group's own buffers.
++        if full_cuda_graph and meta.num_prefills == 0 and actual is not None:
++            assert actual.data_ptr() == getattr(dst, field).data_ptr()
++
++
+ def test_has_initial_state_after_reclassification():
+     """After reclassification, num_prefills > 0 so the prefill kernel path
+     should compute has_initial_state. For the reclassified request with
+diff --git a/vllm/v1/attention/backends/gdn_attn.py b/vllm/v1/attention/backends/gdn_attn.py
+index dfc04a84db..f11e2a98c8 100644
+--- a/vllm/v1/attention/backends/gdn_attn.py
++++ b/vllm/v1/attention/backends/gdn_attn.py
+@@ -2,7 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """Backend for GatedDeltaNet attention."""
+ 
+-from dataclasses import dataclass
++from dataclasses import dataclass, replace
+ from typing import Literal
+ 
+ import torch
+@@ -60,6 +60,7 @@ class GDNAttentionMetadata:
+         None  # shape: [batch - num_spec_decodes,]
+     )
+     spec_sequence_masks: torch.Tensor | None = None  # shape: [batch,]
++    spec_sequence_masks_cpu: torch.Tensor | None = None  # shape: [batch,]
+     spec_token_indx: torch.Tensor | None = None
+     non_spec_token_indx: torch.Tensor | None = None
+ 
+@@ -113,6 +114,18 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
+         self.use_full_cuda_graph: bool = (
+             self.compilation_config.cudagraph_mode.has_full_cudagraphs()
+         )
++        # update_block_table() keeps the source group's batch-level FULL graph
++        # buffers, so only MRV2, which also reuses metadata at capture, may use
++        # it.
++        self.supports_update_block_table = (
++            vllm_config.use_v2_model_runner
++            and device.type == "cuda"
++            # Not isinstance: KDA's RecoverSSM/checkpoint metadata is per group.
++            and type(self) is GDNAttentionMetadataBuilder
++        )
++        if self.supports_update_block_table:
++            # Opts into MRV2's CUDA-only aligned-index precompute.
++            self.mamba_aligned_state_indices: torch.Tensor | None = None
+ 
+         self.decode_cudagraph_max_bs: int = (
+             self.vllm_config.scheduler_config.max_num_seqs * (self.num_spec + 1)
+@@ -219,12 +232,16 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
+         query_start_loc = m.query_start_loc
+         query_start_loc_cpu = m.query_start_loc_cpu
+         nums_dict, batch_ptr, token_chunk_offset_ptr = None, None, None
+-        block_table_tensor = mamba_get_block_table_tensor(
+-            m.block_table_tensor,
+-            m.seq_lens,
+-            self.kv_cache_spec,
+-            self.vllm_config.cache_config.mamba_cache_mode,
+-        )
++        aligned_state_indices = getattr(self, "mamba_aligned_state_indices", None)
++        if aligned_state_indices is not None:
++            block_table_tensor = aligned_state_indices[: m.num_reqs]
++        else:
++            block_table_tensor = mamba_get_block_table_tensor(
++                m.block_table_tensor,
++                m.seq_lens,
++                self.kv_cache_spec,
++                self.vllm_config.cache_config.mamba_cache_mode,
++            )
+ 
+         spec_sequence_masks_cpu: torch.Tensor | None = None
+         if not self.use_spec_decode or num_decode_draft_tokens_cpu is None:
+@@ -451,12 +468,8 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
+         # metadata below is indexed by request.
+         batch_size = m.num_reqs
+ 
+-        if (
+-            self.use_full_cuda_graph
+-            and num_prefills == 0
+-            and num_decodes == 0
+-            and num_spec_decodes <= self.decode_cudagraph_max_bs
+-            and num_spec_decode_tokens <= self.decode_cudagraph_max_bs
++        if self._stage_spec_decode(
++            num_prefills, num_decodes, num_spec_decodes, num_spec_decode_tokens
+         ):
+             assert spec_sequence_masks is not None
+             self.spec_state_indices_tensor[:num_spec_decodes].copy_(
+@@ -497,12 +510,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
+             num_accepted_tokens = self.num_accepted_tokens[:batch_size]
+             num_accepted_tokens[num_spec_decodes:].fill_(1)
+ 
+-        if (
+-            self.use_full_cuda_graph
+-            and num_prefills == 0
+-            and num_spec_decodes == 0
+-            and num_decodes <= self.decode_cudagraph_max_bs
+-        ):
++        if self._stage_decode(num_prefills, num_decodes, num_spec_decodes):
+             self.non_spec_state_indices_tensor[:num_decodes].copy_(
+                 non_spec_state_indices_tensor, non_blocking=True
+             )
+@@ -537,6 +545,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
+             spec_state_indices_tensor=spec_state_indices_tensor,
+             non_spec_state_indices_tensor=non_spec_state_indices_tensor,
+             spec_sequence_masks=spec_sequence_masks,
++            spec_sequence_masks_cpu=spec_sequence_masks_cpu,
+             spec_token_indx=spec_token_indx,
+             non_spec_token_indx=non_spec_token_indx,
+             num_accepted_tokens=num_accepted_tokens,
+@@ -546,6 +555,83 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
+         )
+         return attn_metadata
+ 
++    def _stage_spec_decode(
++        self,
++        num_prefills: int,
++        num_decodes: int,
++        num_spec_decodes: int,
++        num_spec_decode_tokens: int,
++    ) -> bool:
++        """Whether spec-decode metadata goes into the FULL cudagraph buffers."""
++        return (
++            self.use_full_cuda_graph
++            and num_prefills == 0
++            and num_decodes == 0
++            and num_spec_decodes <= self.decode_cudagraph_max_bs
++            and num_spec_decode_tokens <= self.decode_cudagraph_max_bs
++        )
++
++    def _stage_decode(
++        self, num_prefills: int, num_decodes: int, num_spec_decodes: int
++    ) -> bool:
++        """Whether decode metadata goes into the FULL cudagraph buffers."""
++        return (
++            self.use_full_cuda_graph
++            and num_prefills == 0
++            and num_spec_decodes == 0
++            and num_decodes <= self.decode_cudagraph_max_bs
++        )
++
++    def update_block_table(
++        self,
++        metadata: GDNAttentionMetadata,
++        blk_table: torch.Tensor,
++        slot_mapping: torch.Tensor,
++    ) -> GDNAttentionMetadata:
++        """Re-gather this group's state indices. The other fields are
++        batch-level and stay shared with ``metadata``."""
++        m = metadata
++        if self.vllm_config.cache_config.mamba_cache_mode == "align":
++            assert self.mamba_aligned_state_indices is not None
++            blk_table = self.mamba_aligned_state_indices
++        masks = m.spec_sequence_masks_cpu
++        spec_indices = non_spec_indices = prefill_indices = None
++        if masks is None:
++            non_spec_indices = blk_table[:, 0]
++            if m.num_prefills > 0:
++                prefill_indices = non_spec_indices[m.num_decodes :]
++        else:
++            spec_indices = blk_table[masks, : self.num_spec + 1]
++            if m.num_prefills > 0:
++                non_spec_indices = prefill_indices = blk_table[~masks, 0]
++
++        if self._stage_spec_decode(
++            m.num_prefills, m.num_decodes, m.num_spec_decodes, m.num_spec_decode_tokens
++        ):
++            assert m.spec_state_indices_tensor is not None
++            batch_size = m.spec_state_indices_tensor.shape[0]
++            self.spec_state_indices_tensor[: m.num_spec_decodes].copy_(
++                spec_indices, non_blocking=True
++            )
++            spec_indices = self.spec_state_indices_tensor[:batch_size]
++            spec_indices[m.num_spec_decodes :].fill_(NULL_BLOCK_ID)
++
++        if self._stage_decode(m.num_prefills, m.num_decodes, m.num_spec_decodes):
++            assert m.non_spec_state_indices_tensor is not None
++            batch_size = m.non_spec_state_indices_tensor.shape[0]
++            self.non_spec_state_indices_tensor[: m.num_decodes].copy_(
++                non_spec_indices, non_blocking=True
++            )
++            non_spec_indices = self.non_spec_state_indices_tensor[:batch_size]
++            non_spec_indices[m.num_decodes :].fill_(NULL_BLOCK_ID)
++
++        return replace(
++            m,
++            spec_state_indices_tensor=spec_indices,
++            non_spec_state_indices_tensor=non_spec_indices,
++            prefill_state_indices=prefill_indices,
++        )
++
+     def build_for_cudagraph_capture(
+         self, common_attn_metadata: CommonAttentionMetadata
+     ):
+diff --git a/vllm/v1/worker/gpu/attn_utils.py b/vllm/v1/worker/gpu/attn_utils.py
+index 89f54d4d11..cdf0eb8af1 100644
+--- a/vllm/v1/worker/gpu/attn_utils.py
++++ b/vllm/v1/worker/gpu/attn_utils.py
+@@ -29,6 +29,7 @@ from vllm.v1.kv_cache_interface import (
+     AttentionSpec,
+     KVCacheConfig,
+     KVCacheSpec,
++    MambaSpec,
+     UniformTypeKVCacheSpecs,
+ )
+ from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
+@@ -427,6 +428,10 @@ def build_attn_metadata(
+ 
+     attn_metadata: dict[str, Any] = {}
+     token_to_req_indices: torch.Tensor | None = None
++    # Mamba groups with the same spec and builder differ only in their state
++    # indices, so later groups re-gather those from the first group's metadata.
++    # Also at capture, so FULL graphs share the batch-level buffers.
++    cached_metadata: dict[tuple[KVCacheSpec, type], Any] = {}
+     num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
+     for i in range(num_kv_cache_groups):
+         if not attn_groups[i]:
+@@ -479,7 +484,16 @@ def build_attn_metadata(
+ 
+         for attn_group in attn_groups[i]:
+             attn_metadata_builder = attn_group.get_metadata_builder(ubatch_idx)
+-            if for_cudagraph_capture:
++            reuse_key = None
++            if attn_metadata_builder.supports_update_block_table and isinstance(
++                attn_group.kv_cache_spec, MambaSpec
++            ):
++                reuse_key = (attn_group.kv_cache_spec, type(attn_metadata_builder))
++            if reuse_key in cached_metadata:
++                metadata = attn_metadata_builder.update_block_table(
++                    cached_metadata[reuse_key], block_table, slot_mapping
++                )
++            elif for_cudagraph_capture:
+                 metadata = attn_metadata_builder.build_for_cudagraph_capture(
+                     common_attn_metadata
+                 )
+@@ -497,6 +511,8 @@ def build_attn_metadata(
+                     common_attn_metadata=common_attn_metadata,
+                     **attn_metadata_extra_kwargs,
+                 )
++            if reuse_key is not None and reuse_key not in cached_metadata:
++                cached_metadata[reuse_key] = metadata
+             for layer_name in attn_group.layer_names:
+                 attn_metadata[layer_name] = metadata
+         token_to_req_indices = common_attn_metadata._token_to_req_indices_cache

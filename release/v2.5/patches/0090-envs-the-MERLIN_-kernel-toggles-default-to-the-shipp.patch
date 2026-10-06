@@ -1,0 +1,198 @@
+From 48b61cd335b8b766604154b573f00fd697b7d683 Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Sun, 4 Oct 2026 09:23:24 -0400
+Subject: [PATCH 90/97] envs: the MERLIN_* kernel toggles default to the
+ shipped value when unset
+
+MERLIN_FULL_K, MERLIN_QSA_SORT, MERLIN_TIE_DET, MERLIN_TIE_RECENT and MERLIN_TOPK_SORTED_EMIT defaulted to off in
+code while every shipped launcher set them to 1, so a launch without them ran a different kernel configuration.
+vllm/env_override.py now sets each to 1 when unset; 0 still turns one off. tests/test_merlin_toggle_defaults.py
+covers it.
+---
+ .../moe/marlin_moe_wna16/ops.cu               |  2 +-
+ csrc/libtorch_stable/persistent_topk.cuh      |  4 +-
+ csrc/libtorch_stable/topk.cu                  |  8 ++--
+ tests/test_merlin_toggle_defaults.py          | 48 +++++++++++++++++++
+ vllm/env_override.py                          | 16 +++++++
+ vllm/envs.py                                  |  2 +-
+ .../qwen4_exp/nvidia/ops/qsa_indexer.py       |  4 +-
+ 7 files changed, 74 insertions(+), 10 deletions(-)
+ create mode 100644 tests/test_merlin_toggle_defaults.py
+
+diff --git a/csrc/libtorch_stable/moe/marlin_moe_wna16/ops.cu b/csrc/libtorch_stable/moe/marlin_moe_wna16/ops.cu
+index 0a6f5de67d..12a6a2cf78 100644
+--- a/csrc/libtorch_stable/moe/marlin_moe_wna16/ops.cu
++++ b/csrc/libtorch_stable/moe/marlin_moe_wna16/ops.cu
+@@ -49,7 +49,7 @@ namespace {
+ // Resolved ONCE per process, not per launch, so it is a launch constant in
+ // exactly the sense topk.cu's exact_medium_enabled() is: a cudagraph bakes in
+ // the value that was live at capture time and every replay agrees with it.
+-// Default OFF -- enabling it by default is a separate release decision.
++// Code default off; vllm/env_override.py sets 1 (the shipped value) when unset.
+ //
+ // This std::getenv is the SINGLE source of truth. vllm/envs.py carries a raw
+ // passthrough entry for validate_environ and the compile-factor hash only;
+diff --git a/csrc/libtorch_stable/persistent_topk.cuh b/csrc/libtorch_stable/persistent_topk.cuh
+index 0b1b8b5a59..c86e63dd4a 100644
+--- a/csrc/libtorch_stable/persistent_topk.cuh
++++ b/csrc/libtorch_stable/persistent_topk.cuh
+@@ -58,7 +58,7 @@ __device__ __forceinline__ auto convert_to_uint32_v2(float x) -> uint32_t {
+ // both the host (to report it) and the device (to obey it), so the reported
+ // policy and the executed policy cannot drift.
+ //
+-// `MERLIN_TIE_DET=0` is the shipped default and leaves the buffered paths on
++// `MERLIN_TIE_DET=0` (the code default; launchers ship 1) leaves the buffered paths on
+ // their original racy atomicAdd rule, which has no direction; the medium-path exact
+ // restart is deterministic whatever happens, so it keeps the most-recent-wins
+ // direction the medium-path restart shipped and was measured with.
+@@ -209,7 +209,7 @@ struct PersistentTopKParams {
+   // large tail) re-emit their OWN selected set through sorted_emit_row().
+   // Selection is never re-derived, so the selected set cannot change.
+   // Resolved once per process on the host, so it is a launch constant a
+-  // cudagraph bakes in.  Default OFF.
++  // cudagraph bakes in.  Code default off; vllm/env_override.py sets 1 (the shipped value) when unset.
+   bool sorted_emit;
+ };
+ 
+diff --git a/csrc/libtorch_stable/topk.cu b/csrc/libtorch_stable/topk.cu
+index 060f7a60ea..32009668e3 100644
+--- a/csrc/libtorch_stable/topk.cu
++++ b/csrc/libtorch_stable/topk.cu
+@@ -38,7 +38,7 @@ namespace {
+ //
+ // Our own toggle rather than upstream's VLLM_BATCH_INVARIANT, which aborts
+ // engine startup on GDN models (upstream #42960) and so can never reach this
+-// kernel on Flash-Next. Default OFF -- promotion is a release decision.
++// kernel on Flash-Next. Code default off; vllm/env_override.py sets 1 (the shipped value) when unset.
+ //
+ // This std::getenv is the SINGLE source of truth; vllm/envs.py carries a raw
+ // passthrough for validate_environ and the compile-factor hash only.
+@@ -72,7 +72,7 @@ bool publish_cached(std::atomic<int>& mirror, bool value) {
+ // most-recent-wins is +1.5 %. Both deterministic. Also the direction
+ // medium_exact_restart() already implements, so setting this alongside
+ // MERLIN_TIE_DET makes the medium path agree with itself on overflowing
+-// rows. Only read when MERLIN_TIE_DET is set. Default OFF.
++// rows. Only read when MERLIN_TIE_DET is set; code default OFF; vllm/env_override.py sets 1 (the shipped value) when unset.
+ bool tie_recent_enabled() {
+   static const bool enabled = [] {
+     const char* raw = std::getenv("MERLIN_TIE_RECENT");
+@@ -148,8 +148,8 @@ bool exact_decode_enabled() {
+ // (ascending index, padding last as -1), so qsa_indexer.py can drop that sort.
+ // See sorted_emit_row() in persistent_topk.cuh for the contract; the selected
+ // SET is never touched.  Resolved once per process like every switch here, so
+-// it is a launch constant a cudagraph bakes in.  Default OFF: the maintainer
+-// promotes after reference-host qualification.
++// it is a launch constant a cudagraph bakes in.  Code default OFF; vllm/env_override.py
++// sets 1 (the shipped value) when unset.
+ //
+ // This std::getenv is the single source of truth.  Python does not parse the
+ // variable to decide anything: qsa_indexer.py asks THIS cache, through
+diff --git a/tests/test_merlin_toggle_defaults.py b/tests/test_merlin_toggle_defaults.py
+new file mode 100644
+index 0000000000..bb17582500
+--- /dev/null
++++ b/tests/test_merlin_toggle_defaults.py
+@@ -0,0 +1,48 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Fork (v2.5): the MERLIN_* kernel toggles default to the shipped value (1) when
++unset, and an explicit "0" is left alone. Each case runs `import vllm` in a
++fresh interpreter, since env_override applies the defaults at import time."""
++
++import json
++import os
++import subprocess
++import sys
++
++import pytest
++
++NAMES = (
++    "MERLIN_FULL_K",
++    "MERLIN_QSA_SORT",
++    "MERLIN_TIE_DET",
++    "MERLIN_TIE_RECENT",
++    "MERLIN_TOPK_SORTED_EMIT",
++)
++
++
++def _env_after_import(overrides: dict) -> dict:
++    env = {k: v for k, v in os.environ.items() if k not in NAMES}
++    env.update(overrides)
++    code = (
++        "import json, os, vllm, vllm.envs as e;"
++        f"print(json.dumps({{n: os.environ.get(n) for n in {NAMES!r}}}"
++        " | {'QSA_SORT_ENVS': e.MERLIN_QSA_SORT}))"
++    )
++    out = subprocess.run(
++        [sys.executable, "-c", code], env=env, capture_output=True, text=True, check=True
++    )
++    return json.loads(out.stdout.strip().splitlines()[-1])
++
++
++def test_unset_toggles_default_to_the_shipped_value():
++    got = _env_after_import({})
++    assert {n: got[n] for n in NAMES} == dict.fromkeys(NAMES, "1")
++    assert got["QSA_SORT_ENVS"] is True
++
++
++@pytest.mark.parametrize("name", NAMES)
++def test_explicit_zero_is_kept(name):
++    got = _env_after_import({name: "0"})
++    assert got[name] == "0"
++    others = [n for n in NAMES if n != name]
++    assert all(got[n] == "1" for n in others)
+diff --git a/vllm/env_override.py b/vllm/env_override.py
+index a6b3c373fa..fc15a40d03 100644
+--- a/vllm/env_override.py
++++ b/vllm/env_override.py
+@@ -182,6 +182,22 @@ os.environ.setdefault("TRITON_CACHE_AUTOTUNING", "1")
+ # debug layout (see https://github.com/vllm-project/vllm/issues/41410).
+ os.environ.setdefault("TILELANG_CLEANUP_TEMP_FILES", "1")
+ 
++# Fork (v2.5, knob-absent boot): the MERLIN_* kernel toggles are read by
++# getenv in C++ (FULL_K, TIE_DET, TIE_RECENT, TOPK_SORTED_EMIT) and by
++# vllm.envs (QSA_SORT) with OFF as the code default, while every shipped
++# launcher sets them to 1. Unset now means the shipped value; an explicit "0"
++# still turns a toggle off. Set here because this module runs on `import vllm`,
++# before any reader, and worker processes inherit the environment.
++_SHIPPED_KERNEL_TOGGLE_DEFAULTS = (
++    "MERLIN_FULL_K",
++    "MERLIN_QSA_SORT",
++    "MERLIN_TIE_DET",
++    "MERLIN_TIE_RECENT",
++    "MERLIN_TOPK_SORTED_EMIT",
++)
++for _name in _SHIPPED_KERNEL_TOGGLE_DEFAULTS:
++    os.environ.setdefault(_name, "1")
++
+ # ===================================================
+ # torch 2.9 Inductor PythonWrapperCodegen monkeypatch
+ # ===================================================
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 9fe769a097..7b556188b6 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -515,7 +515,7 @@ if TYPE_CHECKING:
+     # --- determinism toggles -----------------------------------------
+     # The three nondeterminism mechanisms (FULL_K, QSA_SORT, TIE_DET/TIE_RECENT).
+     # Every one of them is
+-    # OFF by default: promotion is the maintainer's decision.
++    # OFF by default in this file; vllm/env_override.py sets each to 1 (the shipped value) when unset.
+     #
+     # Why these are registered at all: validate_environ() only inspects names
+     # beginning with VLLM_, so a MERLIN_ name never trips the unknown-variable
+diff --git a/vllm/models/qwen4_exp/nvidia/ops/qsa_indexer.py b/vllm/models/qwen4_exp/nvidia/ops/qsa_indexer.py
+index b9e88b0913..45ace701d7 100644
+--- a/vllm/models/qwen4_exp/nvidia/ops/qsa_indexer.py
++++ b/vllm/models/qwen4_exp/nvidia/ops/qsa_indexer.py
+@@ -45,8 +45,8 @@ _DECODE_BLOCK_N = 64
+ # on the reference host and is why this version has no Python-visible branch on data.
+ #
+ # Resolved once at import so it is a launch constant: a cudagraph captures the
+-# op sequence that was live at capture time. Default OFF -- promotion is a release
+-# decision, which is the maintainer's.
++# op sequence that was live at capture time. Code default OFF; vllm/env_override.py
++# sets 1 (the shipped value) when unset.
+ # ---------------------------------------------------------------------------
+ _QSA_SORT = envs.MERLIN_QSA_SORT
+ 

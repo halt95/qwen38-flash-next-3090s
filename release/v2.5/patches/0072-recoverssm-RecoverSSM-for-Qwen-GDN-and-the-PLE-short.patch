@@ -1,0 +1,2712 @@
+From 0fefd912b9dd8276191f6baa4a812fd4bf81bb76 Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Sun, 27 Sep 2026 00:07:04 +0200
+Subject: [PATCH 72/97] recoverssm: RecoverSSM for Qwen GDN and the PLE short
+ conv (port of upstream #58863, 03cae7837f)
+
+Port of the upstream vLLM change #58863 (Apache-2.0). With --use-replayssm and speculative decoding, Gated DeltaNet layers verify the
+draft window from a read-only checkpoint and keep a per-token replay record; after sampling one commit replays
+the accepted tokens and writes the recurrent state once. The PLE short conv gets the same treatment.
+---
+ tests/config/test_recoverssm_config.py        | 173 +++++
+ tests/kernels/mamba/test_recoverssm_gdn.py    | 601 +++++++++++++++
+ tests/kernels/mamba/test_recoverssm_ple.py    | 153 ++++
+ vllm/config/cache.py                          |   2 +-
+ vllm/config/compilation.py                    |  13 +-
+ vllm/config/vllm.py                           |  29 +-
+ .../layers/mamba/gdn/qwen_gdn_linear_attn.py  | 132 +++-
+ .../layers/mamba/gdn/recoverssm_gdn.py        | 695 ++++++++++++++++++
+ vllm/model_executor/models/interfaces.py      |   1 +
+ vllm/models/qwen4_exp/nvidia/model.py         |  59 +-
+ vllm/models/qwen4_exp/nvidia/mtp.py           |   6 +-
+ vllm/models/qwen4_exp/nvidia/ple_layer.py     |   8 +
+ vllm/v1/attention/backends/gdn_recoverssm.py  | 181 +++++
+ vllm/v1/attention/backends/mamba_attn.py      |   7 +-
+ vllm/v1/attention/backends/ple_recoverssm.py  | 326 ++++++++
+ 15 files changed, 2352 insertions(+), 34 deletions(-)
+ create mode 100644 tests/config/test_recoverssm_config.py
+ create mode 100644 tests/kernels/mamba/test_recoverssm_gdn.py
+ create mode 100644 tests/kernels/mamba/test_recoverssm_ple.py
+ create mode 100644 vllm/model_executor/layers/mamba/gdn/recoverssm_gdn.py
+ create mode 100644 vllm/v1/attention/backends/gdn_recoverssm.py
+ create mode 100644 vllm/v1/attention/backends/ple_recoverssm.py
+
+diff --git a/tests/config/test_recoverssm_config.py b/tests/config/test_recoverssm_config.py
+new file mode 100644
+index 0000000000..21791aad63
+--- /dev/null
++++ b/tests/config/test_recoverssm_config.py
+@@ -0,0 +1,173 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Configuration-level regression tests for Qwen4Exp GDN/PLE RecoverSSM selection.
++
++``--use-replayssm`` with speculative decoding selects RecoverSSM for Qwen4Exp, as it
++does for Kimi-K3 KDA. The MTP drafter's derived config shares ``cache_config`` and must
++keep the choice. These tests run the real validator function against stand-in configs.
++"""
++
++from types import SimpleNamespace
++from typing import Any, cast
++
++import pytest
++
++from vllm.config.mamba import MambaBackendEnum
++from vllm.config.vllm import VllmConfig
++from vllm.model_executor.layers.mamba.recoverssm_utils import uses_recoverssm
++from vllm.v1.attention.backend import AttentionCGSupport
++
++TARGET = "Qwen4ExpForConditionalGeneration"
++DRAFTER = "Qwen4ExpMTP"
++
++
++def _validator():
++    validators = VllmConfig.__pydantic_decorators__.model_validators  # type: ignore[attr-defined]
++    return validators["validate_mamba_cached_kernel"].func
++
++
++def _config(
++    arch: str,
++    cache_config=None,
++    num_spec: int = 3,
++    use_replayssm: bool = True,
++    supports_replayssm: bool = True,
++    **overrides,
++):
++    cfg = SimpleNamespace(
++        num_speculative_tokens=num_spec,
++        model_config=SimpleNamespace(
++            architecture=arch, supports_replayssm=supports_replayssm
++        ),
++        cache_config=cache_config
++        or SimpleNamespace(
++            use_recoverssm=False,
++            use_replayssm=use_replayssm,
++            mamba_cache_mode="align",
++        ),
++        mamba_config=SimpleNamespace(
++            enable_stochastic_rounding=False, backend=MambaBackendEnum.TRITON
++        ),
++        use_v2_model_runner=True,
++        parallel_config=SimpleNamespace(pipeline_parallel_size=1),
++        kv_transfer_config=None,
++    )
++    for key, value in overrides.items():
++        target, _, attr = key.partition("__")
++        if attr:
++            setattr(getattr(cfg, target), attr, value)
++        else:
++            setattr(cfg, target, value)
++    return cfg
++
++
++def test_validator_is_registered():
++    assert "validate_mamba_cached_kernel" in (
++        VllmConfig.__pydantic_decorators__.model_validators  # type: ignore[attr-defined]
++    )
++
++
++@pytest.mark.parametrize(
++    "arch", ["Qwen4ExpForConditionalGeneration", "Qwen4ExpForCausalLM"]
++)
++def test_replayssm_with_spec_selects_recoverssm(arch):
++    cfg = _config(arch)
++    _validator()(cfg)
++    assert cfg.cache_config.use_recoverssm is True
++    assert uses_recoverssm(cfg.cache_config, 3)
++
++
++def test_derived_drafter_keeps_the_choice_and_runs_the_checks():
++    target = _config(TARGET)
++    _validator()(target)
++    drafter = _config(DRAFTER, cache_config=target.cache_config)
++    _validator()(drafter)
++    assert target.cache_config.use_recoverssm is True
++    bad = _config(
++        DRAFTER,
++        cache_config=target.cache_config,
++        parallel_config__pipeline_parallel_size=2,
++    )
++    with pytest.raises(ValueError, match="pipeline_parallel_size"):
++        _validator()(bad)
++
++
++@pytest.mark.parametrize(
++    ("override", "value", "match"),
++    [
++        ("parallel_config__pipeline_parallel_size", 2, "pipeline_parallel_size"),
++        ("mamba_config__enable_stochastic_rounding", True, "stochastic"),
++        ("mamba_config__backend", "flashinfer", "mamba-backend triton"),
++        ("use_v2_model_runner", False, "V2_MODEL_RUNNER"),
++        ("cache_config__mamba_cache_mode", "all", "none and align"),
++    ],
++)
++def test_runtime_checks_reject(override, value, match):
++    cfg = _config(TARGET, **{override: value})
++    with pytest.raises(ValueError, match=match):
++        _validator()(cfg)
++
++
++def test_flag_unset_keeps_the_stock_path():
++    cfg = _config(TARGET, use_replayssm=False)
++    _validator()(cfg)
++    assert cfg.cache_config.use_recoverssm is False
++    assert not uses_recoverssm(cfg.cache_config, 3)
++
++
++def test_qwen4exp_replayssm_requires_speculative_decoding():
++    with pytest.raises(ValueError, match="requires speculative decoding"):
++        _validator()(_config(TARGET, num_spec=0))
++
++
++def test_architecture_without_replayssm_support_is_rejected():
++    cfg = _config("Qwen3NextForCausalLM", supports_replayssm=False)
++    with pytest.raises(ValueError, match="not supported for architecture"):
++        _validator()(cfg)
++
++
++def test_uses_recoverssm_predicate():
++    on = SimpleNamespace(use_recoverssm=True)
++    assert uses_recoverssm(on, 3)
++    assert not uses_recoverssm(on, 0)
++    assert not uses_recoverssm(SimpleNamespace(use_recoverssm=False), 3)
++    assert not uses_recoverssm(SimpleNamespace(), 3)
++
++
++def test_builders_fall_back_to_piecewise():
++    from vllm.v1.attention.backends.gdn_recoverssm import GDNRecoverSSMMetadataBuilder
++    from vllm.v1.attention.backends.ple_recoverssm import PleRecoverSSMMetadataBuilder
++
++    for builder in (GDNRecoverSSMMetadataBuilder, PleRecoverSSMMetadataBuilder):
++        assert (
++            builder.get_cudagraph_support(cast(Any, None), cast(Any, None))
++            == AttentionCGSupport.NEVER
++        )
++
++
++@pytest.mark.parametrize("compile_mode", ["VLLM_COMPILE", "NONE"])
++@pytest.mark.parametrize(("breakable", "expected"), [("1", "PIECEWISE"), ("0", "NONE")])
++def test_never_support_falls_back_to_piecewise_with_breakable_cudagraphs(
++    monkeypatch, compile_mode, breakable, expected
++):
++    """A backend without full-graph support must keep piecewise graphs when breakable
++    CUDA graphs split at attention (splitting_ops is empty then, and torch.compile may
++    be off)."""
++    from vllm.config.compilation import (
++        CompilationConfig,
++        CompilationMode,
++        CUDAGraphMode,
++    )
++
++    monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", breakable)
++    compilation_config = CompilationConfig(
++        mode=CompilationMode[compile_mode],
++        cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
++        splitting_ops=[],
++    )
++    resolved = compilation_config.resolve_cudagraph_mode_and_sizes(
++        AttentionCGSupport.NEVER,
++        "GDNRecoverSSMAttentionBackend",
++        uniform_decode_query_len=4,
++    )
++    assert resolved.name == expected
+diff --git a/tests/kernels/mamba/test_recoverssm_gdn.py b/tests/kernels/mamba/test_recoverssm_gdn.py
+new file mode 100644
+index 0000000000..1e0cbcf8f8
+--- /dev/null
++++ b/tests/kernels/mamba/test_recoverssm_gdn.py
+@@ -0,0 +1,601 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""GDN RecoverSSM: verify against the native fused kernel, commit against the native
++per-token states, and the boundary checks (malformed metadata must raise ValueError
++before any kernel reads or writes out of bounds)."""
++
++from typing import Any, cast
++
++import pytest
++import torch
++
++from vllm.model_executor.layers.mamba.gdn.recoverssm_gdn import (
++    GDNRecoverSSMCommitContext,
++    gdn_recoverssm_verify,
++)
++from vllm.third_party.flash_linear_attention.ops.fused_sigmoid_gating import (
++    fused_sigmoid_gating_delta_rule_update,
++)
++
++pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
++H, HV, K, V, T = 16, 48, 128, 128, 4
++QLENS = (4, 4, 3)
++
++
++def _inputs(nb: int = 10) -> dict:
++    torch.manual_seed(0)
++    dev = "cuda"
++    tot = sum(QLENS)
++    qsl = torch.tensor([0, 4, 8, 11], dtype=torch.int32, device=dev)
++    return dict(
++        A_log=(torch.rand(HV, device=dev) * 2 - 1).float(),
++        a=torch.randn(tot, HV, device=dev, dtype=torch.bfloat16),
++        b=torch.randn(tot, HV, device=dev, dtype=torch.bfloat16),
++        dt_bias=(torch.randn(HV, device=dev) * 0.5).bfloat16(),
++        q=torch.randn(1, tot, H, K, device=dev, dtype=torch.bfloat16),
++        k=torch.randn(1, tot, H, K, device=dev, dtype=torch.bfloat16),
++        v=torch.randn(1, tot, HV, V, device=dev, dtype=torch.bfloat16),
++        checkpoint_state=(torch.randn(nb, HV, V, K, device=dev) * 0.05).float(),
++        replay_cache=torch.zeros(nb, HV, T, V + K + 1, device=dev),
++        query_start_loc=qsl,
++        state_indices=torch.tensor([2, 5, 7], dtype=torch.int32, device=dev),
++        spec_query_len=T,
++    )
++
++
++def _verify(inp: dict, **override):
++    d = {**inp, **override}
++    return gdn_recoverssm_verify(
++        d["A_log"],
++        d["a"],
++        d["b"],
++        d["dt_bias"],
++        d["q"],
++        d["k"],
++        d["v"],
++        checkpoint_state=d["checkpoint_state"],
++        replay_cache=d["replay_cache"],
++        query_start_loc=d["query_start_loc"],
++        state_indices=d["state_indices"],
++        spec_query_len=d["spec_query_len"],
++        out=d.get("out"),
++    )
++
++
++def _native(inp: dict):
++    return fused_sigmoid_gating_delta_rule_update(
++        A_log=inp["A_log"],
++        a=inp["a"],
++        b=inp["b"],
++        dt_bias=inp["dt_bias"],
++        q=inp["q"],
++        k=inp["k"],
++        v=inp["v"],
++        initial_state=inp["checkpoint_state"].clone(),
++        inplace_final_state=False,
++        cu_seqlens=inp["query_start_loc"].long(),
++        ssm_state_indices=inp["state_indices"].long(),
++        use_qk_l2norm_in_kernel=True,
++    )
++
++
++def _context(inp: dict, ckpt: torch.Tensor) -> GDNRecoverSSMCommitContext:
++    nb = ckpt.shape[0]
++    conv = [torch.zeros(nb, 8, 3 + T - 1, device="cuda", dtype=torch.bfloat16)]
++    return GDNRecoverSSMCommitContext.from_tensors(
++        conv, [ckpt], [inp["replay_cache"]], spec_query_len=T, max_num_reqs=8
++    )
++
++
++def test_verify_matches_native_and_keeps_the_checkpoint():
++    inp = _inputs()
++    before = inp["checkpoint_state"].clone()
++    out = _verify(inp)
++    ref, _ = _native(inp)
++    torch.testing.assert_close(
++        out.float(), ref.reshape(out.shape).float(), rtol=0, atol=0
++    )
++    assert torch.equal(inp["checkpoint_state"], before)
++
++
++@pytest.mark.parametrize("accepted", [1, 2, 3, 4])
++def test_commit_matches_native_per_token_state(accepted):
++    inp = _inputs()
++    _verify(inp)
++    _, states = _native(inp)
++    ckpt = inp["checkpoint_state"].clone()
++    ctx = _context(inp, ckpt)
++    acc = torch.tensor(
++        [min(accepted, q) for q in QLENS], dtype=torch.int32, device="cuda"
++    )
++    ctx.commit(acc, inp["state_indices"], inp["query_start_loc"])
++    for i, blk in enumerate(inp["state_indices"].tolist()):
++        tok = int(inp["query_start_loc"][i]) + int(acc[i]) - 1
++        torch.testing.assert_close(ckpt[blk], states[tok], rtol=1e-5, atol=1e-6)
++    others = [b for b in range(ckpt.shape[0]) if b not in inp["state_indices"].tolist()]
++    assert torch.equal(ckpt[others], inp["checkpoint_state"][others])
++
++
++@pytest.mark.parametrize(
++    "case", ["short_qsl", "capacity", "hv_lt_h", "a_log", "out", "replay", "device"]
++)
++def test_verify_rejects_malformed_inputs(case):
++    inp = _inputs()
++    over, match = {
++        "short_qsl": (
++            dict(query_start_loc=inp["query_start_loc"][:-1]),
++            "query metadata",
++        ),
++        "capacity": (
++            dict(
++                state_indices=inp["state_indices"][:2],
++                query_start_loc=inp["query_start_loc"][:3],
++            ),
++            "activation capacity",
++        ),
++        "hv_lt_h": (
++            dict(
++                v=inp["v"][:, :, :8].contiguous(),
++                a=inp["a"][:, :8].contiguous(),
++                b=inp["b"][:, :8].contiguous(),
++            ),
++            "positive multiple",
++        ),
++        "a_log": (dict(A_log=torch.zeros(HV + 1, device="cuda")), "A_log"),
++        "out": (
++            dict(
++                out=torch.empty(1, 11, HV, V + 1, device="cuda", dtype=torch.bfloat16)
++            ),
++            "output shape",
++        ),
++        "replay": (
++            dict(replay_cache=torch.zeros(10, HV, T, V + K, device="cuda")),
++            "replay buffer",
++        ),
++        "device": (dict(A_log=inp["A_log"].cpu()), "same device"),
++    }[case]
++    with pytest.raises(ValueError, match=match):
++        _verify(inp, **over)
++
++
++def test_commit_rejects_partial_or_short_metadata():
++    inp = _inputs()
++    ctx = _context(inp, inp["checkpoint_state"].clone())
++    acc = torch.ones(3, dtype=torch.int32, device="cuda")
++    bt = torch.zeros(3, 4, dtype=torch.int32, device="cuda")
++    with pytest.raises(ValueError, match="align metadata is incomplete"):
++        ctx.commit(
++            acc,
++            inp["state_indices"],
++            inp["query_start_loc"],
++            block_table=bt,
++            mamba_block_size=16,
++        )
++    with pytest.raises(ValueError, match="commit metadata"):
++        ctx.commit(acc, inp["state_indices"], inp["query_start_loc"][:-1])
++    with pytest.raises(ValueError, match="request mapping"):
++        ctx.commit(
++            acc,
++            inp["state_indices"],
++            inp["query_start_loc"],
++            request_indices=torch.zeros(2, dtype=torch.int32, device="cuda"),
++        )
++
++
++def test_context_rejects_inconsistent_layers():
++    inp = _inputs()
++    ck = inp["checkpoint_state"]
++    conv = torch.zeros(ck.shape[0], 8, 3 + T - 1, device="cuda", dtype=torch.bfloat16)
++    with pytest.raises(ValueError, match="at least one layer"):
++        GDNRecoverSSMCommitContext.from_tensors(
++            [], [], [], spec_query_len=T, max_num_reqs=8
++        )
++    with pytest.raises(ValueError, match="differ"):
++        GDNRecoverSSMCommitContext.from_tensors(
++            [conv], [ck, ck], [inp["replay_cache"]], spec_query_len=T, max_num_reqs=8
++        )
++    with pytest.raises(ValueError, match="block count"):
++        GDNRecoverSSMCommitContext.from_tensors(
++            [conv[:5]], [ck], [inp["replay_cache"]], spec_query_len=T, max_num_reqs=8
++        )
++
++
++# ------------------------------------------------------------------ more cases:
++# mapping, align, extreme gates
++from vllm.v1.attention.backends.recoverssm_metadata import (  # noqa: E402
++    recoverssm_request_indices,
++    recoverssm_spec_rows,
++)
++
++# (A_log range, a scale, b offset): drive g = -exp(A_log) * softplus(a + dt_bias)
++# and beta = sigmoid(b)
++GATES = {
++    "typical": (0.0, 1.0, 0.0),
++    "g_near_0": (-12.0, 1.0, 0.0),
++    "g_very_negative": (2.5, 4.0, 0.0),
++    "beta_near_0": (0.0, 1.0, -12.0),
++    "beta_near_1": (0.0, 1.0, 12.0),
++}
++
++
++def _make(qlens, nb=16, seed=0, gate="typical"):
++    g = torch.Generator(device="cuda").manual_seed(seed)
++    rnd = lambda *s: torch.randn(*s, device="cuda", generator=g)  # noqa: E731
++    a_log_shift, ascale, boff = GATES[gate]
++    tot = sum(qlens)
++    qsl = torch.tensor(
++        [0, *torch.tensor(qlens).cumsum(0).tolist()], dtype=torch.int32, device="cuda"
++    )
++    return dict(
++        A_log=(
++            torch.rand(HV, device="cuda", generator=g) * 2 - 1 + a_log_shift
++        ).float(),
++        a=(rnd(tot, HV) * ascale).bfloat16(),
++        b=(rnd(tot, HV) + boff).bfloat16(),
++        dt_bias=(rnd(HV) * 0.5).bfloat16(),
++        q=rnd(1, tot, H, K).bfloat16(),
++        k=rnd(1, tot, H, K).bfloat16(),
++        v=rnd(1, tot, HV, V).bfloat16(),
++        checkpoint_state=(rnd(nb, HV, V, K) * 0.05).float(),
++        replay_cache=torch.zeros(nb, HV, T, V + K + 1, device="cuda"),
++        query_start_loc=qsl,
++        spec_query_len=T,
++    )
++
++
++def test_spec_rows_mixed_batch():
++    # rows: 0 spec K=3 | 1 prefill | 2 draft-less decode | 3 spec K=1 | 4 padded
++    # zero-query | 5,6 beyond num_reqs
++    is_prefilling = torch.tensor([False, True, False, False, False, False, False])
++    qsl = torch.tensor([0, 4, 104, 105, 107, 107], dtype=torch.int32)
++    drafts_in = torch.tensor(
++        [3, -1, -1, 1, -1, 2, 0], dtype=torch.int32
++    )  # 5, 6: garbage padding
++    drafts, rows = recoverssm_spec_rows(is_prefilling, qsl, drafts_in, num_reqs=5)
++    assert rows.tolist() == [0, 2, 3]
++    assert drafts.tolist() == [1, -1, 1, 1, -1, -1, -1]
++    idx = recoverssm_request_indices(rows, 3, torch.device("cuda"))
++    assert idx is not None and idx.tolist() == [0, 2, 3]
++    assert (
++        recoverssm_request_indices(torch.tensor([0, 1, 2]), 3, torch.device("cuda"))
++        is None
++    )
++    with pytest.raises(ValueError, match="spec rows classified"):
++        recoverssm_request_indices(rows, 2, torch.device("cuda"))
++
++
++def test_commit_maps_noncontiguous_requests_in_align_mode():
++    """Spec rows 0, 2, 3 of a 5-request batch; accepted counts, block table and
++    num_computed are indexed by request row. Every spec request must commit its own
++    state into its own block."""
++    qlens = [4, 1, 2]  # the spec rows' windows (K=3, draft-less, K=1)
++    inp = _make(qlens, nb=40)
++    bs = 8
++    bt = torch.arange(1, 1 + 5 * 6, dtype=torch.int32, device="cuda").reshape(
++        5, 6
++    )  # request row -> blocks
++    nc = torch.tensor(
++        [5, 0, 16, 9, 0], dtype=torch.int32, device="cuda"
++    )  # per request row
++    req_rows = torch.tensor([0, 2, 3], dtype=torch.int32, device="cuda")
++    src = torch.stack([bt[r, int(nc[r]) // bs] for r in req_rows.tolist()]).contiguous()
++    inp["state_indices"] = src
++    _verify(inp)
++    _, states = _native(inp)
++    ckpt = inp["checkpoint_state"].clone()
++    ctx = _context(inp, ckpt)
++    acc = torch.tensor(
++        [3, 9, 1, 2, 9], dtype=torch.int32, device="cuda"
++    )  # rows 1, 4 must be ignored
++    ctx.commit(
++        acc,
++        src,
++        inp["query_start_loc"],
++        request_indices=req_rows,
++        block_table=bt,
++        num_computed_tokens=nc,
++        mamba_block_size=bs,
++    )
++    for i, r in enumerate(req_rows.tolist()):
++        n = min(int(acc[r]), qlens[i])
++        c0 = int(nc[r])
++        final_blk = int(bt[r, (c0 + n) // bs])
++        tok = int(inp["query_start_loc"][i]) + n - 1
++        torch.testing.assert_close(ckpt[final_blk], states[tok], rtol=1e-5, atol=1e-6)
++
++
++# (num_computed, accepted, block size): boundary after 1 / after 2 / ending exactly on
++# it / crossing and continuing / accepted = 1 without crossing / the full window
++# crossing after 3
++ALIGN_CASES = [
++    (3, 2, 4),
++    (2, 3, 4),
++    (0, 4, 4),
++    (6, 4, 4),
++    (1, 1, 4),
++    (5, 4, 8),
++    (7, 4, 8),
++    (4, 4, 8),
++]
++
++
++@pytest.mark.parametrize("nc,accepted,bs", ALIGN_CASES)
++def test_align_boundary_and_final_state_match_native(nc, accepted, bs):
++    inp = _make([T], nb=12)
++    bt = torch.arange(2, 8, dtype=torch.int32, device="cuda").reshape(1, 6)
++    src = bt[0, nc // bs].reshape(1).contiguous()
++    inp["state_indices"] = src
++    _verify(inp)
++    _, states = _native(inp)
++    ckpt = inp["checkpoint_state"].clone()
++    ctx = _context(inp, ckpt)
++    ctx.commit(
++        torch.tensor([accepted], dtype=torch.int32, device="cuda"),
++        src,
++        inp["query_start_loc"],
++        block_table=bt,
++        num_computed_tokens=torch.tensor([nc], dtype=torch.int32, device="cuda"),
++        mamba_block_size=bs,
++    )
++    next_boundary = (nc // bs + 1) * bs
++    final_blk = int(bt[0, (nc + accepted) // bs])
++    if (
++        nc + accepted >= next_boundary
++    ):  # crosses: the boundary state goes into the source block
++        torch.testing.assert_close(
++            ckpt[int(src)], states[next_boundary - nc - 1], rtol=1e-5, atol=1e-6
++        )
++    torch.testing.assert_close(
++        ckpt[final_blk], states[accepted - 1], rtol=1e-5, atol=1e-6
++    )
++
++
++@pytest.mark.parametrize("gate", list(GATES))
++@pytest.mark.parametrize("seed", [0, 1, 2])
++def test_commit_matches_native_under_extreme_gates(gate, seed):
++    inp = _make(list(QLENS), nb=10, seed=seed, gate=gate)
++    inp["state_indices"] = torch.tensor([2, 5, 7], dtype=torch.int32, device="cuda")
++    _verify(inp)
++    _, states = _native(inp)
++    for accepted in (1, 2, 3, 4):
++        ckpt = inp["checkpoint_state"].clone()
++        ctx = _context(inp, ckpt)
++        acc = torch.tensor(
++            [min(accepted, q) for q in QLENS], dtype=torch.int32, device="cuda"
++        )
++        ctx.commit(acc, inp["state_indices"], inp["query_start_loc"])
++        for i, blk in enumerate(inp["state_indices"].tolist()):
++            tok = int(inp["query_start_loc"][i]) + int(acc[i]) - 1
++            torch.testing.assert_close(ckpt[blk], states[tok], rtol=1e-5, atol=1e-6)
++
++
++@pytest.mark.parametrize("batch", [1, 2, 4])
++def test_verify_on_strided_views_writes_in_place(batch):
++    """The layer passes views of the packed conv output (token stride = the packed
++    width) and the layer's output buffer; result and replay record must equal the
++    contiguous-copy path."""
++    torch.manual_seed(batch)
++    H, HV, K, V, SQ, NB = 16, 48, 128, 128, 4, 6
++    T = batch * SQ
++    qd, vd = H * K, HV * V
++    packed = torch.randn(T, 2 * qd + 2 * vd, device="cuda", dtype=torch.bfloat16)
++    mixed = packed[:, : 2 * qd + vd]
++    a = torch.randn(T, HV, device="cuda", dtype=torch.bfloat16)
++    b = torch.randn(T, HV, device="cuda", dtype=torch.bfloat16)
++    A_log = torch.randn(HV, device="cuda")
++    dt_bias = torch.randn(HV, device="cuda")
++    checkpoint = torch.randn(NB, HV, V, K, device="cuda") * 0.05
++    qsl = torch.arange(0, T + 1, SQ, device="cuda", dtype=torch.int32)
++    si = torch.arange(1, batch + 1, device="cuda", dtype=torch.int32)
++
++    def run(q, k, v, out=None):
++        replay = torch.zeros(NB, HV, SQ, V + K + 1, device="cuda")
++        o = gdn_recoverssm_verify(
++            A_log,
++            a,
++            b,
++            dt_bias,
++            q,
++            k,
++            v,
++            checkpoint_state=checkpoint,
++            replay_cache=replay,
++            query_start_loc=qsl,
++            state_indices=si,
++            spec_query_len=SQ,
++            out=out,
++        )
++        return o, replay
++
++    q, k, v = (
++        x.contiguous().view(1, T, -1, d)
++        for x, d in zip(torch.split(mixed, [qd, qd, vd], dim=-1), (K, K, V))
++    )
++    want_out, want_replay = run(q, k, v)
++
++    core = torch.zeros(T + 3, HV, V, device="cuda", dtype=torch.bfloat16)
++    views = (
++        mixed[:, :qd].view(1, T, -1, K),
++        mixed[:, qd : 2 * qd].view(1, T, -1, K),
++        mixed[:, 2 * qd :].view(1, T, -1, V),
++    )
++    got_out, got_replay = run(*views, out=core[:T].unsqueeze(0))
++    assert got_out.data_ptr() == core.data_ptr()
++    assert torch.equal(core[:T].unsqueeze(0), want_out)
++    assert torch.equal(got_replay, want_replay)
++
++
++def test_verify_on_strided_views_with_variable_query_lengths():
++    """Token-strided views with ragged windows (query lengths 4, 1, 3), as MTP
++    scheduling produces them."""
++    torch.manual_seed(7)
++    H, HV, K, V, SQ, NB = 16, 48, 128, 128, 4, 6
++    qsl_list = [0, 4, 5, 8]
++    T = qsl_list[-1]
++    qd, vd = H * K, HV * V
++    packed = torch.randn(T, 2 * qd + 2 * vd, device="cuda", dtype=torch.bfloat16)
++    mixed = packed[:, : 2 * qd + vd]
++    a = torch.randn(T, HV, device="cuda", dtype=torch.bfloat16)
++    b = torch.randn(T, HV, device="cuda", dtype=torch.bfloat16)
++    A_log = torch.randn(HV, device="cuda")
++    dt_bias = torch.randn(HV, device="cuda")
++    checkpoint = torch.randn(NB, HV, V, K, device="cuda") * 0.05
++    qsl = torch.tensor(qsl_list, device="cuda", dtype=torch.int32)
++    si = torch.tensor([1, 3, 5], device="cuda", dtype=torch.int32)
++
++    def run(q, k, v, out=None):
++        replay = torch.zeros(NB, HV, SQ, V + K + 1, device="cuda")
++        o = gdn_recoverssm_verify(
++            A_log,
++            a,
++            b,
++            dt_bias,
++            q,
++            k,
++            v,
++            checkpoint_state=checkpoint,
++            replay_cache=replay,
++            query_start_loc=qsl,
++            state_indices=si,
++            spec_query_len=SQ,
++            out=out,
++        )
++        return o, replay
++
++    q, k, v = (
++        x.contiguous().view(1, T, -1, d)
++        for x, d in zip(torch.split(mixed, [qd, qd, vd], dim=-1), (K, K, V))
++    )
++    want_out, want_replay = run(q, k, v)
++    core = torch.zeros(T + 2, HV, V, device="cuda", dtype=torch.bfloat16)
++    views = (
++        mixed[:, :qd].view(1, T, -1, K),
++        mixed[:, qd : 2 * qd].view(1, T, -1, K),
++        mixed[:, 2 * qd :].view(1, T, -1, V),
++    )
++    _, got_replay = run(*views, out=core[:T].unsqueeze(0))
++    assert torch.equal(core[:T].unsqueeze(0), want_out)
++    assert torch.equal(got_replay, want_replay)
++
++
++def test_layer_verify_qkv_views_and_fallback():
++    """The layer's guard: views for a [tokens, q|k|v] conv output with a contiguous
++    last dimension, the contiguous-copy fallback for any other layout; same values
++    either way."""
++    from types import SimpleNamespace
++
++    from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
++        QwenGatedDeltaNetAttention as Layer,
++    )
++
++    H, HV, K, V, T = 4, 8, 16, 16, 5
++    layer = SimpleNamespace(
++        key_dim=H * K, value_dim=HV * V, tp_size=1, head_k_dim=K, head_v_dim=V
++    )
++    layer.rearrange_mixed_qkv = lambda x: Layer.rearrange_mixed_qkv(cast(Any, layer), x)
++    width = 2 * H * K + HV * V
++    packed = torch.randn(T, width + HV * V, dtype=torch.bfloat16)  # q|k|v|z, like qkvz
++    strided = packed[:, :width]
++    q, k, v, is_view = Layer._recoverssm_verify_qkv(cast(Any, layer), strided)
++    assert is_view
++    assert q.data_ptr() == packed.data_ptr()
++    rq, rk, rv = Layer.rearrange_mixed_qkv(cast(Any, layer), strided)
++    assert torch.equal(q, rq) and torch.equal(k, rk) and torch.equal(v, rv)
++
++    # Column-major storage: last dimension not contiguous -> copies, same values.
++    col_major = strided.t().contiguous().t()
++    assert col_major.stride(-1) != 1
++    q2, k2, v2, is_view2 = Layer._recoverssm_verify_qkv(cast(Any, layer), col_major)
++    assert not is_view2
++    assert torch.equal(q2, rq) and torch.equal(k2, rk) and torch.equal(v2, rv)
++
++
++# ------------------------------------------------------------- BF16 recurrent state
++# RecoverSSM upcasts the BF16 checkpoint, carries the accepted window in FP32 and rounds
++# once when it writes the committed state. The reference is the FP32 trajectory from the
++# same (already BF16-rounded) checkpoint; the committed state must equal its BF16
++# rounding up to one BF16 ulp, and be no further from it than the native path is.
++BF16_ULP = 2**-7
++
++
++def _bf16_case(qlens, nb=12, seed=0):
++    inp = _make(qlens, nb=nb, seed=seed)
++    inp["checkpoint_state"] = inp["checkpoint_state"].bfloat16()
++    ref = dict(inp)
++    ref["checkpoint_state"] = inp["checkpoint_state"].float()
++    return inp, ref
++
++
++def test_verify_bf16_state_matches_native():
++    inp, _ = _bf16_case(list(QLENS))
++    inp["state_indices"] = torch.tensor([2, 5, 7], dtype=torch.int32, device="cuda")
++    before = inp["checkpoint_state"].clone()
++    out = _verify(inp)
++    ref, _ = _native(inp)
++    torch.testing.assert_close(
++        out.float(), ref.reshape(out.shape).float(), rtol=0, atol=0
++    )
++    assert torch.equal(inp["checkpoint_state"], before)
++
++
++@pytest.mark.parametrize("accepted", [1, 2, 3, 4])
++@pytest.mark.parametrize("seed", [0, 1])
++def test_commit_bf16_state_rounds_once(accepted, seed):
++    inp, ref_inp = _bf16_case(list(QLENS), seed=seed)
++    idx = torch.tensor([2, 5, 7], dtype=torch.int32, device="cuda")
++    inp["state_indices"] = ref_inp["state_indices"] = idx
++    _verify(inp)
++    _, native_states = _native(inp)
++    _, ref_states = _native(ref_inp)
++    ckpt = inp["checkpoint_state"].clone()
++    _context(inp, ckpt).commit(
++        torch.tensor(
++            [min(accepted, q) for q in QLENS], dtype=torch.int32, device="cuda"
++        ),
++        idx,
++        inp["query_start_loc"],
++    )
++    for i, blk in enumerate(idx.tolist()):
++        tok = int(inp["query_start_loc"][i]) + min(accepted, QLENS[i]) - 1
++        ref = ref_states[tok].float()
++        got = ckpt[blk].float()
++        torch.testing.assert_close(
++            got, ref.bfloat16().float(), rtol=BF16_ULP, atol=1e-5
++        )
++        err_rssm = (got - ref).abs().mean()
++        err_native = (native_states[tok].bfloat16().float() - ref).abs().mean()
++        assert err_rssm <= err_native * 1.05 + 1e-7, (err_rssm, err_native)
++
++
++@pytest.mark.parametrize("nc,accepted,bs", ALIGN_CASES)
++def test_align_boundary_bf16_state(nc, accepted, bs):
++    inp, ref_inp = _bf16_case([T])
++    bt = torch.arange(2, 8, dtype=torch.int32, device="cuda").reshape(1, 6)
++    src = bt[0, nc // bs].reshape(1).contiguous()
++    inp["state_indices"] = ref_inp["state_indices"] = src
++    _verify(inp)
++    _, ref_states = _native(ref_inp)
++    ckpt = inp["checkpoint_state"].clone()
++    _context(inp, ckpt).commit(
++        torch.tensor([accepted], dtype=torch.int32, device="cuda"),
++        src,
++        inp["query_start_loc"],
++        block_table=bt,
++        num_computed_tokens=torch.tensor([nc], dtype=torch.int32, device="cuda"),
++        mamba_block_size=bs,
++    )
++    next_boundary = (nc // bs + 1) * bs
++    final_blk = int(bt[0, (nc + accepted) // bs])
++    if nc + accepted >= next_boundary:
++        torch.testing.assert_close(
++            ckpt[int(src)].float(),
++            ref_states[next_boundary - nc - 1].float().bfloat16().float(),
++            rtol=BF16_ULP,
++            atol=1e-5,
++        )
++    torch.testing.assert_close(
++        ckpt[final_blk].float(),
++        ref_states[accepted - 1].float().bfloat16().float(),
++        rtol=BF16_ULP,
++        atol=1e-5,
++    )
+diff --git a/tests/kernels/mamba/test_recoverssm_ple.py b/tests/kernels/mamba/test_recoverssm_ple.py
+new file mode 100644
+index 0000000000..ec11ad3405
+--- /dev/null
++++ b/tests/kernels/mamba/test_recoverssm_ple.py
+@@ -0,0 +1,153 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""PLE short-conv RecoverSSM against the sequential reference.
++
++Reference: the stock decode path fed the accepted tokens one at a time.
++RecoverSSM: one spec-mode conv over the whole window from the checkpoint
++(offset 0), then ``_PleConvCommit`` compacts the accepted suffix to the front.
++The conv history is pure data movement, so the states must be bit-identical,
++and the outputs of the accepted tokens must match as well.
++"""
++
++import pytest
++import torch
++
++from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
++from vllm.models.qwen4_exp.nvidia.ops.ple import ple_conv
++from vllm.v1.attention.backends.ple_recoverssm import _PleConvCommit
++
++C, KSIZE, DIL, SQ, NB = 512, 4, 3, 4, 8
++STATE_LEN = (KSIZE - 1) * DIL
++WIDTH = STATE_LEN + SQ - 1
++DEV = "cuda"
++
++
++def _state():
++    if is_conv_state_dim_first():
++        raw = torch.zeros(NB, C, WIDTH, dtype=torch.bfloat16, device=DEV)
++        return raw, raw
++    raw = torch.zeros(NB, WIDTH, C, dtype=torch.bfloat16, device=DEV)
++    return raw, raw.transpose(-1, -2)
++
++
++def _i32(xs):
++    return torch.tensor(xs, dtype=torch.int32, device=DEV)
++
++
++def _setup(seed, blocks):
++    g = torch.Generator(device=DEV).manual_seed(seed)
++    w = torch.randn(C, KSIZE, generator=g, device=DEV).to(torch.bfloat16)
++    x = torch.randn(len(blocks) * SQ, C, generator=g, device=DEV).to(torch.bfloat16)
++    outer = torch.randn_like(x)
++    raw, view = _state()
++    for b in blocks:
++        view[b, :, :STATE_LEN] = torch.randn(C, STATE_LEN, generator=g, device=DEV).to(
++            torch.bfloat16
++        )
++    return w, x, outer, raw, view
++
++
++def _sequential(w, x, outer, view, block, first, count):
++    """Stock decode, one token at a time, on a copy of the checkpoint block."""
++    ref = view.clone()
++    res = torch.zeros(count, C, dtype=torch.bfloat16, device=DEV)
++    for i in range(count):
++        t = first + i
++        ple_conv(
++            inputs=x[t : t + 1],
++            residual=res[i : i + 1],
++            conv_state=ref,
++            conv_weights=w,
++            state_indices=_i32([block]),
++            outer_residual=outer[t : t + 1],
++            mode="decode",
++            dilation=DIL,
++        )
++    return ref[block, :, :STATE_LEN].clone(), res
++
++
++def _spec(w, x, outer, view, blocks):
++    res = torch.zeros(len(blocks) * SQ, C, dtype=torch.bfloat16, device=DEV)
++    ple_conv(
++        inputs=x,
++        residual=res,
++        conv_state=view,
++        conv_weights=w,
++        state_indices=_i32(blocks),
++        outer_residual=outer,
++        mode="spec",
++        dilation=DIL,
++        query_start_loc=_i32(list(range(0, len(blocks) * SQ + 1, SQ))),
++        num_accepted_tokens=_i32([1] * len(blocks)),
++        spec_query_len=SQ,
++    )
++    return res
++
++
++@pytest.mark.parametrize("accepted", [1, 2, SQ])
++@pytest.mark.parametrize("seed", [0, 1])
++def test_ple_commit_matches_sequential(accepted, seed):
++    block = 3
++    w, x, outer, raw, view = _setup(seed, [block])
++    want_state, want_out = _sequential(w, x, outer, view, block, 0, accepted)
++    history = torch.cat([view[block, :, :STATE_LEN], x[:accepted].T], dim=1)
++
++    got_out = _spec(w, x, outer, view, [block])
++    ctx = _PleConvCommit([raw], spec_query_len=SQ, max_num_reqs=NB)
++    ctx.commit(_i32([accepted]), _i32([block]), _i32([0, SQ]))
++
++    got_state = view[block, :, :STATE_LEN]
++    assert torch.equal(got_state, want_state)
++    assert torch.equal(got_state, history[:, -STATE_LEN:])
++    assert torch.equal(got_out[:accepted], want_out)
++
++
++@pytest.mark.parametrize(
++    ("num_computed", "accepted", "crosses"),
++    [(6, 3, True), (6, 2, True), (1, 2, False), (7, SQ, True)],
++)
++def test_ple_commit_align_boundary(num_computed, accepted, crosses):
++    block_size, src, nxt = 8, 2, 5
++    w, x, outer, raw, view = _setup(7, [src])
++    boundary_len = block_size - num_computed
++    want_final, _ = _sequential(w, x, outer, view, src, 0, accepted)
++    want_boundary, _ = _sequential(w, x, outer, view, src, 0, min(boundary_len, SQ))
++
++    _spec(w, x, outer, view, [src])
++    ctx = _PleConvCommit([raw], spec_query_len=SQ, max_num_reqs=NB)
++    ctx.commit(
++        _i32([accepted]),
++        _i32([src]),
++        _i32([0, SQ]),
++        block_table=_i32([[src, nxt]]),
++        num_computed_tokens=_i32([num_computed]),
++        mamba_block_size=block_size,
++    )
++
++    final_block = nxt if num_computed + accepted >= block_size else src
++    assert torch.equal(view[final_block, :, :STATE_LEN], want_final)
++    if crosses:
++        assert torch.equal(view[src, :, :STATE_LEN], want_boundary)
++
++
++def test_ple_commit_non_contiguous_request_rows():
++    blocks, accepted = [1, 6], [3, 1]
++    w, x, outer, raw, view = _setup(11, blocks)
++    want = [
++        _sequential(w, x, outer, view, b, i * SQ, a)[0]
++        for i, (b, a) in enumerate(zip(blocks, accepted))
++    ]
++
++    _spec(w, x, outer, view, blocks)
++    # Spec rows 0 and 1 belong to requests 1 and 3 of a four-request batch.
++    counts = _i32([9, accepted[0], 9, accepted[1]])
++    ctx = _PleConvCommit([raw], spec_query_len=SQ, max_num_reqs=NB)
++    ctx.commit(
++        counts,
++        _i32(blocks),
++        _i32([0, SQ, 2 * SQ]),
++        request_indices=_i32([1, 3]),
++    )
++
++    for b, ref in zip(blocks, want):
++        assert torch.equal(view[b, :, :STATE_LEN], ref)
+diff --git a/vllm/config/cache.py b/vllm/config/cache.py
+index 6dca830d99..e276dda635 100644
+--- a/vllm/config/cache.py
++++ b/vllm/config/cache.py
+@@ -202,7 +202,7 @@ class CacheConfig:
+     mode flushes are most efficient when mamba_block_size is a multiple of
+     replayssm_buffer_len, but this is not required."""
+     use_recoverssm: bool = field(default=False, init=False)
+-    """Whether Kimi-K3 KDA uses RecoverSSM speculative decode."""
++    """Whether RecoverSSM speculative decode is used (Kimi-K3 KDA; Qwen4Exp GDN and PLE)."""
+ 
+     # Will be set after profiling.
+     num_gpu_blocks: int | None = field(default=None, init=False)
+diff --git a/vllm/config/compilation.py b/vllm/config/compilation.py
+index f11bea4e6d..791975bd3e 100644
+--- a/vllm/config/compilation.py
++++ b/vllm/config/compilation.py
+@@ -1446,10 +1446,15 @@ class CompilationConfig:
+                 f"with {min_cg_attn_backend} backend (support: "
+                 f"{min_cg_support})"
+             )
+-            if self.mode == CompilationMode.VLLM_COMPILE and (
+-                self.splitting_ops_contain_attention()
+-                or self.use_inductor_graph_partition
+-            ):
++            if (
++                self.mode == CompilationMode.VLLM_COMPILE
++                and (
++                    self.splitting_ops_contain_attention()
++                    or self.use_inductor_graph_partition
++                )
++            ) or envs.VLLM_USE_BREAKABLE_CUDAGRAPH:
++                # Breakable CUDA graphs break at the attention kernels at runtime,
++                # with or without torch.compile.
+                 msg += (
+                     "; setting cudagraph_mode=PIECEWISE because "
+                     "attention is compiled piecewise"
+diff --git a/vllm/config/vllm.py b/vllm/config/vllm.py
+index 67ba1373e6..f215ab3cc7 100644
+--- a/vllm/config/vllm.py
++++ b/vllm/config/vllm.py
+@@ -68,6 +68,13 @@ else:
+ 
+ logger = init_logger(__name__)
+ 
++# Architectures whose GDN (and PLE) layers run RecoverSSM under --use-replayssm.
++_QWEN4EXP_RECOVERSSM_ARCHS = (
++    "Qwen4ExpForCausalLM",
++    "Qwen4ExpForConditionalGeneration",
++    "Qwen4ExpMTP",
++)
++
+ # TODO(rocm): These models are either unsupported by MRV2 or slower with
+ # MRV2 on AMD GPUs.
+ ROCM_DEFAULT_MRV1_ARCHITECTURES = frozenset(
+@@ -3218,21 +3225,35 @@ class VllmConfig:
+     @model_validator(mode="after")
+     def validate_mamba_cached_kernel(self) -> "VllmConfig":
+         if not self.cache_config.use_replayssm:
+-            self.cache_config.use_kda_recoverssm = False
++            self.cache_config.use_recoverssm = False
+             return self
+-        self.cache_config.use_kda_recoverssm = self.num_speculative_tokens > 0
++        self.cache_config.use_recoverssm = self.num_speculative_tokens > 0
+ 
+         if self.model_config is not None and not self.model_config.supports_replayssm:
+             raise ValueError(
+                 "--use-replayssm is not supported for architecture "
+                 f"{self.model_config.architecture!r}"
+             )
+-        if self.cache_config.use_kda_recoverssm:
++        if (
++            self.model_config is not None
++            and self.model_config.architecture in _QWEN4EXP_RECOVERSSM_ARCHS
++            and not self.cache_config.use_recoverssm
++        ):
++            # Qwen4Exp's GDN and PLE layers have no plain ReplaySSM path; with them the
++            # flag selects RecoverSSM, which needs speculative decoding.
++            raise ValueError(
++                "--use-replayssm on Qwen4Exp selects GDN RecoverSSM and requires "
++                "speculative decoding (num_speculative_tokens > 0)"
++            )
++        if self.cache_config.use_recoverssm:
+             if self.model_config is not None and self.model_config.architecture not in (
+                 "KimiLinearForCausalLM",
+                 "KimiK3ForConditionalGeneration",
++                *_QWEN4EXP_RECOVERSSM_ARCHS,
+             ):
+-                raise ValueError("RecoverSSM is only supported for Kimi-K3 KDA")
++                raise ValueError(
++                    "RecoverSSM is only supported for Kimi-K3 KDA and Qwen4Exp GDN"
++                )
+             if self.mamba_config.enable_stochastic_rounding:
+                 raise ValueError(
+                     "RecoverSSM supports bfloat16/float32 "
+diff --git a/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py b/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+index bbbb1c8bd5..2d6b675636 100644
+--- a/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
++++ b/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+@@ -368,10 +368,15 @@ class ChunkGatedDeltaRule(CustomOp):
+ 
+ @PluggableLayer.register("qwen_gated_delta_net_attention")
+ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+-    def get_state_shape(
+-        self,
+-    ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
+-        return MambaStateShapeCalculator.gated_delta_net_state_shape(
++    def _uses_gdn_recoverssm(self) -> bool:
++        """One predicate for the replay state's shape, dtype and the attention
++        backend."""
++        from vllm.model_executor.layers.mamba.recoverssm_utils import uses_recoverssm
++
++        return uses_recoverssm(self.cache_config, self.num_spec)
++
++    def get_state_shape(self) -> tuple[tuple[int, ...], ...]:
++        shapes = MambaStateShapeCalculator.gated_delta_net_state_shape(
+             self.tp_size,
+             self.num_k_heads,
+             self.num_v_heads,
+@@ -380,6 +385,32 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+             self.conv_kernel_size,
+             self.num_spec,
+         )
++        if self._uses_gdn_recoverssm():
++            # per-token replay record [HV, spec_query_len, V + K + 1] fp32
++            shapes = (
++                *shapes,
++                (
++                    self.num_v_heads // self.tp_size,
++                    self.num_spec + 1,
++                    self.head_v_dim + self.head_k_dim + 1,
++                ),
++            )
++        return shapes
++
++    def get_state_dtype(self) -> tuple[torch.dtype, ...]:
++        dtypes = super().get_state_dtype()
++        if self._uses_gdn_recoverssm():
++            dtypes = (*dtypes, torch.float32)
++        return dtypes
++
++    def get_attn_backend(self):
++        if self._uses_gdn_recoverssm():
++            from vllm.v1.attention.backends.gdn_recoverssm import (
++                GDNRecoverSSMAttentionBackend,
++            )
++
++            return GDNRecoverSSMAttentionBackend
++        return super().get_attn_backend()
+ 
+     def __init__(
+         self,
+@@ -525,6 +556,17 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+             self.gdn_decode_kernel = "CPU"
+ 
+         self.enable_fused_gdn_decode = self.gdn_decode_kernel == "cuda"
++        # RecoverSSM verify replaces the per-draft snapshot path (Triton decode
++        # only)
++        self.use_gdn_recoverssm = self._uses_gdn_recoverssm()
++        if self.use_gdn_recoverssm:
++            self.gdn_decode_kernel = "triton"
++            self.enable_fused_gdn_decode = False
++            self.enable_packed_recurrent_decode = False
++            logger.info_once(
++                "GDN RecoverSSM speculative verify active (spec_query_len %d)",
++                self.num_spec + 1,
++            )
+         logger.info_once("GDN decode kernel: %s", self.gdn_decode_kernel)
+ 
+         compilation_config = get_current_vllm_config().compilation_config
+@@ -535,7 +577,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+     def _fused_gdn_decode_unsupported_reason(
+         self, vllm_config: VllmConfig
+     ) -> str | None:
+-        conv_state_dtype, recurrent_state_dtype = self.get_state_dtype()
++        conv_state_dtype, recurrent_state_dtype = self.get_state_dtype()[:2]
+         if (
+             self.gqa_interleaved_layout
+             or self.head_k_dim != 128
+@@ -798,6 +840,25 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+ 
+         return mixed_qkv_out, z_out, b_out, a_out
+ 
++    def _recoverssm_verify_qkv(self, mixed_qkv):
++        """Q/K/V for the RecoverSSM verify.
++
++        The verify kernel reads token-strided heads, so for a 2-D [tokens, q|k|v] conv
++        output with a contiguous last dimension it gets views instead of copies. Any
++        other layout falls back to the contiguous copies of rearrange_mixed_qkv().
++        Returns (query, key, value, is_view)."""
++        if mixed_qkv.ndim != 2 or mixed_qkv.stride(-1) != 1:
++            return (*self.rearrange_mixed_qkv(mixed_qkv), False)
++        q_dim = self.key_dim // self.tp_size
++        v_dim = self.value_dim // self.tp_size
++        num_tokens = mixed_qkv.shape[0]
++        query = mixed_qkv[:, :q_dim].view(1, num_tokens, -1, self.head_k_dim)
++        key = mixed_qkv[:, q_dim : 2 * q_dim].view(1, num_tokens, -1, self.head_k_dim)
++        value = mixed_qkv[:, 2 * q_dim : 2 * q_dim + v_dim].view(
++            1, num_tokens, -1, self.head_v_dim
++        )
++        return query, key, value, True
++
+     def rearrange_mixed_qkv(self, mixed_qkv):
+         """Split packed qkv into contiguous (1, seq, heads, dim) tensors.
+ 
+@@ -1105,7 +1166,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+         dtype = qkv_or_qkvz.dtype
+         num_k_heads = self.num_k_heads // self.tp_size
+         num_v_heads = self.num_v_heads // self.tp_size
+-        _, state_dtype = self.get_state_dtype()
++        state_dtype = self.get_state_dtype()[1]  # 3 dtypes with the replay record
+ 
+         # All kernels use BT = chunk_size, so a single pass with T = chunk_size
+         # is sufficient to populate every autotuner cache. Mirror the real
+@@ -1365,7 +1426,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+                 ],
+                 num_accepted_tokens=num_accepted_tokens,
+                 query_start_loc=spec_query_start_loc,
+-                max_query_len=spec_state_indices_tensor.size(-1),
++                max_query_len=(
++                    self.num_spec + 1
++                    if getattr(self, "use_gdn_recoverssm", False)
++                    else spec_state_indices_tensor.size(-1)
++                ),
+                 validate_data=False,
+             )
+ 
+@@ -1402,7 +1467,17 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+         else:
+             mixed_qkv_non_spec = None
+ 
+-        query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)
++        if (
++            spec_sequence_masks is not None
++            and mixed_qkv_spec is not None
++            and self.use_gdn_recoverssm
++        ):
++            query_spec, key_spec, value_spec, verify_views = (
++                self._recoverssm_verify_qkv(mixed_qkv_spec)
++            )
++        else:
++            verify_views = False
++            query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)
+ 
+         # Split mixed non-spec-decode+prefill to process independently
+         split_non_spec = (
+@@ -1465,7 +1540,43 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+         # 2. Recurrent attention
+ 
+         # 2.1: Process the multi-query part
+-        if spec_sequence_masks is not None:
++        if spec_sequence_masks is not None and getattr(
++            self, "use_gdn_recoverssm", False
++        ):
++            # verify the window off the checkpoint; the commit after sampling
++            # writes the state once
++            from vllm.model_executor.layers.mamba.gdn.recoverssm_gdn import (
++                gdn_recoverssm_verify,
++            )
++
++            _n = attn_metadata.num_spec_decodes
++            assert spec_query_start_loc is not None
++            assert spec_state_indices_tensor is not None
++            core_attn_out_spec = gdn_recoverssm_verify(
++                self.A_log,
++                a_spec,
++                b_spec,
++                self.dt_bias,
++                query_spec,
++                key_spec,
++                value_spec,
++                checkpoint_state=ssm_state,
++                replay_cache=self_kv_cache[2],
++                query_start_loc=spec_query_start_loc[: _n + 1],
++                state_indices=spec_state_indices_tensor[:_n, 0],
++                spec_query_len=self.num_spec + 1,
++                use_qk_l2norm_in_kernel=True,
++                # spec-only batch: write straight into the layer output
++                out=(
++                    core_attn_out[:num_actual_tokens].unsqueeze(0)
++                    if verify_views
++                    and mixed_qkv_non_spec is None
++                    and query_spec.shape[1] == num_actual_tokens
++                    else None
++                ),
++            )
++            last_recurrent_state = None
++        elif spec_sequence_masks is not None:
+             core_attn_out_spec, last_recurrent_state = (
+                 fused_sigmoid_gating_delta_rule_update(
+                     A_log=self.A_log,
+@@ -1584,7 +1695,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+             merged_out.index_copy_(1, non_spec_token_indx, core_attn_out_non_spec)
+             core_attn_out[:num_actual_tokens] = merged_out.squeeze(0)
+         elif spec_sequence_masks is not None:
+-            core_attn_out[:num_actual_tokens] = core_attn_out_spec.squeeze(0)
++            if core_attn_out_spec.data_ptr() != core_attn_out.data_ptr():
++                core_attn_out[:num_actual_tokens] = core_attn_out_spec.squeeze(0)
+         else:
+             core_attn_out[:num_actual_tokens] = core_attn_out_non_spec.squeeze(0)
+ 
+diff --git a/vllm/model_executor/layers/mamba/gdn/recoverssm_gdn.py b/vllm/model_executor/layers/mamba/gdn/recoverssm_gdn.py
+new file mode 100644
+index 0000000000..d347befcce
+--- /dev/null
++++ b/vllm/model_executor/layers/mamba/gdn/recoverssm_gdn.py
+@@ -0,0 +1,695 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""RecoverSSM for Gated DeltaNet (Qwen-style GDN): speculative verify from one
++checkpoint without per-draft state snapshots, and accepted-state recovery after
++sampling.
++
++GDN port of the Kimi-K3 KDA RecoverSSM path
++(vllm/models/kimi_k3/nvidia/ops/recoverssm.py). Differences from KDA: the gate is a
++scalar per value head (g = -exp(A_log) * softplus(a + dt_bias)), q/k heads are grouped
++over value heads (HV // H), and q/k are L2-normalised inside the kernel when requested.
++The verify step caches, per token, the delta-rule correction c_t = beta_t * (v_t - S'_t
++k_t) (V floats), the normalised key (K floats) and the log-decay g_t (1 float) in one
++fp32 "replay" record. Recovery folds the accepted prefix: S_n = exp(sum_t g_t) S_0 +
++sum_t exp(sum_{s>t} g_s) c_t k_t^T and writes the checkpoint once (plus the
++block-boundary state in align mode)."""
++
++from collections.abc import Sequence
++from dataclasses import dataclass
++from typing import Any
++
++import torch
++
++from vllm.model_executor.layers.mamba.ops.recoverssm import (
++    compact_conv_state_kernel,
++    prepare_commit_plan_kernel,
++)
++from vllm.model_executor.layers.mamba.recoverssm_utils import recoverssm_require
++from vllm.triton_utils import tl, triton
++from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
++
++
++def _require(cond: bool, msg: str) -> None:
++    recoverssm_require(cond, msg, "GDN RecoverSSM")
++
++
++@triton.jit
++def _gdn_recoverssm_verify_kernel(
++    q_ptr,
++    k_ptr,
++    v_ptr,
++    a_ptr,
++    b_ptr,
++    A_log_ptr,
++    dt_bias_ptr,
++    state_ptr,
++    replay_ptr,
++    out_ptr,
++    query_start_loc_ptr,
++    state_indices_ptr,
++    scale,
++    softplus_beta,
++    softplus_threshold,
++    null_block_id,
++    stride_q_token,
++    stride_k_token,
++    stride_v_token,
++    stride_a_token,
++    stride_b_token,
++    stride_state_block,
++    stride_state_head,
++    stride_state_v,
++    stride_state_k,
++    stride_replay_block,
++    stride_replay_head,
++    stride_replay_pos,
++    stride_replay_dim,
++    stride_out_token,
++    stride_qsl,
++    stride_si,
++    H: tl.constexpr,
++    HV: tl.constexpr,
++    K: tl.constexpr,
++    V: tl.constexpr,
++    BK: tl.constexpr,
++    BV: tl.constexpr,
++    SPEC_QUERY_LEN: tl.constexpr,
++    USE_QK_L2NORM: tl.constexpr,
++):
++    pid_v = tl.program_id(0)
++    pid_b = tl.program_id(1)
++    pid_hv = tl.program_id(2)
++    pid_h = pid_hv // (HV // H)
++    bos = tl.load(query_start_loc_ptr + pid_b * stride_qsl).to(tl.int64)
++    eos = tl.load(query_start_loc_ptr + (pid_b + 1) * stride_qsl).to(tl.int64)
++    query_len = eos - bos
++    state_idx = tl.load(state_indices_ptr + pid_b * stride_si).to(tl.int64)
++    offs_k = tl.arange(0, BK)
++    offs_v = pid_v * BV + tl.arange(0, BV)
++    mask_k = offs_k < K
++    mask_v = offs_v < V
++    mask_state = mask_v[:, None] & mask_k[None, :]
++    if state_idx <= null_block_id:
++        for t in tl.static_range(SPEC_QUERY_LEN):
++            tl.store(
++                out_ptr + (bos + t) * stride_out_token + pid_hv * V + offs_v,
++                tl.zeros([BV], dtype=tl.float32),
++                mask=(t < query_len) & mask_v,
++            )
++        return
++    state = tl.load(
++        state_ptr
++        + state_idx * stride_state_block
++        + pid_hv * stride_state_head
++        + offs_v[:, None] * stride_state_v
++        + offs_k[None, :] * stride_state_k,
++        mask=mask_state,
++        other=0.0,
++    ).to(tl.float32)
++    neg_A = -tl.exp(tl.load(A_log_ptr + pid_hv).to(tl.float32))
++    dt_bias = tl.load(dt_bias_ptr + pid_hv).to(tl.float32)
++    rec_base = (
++        replay_ptr + state_idx * stride_replay_block + pid_hv * stride_replay_head
++    )
++    for t in tl.static_range(SPEC_QUERY_LEN):
++        valid = t < query_len
++        tok = bos + t
++        q = tl.load(
++            q_ptr + tok * stride_q_token + pid_h * K + offs_k,
++            mask=valid & mask_k,
++            other=0.0,
++        ).to(tl.float32)
++        k = tl.load(
++            k_ptr + tok * stride_k_token + pid_h * K + offs_k,
++            mask=valid & mask_k,
++            other=0.0,
++        ).to(tl.float32)
++        v = tl.load(
++            v_ptr + tok * stride_v_token + pid_hv * V + offs_v,
++            mask=valid & mask_v,
++            other=0.0,
++        ).to(tl.float32)
++        x = (
++            tl.load(a_ptr + tok * stride_a_token + pid_hv, mask=valid, other=0.0).to(
++                tl.float32
++            )
++            + dt_bias
++        )
++        sp = tl.where(
++            softplus_beta * x <= softplus_threshold,
++            (1 / softplus_beta) * tl.log(1 + tl.exp(softplus_beta * x)),
++            x,
++        )
++        g = neg_A * sp
++        beta = tl.sigmoid(
++            tl.load(b_ptr + tok * stride_b_token + pid_hv, mask=valid, other=0.0).to(
++                tl.float32
++            )
++        )
++        if USE_QK_L2NORM:
++            q = q * tl.rsqrt(tl.sum(q * q) + 1e-6)
++            k = k * tl.rsqrt(tl.sum(k * k) + 1e-6)
++        q = q * scale
++        new_state = state * tl.exp(g)
++        corr = (v - tl.sum(new_state * k[None, :], 1)) * beta
++        new_state = new_state + corr[:, None] * k[None, :]
++        state = tl.where(valid, new_state, state)
++        o = tl.sum(state * q[None, :], 1)
++        tl.store(
++            out_ptr + tok * stride_out_token + pid_hv * V + offs_v,
++            o.to(out_ptr.dtype.element_ty),
++            mask=valid & mask_v,
++        )
++        rec = rec_base + t * stride_replay_pos
++        tl.store(rec + offs_v * stride_replay_dim, corr, mask=valid & mask_v)
++        if pid_v == 0:
++            tl.store(rec + (V + offs_k) * stride_replay_dim, k, mask=valid & mask_k)
++            tl.store(rec + (V + K) * stride_replay_dim, g, mask=valid)
++
++
++def gdn_recoverssm_verify(
++    A_log: torch.Tensor,
++    a: torch.Tensor,
++    b: torch.Tensor,
++    dt_bias: torch.Tensor,
++    q: torch.Tensor,
++    k: torch.Tensor,
++    v: torch.Tensor,
++    *,
++    checkpoint_state: torch.Tensor,
++    replay_cache: torch.Tensor,
++    query_start_loc: torch.Tensor,
++    state_indices: torch.Tensor,
++    spec_query_len: int,
++    scale: float | None = None,
++    softplus_beta: float = 1.0,
++    softplus_threshold: float = 20.0,
++    use_qk_l2norm_in_kernel: bool = True,
++    out: torch.Tensor | None = None,
++) -> torch.Tensor:
++    """Verify a GDN speculative window against its checkpoint without modifying the
++    checkpoint. q, k: [1, T, H, K]; v: [1, T, HV, V]; a, b: [T, HV] (or [1, T, HV]);
++    checkpoint_state: [blocks, HV, V, K]; replay_cache: [blocks, HV, spec_query_len, V +
++    K + 1] fp32. Returns out [1, T, HV, V]."""
++    _require(
++        q.ndim == 4 and q.shape[0] == 1, "q must have shape [1, tokens, heads, dim]"
++    )
++    _, total, H, K = q.shape
++    _require(k.shape == q.shape, "q and k shapes differ")
++    _require(
++        v.ndim == 4 and tuple(v.shape[:2]) == (1, total),
++        "v must have shape [1, tokens, value heads, dim]",
++    )
++    HV, V = v.shape[-2], v.shape[-1]
++    _require(
++        H > 0 and HV >= H and HV % H == 0,
++        "value heads must be a positive multiple of the q/k heads",
++    )
++    _require(
++        a.numel() == total * HV and b.numel() == total * HV,
++        "gate or beta shape is incompatible",
++    )
++    a2 = a.reshape(total, HV)
++    b2 = b.reshape(total, HV)
++    _require(
++        a2.stride(1) == 1 and b2.stride(1) == 1,
++        "gate and beta heads must be contiguous",
++    )
++    _require(
++        tuple(A_log.shape) == (HV,) and tuple(dt_bias.shape) == (HV,),
++        "A_log or dt_bias shape is incompatible",
++    )
++    _require(
++        all(t_.stride(-1) == 1 and t_.stride(-2) == K for t_ in (q, k)),
++        "q and k heads must be contiguous",
++    )
++    _require(v.stride(-1) == 1 and v.stride(-2) == V, "v heads must be contiguous")
++    _require(checkpoint_state.ndim == 4, "checkpoint must be four-dimensional")
++    nb = checkpoint_state.shape[0]
++    _require(
++        tuple(checkpoint_state.shape[1:]) == (HV, V, K),
++        "checkpoint shape is incompatible",
++    )
++    _rec = (nb, HV, spec_query_len, V + K + 1)
++    _require(tuple(replay_cache.shape) == _rec, f"replay buffer needs shape {_rec}")
++    _require(replay_cache.dtype == torch.float32, "replay buffer must use float32")
++    _require(state_indices.ndim == 1, "state indices must be one-dimensional")
++    _require(
++        query_start_loc.ndim == 1
++        and query_start_loc.shape[0] == state_indices.shape[0] + 1,
++        "query metadata is incompatible",
++    )
++    _require(
++        total <= state_indices.shape[0] * spec_query_len,
++        "speculative decode input exceeds its activation capacity",
++    )
++    _dev = q.device
++    _require(
++        all(
++            t_.device == _dev
++            for t_ in (
++                k,
++                v,
++                a,
++                b,
++                A_log,
++                dt_bias,
++                checkpoint_state,
++                replay_cache,
++                query_start_loc,
++                state_indices,
++            )
++            if t_ is not None
++        )
++        and (out is None or out.device == _dev),
++        "inputs must be on the same device",
++    )
++    if scale is None:
++        scale = K**-0.5
++    if out is None:
++        out = torch.empty(1, total, HV, V, dtype=v.dtype, device=v.device)
++    _require(
++        tuple(out.shape) == (1, total, HV, V) and out.stride()[2:] == (V, 1),
++        "output shape or layout is incompatible",
++    )
++    batch = state_indices.shape[0]
++    if total == 0 or batch == 0:
++        return out
++    BK = triton.next_power_of_2(K)
++    BV = min(triton.next_power_of_2(V), 32)
++    grid = (triton.cdiv(V, BV), batch, HV)
++    _gdn_recoverssm_verify_kernel[grid](
++        q,
++        k,
++        v,
++        a2,
++        b2,
++        A_log,
++        dt_bias,
++        checkpoint_state,
++        replay_cache,
++        out,
++        query_start_loc,
++        state_indices,
++        scale,
++        softplus_beta,
++        softplus_threshold,
++        NULL_BLOCK_ID,
++        q.stride(1),
++        k.stride(1),
++        v.stride(1),
++        a2.stride(0),
++        b2.stride(0),
++        checkpoint_state.stride(0),
++        checkpoint_state.stride(1),
++        checkpoint_state.stride(2),
++        checkpoint_state.stride(3),
++        replay_cache.stride(0),
++        replay_cache.stride(1),
++        replay_cache.stride(2),
++        replay_cache.stride(3),
++        out.stride(1),
++        query_start_loc.stride(0),
++        state_indices.stride(0),
++        H=H,
++        HV=HV,
++        K=K,
++        V=V,
++        BK=BK,
++        BV=BV,
++        SPEC_QUERY_LEN=spec_query_len,
++        USE_QK_L2NORM=use_qk_l2norm_in_kernel,
++        num_warps=4,
++        num_stages=2,
++    )
++    return out
++
++
++@triton.jit
++def _commit_gdn_state_kernel(
++    state_ref_ptr,
++    state_base_addrs_ptr,
++    state_block_strides_ptr,
++    replay_ref_ptr,
++    replay_base_addrs_ptr,
++    replay_block_strides_ptr,
++    state_indices_ptr,
++    commit_lens_ptr,
++    final_state_indices_ptr,
++    boundary_state_indices_ptr,
++    boundary_recovery_lens_ptr,
++    null_block_id,
++    stride_state_head,
++    stride_state_v,
++    stride_state_k,
++    stride_replay_head,
++    stride_replay_pos,
++    stride_replay_dim,
++    stride_si,
++    K: tl.constexpr,
++    V: tl.constexpr,
++    BK: tl.constexpr,
++    BV: tl.constexpr,
++    NUM_HEADS: tl.constexpr,
++    ALIGN_MODE: tl.constexpr,
++):
++    pid_v = tl.program_id(0)
++    pid_b = tl.program_id(1)
++    pid_lh = tl.program_id(2)
++    pid_l = pid_lh // NUM_HEADS
++    pid_h = pid_lh % NUM_HEADS
++    src = tl.load(state_indices_ptr + pid_b * stride_si).to(tl.int64)
++    if src <= null_block_id:
++        return
++    n = tl.load(commit_lens_ptr + pid_b)
++    if n == 0:
++        return
++    final_idx = tl.load(final_state_indices_ptr + pid_b).to(tl.int64)
++    boundary_idx = tl.load(boundary_state_indices_ptr + pid_b).to(tl.int64)
++    boundary_len = tl.load(boundary_recovery_lens_ptr + pid_b)
++    if final_idx <= null_block_id:
++        return
++    state_ptr = tl.load(state_base_addrs_ptr + pid_l).to(
++        tl.pointer_type(state_ref_ptr.dtype.element_ty)
++    )
++    sbs = tl.load(state_block_strides_ptr + pid_l)
++    replay_ptr = tl.load(replay_base_addrs_ptr + pid_l).to(
++        tl.pointer_type(replay_ref_ptr.dtype.element_ty)
++    )
++    rbs = tl.load(replay_block_strides_ptr + pid_l)
++    rec_base = replay_ptr + src * rbs + pid_h * stride_replay_head
++    offs_k = tl.arange(0, BK)
++    offs_v = pid_v * BV + tl.arange(0, BV)
++    mask_k = offs_k < K
++    mask_v = offs_v < V
++    mask_state = mask_v[:, None] & mask_k[None, :]
++    sp = offs_v[:, None] * stride_state_v + offs_k[None, :] * stride_state_k
++    s0 = tl.load(
++        state_ptr + src * sbs + pid_h * stride_state_head + sp,
++        mask=mask_state,
++        other=0.0,
++    ).to(tl.float32)
++    fin_decay = 1.0
++    fin_corr = tl.zeros([BV, BK], tl.float32)
++    bnd_decay = 1.0
++    bnd_corr = tl.zeros([BV, BK], tl.float32)
++    for r in range(n):
++        t = n - r - 1
++        rec = rec_base + t * stride_replay_pos
++        c = tl.load(rec + offs_v * stride_replay_dim, mask=mask_v, other=0.0)
++        kk = tl.load(rec + (V + offs_k) * stride_replay_dim, mask=mask_k, other=0.0)
++        g = tl.load(rec + (V + K) * stride_replay_dim)
++        upd = c[:, None] * kk[None, :]
++        dec = tl.exp(g)
++        fin_corr += upd * fin_decay
++        fin_decay *= dec
++        if ALIGN_MODE:
++            before = t < boundary_len
++            bnd_corr += tl.where(before, upd * bnd_decay, 0.0)
++            bnd_decay *= tl.where(before, dec, 1.0)
++    if ALIGN_MODE:
++        bs = s0 * bnd_decay + bnd_corr
++        tl.store(
++            state_ptr + boundary_idx * sbs + pid_h * stride_state_head + sp,
++            bs.to(state_ref_ptr.dtype.element_ty),
++            mask=mask_state & (boundary_idx > null_block_id),
++        )
++    fs = s0 * fin_decay + fin_corr
++    tl.store(
++        state_ptr + final_idx * sbs + pid_h * stride_state_head + sp,
++        fs.to(state_ref_ptr.dtype.element_ty),
++        mask=mask_state,
++    )
++
++
++@dataclass
++class GDNRecoverSSMCommitContext:
++    conv_states: tuple[torch.Tensor, ...]
++    conv_state_base_addrs: torch.Tensor
++    conv_state_block_strides: torch.Tensor
++    conv_state_dim_strides: torch.Tensor
++    conv_state_token_strides: torch.Tensor
++    conv_history_len: int
++    checkpoints: tuple[torch.Tensor, ...]
++    state_base_addrs: torch.Tensor
++    state_block_strides: torch.Tensor
++    replays: tuple[torch.Tensor, ...]
++    replay_base_addrs: torch.Tensor
++    replay_block_strides: torch.Tensor
++    commit_lens: torch.Tensor
++    final_state_indices: torch.Tensor
++    boundary_state_indices: torch.Tensor
++    boundary_recovery_lens: torch.Tensor
++    spec_query_len: int
++
++    @classmethod
++    def from_tensors(
++        cls,
++        conv_states: Sequence[torch.Tensor],
++        checkpoints: Sequence[torch.Tensor],
++        replays: Sequence[torch.Tensor],
++        *,
++        spec_query_len: int,
++        max_num_reqs: int,
++        conv_dim_first: bool = True,
++    ) -> "GDNRecoverSSMCommitContext":
++        _require(len(checkpoints) > 0, "commit requires at least one layer")
++        _require(
++            len(conv_states) == len(checkpoints) == len(replays),
++            "conv, state and replay lists differ",
++        )
++        if not conv_dim_first:
++            conv_states = [s.transpose(-1, -2) for s in conv_states]
++        ref = checkpoints[0]
++        _require(ref.ndim == 4, "checkpoint must be four-dimensional")
++        nb, HV, V, K = ref.shape
++        _dev = ref.device
++        for s in checkpoints:
++            _require(
++                s.shape == ref.shape
++                and s.dtype == ref.dtype
++                and s.stride()[1:] == ref.stride()[1:]
++                and s.device == _dev,
++                "layers need matching checkpoints",
++            )
++        _rec = (nb, HV, spec_query_len, V + K + 1)
++        for r in replays:
++            _require(
++                tuple(r.shape) == _rec
++                and r.dtype == torch.float32
++                and r.stride()[1:] == replays[0].stride()[1:]
++                and r.device == _dev,
++                f"layers need matching float32 replay buffers of shape {_rec}",
++            )
++        conv_ref = conv_states[0]
++        _require(
++            conv_ref.ndim == 3 and conv_ref.shape[0] == nb,
++            "conv state must be [blocks, dim, window] with the checkpoint's "
++            "block count",
++        )
++        for c in conv_states:
++            _require(
++                c.shape == conv_ref.shape
++                and c.dtype == conv_ref.dtype
++                and c.stride()[1:] == conv_ref.stride()[1:]
++                and c.device == _dev,
++                "layers need matching conv states",
++            )
++        conv_dim, conv_len = conv_ref.shape[1:]
++        hist = conv_len - spec_query_len + 1
++        _require(hist > 0, "conv state is shorter than its window")
++        dev = ref.device
++        addr = lambda ts: torch.tensor(
++            [t.data_ptr() for t in ts], dtype=torch.int64, device=dev
++        )
++        bstr = lambda ts: torch.tensor(
++            [t.stride(0) for t in ts], dtype=torch.int64, device=dev
++        )
++        z = lambda: torch.empty(max_num_reqs, dtype=torch.int32, device=dev)
++        return cls(
++            tuple(conv_states),
++            addr(conv_states),
++            bstr(conv_states),
++            torch.tensor(
++                [s.stride(1) for s in conv_states], dtype=torch.int64, device=dev
++            ),
++            torch.tensor(
++                [s.stride(2) for s in conv_states], dtype=torch.int64, device=dev
++            ),
++            hist,
++            tuple(checkpoints),
++            addr(checkpoints),
++            bstr(checkpoints),
++            tuple(replays),
++            addr(replays),
++            bstr(replays),
++            z(),
++            z(),
++            z(),
++            z(),
++            spec_query_len,
++        )
++
++    @classmethod
++    def create(
++        cls, layers: Sequence[Any], *, spec_query_len: int, max_num_reqs: int
++    ) -> "GDNRecoverSSMCommitContext":
++        from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
++
++        if any(len(layer.kv_cache) != 3 for layer in layers):
++            raise ValueError("GDN RecoverSSM pages must contain conv, state and replay")
++        return cls.from_tensors(
++            [layer.kv_cache[0] for layer in layers],
++            [layer.kv_cache[1] for layer in layers],
++            [layer.kv_cache[2] for layer in layers],
++            spec_query_len=spec_query_len,
++            max_num_reqs=max_num_reqs,
++            conv_dim_first=is_conv_state_dim_first(),
++        )
++
++    def commit(
++        self,
++        num_accepted_tokens: torch.Tensor,
++        state_indices: torch.Tensor,
++        query_start_loc: torch.Tensor,
++        request_indices: torch.Tensor | None = None,
++        block_table: torch.Tensor | None = None,
++        num_computed_tokens: torch.Tensor | None = None,
++        mamba_block_size: int | None = None,
++        commit_conv: bool = True,
++    ) -> None:
++        """Fold accepted GDN and convolution inputs into every layer's checkpoint."""
++        batch = state_indices.shape[0]
++        if batch == 0:
++            return
++        _require(state_indices.ndim == 1, "state indices must be one-dimensional")
++        _require(
++            batch <= self.commit_lens.shape[0], "commit batch exceeds its plan capacity"
++        )
++        _require(
++            query_start_loc.ndim == 1 and query_start_loc.shape[0] == batch + 1,
++            "commit metadata is incompatible",
++        )
++        _require(
++            request_indices is None or request_indices.shape[0] >= batch,
++            "request mapping is too short",
++        )
++        _require(
++            num_accepted_tokens.ndim == 1
++            and (request_indices is not None or num_accepted_tokens.shape[0] >= batch),
++            "accepted-token counts are too short",
++        )
++        _align = (block_table, num_computed_tokens, mamba_block_size)
++        _require(
++            all(x is None for x in _align) or all(x is not None for x in _align),
++            "align metadata is incomplete",
++        )
++        _require(
++            mamba_block_size is None or mamba_block_size >= self.spec_query_len,
++            "align block size must cover one speculative window",
++        )
++        _require(
++            block_table is None or block_table.ndim == 2,
++            "block table must be two-dimensional",
++        )
++        _dev = self.checkpoints[0].device
++        _require(
++            all(
++                t_ is None or t_.device == _dev
++                for t_ in (
++                    num_accepted_tokens,
++                    state_indices,
++                    query_start_loc,
++                    request_indices,
++                    block_table,
++                    num_computed_tokens,
++                )
++            ),
++            "commit inputs must be on the same device",
++        )
++        bt_stride = (0, 0) if block_table is None else block_table.stride()
++        prepare_commit_plan_kernel[(batch,)](
++            num_accepted_tokens,
++            request_indices,
++            state_indices,
++            query_start_loc,
++            block_table,
++            num_computed_tokens,
++            self.commit_lens,
++            self.final_state_indices,
++            self.boundary_state_indices,
++            self.boundary_recovery_lens,
++            NULL_BLOCK_ID,
++            mamba_block_size or 1,
++            block_table.shape[1] if block_table is not None else 1,
++            num_accepted_tokens.stride(0),
++            request_indices.stride(0) if request_indices is not None else 0,
++            state_indices.stride(0),
++            query_start_loc.stride(0),
++            bt_stride[0],
++            bt_stride[1],
++            0 if num_computed_tokens is None else num_computed_tokens.stride(0),
++            SPEC_QUERY_LEN=self.spec_query_len,
++            num_warps=1,
++        )
++        num_layers = len(self.checkpoints)
++        if commit_conv:
++            conv_ref = self.conv_states[0]
++            conv_dim = conv_ref.shape[1]
++            compact_conv_state_kernel[(triton.cdiv(conv_dim, 256), batch, num_layers)](
++                conv_ref,
++                self.conv_state_base_addrs,
++                self.conv_state_block_strides,
++                self.conv_state_dim_strides,
++                self.conv_state_token_strides,
++                state_indices,
++                self.commit_lens,
++                self.final_state_indices,
++                self.boundary_state_indices,
++                self.boundary_recovery_lens,
++                NULL_BLOCK_ID,
++                conv_dim,
++                self.conv_history_len,
++                state_indices.stride(0),
++                BLOCK_D=256,
++                BLOCK_HISTORY=triton.next_power_of_2(self.conv_history_len),
++                ALIGN_MODE=block_table is not None,
++                num_warps=4,
++            )
++        ref = self.checkpoints[0]
++        _, HV, V, K = ref.shape
++        BK = triton.next_power_of_2(K)
++        BV = min(triton.next_power_of_2(V), 32)
++        rr = self.replays[0]
++        _commit_gdn_state_kernel[(triton.cdiv(V, BV), batch, num_layers * HV)](
++            ref,
++            self.state_base_addrs,
++            self.state_block_strides,
++            rr,
++            self.replay_base_addrs,
++            self.replay_block_strides,
++            state_indices,
++            self.commit_lens,
++            self.final_state_indices,
++            self.boundary_state_indices,
++            self.boundary_recovery_lens,
++            NULL_BLOCK_ID,
++            ref.stride(1),
++            ref.stride(2),
++            ref.stride(3),
++            rr.stride(1),
++            rr.stride(2),
++            rr.stride(3),
++            state_indices.stride(0),
++            K=K,
++            V=V,
++            BK=BK,
++            BV=BV,
++            NUM_HEADS=HV,
++            ALIGN_MODE=block_table is not None,
++            num_warps=4,
++            num_stages=2,
++        )
++
++
++__all__ = ["GDNRecoverSSMCommitContext", "gdn_recoverssm_verify"]
+diff --git a/vllm/model_executor/models/interfaces.py b/vllm/model_executor/models/interfaces.py
+index 2e79001add..90f771409f 100644
+--- a/vllm/model_executor/models/interfaces.py
++++ b/vllm/model_executor/models/interfaces.py
+@@ -85,6 +85,7 @@ MambaStateShapes: TypeAlias = (
+     | tuple[tuple[int, int, int]]
+     | tuple[tuple[int, int], tuple[int, int]]
+     | tuple[tuple[int, int], tuple[int, int, int]]
++    | tuple[tuple[int, int], tuple[int, int, int], tuple[int, int, int]]
+     | tuple[
+         tuple[int, int],
+         tuple[int, int, int],
+diff --git a/vllm/models/qwen4_exp/nvidia/model.py b/vllm/models/qwen4_exp/nvidia/model.py
+index 2b9906310f..fe416d4646 100644
+--- a/vllm/models/qwen4_exp/nvidia/model.py
++++ b/vllm/models/qwen4_exp/nvidia/model.py
+@@ -37,11 +37,13 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
+ from vllm.model_executor.models.interfaces import (
+     HasInnerState,
+     IsHybrid,
++    MambaStateShapes,
+     MixtureOfExperts,
+     MultiModalEmbeddings,
+     SupportsLoRA,
+     SupportsMRoPE,
+     SupportsPP,
++    SupportsReplaySSM,
+     _require_is_multimodal,
+ )
+ from vllm.model_executor.models.qwen3_5 import (
+@@ -791,6 +793,7 @@ class Qwen4ExpForCausalLM(
+     SupportsPP,
+     Qwen4ExpMixtureOfExperts,
+     IsHybrid,
++    SupportsReplaySSM,
+ ):
+     packed_modules_mapping = {
+         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+@@ -911,20 +914,38 @@ class Qwen4ExpForCausalLM(
+             num_spec=num_spec,
+         )
+ 
++    @classmethod
++    def _uses_gdn_recoverssm(cls, vllm_config: VllmConfig) -> bool:
++        """One predicate for the replay record's shape AND dtype (they must
++        agree for the MambaSpec)."""
++        num_spec = (
++            vllm_config.speculative_config.num_speculative_tokens
++            if vllm_config.speculative_config
++            else 0
++        )
++        from vllm.model_executor.layers.mamba.recoverssm_utils import uses_recoverssm
++
++        return uses_recoverssm(vllm_config.cache_config, num_spec or 0)
++
+     @classmethod
+     def get_gdn_mamba_state_dtype_from_config(
+         cls, vllm_config: VllmConfig
+-    ) -> tuple[torch.dtype, torch.dtype]:
+-        return MambaStateDtypeCalculator.gated_delta_net_state_dtype(
+-            vllm_config.model_config.dtype,
+-            vllm_config.cache_config.mamba_cache_dtype,
+-            vllm_config.cache_config.mamba_ssm_cache_dtype,
++    ) -> tuple[torch.dtype, ...]:
++        dtypes: tuple[torch.dtype, ...] = (
++            MambaStateDtypeCalculator.gated_delta_net_state_dtype(
++                vllm_config.model_config.dtype,
++                vllm_config.cache_config.mamba_cache_dtype,
++                vllm_config.cache_config.mamba_ssm_cache_dtype,
++            )
+         )
++        if cls._uses_gdn_recoverssm(vllm_config):  # replay record, fp32
++            dtypes = (*dtypes, torch.float32)
++        return dtypes
+ 
+     @classmethod
+     def get_gdn_mamba_state_shape_from_config(
+         cls, vllm_config: VllmConfig
+-    ) -> tuple[tuple[int, int], tuple[int, int]]:
++    ) -> MambaStateShapes:
+         parallel_config = vllm_config.parallel_config
+         hf_config = vllm_config.model_config.hf_text_config
+         tp_size = parallel_config.tensor_parallel_size
+@@ -933,7 +954,7 @@ class Qwen4ExpForCausalLM(
+             if vllm_config.speculative_config
+             else 0
+         )
+-        return MambaStateShapeCalculator.gated_delta_net_state_shape(
++        shapes = MambaStateShapeCalculator.gated_delta_net_state_shape(
+             tp_size,
+             hf_config.linear_num_key_heads,
+             hf_config.linear_num_value_heads,
+@@ -942,18 +963,30 @@ class Qwen4ExpForCausalLM(
+             hf_config.linear_conv_kernel_dim,
+             num_spec,
+         )
++        if cls._uses_gdn_recoverssm(
++            vllm_config
++        ):  # replay record [HV, spec_query_len, V + K + 1]
++            shapes = (
++                *shapes,
++                (
++                    hf_config.linear_num_value_heads // tp_size,
++                    num_spec + 1,
++                    hf_config.linear_value_head_dim + hf_config.linear_key_head_dim + 1,
++                ),
++            )
++        return shapes
+ 
+     @classmethod
+     def get_mamba_state_dtype_from_config(
+         cls,
+         vllm_config: VllmConfig,
+-    ) -> tuple[torch.dtype, torch.dtype]:
++    ) -> tuple[torch.dtype, ...]:
+         return cls.get_gdn_mamba_state_dtype_from_config(vllm_config)
+ 
+     @classmethod
+     def get_mamba_state_shape_from_config(
+         cls, vllm_config: VllmConfig
+-    ) -> tuple[tuple[int, int], tuple[int, int]]:
++    ) -> MambaStateShapes:
+         return cls.get_gdn_mamba_state_shape_from_config(vllm_config)
+ 
+     @classmethod
+@@ -1043,6 +1076,7 @@ class Qwen4ExpForConditionalGeneration(
+     Qwen3_5ForConditionalGeneration,
+     HasInnerState,
+     Qwen4ExpMixtureOfExperts,
++    SupportsReplaySSM,
+ ):
+     """Qwen3-VL vision tower backed by the Qwen4Exp language model."""
+ 
+@@ -1252,14 +1286,15 @@ class Qwen4ExpForConditionalGeneration(
+     def get_mamba_state_dtype_from_config(
+         cls,
+         vllm_config: VllmConfig,
+-    ) -> tuple[torch.dtype, torch.dtype]:
++    ) -> tuple[torch.dtype, ...]:
+         return Qwen4ExpForCausalLM.get_mamba_state_dtype_from_config(vllm_config)
+ 
+     @classmethod
+-    def get_mamba_state_shape_from_config(
++    def get_mamba_state_shape_from_config(  # type: ignore[override]
+         cls,
+         vllm_config: VllmConfig,
+-    ) -> tuple[tuple[int, int], tuple[int, int]]:
++    ) -> MambaStateShapes:
++        # GDN RecoverSSM adds a third state (the replay record) to Qwen3.5's two.
+         return Qwen4ExpForCausalLM.get_mamba_state_shape_from_config(vllm_config)
+ 
+     @classmethod
+diff --git a/vllm/models/qwen4_exp/nvidia/mtp.py b/vllm/models/qwen4_exp/nvidia/mtp.py
+index 564047411f..76c0d7cfdf 100644
+--- a/vllm/models/qwen4_exp/nvidia/mtp.py
++++ b/vllm/models/qwen4_exp/nvidia/mtp.py
+@@ -35,7 +35,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
+     should_use_host_embed_table,
+ )
+ from vllm.model_executor.model_loader.utils import configure_quant_config
+-from vllm.model_executor.models.interfaces import SupportsPP
++from vllm.model_executor.models.interfaces import SupportsPP, SupportsReplaySSM
+ from vllm.model_executor.models.qwen3_5 import Qwen3_5Model
+ from vllm.model_executor.models.utils import (
+     AutoWeightsLoader,
+@@ -408,7 +408,9 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
+         "hidden_states": 0,
+     }
+ )
+-class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
++class Qwen4ExpMTP(
++    nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts, SupportsReplaySSM
++):
+     packed_modules_mapping = {
+         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+         "gate_up_proj": ["gate_proj", "up_proj"],
+diff --git a/vllm/models/qwen4_exp/nvidia/ple_layer.py b/vllm/models/qwen4_exp/nvidia/ple_layer.py
+index 4925e0329a..af8f528512 100644
+--- a/vllm/models/qwen4_exp/nvidia/ple_layer.py
++++ b/vllm/models/qwen4_exp/nvidia/ple_layer.py
+@@ -203,6 +203,14 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
+         return True
+ 
+     def get_attn_backend(self) -> type[PleShortConvAttentionBackend]:
++        from vllm.model_executor.layers.mamba.recoverssm_utils import uses_recoverssm
++
++        if uses_recoverssm(self.cache_config, self.num_spec_tokens):
++            from vllm.v1.attention.backends.ple_recoverssm import (
++                PleRecoverSSMAttentionBackend,
++            )
++
++            return PleRecoverSSMAttentionBackend
+         return PleShortConvAttentionBackend
+ 
+     def get_state_dtype(self) -> tuple[torch.dtype, ...]:
+diff --git a/vllm/v1/attention/backends/gdn_recoverssm.py b/vllm/v1/attention/backends/gdn_recoverssm.py
+new file mode 100644
+index 0000000000..a45142ab3c
+--- /dev/null
++++ b/vllm/v1/attention/backends/gdn_recoverssm.py
+@@ -0,0 +1,181 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""GDN attention metadata for RecoverSSM speculative decode (Qwen-style Gated DeltaNet).
++
++Wraps the generic GDN builder: every active decode row runs through the spec path (a
++draft-less step is a T=1 window), the spec state indices keep only the checkpoint
++column, num_accepted_tokens is always 1 (the checkpoint and the compacted conv window
++already hold the accepted state), and the metadata carries what the post-sampling commit
++needs. Mirrors the Kimi-K3 KDA builder's RecoverSSM handling."""
++
++from dataclasses import dataclass, field, fields
++from typing import Any
++
++import torch
++
++from vllm.logger import init_logger
++from vllm.v1.attention.backend import AttentionCGSupport, CommonAttentionMetadata
++from vllm.v1.attention.backends.gdn_attn import (
++    GDNAttentionBackend,
++    GDNAttentionMetadata,
++    GDNAttentionMetadataBuilder,
++)
++from vllm.v1.attention.backends.recoverssm_metadata import (
++    RecoverSSMMetadata,
++    RecoverSSMPostprocessMetadata,
++    recoverssm_request_indices,
++    recoverssm_spec_rows,
++)
++
++logger = init_logger(__name__)
++
++
++@dataclass
++class GDNRecoverSSMCommitMetadata:
++    state_indices: torch.Tensor  # [num_spec_decodes, 1]
++    query_start_loc: torch.Tensor  # [num_spec_decodes + 1]
++    request_indices: (
++        torch.Tensor | None
++    )  # batch rows of the spec requests (None: rows 0..n-1)
++    block_table: torch.Tensor | None  # align mode
++    num_computed_tokens: torch.Tensor | None
++    block_size: int | None
++
++
++@dataclass
++class GDNRecoverSSMMetadata(GDNAttentionMetadata, RecoverSSMMetadata):
++    recoverssm_commit: GDNRecoverSSMCommitMetadata | None = None
++    recoverssm_context: Any = field(default=None, repr=False, compare=False)
++
++    def commit_recoverssm_state(
++        self, num_accepted_tokens: torch.Tensor
++    ) -> RecoverSSMPostprocessMetadata | None:
++        c = self.recoverssm_commit
++        if c is None:
++            return None
++        n = self.num_spec_decodes
++        self.recoverssm_context.commit(
++            num_accepted_tokens,
++            c.state_indices[:n, 0],
++            c.query_start_loc[: n + 1],
++            request_indices=c.request_indices,
++            block_table=c.block_table,
++            num_computed_tokens=c.num_computed_tokens,
++            mamba_block_size=c.block_size,
++        )
++        if c.block_table is None:
++            return None
++        assert c.block_size is not None and c.num_computed_tokens is not None
++        return RecoverSSMPostprocessMetadata(
++            num_spec_decodes=n,
++            request_indices=c.request_indices,
++            block_table=c.block_table,
++            num_computed_tokens=c.num_computed_tokens,
++            block_size=c.block_size,
++        )
++
++
++class GDNRecoverSSMMetadataBuilder(GDNAttentionMetadataBuilder):
++    # The verify/commit metadata is not staged for FULL graph replay yet; declaring
++    # NEVER makes the runner fall back to PIECEWISE (attention compiled piecewise).
++    _cudagraph_support = AttentionCGSupport.NEVER
++
++    def __init__(self, kv_cache_spec, layer_names, vllm_config, device) -> None:
++        super().__init__(kv_cache_spec, layer_names, vllm_config, device)
++        # The builder may be created before the runner resolves the CUDA graph mode.
++        self.use_full_cuda_graph = False
++        max_reqs = vllm_config.scheduler_config.max_num_seqs
++        self._ones = torch.ones(max_reqs, dtype=torch.int32, device=device)
++        self._context: Any = None
++        self._logged = False
++
++    def _get_context(self):
++        if self._context is None:
++            from vllm.model_executor.layers.mamba.gdn.recoverssm_gdn import (
++                GDNRecoverSSMCommitContext,
++            )
++
++            fc = self.vllm_config.compilation_config.static_forward_context
++            layers = [fc[name] for name in self.layer_names]
++            self._context = GDNRecoverSSMCommitContext.create(
++                layers,
++                spec_query_len=1 + self.num_spec,
++                max_num_reqs=self.vllm_config.scheduler_config.max_num_seqs,
++            )
++            logger.info(
++                "GDN RecoverSSM commit context: %d layers, spec_query_len %d",
++                len(layers),
++                1 + self.num_spec,
++            )
++        return self._context
++
++    def build(  # type: ignore[override]
++        self,
++        common_prefix_len: int,
++        common_attn_metadata: CommonAttentionMetadata,
++        num_accepted_tokens: torch.Tensor | None = None,
++        num_decode_draft_tokens_cpu: torch.Tensor | None = None,
++        fast_build: bool = False,
++    ) -> "GDNRecoverSSMMetadata":
++        m = common_attn_metadata
++        rows = None
++        if self.use_spec_decode and num_decode_draft_tokens_cpu is not None:
++            if m.is_prefilling is None or m.is_prefilling.device.type != "cpu":
++                raise ValueError("GDN RecoverSSM needs the CPU is_prefilling mask")
++            # Positive counts only defeat the base builder's "no drafts -> regular
++            # decode" shortcut: RecoverSSM keeps every post-prefill row on the spec path
++            # (extended conv window).
++            num_decode_draft_tokens_cpu, rows = recoverssm_spec_rows(
++                m.is_prefilling,
++                m.query_start_loc_cpu,
++                num_decode_draft_tokens_cpu,
++                m.num_reqs,
++            )
++        meta = super().build(
++            common_prefix_len,
++            m,
++            num_accepted_tokens=num_accepted_tokens,
++            num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
++            fast_build=fast_build,
++        )
++        base = {f.name: getattr(meta, f.name) for f in fields(meta)}
++        commit = None
++        if meta.num_spec_decodes > 0:
++            n = meta.num_spec_decodes
++            assert meta.spec_state_indices_tensor is not None
++            base["spec_state_indices_tensor"] = meta.spec_state_indices_tensor[:, :1]
++            base["num_accepted_tokens"] = self._ones[:n]
++            if rows is None:
++                raise ValueError("GDN RecoverSSM: spec rows without draft counts")
++            request_indices = recoverssm_request_indices(
++                rows, n, m.query_start_loc.device
++            )
++            align = self.vllm_config.cache_config.mamba_cache_mode == "align"
++            commit = GDNRecoverSSMCommitMetadata(
++                state_indices=base["spec_state_indices_tensor"],
++                query_start_loc=meta.spec_query_start_loc,
++                request_indices=request_indices,
++                block_table=m.block_table_tensor if align else None,
++                num_computed_tokens=m.compute_num_computed_tokens() if align else None,
++                block_size=self.kv_cache_spec.block_size if align else None,
++            )
++            if not self._logged:
++                self._logged = True
++                logger.info(
++                    "GDN RecoverSSM path taken: %d spec rows, align=%s", n, align
++                )
++        return GDNRecoverSSMMetadata(
++            **base,
++            recoverssm_commit=commit,
++            recoverssm_context=self._get_context() if commit is not None else None,
++        )
++
++
++class GDNRecoverSSMAttentionBackend(GDNAttentionBackend):
++    @staticmethod
++    def get_name() -> str:
++        return "GDN_RECOVERSSM"
++
++    @staticmethod
++    def get_builder_cls() -> type[GDNRecoverSSMMetadataBuilder]:
++        return GDNRecoverSSMMetadataBuilder
+diff --git a/vllm/v1/attention/backends/mamba_attn.py b/vllm/v1/attention/backends/mamba_attn.py
+index 817773a6ab..29352b3269 100644
+--- a/vllm/v1/attention/backends/mamba_attn.py
++++ b/vllm/v1/attention/backends/mamba_attn.py
+@@ -110,7 +110,12 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
+         self.compilation_config = vllm_config.compilation_config
+         self.num_spec_tokens: int = vllm_config.num_speculative_tokens
+         self.use_spec_decode = self.num_spec_tokens > 0
+-        self.use_replayssm = vllm_config.cache_config.use_replayssm
++        # RecoverSSM also rides on --use-replayssm but keeps its own metadata; the
++        # Mamba2 ReplaySSM ring-buffer workspaces below are not used then.
++        self.use_replayssm = (
++            vllm_config.cache_config.use_replayssm
++            and not vllm_config.cache_config.use_recoverssm
++        )
+         self.replayssm_buffer_len = vllm_config.cache_config.replayssm_buffer_len
+         self.use_flashinfer_replayssm = (
+             self.use_replayssm
+diff --git a/vllm/v1/attention/backends/ple_recoverssm.py b/vllm/v1/attention/backends/ple_recoverssm.py
+new file mode 100644
+index 0000000000..7402001fc0
+--- /dev/null
++++ b/vllm/v1/attention/backends/ple_recoverssm.py
+@@ -0,0 +1,326 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""RecoverSSM protocol for the Qwen4Exp PLE short-conv layer.
++
++When the GDN layers run RecoverSSM, the runner resets the shared num_accepted_tokens to
++1 after each commit (align mode). The PLE dilated short conv keeps an extended window in
++one state block and reads it at num_accepted - 1, so it must follow the same protocol:
++every active decode row takes the spec path, the conv reads at offset 0, and after
++sampling the accepted window is compacted to the front (the shared RecoverSSM compaction
++kernel; in align mode it also writes the block-boundary window)."""
++
++from dataclasses import dataclass, field, fields
++from typing import Any
++
++import torch
++
++from vllm.logger import init_logger
++from vllm.model_executor.layers.mamba.ops.recoverssm import (
++    compact_conv_state_kernel,
++    prepare_commit_plan_kernel,
++)
++from vllm.model_executor.layers.mamba.recoverssm_utils import recoverssm_require
++from vllm.triton_utils import triton
++from vllm.v1.attention.backend import AttentionCGSupport
++from vllm.v1.attention.backends.recoverssm_metadata import (
++    RecoverSSMMetadata,
++    RecoverSSMPostprocessMetadata,
++    recoverssm_request_indices,
++    recoverssm_spec_rows,
++)
++from vllm.v1.attention.backends.short_conv_attn import (
++    PleShortConvAttentionBackend,
++    PleShortConvAttentionMetadata,
++    PleShortConvAttentionMetadataBuilder,
++)
++from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
++
++logger = init_logger(__name__)
++
++
++def _require(cond: bool, msg: str) -> None:
++    recoverssm_require(cond, msg, "PLE RecoverSSM")
++
++
++class _PleConvCommit:
++    def __init__(self, conv_states, spec_query_len: int, max_num_reqs: int):
++        from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
++
++        _require(len(conv_states) > 0, "PLE commit requires at least one layer")
++        if not is_conv_state_dim_first():
++            conv_states = [
++                s.transpose(-1, -2) for s in conv_states
++            ]  # -> [blocks, C, W]
++        self.conv_states = list(conv_states)
++        ref = self.conv_states[0]
++        _require(ref.ndim == 3, "PLE conv state must be [blocks, dim, window]")
++        dev = ref.device
++        for s in self.conv_states:
++            _require(
++                s.shape == ref.shape
++                and s.dtype == ref.dtype
++                and s.stride()[1:] == ref.stride()[1:]
++                and s.device == dev,
++                "PLE layers need matching conv states",
++            )
++        self.conv_dim, conv_len = ref.shape[1], ref.shape[2]
++        self.hist = conv_len - spec_query_len + 1
++        _require(self.hist > 0, "PLE conv state is shorter than its window")
++        self.spec_query_len = spec_query_len
++        t = lambda xs: torch.tensor(xs, dtype=torch.int64, device=dev)
++        self.base = t([s.data_ptr() for s in self.conv_states])
++        self.bstride = t([s.stride(0) for s in self.conv_states])
++        self.dstride = t([s.stride(1) for s in self.conv_states])
++        self.tstride = t([s.stride(2) for s in self.conv_states])
++        z = lambda: torch.empty(max_num_reqs, dtype=torch.int32, device=dev)
++        self.commit_lens, self.final_idx, self.bnd_idx, self.bnd_len = (
++            z(),
++            z(),
++            z(),
++            z(),
++        )
++
++    def commit(
++        self,
++        num_accepted_tokens,
++        state_indices,
++        query_start_loc,
++        request_indices=None,
++        block_table=None,
++        num_computed_tokens=None,
++        mamba_block_size=None,
++    ):
++        batch = state_indices.shape[0]
++        if batch == 0:
++            return
++        _require(state_indices.ndim == 1, "state indices must be one-dimensional")
++        _require(
++            batch <= self.commit_lens.shape[0],
++            "PLE commit batch exceeds its plan capacity",
++        )
++        _require(
++            query_start_loc.ndim == 1 and query_start_loc.shape[0] == batch + 1,
++            "PLE commit metadata is incompatible",
++        )
++        _require(
++            request_indices is None or request_indices.shape[0] >= batch,
++            "PLE request mapping is too short",
++        )
++        _require(
++            num_accepted_tokens.ndim == 1
++            and (request_indices is not None or num_accepted_tokens.shape[0] >= batch),
++            "PLE accepted-token counts are too short",
++        )
++        _align = (block_table, num_computed_tokens, mamba_block_size)
++        _require(
++            all(x is None for x in _align) or all(x is not None for x in _align),
++            "PLE align metadata is incomplete",
++        )
++        _require(
++            mamba_block_size is None or mamba_block_size >= self.spec_query_len,
++            "PLE align block size must cover one speculative window",
++        )
++        _require(
++            block_table is None or block_table.ndim == 2,
++            "PLE block table must be two-dimensional",
++        )
++        _dev = self.conv_states[0].device
++        _require(
++            all(
++                t_ is None or t_.device == _dev
++                for t_ in (
++                    num_accepted_tokens,
++                    state_indices,
++                    query_start_loc,
++                    request_indices,
++                    block_table,
++                    num_computed_tokens,
++                )
++            ),
++            "PLE commit inputs must be on the same device",
++        )
++        bt = (0, 0) if block_table is None else block_table.stride()
++        prepare_commit_plan_kernel[(batch,)](
++            num_accepted_tokens,
++            request_indices,
++            state_indices,
++            query_start_loc,
++            block_table,
++            num_computed_tokens,
++            self.commit_lens,
++            self.final_idx,
++            self.bnd_idx,
++            self.bnd_len,
++            NULL_BLOCK_ID,
++            mamba_block_size or 1,
++            block_table.shape[1] if block_table is not None else 1,
++            num_accepted_tokens.stride(0),
++            request_indices.stride(0) if request_indices is not None else 0,
++            state_indices.stride(0),
++            query_start_loc.stride(0),
++            bt[0],
++            bt[1],
++            0 if num_computed_tokens is None else num_computed_tokens.stride(0),
++            SPEC_QUERY_LEN=self.spec_query_len,
++            num_warps=1,
++        )
++        compact_conv_state_kernel[
++            (triton.cdiv(self.conv_dim, 256), batch, len(self.conv_states))
++        ](
++            self.conv_states[0],
++            self.base,
++            self.bstride,
++            self.dstride,
++            self.tstride,
++            state_indices,
++            self.commit_lens,
++            self.final_idx,
++            self.bnd_idx,
++            self.bnd_len,
++            NULL_BLOCK_ID,
++            self.conv_dim,
++            self.hist,
++            state_indices.stride(0),
++            BLOCK_D=256,
++            BLOCK_HISTORY=triton.next_power_of_2(self.hist),
++            ALIGN_MODE=block_table is not None,
++            num_warps=4,
++        )
++
++
++@dataclass
++class PleRecoverSSMCommitMetadata:
++    state_indices: torch.Tensor  # [n]
++    query_start_loc: torch.Tensor  # [n + 1]
++    request_indices: torch.Tensor | None
++    block_table: torch.Tensor | None
++    num_computed_tokens: torch.Tensor | None
++    block_size: int | None
++
++
++@dataclass
++class PleRecoverSSMMetadata(PleShortConvAttentionMetadata, RecoverSSMMetadata):
++    recoverssm_commit: PleRecoverSSMCommitMetadata | None = None
++    recoverssm_context: Any = field(default=None, repr=False, compare=False)
++
++    def commit_recoverssm_state(self, num_accepted_tokens):
++        c = self.recoverssm_commit
++        if c is None:
++            return None
++        n = self.num_spec_decodes
++        self.recoverssm_context.commit(
++            num_accepted_tokens,
++            c.state_indices[:n],
++            c.query_start_loc[: n + 1],
++            request_indices=c.request_indices,
++            block_table=c.block_table,
++            num_computed_tokens=c.num_computed_tokens,
++            mamba_block_size=c.block_size,
++        )
++        if c.block_table is None:
++            return None
++        assert c.block_size is not None and c.num_computed_tokens is not None
++        return RecoverSSMPostprocessMetadata(
++            num_spec_decodes=n,
++            request_indices=c.request_indices,
++            block_table=c.block_table,
++            num_computed_tokens=c.num_computed_tokens,
++            block_size=c.block_size,
++        )
++
++
++class PleRecoverSSMMetadataBuilder(PleShortConvAttentionMetadataBuilder):
++    # Same as the GDN RecoverSSM builder: PIECEWISE only for now.
++    _cudagraph_support = AttentionCGSupport.NEVER
++
++    def __init__(self, kv_cache_spec, layer_names, vllm_config, device) -> None:
++        super().__init__(kv_cache_spec, layer_names, vllm_config, device)
++        self.use_full_cuda_graph = False
++        self._ones = torch.ones(
++            vllm_config.scheduler_config.max_num_seqs, dtype=torch.int32, device=device
++        )
++        self._ctx: _PleConvCommit | None = None
++        self._logged = False
++
++    def _get_ctx(self):
++        if self._ctx is None:
++            fc = self.vllm_config.compilation_config.static_forward_context
++            convs = [fc[name].kv_cache[0] for name in self.layer_names]
++            ctx = _PleConvCommit(
++                convs, 1 + self.num_spec, self.vllm_config.scheduler_config.max_num_seqs
++            )
++            self._ctx = ctx
++            logger.info(
++                "PLE RecoverSSM commit context: %d layers, history %d",
++                len(convs),
++                ctx.hist,
++            )
++        return self._ctx
++
++    def build(
++        self,
++        common_prefix_len,
++        common_attn_metadata,
++        fast_build=False,
++        *,
++        num_accepted_tokens=None,
++        num_decode_draft_tokens_cpu=None,
++        **kwargs,
++    ):  # type: ignore[override]
++        m = common_attn_metadata
++        rows = None
++        if self.use_spec_decode and num_decode_draft_tokens_cpu is not None:
++            if m.is_prefilling is None or m.is_prefilling.device.type != "cpu":
++                raise ValueError("PLE RecoverSSM needs the CPU is_prefilling mask")
++            # the same classification as the GDN builder, so both commits map the same
++            # requests
++            num_decode_draft_tokens_cpu, rows = recoverssm_spec_rows(
++                m.is_prefilling,
++                m.query_start_loc_cpu,
++                num_decode_draft_tokens_cpu,
++                m.num_reqs,
++            )
++        meta = super().build(
++            common_prefix_len,
++            m,
++            fast_build,
++            num_accepted_tokens=num_accepted_tokens,
++            num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
++            **kwargs,
++        )
++        if (
++            not isinstance(meta, PleShortConvAttentionMetadata)
++            or meta.num_spec_decodes == 0
++        ):
++            return meta
++        base = {f.name: getattr(meta, f.name) for f in fields(meta)}
++        n = meta.num_spec_decodes
++        base["num_accepted_tokens"] = self._ones[:n]
++        if rows is None:
++            raise ValueError("PLE RecoverSSM: spec rows without draft counts")
++        req_idx = recoverssm_request_indices(rows, n, m.query_start_loc.device)
++        align = self.vllm_config.cache_config.mamba_cache_mode == "align"
++        commit = PleRecoverSSMCommitMetadata(
++            state_indices=meta.spec_state_indices_tensor,
++            query_start_loc=meta.spec_query_start_loc,
++            request_indices=req_idx,
++            block_table=m.block_table_tensor if align else None,
++            num_computed_tokens=m.compute_num_computed_tokens() if align else None,
++            block_size=self.kv_cache_spec.block_size if align else None,
++        )
++        if not self._logged:
++            self._logged = True
++            logger.info("PLE RecoverSSM path taken: %d spec rows, align=%s", n, align)
++        return PleRecoverSSMMetadata(
++            **base, recoverssm_commit=commit, recoverssm_context=self._get_ctx()
++        )
++
++
++class PleRecoverSSMAttentionBackend(PleShortConvAttentionBackend):
++    @staticmethod
++    def get_name() -> str:
++        return "PLE_SHORT_CONV_RECOVERSSM"
++
++    @staticmethod
++    def get_builder_cls() -> type[PleRecoverSSMMetadataBuilder]:
++        return PleRecoverSSMMetadataBuilder

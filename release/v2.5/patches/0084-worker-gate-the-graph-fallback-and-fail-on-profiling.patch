@@ -1,0 +1,84 @@
+From 704a98d87fb118aaf4c7cf9b91595a010b207a13 Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 04:07:45 +0100
+Subject: [PATCH 84/97] worker: gate the graph fallback and fail on profiling
+ leaks
+
+The breakable-CUDA-graph fallback in the compilation config now applies only with --use-replayssm, and a
+profiling KV cache that survives the teardown fails the boot instead of only being logged
+(VLLM_FAIL_ON_PROFILING_KV_LEAK=0 turns it back into a warning).
+---
+ .../worker/gpu/test_recoverssm_pp_deferral.py   | 11 +++++++++++
+ vllm/config/compilation.py                      |  5 ++++-
+ vllm/v1/worker/gpu/cudagraph_utils.py           | 17 ++++++++++++-----
+ 3 files changed, 27 insertions(+), 6 deletions(-)
+
+diff --git a/tests/v1/worker/gpu/test_recoverssm_pp_deferral.py b/tests/v1/worker/gpu/test_recoverssm_pp_deferral.py
+index 7fa3162243..aab545aafb 100644
+--- a/tests/v1/worker/gpu/test_recoverssm_pp_deferral.py
++++ b/tests/v1/worker/gpu/test_recoverssm_pp_deferral.py
+@@ -483,3 +483,14 @@ def test_teardown_reports_a_held_profiling_kv_cache(monkeypatch, case):
+         assert warnings == []
+         assert ref() is None
+     del stray
++
++
++@pytest.mark.parametrize("case", ["request_id_reuse", "prefix_cache_shared_block"])
++def test_lifetime_scenario_is_explicitly_not_synthetic(case):
++    """Guard the CPU protocol suite from being mistaken for MRV2 scheduling coverage.
++
++    The scheduler and prefix-cache lifetime regression is exercised by the
++    GPU integration runs, which are not part of this tree. This CPU suite
++    only validates the PP queue protocol.
++    """
++    pytest.skip(f"{case} requires the TP2xPP2 MRV2 integration harness")
+diff --git a/vllm/config/compilation.py b/vllm/config/compilation.py
+index 791975bd3e..bd63f994b8 100644
+--- a/vllm/config/compilation.py
++++ b/vllm/config/compilation.py
+@@ -1452,7 +1452,10 @@ class CompilationConfig:
+                     self.splitting_ops_contain_attention()
+                     or self.use_inductor_graph_partition
+                 )
+-            ) or envs.VLLM_USE_BREAKABLE_CUDAGRAPH:
++            ) or (
++                envs.VLLM_USE_BREAKABLE_CUDAGRAPH
++                and self.cache_config.use_replayssm
++            ):
+                 # Breakable CUDA graphs break at the attention kernels at runtime,
+                 # with or without torch.compile.
+                 msg += (
+diff --git a/vllm/v1/worker/gpu/cudagraph_utils.py b/vllm/v1/worker/gpu/cudagraph_utils.py
+index 1cdceb388b..00eee6b58e 100644
+--- a/vllm/v1/worker/gpu/cudagraph_utils.py
++++ b/vllm/v1/worker/gpu/cudagraph_utils.py
+@@ -3,6 +3,7 @@
+ import contextlib
+ import gc
+ import itertools
++import os
+ from collections import defaultdict
+ from collections.abc import Callable, Iterable, Iterator
+ from contextlib import ExitStack
+@@ -1187,10 +1188,16 @@ def _teardown_profiling_state(runner: "GPUModelRunner") -> None:
+             kv_bytes, allocated_before, torch.cuda.memory_allocated()
+         )
+         if held > (1 << 20):
+-            logger.warning(
++            message = (
+                 "Profiling teardown: at least %.1f MiB of the %.1f MiB profiling KV "
+                 "cache is still allocated; something still references it (it will "
+-                "be missing from the real KV cache / free-memory cushion)",
+-                held / (1 << 20),
+-                kv_bytes / (1 << 20),
+-            )
++                "be missing from the real KV cache / free-memory cushion)"
++            ) % (held / (1 << 20), kv_bytes / (1 << 20))
++            # Fail boot by default: this memory is absent from the real KV
++            # pool and can invalidate capacity planning. Operators may opt out
++            # temporarily while diagnosing with VLLM_FAIL_ON_PROFILING_KV_LEAK=0.
++            if os.getenv("VLLM_FAIL_ON_PROFILING_KV_LEAK", "1").lower() not in (
++                "0", "false", "no"
++            ):
++                raise RuntimeError(message)
++            logger.warning(message)

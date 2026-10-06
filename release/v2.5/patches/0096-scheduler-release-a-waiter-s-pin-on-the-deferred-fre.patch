@@ -1,0 +1,113 @@
+From cee9c454eae4789ad90cee7e1955a1fd3e04e41f Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 02:49:52 -0400
+Subject: [PATCH 96/97] scheduler: release a waiter's pin on the deferred free
+ path too
+
+The scheduler takes pop_blocks_for_free when a step may still be in
+flight, for example when a preempted request is aborted before its
+fence drained. A waiting request's pin is never written by any step, so
+it is now released there at once. Before, it stayed until the next
+yield or reset, keeping its blocks pinned and a waiter slot taken.
+
+pin_waiting_hit touches each block in the pool it belongs to; private
+pool groups route like free_blocks. Its docstring states the known gap:
+a pin is a snapshot of the hit at pin time. It is not refreshed if the
+hit grows while the request waits, or if a producer moves a pinned live
+block's hash into its copy. The admission lookup still sees whatever is
+cached, so the cost is a smaller hit, never a wrong one.
+MAX_PINNED_WAITERS goes from 8 to 16.
+
+Test: a pinned waiter popped through the deferred path leaves no pin,
+no waiter slot and the pool at its baseline.
+---
+ .../test_partial_prefix_cache_hits.py         | 23 +++++++++++++++++++
+ vllm/v1/core/kv_cache_manager.py              | 23 +++++++++++++++----
+ 2 files changed, 42 insertions(+), 4 deletions(-)
+
+diff --git a/tests/v1/core/prefix_cache/test_partial_prefix_cache_hits.py b/tests/v1/core/prefix_cache/test_partial_prefix_cache_hits.py
+index f5de3e7c59..75d6477f28 100644
+--- a/tests/v1/core/prefix_cache/test_partial_prefix_cache_hits.py
++++ b/tests/v1/core/prefix_cache/test_partial_prefix_cache_hits.py
+@@ -3368,3 +3368,26 @@ def test_scheduler_pins_the_front_of_the_waiting_queue(tail_retain):
+     Scheduler._pin_waiting_hits(stub)
+     assert not _pinned(manager)
+     _tail_assert_pool_clean(manager, 96)
++
++
++def test_deferred_abort_of_a_pinned_waiter_releases_the_pin(tail_retain):
++    """pop_blocks_for_free (the deferred-free path a scheduler takes when a
++    step may still be in flight) releases a waiter's pin at once: the pin
++    is never written by any step, and leaving it would keep the blocks
++    pinned and a waiter slot taken until the next yield or reset."""
++    manager = _tail_manager(64, attn_block=TAIL_BLOCK)
++    pool = manager.block_pool
++    a0 = make_request("A0", _tail_tokens(1, 150), TAIL_HASH, sha256)
++    _tail_run(manager, a0)
++    manager.free(a0)
++    _tail_drain_copies(manager)
++    baseline = pool.get_num_free_blocks()
++    w = _tail_followup(a0, 20, seed=3)
++    assert manager.pin_waiting_hit(w) > 0
++    assert pool.get_num_free_blocks() < baseline
++    deferred = manager.pop_blocks_for_free(w)
++    assert deferred == []  # a waiter has no table blocks
++    assert not _pinned(manager) and manager.num_pinned_waiters == 0
++    assert pool.get_num_free_blocks() == baseline
++    pool.free_blocks(deferred)
++    _tail_assert_pool_clean(manager, 64)
+diff --git a/vllm/v1/core/kv_cache_manager.py b/vllm/v1/core/kv_cache_manager.py
+index dac8b8f298..3dbda90124 100644
+--- a/vllm/v1/core/kv_cache_manager.py
++++ b/vllm/v1/core/kv_cache_manager.py
+@@ -631,8 +631,9 @@ class KVCacheManager:
+ 
+     # Waiting requests whose prefix-cache hit is pinned at once (arrival
+     # order). Pins never block anyone (they yield before a running request
+-    # fails to allocate), so the bound only caps the lookup work per step.
+-    MAX_PINNED_WAITERS = 8
++    # fails to allocate), so the bound only caps the lookup work per step;
++    # twice the deployed max_num_seqs covers every waiter seen under load.
++    MAX_PINNED_WAITERS = 16
+ 
+     @property
+     def num_pinned_waiters(self) -> int:
+@@ -648,7 +649,15 @@ class KVCacheManager:
+         prefix up to the key and the GDN state it resumes from) takes a ref
+         and leaves the free queue. Idempotent. Returns the number of blocks
+         pinned now (0 if nothing hit, already pinned, caching is off, or the
+-        waiter bound is reached)."""
++        waiter bound is reached).
++
++        Known gap: a pin is a snapshot of the hit at pin time. It is not
++        refreshed if the hit grows while the request waits (a sibling
++        computing more of the same prefix) or if a producer moves the hash of
++        a pinned live block into its CoW copy (a resume at a running
++        producer's tail, unreachable under the EAGLE drop); the admission
++        lookup still finds whatever is cached then, so the only cost is a
++        smaller hit, never a wrong one."""
+         request_id = request.request_id
+         if (
+             request_id in self._pinned_hits
+@@ -681,7 +690,10 @@ class KVCacheManager:
+                 if cached and cached[0].block_id not in seen:
+                     seen.add(cached[0].block_id)
+                     blocks.append(cached[0])
+-        self.block_pool.touch(blocks)
++        # Blocks of a private-pool group (hisparse host tier) are touched in
++        # their own pool, as free_blocks routes them.
++        for block in blocks:
++            (block.pool or self.block_pool).touch([block])
+         self._pinned_hits[request_id] = blocks
+         return len(blocks)
+ 
+@@ -752,6 +764,9 @@ class KVCacheManager:
+             The request's blocks in eviction order (each group's blocks
+             reversed, then concatenated group by group).
+         """
++        # A pin is never written by an in-flight step (the waiter has no
++        # table), so it is released now, not with the deferred blocks.
++        self.release_pinned_hit(request.request_id)
+         return self.coordinator.pop_blocks_for_free(request.request_id)
+ 
+     def evict_blocks(self, block_ids: set[int]) -> None:

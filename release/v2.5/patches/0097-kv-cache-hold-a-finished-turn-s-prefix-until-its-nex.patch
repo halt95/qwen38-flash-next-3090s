@@ -1,0 +1,1451 @@
+From 96a0d13b6e98ad4ef86e66a3f6ddb5dd9199a591 Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 02:49:52 -0400
+Subject: [PATCH 97/97] kv cache: hold a finished turn's prefix until its next
+ turn is admitted
+
+With a prefix unit finer than the block, a hybrid follow-up resumes from
+a single GDN state at the previous prompt's tail, and that key sits in
+the top attention block. Losing any one block of that prefix is a total
+miss. The waiting-request pins only protect a hit that is still whole
+when the follow-up is first looked up. Tracing the remaining misses
+under a long-context multi-turn agent load shows they lost their top
+attention block before that, in the gap between the previous turn
+finishing and the next turn arriving. In that gap nothing referenced
+the prefix. LRU then consumed it ahead of dead blocks freed later
+(other conversations' handed-over CoW sources and superseded states).
+
+A finished turn (stop, length, repetition, or an abort after decoding)
+now keeps one extra ref on each of its hashed blocks, including its GDN
+holds, as a grace pin. The ref is taken on both free paths, the
+immediate free and the deferred pop_blocks_for_free behind an in-flight
+step, so the prefix never passes through the free queue. A grace is
+released when:
+
+- the next turn is admitted on it. That is the grace holding the
+  deepest hit block of every group, with a hit that reaches its prompt
+  to within two prefix units, so a new turn sharing only a system
+  prompt releases nothing. The table takes the blocks over, with no
+  double ref.
+- anyone needs blocks. Graces yield before waiter pins, oldest first and
+  one per failed allocation, so they never cause a preemption.
+- the bound (16) is exceeded. The oldest grace goes.
+- reset_prefix_cache runs.
+
+A head waiter whose admission fails pins its own hit first. It then
+yields graces and other pins one at a time, and only when everything
+yieldable covers its shortfall. Otherwise yielding would drop other
+conversations' prefixes and still not admit it. The shortfall is
+measured after the pin: the pin takes the proof block past the hit (and
+any hit block the lookup did not return) out of the free queue, so the
+shortfall of the failed attempt can be short by those blocks and the
+guard would yield another conversation's grace for nothing. Its own
+pinned blocks outside the hit it is admitted on, the proof block past
+it, go back first: once the hit is taken over they protect nothing, and
+they cost nobody else anything. At an exact fit they are the blocks it
+needs, and nothing else ever yields a head waiter's own pin, so without
+this a request that needs the whole pool waited forever.
+
+While any pin or grace is held the scheduler reports no common prefix
+to cascade attention. Those refs can make a block's count equal the
+number of running requests when only some of them share it, and cascade
+attention would then read it for all of them.
+
+Graces and waiter pins now follow a producer's GDN hash into its CoW
+copy, as holds already do. Otherwise they would keep a second ref on a
+running state block that its owner must own exclusively. Graces apply
+only to fine-grained hybrid hits (coordinator.enable_partial_hash_hits)
+and are off with a KV connector; a block-sized unit (the 4096 lane) is
+unchanged. When graces are active the scheduler logs one startup line
+saying so, with the bound, the hash unit and the block size.
+
+Tests: the arrival-gap reproduction fails on the previous commit (hit 0
+instead of 168, both free paths). It passes here. Further tests cover
+the handover refcounts, yield order and bound, finish statuses, a
+running request at an exactly full pool, yieldable accounting,
+moved-hash following, the pin's extras contract, and six runs on the
+real scheduler: among them a head waiter whose pin raises its shortfall
+(it gives its proof block back and the one grace that covers the rest
+yields), a request that needs the whole pool (admitted on its own proof
+block; it waited forever before), and the common-prefix count under a
+grace (none reported; the count returns once the pins are gone).
+---
+ .../test_partial_prefix_cache_hits.py         | 818 ++++++++++++++++++
+ vllm/v1/core/kv_cache_manager.py              | 302 ++++++-
+ vllm/v1/core/sched/scheduler.py               |  99 ++-
+ vllm/v1/core/single_type_kv_cache_manager.py  |  10 +-
+ 4 files changed, 1210 insertions(+), 19 deletions(-)
+
+diff --git a/tests/v1/core/prefix_cache/test_partial_prefix_cache_hits.py b/tests/v1/core/prefix_cache/test_partial_prefix_cache_hits.py
+index 75d6477f28..17e1cbc86a 100644
+--- a/tests/v1/core/prefix_cache/test_partial_prefix_cache_hits.py
++++ b/tests/v1/core/prefix_cache/test_partial_prefix_cache_hits.py
+@@ -2713,6 +2713,7 @@ def _tail_free_ids(manager) -> set[int]:
+ 
+ def _tail_assert_pool_clean(manager, num_blocks: int) -> None:
+     pool = manager.block_pool
++    assert not getattr(manager, "_grace_pins", {})  # released explicitly
+     assert pool.get_num_free_blocks() == num_blocks - 1  # all but the null block
+     assert all(blk.ref_cnt == 0 for blk in pool.blocks[1:])
+     mamba = _tail_mamba(manager)
+@@ -3391,3 +3392,820 @@ def test_deferred_abort_of_a_pinned_waiter_releases_the_pin(tail_retain):
+     assert pool.get_num_free_blocks() == baseline
+     pool.free_blocks(deferred)
+     _tail_assert_pool_clean(manager, 64)
++
++
++# ---------------------------------------------------------------------------
++# A finished turn's hashed blocks stay referenced ("grace") until the
++# conversation's next turn is admitted on them.
++# ---------------------------------------------------------------------------
++def _graces(manager) -> dict:
++    return getattr(manager, "_grace_pins", {})
++
++
++def _finish(request, status=None) -> None:
++    from vllm.v1.request import RequestStatus
++
++    request.status = status or RequestStatus.FINISHED_STOPPED
++
++
++def _finish_and_free(manager, request, path: str = "immediate", status=None):
++    """The scheduler's _free_request_blocks for a finished turn: free now, or
++    (a step still in flight) pop now and free the list at the fence."""
++    _finish(request, status)
++    if path == "immediate":
++        manager.free(request)
++    else:
++        deferred = manager.pop_blocks_for_free(request)
++        grace = _graces(manager).get(request.request_id, [])
++        assert all(b.ref_cnt >= 2 for b in grace)  # the table's + the grace's
++        manager.block_pool.free_blocks(deferred)  # the fence drains
++    _tail_drain_copies(manager)
++
++
++def _table_and_hold(manager, request) -> list:
++    blocks = [b for g in manager.get_blocks(request.request_id).blocks for b in g]
++    held = _tail_mamba(manager)._retained_checkpoints.get(request.request_id)
++    if held is not None:
++        blocks.append(held[1])
++    return [b for b in blocks if not b.is_null]
++
++
++@pytest.mark.parametrize("free_path", ["immediate", "deferred"])
++def test_finished_turn_keeps_its_prefix_through_the_arrival_gap(
++    tail_retain, free_path
++):
++    """The residual miss at a fine prefix unit: a conversation's turn A1
++    has finished and its next turn A2 has not been looked up yet. Meanwhile
++    another conversation's follow-up B1 is admitted, which frees blocks that
++    are dead from then on (B0's CoW source, superseded states) -- AFTER A1's
++    prefix -- and the running set then consumes about that many blocks. LRU
++    (without the grace) consumes A1's older prefix first, its top attention block
++    first, while the dead blocks survive: A2 is a total miss. With the grace
++    A1's hashed blocks stay referenced, the dead blocks go, A2 resumes at
++    A1's tail, and A2's admission hands the grace over (no double ref)."""
++    num_blocks = 64
++    manager = _tail_manager(num_blocks, attn_block=TAIL_BLOCK)
++    pool = manager.block_pool
++    a0 = make_request("A0", _tail_tokens(1, 150), TAIL_HASH, sha256)
++    _tail_run(manager, a0)
++    _finish_and_free(manager, a0, free_path)
++    a1 = _tail_followup(a0, 26, seed=3)
++    _tail_run(manager, a1)
++    a1_ids = {id(b) for b in _table_and_hold(manager, a1) if b.block_hash is not None}
++    _finish_and_free(manager, a1, free_path)
++    a1_tail = _tail_position(a1.num_prompt_tokens)
++
++    b0 = make_request("B0", _tail_tokens(2, 150), TAIL_HASH, sha256)
++    _tail_run(manager, b0)
++    _finish_and_free(manager, b0, free_path)
++    b1 = _tail_followup(b0, 26, seed=5)
++    _tail_run(manager, b1)  # B1 stays running
++
++    # The running set consumes as many blocks as are free besides A1's.
++    free_now = pool.free_block_queue.get_all_free_blocks()
++    dead = [b for b in free_now if id(b) not in a1_ids]
++    taken = pool.get_new_blocks(len(dead))
++
++    a2 = _tail_followup(a1, 20, seed=4)
++    _, num_hit, _ = manager.get_computed_blocks(a2)
++    if tail_retain:
++        assert num_hit == a1_tail
++    # (Retain off = the no-hold control: A1's tail state is a CoW copy
++    # nobody holds, so it is among the "dead" blocks and the hit drops.)
++    pool.free_blocks(taken)
++
++    # Admission hands the grace over: the table holds the hit, nothing else.
++    _tail_prefill(manager, a2)
++    if tail_retain:
++        assert a1.request_id not in _graces(manager)
++        attn = manager.coordinator.single_type_managers[TAIL_ATTN]
++        for block in attn.req_to_blocks[a2.request_id]:
++            if id(block) in a1_ids:
++                assert block.ref_cnt == 1
++    _tail_decode(manager, a2, steps=2)
++    _finish_and_free(manager, a2, free_path)
++    _finish_and_free(manager, b1, free_path)
++    assert {a2.request_id, b1.request_id} <= set(_graces(manager))
++    assert manager.yield_pinned_hits() > 0
++    _tail_assert_pool_clean(manager, num_blocks)
++
++
++def test_grace_pins_yield_before_waiter_pins_oldest_first_and_are_bounded(
++    tail_retain,
++):
++    num_blocks = 192
++    manager = _tail_manager(num_blocks, attn_block=TAIL_BLOCK)
++    finished = []
++    for i in range(3):
++        req = make_request(f"F{i}", _tail_tokens(10 + i, 150), TAIL_HASH, sha256)
++        _tail_run(manager, req)
++        _finish_and_free(manager, req)
++        finished.append(req)
++    assert list(_graces(manager)) == ["F0", "F1", "F2"]
++    for req in finished:
++        grace = manager.grace_pinned_blocks(req.request_id)
++        assert grace and all(b.block_hash is not None for b in grace)
++        assert all(b.ref_cnt == 1 for b in grace)
++
++    # A waiter pinned on F2's prefix: graces yield first, oldest first.
++    w = _tail_followup(finished[2], 20, seed=5)
++    assert manager.pin_waiting_hit(w) > 0
++    f0 = manager.grace_pinned_blocks("F0")
++    assert manager.yield_pinned_hits(limit=1) == len(f0)
++    assert all(b.ref_cnt == 0 for b in f0)  # back in the free queue
++    assert list(_graces(manager)) == ["F1", "F2"]
++    assert w.request_id in _pinned(manager)
++    assert manager.yield_pinned_hits(keep=w.request_id, limit=2) > 0
++    assert not _graces(manager) and w.request_id in _pinned(manager)
++    # The waiter's hit outlived F2's grace: its own pin holds it.
++    assert all(b.ref_cnt == 1 for b in _pinned(manager)[w.request_id])
++
++    # Bound: beyond MAX_GRACE_PINS the oldest grace goes.
++    for i in range(manager.MAX_GRACE_PINS + 2):
++        req = make_request(
++            f"G{i}", _tail_tokens(100 + i, 2 * TAIL_BLOCK + 9), TAIL_HASH, sha256
++        )
++        _tail_run(manager, req, decode_steps=1)
++        _finish_and_free(manager, req)
++    assert manager.num_grace_pins == manager.MAX_GRACE_PINS
++    assert list(_graces(manager))[0] == "G2"
++
++    # An aborted waiter (no output) takes no grace; reset releases all.
++    from vllm.v1.request import RequestStatus
++
++    _finish(w, RequestStatus.FINISHED_ABORTED)
++    manager.free(w)
++    assert w.request_id not in _graces(manager) and not _pinned(manager)
++    assert manager.reset_prefix_cache()
++    assert not _graces(manager) and not _pinned(manager)
++    _tail_assert_pool_clean(manager, num_blocks)
++
++
++@pytest.mark.parametrize("free_path", ["immediate", "deferred"])
++def test_grace_only_for_turns_that_finished_with_output(tail_retain, free_path):
++    """Abort after decoding / stop / length: grace. Error, ignored, a
++    preemption (frees while RUNNING), graces off (connector) and a
++    block-sized unit: plain free. Nothing leaks."""
++    from vllm.v1.request import RequestStatus
++
++    num_blocks = 96
++    manager = _tail_manager(num_blocks, attn_block=TAIL_BLOCK)
++    pool = manager.block_pool
++
++    def turn(name, seed, status):
++        req = make_request(
++            name, _tail_tokens(seed, 2 * TAIL_BLOCK + 9), TAIL_HASH, sha256
++        )
++        _tail_run(manager, req, decode_steps=1)
++        _finish_and_free(manager, req, free_path, status)
++        return req
++
++    graced = [
++        turn("stop", 1, RequestStatus.FINISHED_STOPPED),
++        turn("len", 2, RequestStatus.FINISHED_LENGTH_CAPPED),
++        turn("abort", 3, RequestStatus.FINISHED_ABORTED),
++    ]
++    plain = [
++        turn("err", 4, RequestStatus.FINISHED_ERROR),
++        turn("ign", 5, RequestStatus.FINISHED_IGNORED),
++        turn("pre", 6, RequestStatus.RUNNING),  # a preemption's free
++    ]
++    assert list(_graces(manager)) == [r.request_id for r in graced]
++    for req in plain:
++        assert req.request_id not in _graces(manager)
++    held = manager.num_grace_pinned_blocks
++    assert held > 0
++    assert pool.get_num_free_blocks() == num_blocks - 1 - held
++    manager.enable_grace_pins = False  # what the scheduler sets with a connector
++    turn("conn", 7, RequestStatus.FINISHED_STOPPED)
++    assert "conn" not in _graces(manager)
++    manager.enable_grace_pins = True
++    assert manager.yield_pinned_hits() == held
++    _tail_assert_pool_clean(manager, num_blocks)
++
++    # A block-sized prefix unit (the U=4096 lane): graces are off.
++    coarse = make_kv_cache_manager(
++        kv_cache_config=manager.kv_cache_config,
++        max_model_len=8192,
++        enable_caching=True,
++        hash_block_size=TAIL_BLOCK,
++        use_eagle=True,
++        retention_interval=0,
++    )
++    assert not coarse.enable_grace_pins
++
++
++def test_grace_pin_never_stops_a_running_request_at_a_full_pool(tail_retain):
++    """Pool exactly full (graces + running): a running request that needs a
++    block gets one after yielding one grace (the oldest), no preemption,
++    the newer graces stay; nothing leaks."""
++    num_blocks = 40
++    manager = _tail_manager(num_blocks, attn_block=TAIL_BLOCK)
++    pool = manager.block_pool
++    r = make_request("R", _tail_tokens(7, 2 * TAIL_BLOCK), TAIL_HASH, sha256)
++    _tail_run(manager, r, decode_steps=0)
++    for i in range(3):
++        req = make_request(
++            f"F{i}", _tail_tokens(20 + i, 2 * TAIL_BLOCK + 9), TAIL_HASH, sha256
++        )
++        _tail_run(manager, req, decode_steps=1)
++        _finish_and_free(manager, req)
++    taken = pool.get_new_blocks(pool.get_num_free_blocks())
++    assert pool.get_num_free_blocks() == 0 and manager.num_grace_pins == 3
++    r.append_output_token_ids(777)
++    r.spec_token_ids = [778, 779, 780]
++    blocks = manager.allocate_slots(r, 1 + TAIL_SPEC, num_lookahead_tokens=TAIL_SPEC)
++    assert blocks is None and manager.last_alloc_shortfall > 0
++    # The scheduler's running loop: yield one, retry; never preempt.
++    yields = 0
++    while blocks is None:
++        assert manager.yield_pinned_hits(limit=1) > 0, "nothing left to yield"
++        yields += 1
++        blocks = manager.allocate_slots(
++            r, 1 + TAIL_SPEC, num_lookahead_tokens=TAIL_SPEC
++        )
++    assert yields == 1 and manager.last_alloc_shortfall == 0
++    assert list(_graces(manager)) == ["F1", "F2"]
++    r.spec_token_ids = []
++    r.num_computed_tokens += 1
++    manager.new_step_starts()
++    _tail_drain_copies(manager)
++    pool.free_blocks(taken)
++    _finish_and_free(manager, r)
++    manager.yield_pinned_hits()
++    _tail_assert_pool_clean(manager, num_blocks)
++
++
++def test_yieldable_blocks_exclude_the_head_waiters_own_hit(tail_retain):
++    """num_yieldable_blocks counts only blocks a release would return to the
++    free queue: never the head waiter's own pinned hit."""
++    num_blocks = 96
++    manager = _tail_manager(num_blocks, attn_block=TAIL_BLOCK)
++    a0 = make_request("A0", _tail_tokens(1, 150), TAIL_HASH, sha256)
++    _tail_run(manager, a0)
++    _finish_and_free(manager, a0)
++    grace = manager.grace_pinned_blocks("A0")
++    assert manager.num_yieldable_blocks() == len(grace)
++    a1 = _tail_followup(a0, 26, seed=3)
++    assert manager.pin_waiting_hit(a1) > 0
++    own = {id(b) for b in _pinned(manager)[a1.request_id]}
++    others = [b for b in grace if id(b) not in own]
++    assert manager.num_yieldable_blocks(keep=a1.request_id) == len(others)
++    assert manager.num_yieldable_blocks() == len({id(b) for b in grace} | own)
++    _tail_run(manager, a1)  # admission releases both the pin and A0's grace
++    assert not _graces(manager) and not _pinned(manager)
++    _finish_and_free(manager, a1)
++    manager.yield_pinned_hits()
++    _tail_assert_pool_clean(manager, num_blocks)
++
++
++def test_pins_and_graces_follow_a_producers_moved_tail(tail_retain):
++    """Without the eagle drop a sibling can resume at a producer's LIVE tail
++    block. A waiter pin (and, retain on, a finished consumer's grace via its
++    hold) on that block must follow the hash into the producer's CoW copy:
++    otherwise it leaves ref 2 on a running state block its owner keeps
++    writing, and protects nothing."""
++    from vllm.v1.request import RequestStatus
++
++    num_blocks = 96
++    manager = _tail_manager(num_blocks, use_eagle=False)
++    pool = manager.block_pool
++
++    producer = make_request("P", _tail_tokens(1, 150), TAIL_HASH, sha256)
++    tail = producer.num_prompt_tokens // TAIL_HASH * TAIL_HASH
++    computed, num_hit, _ = manager.get_computed_blocks(producer)
++    while producer.num_computed_tokens < tail:
++        num_new = _tail_split(
++            producer,
++            producer.num_tokens - producer.num_computed_tokens,
++            use_eagle=False,
++        )
++        assert manager.allocate_slots(
++            producer, num_new, num_hit, computed, num_lookahead_tokens=TAIL_SPEC
++        )
++        producer.num_computed_tokens += num_new
++        computed, num_hit = None, 0
++        manager.new_step_starts()
++        _tail_drain_copies(manager)
++    [live] = pool.get_cached_block(
++        producer.block_hashes[tail // TAIL_HASH - 1], [TAIL_MAMBA]
++    )
++
++    # A consumer admitted on the live tail finishes (aborted after one output
++    # token) before the producer moves on; retain on, its hold of the live
++    # block becomes part of its grace.
++    consumer = make_request(
++        "C", list(producer.prompt_token_ids) + _tail_tokens(2, 30), TAIL_HASH, sha256
++    )
++    c_computed, c_hit, _ = manager.get_computed_blocks(consumer)
++    assert c_hit == tail
++    num_new = _tail_split(
++        consumer, consumer.num_tokens - c_hit, c_hit, use_eagle=False
++    )
++    assert manager.allocate_slots(
++        consumer, num_new, c_hit, c_computed, num_lookahead_tokens=TAIL_SPEC
++    )
++    consumer.num_computed_tokens = c_hit + num_new
++    consumer.append_output_token_ids(4242)
++    _finish(consumer, RequestStatus.FINISHED_ABORTED)
++    manager.free(consumer)
++    assert (live in manager.grace_pinned_blocks("C")) == tail_retain
++    # And a waiter pinned on the same live tail.
++    w = make_request(
++        "W", list(producer.prompt_token_ids) + _tail_tokens(3, 30), TAIL_HASH, sha256
++    )
++    assert manager.pin_waiting_hit(w) > 0
++    assert live in _pinned(manager)["W"]
++
++    # The producer's next chunk moves the tail hash into its CoW block.
++    manager.new_step_starts()
++    _tail_drain_copies(manager)
++    num_new = _tail_split(
++        producer, producer.num_tokens - producer.num_computed_tokens, use_eagle=False
++    )
++    assert manager.allocate_slots(producer, num_new, num_lookahead_tokens=TAIL_SPEC)
++    producer.num_computed_tokens += num_new
++    [moved] = pool.get_cached_block(
++        producer.block_hashes[tail // TAIL_HASH - 1], [TAIL_MAMBA]
++    )
++    assert moved is not live and live.block_hash is None
++    assert live not in manager.grace_pinned_blocks("C")
++    assert live not in _pinned(manager)["W"] and moved in _pinned(manager)["W"]
++    if tail_retain:
++        assert moved in manager.grace_pinned_blocks("C")
++    manager.new_step_starts()
++    _tail_drain_copies(manager)
++    assert live.ref_cnt == 1  # the producer's table alone
++
++    _tail_decode(manager, producer, steps=2)
++    _finish_and_free(manager, producer)
++    _, w_hit, _ = manager.get_computed_blocks(w)
++    assert w_hit == tail
++    manager.free(w)  # abort the waiter (no output: no grace)
++    manager.yield_pinned_hits()
++    _tail_assert_pool_clean(manager, num_blocks)
++
++
++# --- the real scheduler (full attention, block 16; graces forced on, as the
++# --- fine-grained hybrid lane gets them by default) -------------------------
++def _sched_request(request_id: str, tokens: list[int], max_tokens: int):
++    from vllm.sampling_params import SamplingParams
++    from vllm.v1.core.kv_cache_utils import get_request_block_hasher
++    from vllm.v1.request import Request
++
++    params = SamplingParams(ignore_eos=True, max_tokens=max_tokens)
++    params.update_from_generation_config({}, 50256)
++    return Request(
++        request_id=request_id,
++        prompt_token_ids=tokens,
++        sampling_params=params,
++        pooling_params=None,
++        block_hasher=get_request_block_hasher(16, sha256),
++    )
++
++
++def _sched_step(scheduler):
++    from vllm.v1.outputs import ModelRunnerOutput
++
++    out = scheduler.schedule()
++    req_ids = list(out.num_scheduled_tokens)
++    scheduler.update_from_output(
++        out,
++        ModelRunnerOutput(
++            req_ids=req_ids,
++            req_id_to_index={r: i for i, r in enumerate(req_ids)},
++            sampled_token_ids=[[7] for _ in req_ids],
++            logprobs=None,
++            prompt_logprobs_dict={},
++            pooler_output=[],
++        ),
++    )
++    return out
++
++
++def _grace_scheduler(num_blocks: int):
++    import os
++
++    from tests.v1.core.utils import create_scheduler
++
++    scheduler = create_scheduler(
++        model=os.environ.get("VLLM_TEST_DEFER_FREE_MODEL", "facebook/opt-125m"),
++        enable_prefix_caching=True,
++        num_blocks=num_blocks,
++        block_size=16,
++        max_num_seqs=4,
++    )
++    scheduler.kv_cache_manager.enable_grace_pins = True
++    return scheduler
++
++
++def _sched_finish(scheduler, request) -> None:
++    scheduler.add_request(request)
++    while not request.is_finished():
++        _sched_step(scheduler)
++
++
++def test_scheduler_running_request_yields_graces_never_preempts():
++    scheduler = _grace_scheduler(num_blocks=12)  # 11 usable
++    manager = scheduler.kv_cache_manager
++    pool = manager.block_pool
++    a = _sched_request("A", list(range(1000, 1048)), max_tokens=2)
++    _sched_finish(scheduler, a)
++    assert manager.num_grace_pinned_blocks == 3  # the 3 full prompt blocks
++    assert pool.get_num_free_blocks() == 8
++
++    r = _sched_request("R", list(range(2000, 2128)), max_tokens=4)  # 8 blocks
++    scheduler.add_request(r)
++    out = _sched_step(scheduler)  # admitted on the 8 free blocks
++    assert "R" in out.num_scheduled_tokens and manager.num_grace_pins == 1
++    assert pool.get_num_free_blocks() == 0
++    out = _sched_step(scheduler)  # token 129 needs a 9th block
++    assert "R" in out.num_scheduled_tokens
++    assert r.num_preemptions == 0 and not out.preempted_req_ids
++    assert manager.num_grace_pins == 0  # A's grace yielded instead
++    while not r.is_finished():
++        _sched_step(scheduler)
++    assert list(manager._grace_pins) == ["R"]
++    manager.yield_pinned_hits()
++    assert pool.get_num_free_blocks() == 11
++
++
++def test_scheduler_head_admission_yields_graces_only_when_they_cover_it():
++    scheduler = _grace_scheduler(num_blocks=12)  # 11 usable
++    manager = scheduler.kv_cache_manager
++    pool = manager.block_pool
++    a = _sched_request("A", list(range(1000, 1048)), max_tokens=2)
++    _sched_finish(scheduler, a)  # grace 3, free 8
++    r = _sched_request("R", list(range(2000, 2112)), max_tokens=6)  # 7 blocks
++    scheduler.add_request(r)
++    _sched_step(scheduler)
++    assert pool.get_num_free_blocks() == 1
++    # W needs 4 blocks; R's next decode takes the free one first, so 4 > 0
++    # free + 3 yieldable: no yield, W waits, A keeps its grace, nobody is
++    # preempted.
++    w = _sched_request("W", list(range(3000, 3064)), max_tokens=2)
++    scheduler.add_request(w)
++    out = _sched_step(scheduler)
++    assert "W" not in out.num_scheduled_tokens
++    assert manager.grace_pinned_blocks("A") and r.num_preemptions == 0
++    while not r.is_finished():
++        _sched_step(scheduler)
++        assert "W" not in scheduler.running or r.is_finished()
++    # R finished: grace 7, free 1 (R's unhashed tail). W (head) needs 4:
++    # the graces cover it, the OLDEST (A's) yields first and is enough.
++    out = _sched_step(scheduler)
++    assert "W" in out.num_scheduled_tokens
++    assert "A" not in manager._grace_pins and "R" in manager._grace_pins
++    assert w.num_preemptions == 0 and r.num_preemptions == 0
++    while not w.is_finished():
++        _sched_step(scheduler)
++    manager.yield_pinned_hits()
++    assert pool.get_num_free_blocks() == 11
++
++
++def _proof_pin_scene():
++    """99 usable blocks, EAGLE drop on. A (80 tokens) and B (16) finished; R
++    took every free block and its first decode step made A's grace (the
++    oldest) yield: R consumed A's 5th block, A's first four stay cached in
++    the free queue. Returns (scheduler, manager, pool, a, a4, r): free 4,
++    B's 1-block grace the only other pin."""
++    scheduler = _grace_scheduler(num_blocks=100)
++    manager = scheduler.kv_cache_manager
++    manager.coordinator.eagle_group_ids = {0}  # lookups drop the last hit block
++    pool = manager.block_pool
++    a = _sched_request("A", list(range(1000, 1080)), max_tokens=2)
++    _sched_finish(scheduler, a)  # grace: its 5 prompt blocks
++    b = _sched_request("B", list(range(2000, 2016)), max_tokens=2)
++    _sched_finish(scheduler, b)  # grace: 1 block, newer than A's
++    assert pool.get_num_free_blocks() == 93
++    r = _sched_request("R", list(range(3000, 4488)), max_tokens=4)
++    scheduler.add_request(r)
++    out = _sched_step(scheduler)
++    assert out.num_scheduled_tokens["R"] == 1488 and pool.get_num_free_blocks() == 0
++    _sched_step(scheduler)
++    assert list(manager._grace_pins) == ["B"] and r.num_preemptions == 0
++    assert pool.get_num_free_blocks() == 4
++    [a4] = pool.get_cached_block(a.block_hashes[3], [0])
++    assert a4.ref_cnt == 0
++    assert pool.get_cached_block(a.block_hashes[4], [0]) is None
++    return scheduler, manager, pool, a, a4, r
++
++
++def test_scheduler_head_waiter_measures_its_shortfall_after_pinning():
++    """The head waiter's own pin can raise its shortfall. With the EAGLE drop
++    its hit ends one block below what is cached, and that proof block is
++    pinned along with the hit; when it was free, the failed admission counted
++    it as free and the pin takes it out of the queue. The yield decision uses
++    the shortfall measured after the pin, and the head gives its proof block
++    back first: it is admitted in the same step on exactly the blocks it
++    pinned plus the one grace that covers the rest."""
++    scheduler, manager, pool, a, a4, r = _proof_pin_scene()
++    # H resends A's prompt: 4 cached blocks, the drop returns 3 and the 4th
++    # is the proof block. Admission needs 2 new blocks + the 3 free hit
++    # blocks against 4 free: short by 1 before the pin, by 2 after it (the
++    # pin took the proof block too). The proof block comes back first, B's
++    # grace covers the other one: H is admitted on its 48-token hit. Before
++    # the recompute B's grace yielded against the stale shortfall of 1 and
++    # H still waited.
++    h = _sched_request("H", list(a.prompt_token_ids), max_tokens=2)
++    scheduler.add_request(h)
++    out = _sched_step(scheduler)
++    assert out.num_scheduled_tokens["H"] == 32
++    assert not manager.pinned_hit_blocks("H") and not manager._grace_pins
++    assert pool.get_num_free_blocks() == 0 and r.num_preemptions == 0
++    while not (r.is_finished() and h.is_finished()):
++        _sched_step(scheduler)
++    manager.yield_pinned_hits()
++    assert pool.get_num_free_blocks() == 99
++
++
++def test_scheduler_head_waiter_keeps_every_pin_when_nothing_covers_it():
++    """Same scene, H one block longer: 3 new blocks needed, short by 3 after
++    the pin. Its proof block and B's grace together give 2: nothing is
++    released, nothing yields. B keeps its grace, H keeps its whole pin, and
++    once R has finished H is admitted on the hit the pin protected."""
++    scheduler, manager, pool, a, a4, r = _proof_pin_scene()
++    h = _sched_request("H", list(a.prompt_token_ids) + list(range(5000, 5016)), 2)
++    scheduler.add_request(h)
++    out = _sched_step(scheduler)
++    assert "H" not in out.num_scheduled_tokens
++    assert manager.grace_pinned_blocks("B"), "B's grace yielded for nothing"
++    assert len(manager.pinned_hit_blocks("H")) == 4 and a4.ref_cnt == 1
++    assert pool.get_num_free_blocks() == 0 and r.num_preemptions == 0
++    while not r.is_finished():
++        _sched_step(scheduler)
++    out = _sched_step(scheduler)  # R's grace covers it now; the oldest yields
++    assert out.num_scheduled_tokens["H"] == 96 - 48
++    assert not manager.pinned_hit_blocks("H")
++    while not h.is_finished():
++        _sched_step(scheduler)
++    manager.yield_pinned_hits()
++    assert pool.get_num_free_blocks() == 99
++
++
++def test_scheduler_head_waiter_gives_its_proof_block_back_at_an_exact_fit():
++    """No running request. A finished (grace on its 3 blocks). H resends A's
++    prompt + 1535 tokens: 99 blocks, the whole usable pool. Its hit is 3
++    blocks, the EAGLE drop returns 2 and the 3rd is pinned as the proof. H
++    needs 97 new blocks; the pool has 96 free plus the proof block, held by
++    A's grace and H's own pin. Nothing else ever yields H's own pin, so H
++    gives the proof block back itself, A's grace is then yieldable and H is
++    admitted. Before that H waited forever: shortfall 1, nothing yieldable."""
++    scheduler = _grace_scheduler(num_blocks=100)  # 99 usable
++    manager = scheduler.kv_cache_manager
++    manager.coordinator.eagle_group_ids = {0}
++    pool = manager.block_pool
++    a = _sched_request("A", list(range(1000, 1048)), max_tokens=2)
++    _sched_finish(scheduler, a)
++    assert pool.get_num_free_blocks() == 96 and manager.num_grace_pinned_blocks == 3
++
++    # One output token: the prompt's last block has room for it, so the
++    # whole request fits the pool exactly.
++    h = _sched_request("H", list(a.prompt_token_ids) + list(range(5000, 6535)), 1)
++    assert len(h.block_hashes) == 98 and h.num_prompt_tokens == 1583
++    scheduler.add_request(h)
++    out = _sched_step(scheduler)
++    assert out.num_scheduled_tokens.get("H") == 1583 - 32, (
++        f"H not admitted: free={pool.get_num_free_blocks()} "
++        f"own pin={len(manager.pinned_hit_blocks('H'))} "
++        f"graces={list(manager._grace_pins)} "
++        f"shortfall={manager.last_alloc_shortfall}"
++    )
++    assert h.is_finished() and not manager.pinned_hit_blocks("H")
++    assert list(manager._grace_pins) == ["H"]  # A's yielded, H's taken
++    manager.yield_pinned_hits()
++    assert pool.get_num_free_blocks() == 99
++
++
++def test_scheduler_pins_never_report_a_common_prefix():
++    """A finished on a 2-block system prefix and its grace holds it. R1
++    (system + own) and R2 (unrelated) run. The system blocks have ref 2 =
++    R1's table + A's grace, equal to the number of running requests, which
++    the per-block count would read as a prefix common to all of them. With
++    a pin or grace held the scheduler reports no common prefix, so cascade
++    attention cannot read R2 against blocks it does not share."""
++    scheduler = _grace_scheduler(num_blocks=64)
++    manager = scheduler.kv_cache_manager
++    system = list(range(500, 532))
++    a = _sched_request("A", system + list(range(1000, 1064)), max_tokens=2)
++    _sched_finish(scheduler, a)  # prompt 96: R1's 32-token hit is no follow-up
++    assert len(manager.grace_pinned_blocks("A")) == 6
++    r1 = _sched_request("R1", system + list(range(2000, 2032)), max_tokens=8)
++    r2 = _sched_request("R2", list(range(3000, 3048)), max_tokens=8)
++    scheduler.add_request(r1)
++    scheduler.add_request(r2)
++    out = _sched_step(scheduler)
++    assert "R1" in out.num_scheduled_tokens and "R2" in out.num_scheduled_tokens
++    assert "A" in manager._grace_pins
++    assert out.num_common_prefix_blocks == [0], out.num_common_prefix_blocks
++    # Without any pin the count is what it was: R2 gone, R3 joins the prefix,
++    # every running request shares the system blocks.
++    from vllm.v1.request import RequestStatus
++
++    scheduler.finish_requests("R2", RequestStatus.FINISHED_ABORTED)
++    manager.yield_pinned_hits()  # A's grace and R2's
++    r3 = _sched_request("R3", system + list(range(4000, 4032)), max_tokens=8)
++    scheduler.add_request(r3)
++    out = _sched_step(scheduler)
++    assert "R3" in out.num_scheduled_tokens and not manager._grace_pins
++    assert out.num_common_prefix_blocks == [2]
++    while not (r1.is_finished() and r3.is_finished()):
++        _sched_step(scheduler)
++    manager.yield_pinned_hits()
++    assert manager.block_pool.get_num_free_blocks() == 63
++
++
++def test_release_pinned_extras_drops_only_the_blocks_outside_the_hit():
++    """A waiter's pin = its hit + the proof block past it. Only the proof
++    block counts as yieldable for the waiter itself, and only when its hit is
++    given; releasing the extras drops exactly that block, once, and leaves a
++    block another holder still references out of the free queue."""
++    scheduler = _grace_scheduler(num_blocks=100)
++    manager = scheduler.kv_cache_manager
++    manager.coordinator.eagle_group_ids = {0}
++    pool = manager.block_pool
++    a = _sched_request("A", list(range(1000, 1048)), max_tokens=2)
++    _sched_finish(scheduler, a)  # grace on A1..A3
++    h = _sched_request("H", list(a.prompt_token_ids) + list(range(5000, 5064)), 2)
++    hit, num_hit, _ = manager.get_computed_blocks(h)
++    assert num_hit == 32 and len(hit.blocks[0]) == 2  # A3 dropped
++    assert manager.pin_waiting_hit(h) == 3  # A1, A2 + the proof A3
++    [a3] = pool.get_cached_block(a.block_hashes[2], [0])
++    assert a3.ref_cnt == 2  # A's grace + H's pin
++    assert manager.num_yieldable_blocks(keep="H") == 0
++    assert manager.num_yieldable_blocks(keep="H", keep_hit=hit.blocks) == 1
++    assert manager.release_pinned_extras("H", hit.blocks) == 1
++    assert manager.release_pinned_extras("H", hit.blocks) == 0
++    assert [b.block_id for b in manager.pinned_hit_blocks("H")] == [
++        b.block_id for b in hit.blocks[0]
++    ]
++    assert a3.ref_cnt == 1 and pool.get_num_free_blocks() == 96  # A's grace holds it
++    assert manager.num_yieldable_blocks(keep="H") == 1  # now A's grace can go
++    manager.yield_pinned_hits(keep="H")
++    assert a3.ref_cnt == 0 and pool.get_num_free_blocks() == 97
++    manager.release_pinned_hit("H")
++    assert pool.get_num_free_blocks() == 99
++
++
++def _check_pool_invariants(scheduler) -> None:
++    """Every block's refs are accounted for by a table, a deferred free, a
++    waiter pin or a grace; a referenced block is never in the free queue;
++    every ref-0 block is in it; nothing is pinned twice by one holder."""
++    manager = scheduler.kv_cache_manager
++    pool = manager.block_pool
++    expected: dict[int, int] = {}
++    holders = [
++        blocks
++        for group in manager.coordinator.single_type_managers
++        for blocks in group.req_to_blocks.values()
++    ]
++    holders += [blocks for _, blocks in scheduler.deferred_frees]
++    holders += list(manager._pinned_hits.values())
++    holders += list(manager._grace_pins.values())
++    for blocks in holders:
++        seen: set[int] = set()
++        for block in blocks:
++            if block.is_null:
++                continue
++            assert block.block_id not in seen, f"block {block.block_id} held twice"
++            seen.add(block.block_id)
++            expected[block.block_id] = expected.get(block.block_id, 0) + 1
++    free_ids = _free_block_ids(manager)
++    num_ref0 = 0
++    for block in pool.blocks:
++        if block.is_null:
++            continue
++        assert block.ref_cnt == expected.get(block.block_id, 0), (
++            f"block {block.block_id}: ref {block.ref_cnt}, "
++            f"holders {expected.get(block.block_id, 0)}"
++        )
++        if block.ref_cnt == 0:
++            num_ref0 += 1
++            assert block.block_id in free_ids, f"block {block.block_id} leaked"
++        else:
++            assert block.block_id not in free_ids, f"block {block.block_id} in queue"
++    assert num_ref0 == pool.get_num_free_blocks() == len(free_ids)
++
++
++def test_scheduler_random_mix_keeps_pool_invariants_and_progress():
++    """Seeded random request mixes on small pools (fresh, shared-prefix,
++    follow-up and exact-fit prompts, aborts, finishes, the EAGLE drop on or
++    off). After every step the pool accounting closes, and a head waiter
++    that fits an idle pool is admitted within three passes."""
++    import random
++
++    from vllm.v1.request import RequestStatus
++
++    for seed in range(200):
++        rng = random.Random(seed)
++        num_blocks = rng.randint(16, 40)
++        usable = num_blocks - 1
++        scheduler = _grace_scheduler(num_blocks=num_blocks)
++        manager = scheduler.kv_cache_manager
++        pool = manager.block_pool
++        if rng.random() < 0.7:
++            manager.coordinator.eagle_group_ids = {0}
++        prompts: list[list[int]] = []  # every prompt seen, for prefixes
++        finished_prompts: list[list[int]] = []  # with their outputs
++        live: dict[str, object] = {}
++        next_id = 0
++        stuck = 0
++        for _ in range(80):
++            if len(live) < 4 and rng.random() < 0.6:
++                kind = rng.choice(["fresh", "prefix", "follow", "exact", "exact"])
++                max_tokens = rng.randint(1, 6)
++                if kind == "fresh" or not prompts:
++                    n = rng.randint(1, max(1, usable * 16 - max_tokens))
++                    tokens = [rng.randint(1, 50000) for _ in range(n)]
++                elif kind == "prefix":
++                    base = rng.choice(prompts)
++                    cut = rng.randint(1, len(base))
++                    tokens = base[:cut] + [
++                        rng.randint(1, 50000) for _ in range(rng.randint(1, 48))
++                    ]
++                elif kind == "follow" and finished_prompts:
++                    tokens = rng.choice(finished_prompts) + [
++                        rng.randint(1, 50000) for _ in range(rng.randint(1, 64))
++                    ]
++                else:  # exact: a cached prompt extended to fill the pool
++                    base = rng.choice(finished_prompts or prompts)
++                    max_tokens = 1
++                    room = usable * 16 - 1 - len(base)
++                    tokens = base + [rng.randint(1, 50000) for _ in range(max(room, 1))]
++                limit = usable * 16 - max_tokens
++                if len(tokens) > limit:
++                    tokens = tokens[:limit]
++                if not tokens:
++                    continue
++                req = _sched_request(f"q{seed}-{next_id}", tokens, max_tokens)
++                next_id += 1
++                prompts.append(list(tokens))
++                scheduler.add_request(req)
++                live[req.request_id] = req
++            if live and rng.random() < 0.08:
++                victim = rng.choice(list(live))
++                scheduler.finish_requests(victim, RequestStatus.FINISHED_ABORTED)
++            idle_head = not scheduler.running and len(scheduler.waiting) > 0
++            head = scheduler.waiting.peek_request() if idle_head else None
++            out = _sched_step(scheduler)
++            _check_pool_invariants(scheduler)
++            if head is not None:
++                need = -(-(head.num_prompt_tokens + head.max_tokens) // 16)
++                if need <= usable and head.request_id not in out.num_scheduled_tokens:
++                    stuck += 1
++                    assert stuck < 3, (
++                        f"seed {seed}: head {head.request_id} ({need} blocks of "
++                        f"{usable}) not admitted on an idle pool: free "
++                        f"{pool.get_num_free_blocks()} own pin "
++                        f"{len(manager.pinned_hit_blocks(head.request_id))} "
++                        f"graces {manager.num_grace_pinned_blocks} shortfall "
++                        f"{manager.last_alloc_shortfall}"
++                    )
++                else:
++                    stuck = 0
++            for request_id, req in list(live.items()):
++                if req.is_finished():
++                    if req.num_output_tokens > 0:
++                        finished_prompts.append(list(req.all_token_ids))
++                    del live[request_id]
++        for request_id in list(live):
++            scheduler.finish_requests(request_id, RequestStatus.FINISHED_ABORTED)
++        _sched_step(scheduler)
++        manager.yield_pinned_hits()
++        _check_pool_invariants(scheduler)
++        assert pool.get_num_free_blocks() == usable, f"seed {seed}: leak"
++
++
++def test_scheduler_follow_up_is_admitted_on_the_grace_and_takes_it_over():
++    """A's next turn is admitted on A's grace and takes it over (no double
++    ref). A new conversation that only shares the system prompt with the
++    finished turns A and B releases neither grace."""
++    scheduler = _grace_scheduler(num_blocks=32)
++    manager = scheduler.kv_cache_manager
++    pool = manager.block_pool
++    system = list(range(500, 532))  # 2 shared blocks
++    a = _sched_request("A", system + list(range(1000, 1048)), max_tokens=2)
++    _sched_finish(scheduler, a)
++    b = _sched_request("B", system + list(range(2000, 2048)), max_tokens=2)
++    _sched_finish(scheduler, b)  # B's admission on the system blocks keeps A's
++    grace = manager.grace_pinned_blocks("A")
++    assert len(grace) == 5 and len(manager.grace_pinned_blocks("B")) == 5
++
++    c = _sched_request("C", system + list(range(3000, 3040)), max_tokens=2)
++    scheduler.add_request(c)
++    out = _sched_step(scheduler)
++    assert out.num_scheduled_tokens["C"] == c.num_prompt_tokens - 32  # system hit
++    assert set(manager._grace_pins) == {"A", "B"}
++
++    a2 = _sched_request("A2", list(a.all_token_ids) + list(range(4000, 4030)), 2)
++    scheduler.add_request(a2)
++    out = _sched_step(scheduler)
++    assert out.num_scheduled_tokens["A2"] == a2.num_prompt_tokens - 80  # hit 80
++    assert "A" not in manager._grace_pins and "B" in manager._grace_pins
++    shared = {id(blk) for blk in manager.grace_pinned_blocks("B")}
++    for blk in grace:  # A2's table (+ C's table or grace, B's grace: system)
++        assert blk.ref_cnt == 1 + 2 * (id(blk) in shared)
++    while not (a2.is_finished() and c.is_finished()):
++        _sched_step(scheduler)
++    manager.yield_pinned_hits()
++    assert pool.get_num_free_blocks() == 31
+diff --git a/vllm/v1/core/kv_cache_manager.py b/vllm/v1/core/kv_cache_manager.py
+index 3dbda90124..c0bc6c271c 100644
+--- a/vllm/v1/core/kv_cache_manager.py
++++ b/vllm/v1/core/kv_cache_manager.py
+@@ -240,6 +240,37 @@ class KVCacheManager:
+         # whenever a running request would otherwise fail to allocate
+         # (``yield_pinned_hits``), so a pin never causes a preemption.
+         self._pinned_hits: dict[str, list[KVCacheBlock]] = {}
++        # A finished request's hashed blocks (its attention prefix and
++        # the GDN states it holds) stay referenced as a "grace" pin until the
++        # conversation's next turn is admitted on them. With waiter pins alone,
++        # every remaining total miss had lost its top attention block BEFORE
++        # the next turn was first looked up -- in the gap between the
++        # previous turn's free and the next turn's arrival, or while its
++        # admission kept failing -- when nothing referenced the prefix and
++        # the running set's allocations popped it; once the hybrid hit is 0
++        # a waiter pin has nothing to pin. Grace pins yield first (oldest
++        # first) whenever anyone needs blocks, so they never cost a running
++        # request or an admission anything a free queue would have given.
++        # A grace is one extra ref per block, taken on whichever free path
++        # the request takes (immediate or deferred behind an in-flight step).
++        self._grace_pins: dict[str, list[KVCacheBlock]] = {}
++        self._grace_block_ids: dict[str, frozenset[int]] = {}
++        self._grace_prompt_tokens: dict[str, int] = {}
++        # Only for fine-grained hybrid hits (align Mamba hashed finer than its
++        # block): there the next turn's key sits in the top attention block
++        # and one lost block is a total miss; at a block-sized unit the top
++        # block is a spare and nothing changes. The scheduler also turns
++        # graces off when a KV connector is configured (as for waiter pins).
++        self.enable_grace_pins = (
++            self.enable_caching and self.coordinator.enable_partial_hash_hits
++        )
++        # Shortfall (blocks) of the last allocate_slots that returned None.
++        self.last_alloc_shortfall = 0
++        # A producer that moves its live GDN tail's hash to a CoW copy keeps
++        # writing the source; pins and graces follow the hash to the copy.
++        for manager in self.coordinator.single_type_managers:
++            if isinstance(manager, MambaManager):
++                manager.moved_hash_listeners.append(self._pins_follow_moved_hash)
+ 
+     @property
+     def usage(self) -> float:
+@@ -536,6 +567,9 @@ class KVCacheManager:
+             )
+             required_blocks = num_blocks_to_allocate + watermark_blocks
+             if required_blocks > self.block_pool.get_num_free_blocks():
++                self.last_alloc_shortfall = (
++                    required_blocks - self.block_pool.get_num_free_blocks()
++                )
+                 return None
+ 
+         num_tokens_main_model = total_computed_tokens + num_new_tokens
+@@ -575,7 +609,9 @@ class KVCacheManager:
+         required_blocks = num_blocks_to_allocate + watermark_blocks
+         if required_blocks > available_blocks:
+             # Cannot allocate new blocks
++            self.last_alloc_shortfall = required_blocks - available_blocks
+             return None
++        self.last_alloc_shortfall = 0
+ 
+         if (
+             new_computed_block_list is not self.empty_kv_cache_blocks.blocks
+@@ -601,6 +637,10 @@ class KVCacheManager:
+         # remote. Update state for locally cached blocks.
+         if delay_cache_blocks:
+             self.release_pinned_hit(request.request_id)
++            if self._grace_pins and num_new_computed_tokens > 0:
++                self._release_grace_for_hit(
++                    new_computed_block_list, num_local_computed_tokens
++                )
+             return self.create_kv_cache_blocks(new_blocks)
+ 
+         # NOTE(woosuk): We want to commit (cache) up to num_local_computed_tokens
+@@ -614,8 +654,13 @@ class KVCacheManager:
+         )
+         self.coordinator.cache_blocks(request, num_tokens_to_cache)
+ 
+-        # Admitted: the table now references the hit, the pin is redundant.
++        # Admitted: the table now references the hit, the pins are redundant.
+         self.release_pinned_hit(request.request_id)
++        if self._grace_pins and num_new_computed_tokens > 0:
++            # ... and so does the grace pin of the turn it resumes.
++            self._release_grace_for_hit(
++                new_computed_block_list, num_local_computed_tokens
++            )
+         return self.create_kv_cache_blocks(new_blocks)
+ 
+     def free(self, request: Request) -> None:
+@@ -627,7 +672,220 @@ class KVCacheManager:
+             request: The request to free the blocks.
+         """
+         self.release_pinned_hit(request.request_id)
+-        self.coordinator.free(request.request_id)
++        if not self._grace_eligible(request):
++            self.coordinator.free(request.request_id)
++            return
++        # Same blocks and order as coordinator.free (the deferred path frees
++        # this list as-is too); the grace takes its ref before the table's
++        # goes, so the hashed blocks never pass through the free queue.
++        blocks = self.coordinator.pop_blocks_for_free(request.request_id)
++        self._take_grace_pin(request, blocks)
++        self.block_pool.free_blocks(blocks)
++
++    # Finished requests whose hashed blocks stay pinned for the next turn
++    # (oldest released first beyond this). One per conversation is the
++    # need; twice the deployed max_num_seqs.
++    MAX_GRACE_PINS = 16
++
++    @property
++    def num_grace_pins(self) -> int:
++        return len(self._grace_pins)
++
++    @property
++    def num_grace_pinned_blocks(self) -> int:
++        return sum(len(blocks) for blocks in self._grace_pins.values())
++
++    def grace_pinned_blocks(self, request_id: str) -> list[KVCacheBlock]:
++        return list(self._grace_pins.get(request_id, ()))
++
++    def _grace_eligible(self, request: Request) -> bool:
++        """A turn that finished with output (stop, length, repetition, or
++        an abort after decoding) may have a next turn that resumes it. A
++        preemption (still RUNNING), an aborted waiter (no output), an error
++        or an ignored request leaves nothing worth holding."""
++        return (
++            self.enable_grace_pins
++            and self.enable_caching
++            and self.prefix_cache_lookup_enabled(request)
++            and request.is_finished()
++            and request.status
++            not in (RequestStatus.FINISHED_ERROR, RequestStatus.FINISHED_IGNORED)
++            and request.num_output_tokens > 0
++        )
++
++    def _take_grace_pin(self, request: Request, blocks: list[KVCacheBlock]) -> int:
++        """Take one extra ref on every hashed block of a finished request's
++        just-popped blocks (``blocks`` is in eviction order: each group's
++        table tail first, the held GDN states last). The caller then drops
++        the table refs, now or after the in-flight fence; the hashed blocks
++        stay out of the free queue until the grace is released. Unhashed
++        blocks (running state, MTP scratch, an unkeyed last block) go back
++        with the table refs as before. Returns the number of blocks held."""
++        keep: list[KVCacheBlock] = []
++        seen: set[int] = set()
++        for block in blocks:
++            if block.is_null or block.block_hash is None or id(block) in seen:
++                continue
++            # Still referenced by the request's table or hold: the grace ref
++            # never moves a block in or out of a free queue (any pool).
++            assert block.ref_cnt > 0
++            seen.add(id(block))
++            keep.append(block)
++        if not keep:
++            return 0
++        request_id = request.request_id
++        self.release_grace_pin(request_id)  # a repeated free: replace
++        for block in keep:
++            block.ref_cnt += 1
++        self._grace_pins[request_id] = keep
++        self._grace_block_ids[request_id] = frozenset(seen)
++        self._grace_prompt_tokens[request_id] = request.num_prompt_tokens
++        while len(self._grace_pins) > self.MAX_GRACE_PINS:
++            self.release_grace_pin(next(iter(self._grace_pins)))
++        return len(keep)
++
++    def release_grace_pin(self, request_id: str) -> int:
++        """Return a finished request's grace-pinned blocks to the pool (in
++        the eviction order a free would have used). Returns the count."""
++        blocks = self._grace_pins.pop(request_id, None)
++        self._grace_block_ids.pop(request_id, None)
++        self._grace_prompt_tokens.pop(request_id, None)
++        if not blocks:
++            return 0
++        self.block_pool.free_blocks(blocks)
++        return len(blocks)
++
++    def _release_grace_for_hit(
++        self,
++        computed_blocks: tuple[Sequence[KVCacheBlock], ...],
++        num_hit_tokens: int,
++    ) -> None:
++        """An admitted hit now references its blocks through the table, so
++        the grace of the turn it resumes has done its job. That turn is a
++        grace that holds the deepest hit block of every group whose deepest
++        hit block any grace holds (the GDN state it resumes from, the
++        attention block holding the key), and whose prompt the hit reaches
++        to within two prefix units (the EAGLE-dropped tail key). A new turn
++        that only shares a system prompt with finished conversations
++        releases none of theirs."""
++        candidates: set[str] | None = None
++        for group in computed_blocks:
++            deepest = next((b for b in reversed(group) if not b.is_null), None)
++            if deepest is None:
++                continue
++            owners = {
++                request_id
++                for request_id, block_ids in self._grace_block_ids.items()
++                if id(deepest) in block_ids
++            }
++            if owners:
++                candidates = owners if candidates is None else candidates & owners
++        if not candidates:
++            return
++        reach = num_hit_tokens + 2 * self.block_pool.hash_block_size
++        for request_id in candidates:
++            if reach >= self._grace_prompt_tokens.get(request_id, 0):
++                self.release_grace_pin(request_id)
++
++    def _pins_follow_moved_hash(
++        self, source_block: KVCacheBlock, cow_block: KVCacheBlock
++    ) -> None:
++        """A Mamba producer moved ``source_block``'s hashes to ``cow_block``
++        and keeps writing ``source_block``. A grace or waiter pin on the
++        source follows to the copy (as a hold does), so it protects the
++        hashed state and never leaves an extra ref on a block its owner must
++        hold exclusively (speculative relocation asserts on that)."""
++        for request_id, blocks in self._grace_pins.items():
++            if id(source_block) in self._grace_block_ids[request_id]:
++                self._swap_pinned_block(blocks, source_block, cow_block)
++                self._grace_block_ids[request_id] = frozenset(
++                    id(block) for block in blocks
++                )
++        for blocks in self._pinned_hits.values():
++            self._swap_pinned_block(blocks, source_block, cow_block)
++
++    def _swap_pinned_block(
++        self,
++        blocks: list[KVCacheBlock],
++        source_block: KVCacheBlock,
++        cow_block: KVCacheBlock,
++    ) -> None:
++        for i, block in enumerate(blocks):
++            if block is source_block:
++                if any(other is cow_block for other in blocks):
++                    del blocks[i]
++                else:
++                    assert cow_block.ref_cnt > 0
++                    cow_block.ref_cnt += 1
++                    blocks[i] = cow_block
++                self.block_pool.free_blocks([source_block])
++                return
++
++    def num_yieldable_blocks(
++        self,
++        keep: str | None = None,
++        keep_hit: tuple[Sequence[KVCacheBlock], ...] | None = None,
++    ) -> int:
++        """Blocks that would return to the free queue if every grace and
++        every waiter pin except ``keep``'s were released now. With
++        ``keep_hit`` (the hit ``keep`` is being admitted on), ``keep``'s
++        pinned blocks outside that hit (the proof block past it) count too:
++        ``release_pinned_extras`` can give them back. Blocks of that hit
++        never count: freed, they are taken straight back by the admission
++        (a hit that grew past the pin snapshot would otherwise be counted
++        through the grace that still holds it)."""
++        pins: dict[int, list] = {}
++        holders = [*self._grace_pins.values()] + [
++            blocks
++            for request_id, blocks in self._pinned_hits.items()
++            if request_id != keep
++        ]
++        hit_ids: set[int] = set()
++        if keep is not None and keep_hit is not None:
++            holders.append(self._pinned_extras(keep, keep_hit))
++            hit_ids = {id(block) for group in keep_hit for block in group}
++        for blocks in holders:
++            for block in blocks:
++                entry = pins.setdefault(id(block), [block, 0])
++                entry[1] += 1
++        return sum(
++            1
++            for block_id, (block, n) in pins.items()
++            if block.ref_cnt == n and block_id not in hit_ids
++        )
++
++    def _pinned_extras(
++        self, request_id: str, hit: tuple[Sequence[KVCacheBlock], ...]
++    ) -> list[KVCacheBlock]:
++        hit_ids = {id(block) for group in hit for block in group}
++        return [
++            block
++            for block in self._pinned_hits.get(request_id, ())
++            if id(block) not in hit_ids
++        ]
++
++    def release_pinned_extras(
++        self, request_id: str, hit: tuple[Sequence[KVCacheBlock], ...]
++    ) -> int:
++        """Drop from the request's pin the blocks outside ``hit``: the proof
++        block past it, and any hit block a later lookup added. The request
++        is being admitted on ``hit`` now, so they protect nothing it still
++        needs; they cost it blocks. Returns the number dropped."""
++        extras = self._pinned_extras(request_id, hit)
++        if not extras:
++            return 0
++        extra_ids = {id(block) for block in extras}
++        rest = [
++            block
++            for block in self._pinned_hits[request_id]
++            if id(block) not in extra_ids
++        ]
++        if rest:
++            self._pinned_hits[request_id] = rest
++        else:
++            del self._pinned_hits[request_id]
++        self.block_pool.free_blocks(extras)
++        return len(extras)
+ 
+     # Waiting requests whose prefix-cache hit is pinned at once (arrival
+     # order). Pins never block anyone (they yield before a running request
+@@ -653,11 +911,10 @@ class KVCacheManager:
+ 
+         Known gap: a pin is a snapshot of the hit at pin time. It is not
+         refreshed if the hit grows while the request waits (a sibling
+-        computing more of the same prefix) or if a producer moves the hash of
+-        a pinned live block into its CoW copy (a resume at a running
+-        producer's tail, unreachable under the EAGLE drop); the admission
+-        lookup still finds whatever is cached then, so the only cost is a
+-        smaller hit, never a wrong one."""
++        computing more of the same prefix); the admission lookup still finds
++        whatever is cached then, so the only cost is a smaller hit, never a
++        wrong one. A producer moving the hash of a pinned live GDN block into
++        its CoW copy is followed (``_pins_follow_moved_hash``)."""
+         request_id = request.request_id
+         if (
+             request_id in self._pinned_hits
+@@ -716,13 +973,21 @@ class KVCacheManager:
+         self, keep: str | None = None, limit: int | None = None
+     ) -> int:
+         """Drop pins (except ``keep``'s) so a running request can allocate,
+-        or a waiter ahead in line can be admitted: the most recently pinned
+-        waiters first, at most ``limit`` of them per call (all by default;
+-        the scheduler passes 1 and retries, so a decode step that needs a
+-        block costs one waiter its pin, not every waiter). Returns the number
+-        of blocks released; 0 means there was nothing to yield."""
++        or a waiter ahead in line can be admitted: grace pins of finished
++        turns first (oldest first), then the most recently pinned waiters, at
++        most ``limit`` pins per call (all by default; the scheduler passes 1
++        and retries, so a decode step that needs a block costs one pin, not
++        every pin). Returns the number of blocks released; 0 means there was
++        nothing to yield."""
+         released = 0
+         yielded = 0
++        # Grace pins first (oldest finished conversation first), then the
++        # waiters' pins (most recently pinned first).
++        for request_id in list(self._grace_pins):
++            if limit is not None and yielded >= limit:
++                return released
++            released += self.release_grace_pin(request_id)
++            yielded += 1
+         for request_id in reversed(list(self._pinned_hits)):
+             if request_id == keep:
+                 continue
+@@ -767,7 +1032,12 @@ class KVCacheManager:
+         # A pin is never written by an in-flight step (the waiter has no
+         # table), so it is released now, not with the deferred blocks.
+         self.release_pinned_hit(request.request_id)
+-        return self.coordinator.pop_blocks_for_free(request.request_id)
++        blocks = self.coordinator.pop_blocks_for_free(request.request_id)
++        # A finished turn whose last step is still in flight: the grace takes
++        # its ref now; the table refs go when the fence drains.
++        if self._grace_eligible(request):
++            self._take_grace_pin(request, blocks)
++        return blocks
+ 
+     def evict_blocks(self, block_ids: set[int]) -> None:
+         """evict blocks from the prefix cache by their block IDs.
+@@ -827,6 +1097,12 @@ class KVCacheManager:
+             list[int]: The number of common prefix blocks for each kv cache
+             group.
+         """
++        if self._pinned_hits or self._grace_pins:
++            # A pinned or graced block carries a ref that is not a running
++            # request's, so the ref count can equal the running count for a
++            # block only some of them share. Report no common prefix (cascade
++            # attention is an optimisation; a wrong prefix would be read).
++            return [0] * len(self.kv_cache_config.kv_cache_groups)
+         return self.coordinator.get_num_common_prefix_blocks(running_request_id)
+ 
+     def take_events(self) -> list[KVCacheEvent]:
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index fea77b1f9a..2ad6f1c256 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -347,6 +347,9 @@ class Scheduler(SchedulerInterface):
+         # Bind after construction so connectors can access the cache manager.
+         if self.connector is not None:
+             self.connector.bind_kv_cache_manager(self.kv_cache_manager)
++            # Finished turns' grace pins are off with a connector, as
++            # waiter pins are (_pin_waiting_hits).
++            self.kv_cache_manager.enable_grace_pins = False
+ 
+         self._log_prefix_cache_features()
+ 
+@@ -573,6 +576,15 @@ class Scheduler(SchedulerInterface):
+                 self.hash_block_size,
+                 self.block_size,
+             )
++        if manager.enable_grace_pins:
++            logger.info(
++                "Prefix cache: a finished turn's cached prefix stays referenced "
++                "until its next turn is admitted (up to %d turns; hash unit %d, "
++                "block %d)",
++                manager.MAX_GRACE_PINS,
++                self.hash_block_size,
++                self.block_size,
++            )
+ 
+     def _pin_waiting_hits(self) -> None:
+         """Pin the prefix-cache hits of the requests at the front of the
+@@ -1258,12 +1270,89 @@ class Scheduler(SchedulerInterface):
+                     has_scheduled_reqs=bool(self.running),
+                 )
+ 
+-                if new_blocks is None and self.kv_cache_manager.yield_pinned_hits(
+-                    keep=request_id
++                # Finished turns' grace pins (oldest first), then the
++                # pins of waiters behind this one, yield to it one at a time
++                # (arrival order). Its own hit is pinned first (a turn that
++                # arrived this step is not pinned yet and its hit may sit in
++                # a grace that yields), so only blocks it does not resume
++                # from go back. And only when releasing them all would cover
++                # the shortfall: otherwise yielding costs other conversations
++                # their prefix and still does not admit this one.
++                kv_cache_manager = self.kv_cache_manager
++                yield_for_head = new_blocks is None and (
++                    kv_cache_manager.last_alloc_shortfall > 0
++                    and (
++                        kv_cache_manager.num_grace_pins > 0
++                        or kv_cache_manager.num_pinned_waiters > 0
++                    )
++                )
++                if yield_for_head:
++                    if (
++                        self.connector is None
++                        and request.num_computed_tokens == 0
++                        and kv_cache_manager.pin_waiting_hit(request) > 0
++                    ):
++                        # The pin just took blocks out of the free queue that
++                        # the failed attempt counted as free: the proof block
++                        # past the hit, and any hit block the lookup above did
++                        # not return. Recompute the shortfall on the pinned
++                        # state before measuring it against the others' pins.
++                        new_blocks = self.kv_cache_manager.allocate_slots(
++                            request,
++                            num_new_tokens,
++                            num_new_computed_tokens=num_new_local_computed_tokens,
++                            new_computed_blocks=new_computed_blocks,
++                            num_lookahead_tokens=effective_lookahead_tokens,
++                            num_external_computed_tokens=num_external_computed_tokens,
++                            delay_cache_blocks=load_kv_async,
++                            num_encoder_tokens=num_encoder_tokens,
++                            full_sequence_must_fit=self.scheduler_reserve_full_isl,
++                            reserved_blocks=reserved_blocks,
++                            has_scheduled_reqs=bool(self.running),
++                        )
++                    yield_for_head = new_blocks is None and (
++                        kv_cache_manager.last_alloc_shortfall
++                        <= kv_cache_manager.num_yieldable_blocks(
++                            keep=request_id, keep_hit=new_computed_blocks.blocks
++                        )
++                    )
++                    if (
++                        yield_for_head
++                        and kv_cache_manager.release_pinned_extras(
++                            request_id, new_computed_blocks.blocks
++                        )
++                        > 0
++                    ):
++                        # Its own pinned blocks outside the hit it is admitted
++                        # on (the proof block past it) go first: they cost
++                        # nobody else anything, and at an exact fit they are
++                        # the blocks it needs. Retry on them before the others
++                        # yield.
++                        new_blocks = self.kv_cache_manager.allocate_slots(
++                            request,
++                            num_new_tokens,
++                            num_new_computed_tokens=num_new_local_computed_tokens,
++                            new_computed_blocks=new_computed_blocks,
++                            num_lookahead_tokens=effective_lookahead_tokens,
++                            num_external_computed_tokens=num_external_computed_tokens,
++                            delay_cache_blocks=load_kv_async,
++                            num_encoder_tokens=num_encoder_tokens,
++                            full_sequence_must_fit=self.scheduler_reserve_full_isl,
++                            reserved_blocks=reserved_blocks,
++                            has_scheduled_reqs=bool(self.running),
++                        )
++                # Coverage is re-read before every yield: a retry can fail
++                # by more than the attempt before it (the full-sequence gate
++                # passes, the lookahead gate does not).
++                while (
++                    yield_for_head
++                    and new_blocks is None
++                    and kv_cache_manager.last_alloc_shortfall
++                    <= kv_cache_manager.num_yieldable_blocks(
++                        keep=request_id, keep_hit=new_computed_blocks.blocks
++                    )
++                    and kv_cache_manager.yield_pinned_hits(keep=request_id, limit=1)
+                 ):
+-                    # Pins of waiters behind this one yield to it
+-                    # (arrival order); its own pin stays, those blocks are
+-                    # its hit. One retry with them back in the free queue.
+                     new_blocks = self.kv_cache_manager.allocate_slots(
+                         request,
+                         num_new_tokens,
+diff --git a/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/v1/core/single_type_kv_cache_manager.py
+index cf2b716078..24a72bb9ec 100644
+--- a/vllm/v1/core/single_type_kv_cache_manager.py
++++ b/vllm/v1/core/single_type_kv_cache_manager.py
+@@ -3,7 +3,7 @@
+ import itertools
+ from abc import ABC, abstractmethod
+ from collections import defaultdict
+-from collections.abc import Sequence
++from collections.abc import Callable, Sequence
+ from typing import TYPE_CHECKING, ClassVar
+ 
+ from vllm import envs
+@@ -1693,6 +1693,12 @@ class MambaManager(SingleTypeKVCacheManager):
+         # therefore hold their hashed endpoint here too: the moved tail for
+         # a running request, and the hit source a new request copies from.
+         self._retained_checkpoints: dict[str, tuple[int, KVCacheBlock]] = {}
++        # Callbacks (source_block, cow_block) run after a running
++        # request moved its live tail's hash to the CoW copy, for refs held
++        # outside this manager (the KVCacheManager's grace and waiter pins).
++        self.moved_hash_listeners: list[
++            Callable[[KVCacheBlock, KVCacheBlock], None]
++        ] = []
+         if self.mamba_cache_mode == "align" and self.enable_caching:
+             # The A/B evidence line: boot logs must show which arm ran.
+             logger.info_once(
+@@ -1789,6 +1795,8 @@ class MambaManager(SingleTypeKVCacheManager):
+                 self.block_pool.touch([cow_block])
+                 self._retained_checkpoints[request_id] = (position, cow_block)
+                 self.block_pool.free_blocks([source_block])
++        for listener in self.moved_hash_listeners:
++            listener(source_block, cow_block)
+ 
+     def pop_retained_checkpoints(self, request_id: str) -> list[KVCacheBlock]:
+         if self.mamba_cache_mode != "align":

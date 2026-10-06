@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Create a Proxmox VE LXC container for Flash-Next v2.2.0, modelled on the reference host: a PRIVILEGED Debian 13
+# Create a Proxmox VE LXC container for Flash-Next v2.5.1, modelled on the reference host: a PRIVILEGED Debian 13
 # container with the four cards passed through as devices. Run ON THE PROXMOX HOST as root:
 #
 #   CTID=201 MODELS=/path/to/models CACHE=/path/to/flash-next-cache lxc/pve-create.sh
@@ -42,7 +42,7 @@ for d in $NVIDIA_DEVS; do [ -e "$d" ] || {
   echo "  Load the NVIDIA kernel driver and create its device nodes on the HOST first:  nvidia-smi -L"
   echo "  (that creates /dev/nvidia* including the uvm nodes; nvidia-modprobe -u -c0 alone does not)"
   echo "  If the cards are bound to vfio-pci for a VM, unbind them from vfio-pci first."
-  echo "  To survive host reboots, attach lxc/nvidia-prestart.sh as the CT's pre-start hookscript (README, LXC section)."
+  echo "  To survive host reboots, attach lxc/nvidia-prestart.sh as the CT's pre-start hookscript (docs/reference.md, Proxmox LXC)."
   exit 1; }; done
 mkdir -p "$CACHE"
 [ -f "$MODELS/Qwen3.8-Flash-Next-W4A16-Merlin/config.json" ] || echo "note: $MODELS/Qwen3.8-Flash-Next-W4A16-Merlin/config.json not found; download the checkpoint there before provision.sh (it checks for it)"

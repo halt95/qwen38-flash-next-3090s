@@ -1,35 +1,48 @@
-NOTICE - Flash-Next v2.2.0 (vLLM fork)
+NOTICE - Flash-Next v2.5.1 (vLLM fork)
 
 This distribution contains a modified version of vLLM (https://github.com/vllm-project/vllm),
 Copyright (c) the vLLM project contributors, licensed under the Apache License, Version 2.0 (see LICENSE).
-Upstream base: tag v0.30.0 = ced6857afa0ea7b2e3f0846a62e1394e90f15607. Release: v2.2.0 = commit
-9c27ca9a0657338852c7d3e59561d424fc036fde (tree eebcd6480dba463294e9ca34f24eb770a45e11fe).
-Delta bundle: v2.2.0-from-upstream-v0.30.0.bundle (sha256 599b77644d661a2aae8c5ac69576deac1bca93d4820b6e08f5b9ca6b5d8e2f16;
-shipped gzipped as v2.2.0-from-upstream-v0.30.0.bundle.gz); patch series (reading aid): release/v2.2/patches/0001..0058;
-combined diff: release/v2.2/v2.2.0-combined.diff (v0.30.0 to the release commit).
+Upstream base: tag v0.30.0 = ced6857afa0ea7b2e3f0846a62e1394e90f15607. Release: v2.5.1 = commit
+96a0d13b6e98ad4ef86e66a3f6ddb5dd9199a591 (tree 0df6d7ef38f8ac927bb8feb7dc9887c2c94e3901).
+Delta bundle: v2.5.1-from-upstream-v0.30.0.bundle (sha256 d904e4685877e56b57c9a23a621b537239ba6316ad238c3848c5f03437d03d7c;
+shipped gzipped as v2.5.1-from-upstream-v0.30.0.bundle.gz); patch series (reading aid): release/v2.5/patches/0001..0097;
+combined diff: release/v2.5/v2.5.1-combined.diff (v0.30.0 to the release commit).
 Two compiled extensions are built from the modified sources (vllm/_C_stable_libtorch.abi3.so,
-vllm/_moe_C_stable_libtorch.abi3.so, in build-artifacts-sm86-py313-cu130-v2.2.0.tar.gz); the tarball's other build
-products are the unmodified vLLM 0.30.0 wheel's.
+vllm/_moe_C_stable_libtorch.abi3.so, in build-artifacts-sm86-py313-cu130-v2.2.0.tar.gz, built for v2.2.0; v2.5.1 changes
+no compiled source); the tarball's other build products are the unmodified vLLM 0.30.0 wheel's.
 
-Per Apache-2.0 section 4(b): relative to the upstream base, 85 files were added and 68 modified
-(153 total; `git diff --name-status v0.30.0 <release commit>`, generated 2026-09-24).
+Per Apache-2.0 section 4(b): relative to the upstream base, 105 files were added and 107 modified
+(212 total; `git diff --name-status v0.30.0 <release commit>`, generated 2026-10-04).
 
-Added (85):
+Added (105):
   probe/faultcut_gate.py
   probe/tp2_replay_sentinel.py
+  tests/config/test_recoverssm_config.py
+  tests/config/test_recoverssm_pp_config.py
+  tests/kernels/mamba/test_gdn_decode_paths.py
+  tests/kernels/mamba/test_recoverssm_gdn.py
+  tests/kernels/mamba/test_recoverssm_ple.py
+  tests/kernels/mamba/test_recoverssm_pp_deferral_kernels.py
   tests/kernels/merlin_sorted_emit_arm.py
   tests/kernels/moe/merlin_full_k_child.py
   tests/kernels/moe/test_merlin_full_k.py
   tests/kernels/test_merlin_qsa_sort.py
   tests/kernels/test_merlin_topk_sorted_emit.py
+  tests/merlin_cpu/mk_cpu_tests.sh
+  tests/merlin_cpu/triton_interp_fix.py
+  tests/models/kimi_k3/test_recoverssm_boundary.py
   tests/models/qwen4_exp/test_host_embed_capture_sentinel.py
   tests/models/qwen4_exp/test_host_uva_embedding.py
   tests/models/qwen4_exp/test_ple_fp8_selector_checkpoint.py
   tests/models/qwen4_exp/test_qsa_backend_capability.py
+  tests/models/qwen4_exp/test_qsa_clip_reader_lifecycle.py
   tests/models/qwen4_exp/test_qsa_ring_tag_contract.py
   tests/test_merlin_e2_toggles.py
+  tests/test_merlin_toggle_defaults.py
+  tests/v1/core/test_mamba_checkpoint_retention.py
   tests/v1/core/test_qsa_ring_resume_alignment.py
   tests/v1/core/test_ring_tag_clear.py
+  tests/v1/core/test_side_cache_layout.py
   tests/v1/engine/test_engine_core_teardown_signal.py
   tests/v1/executor/test_multiproc_executor_parent_death.py
   tests/v1/executor/test_multiproc_executor_start_method.py
@@ -66,6 +79,7 @@ Added (85):
   tests/v1/worker/gpu/__init__.py
   tests/v1/worker/gpu/ring_tag_replay.py
   tests/v1/worker/gpu/test_block_table_guards.py
+  tests/v1/worker/gpu/test_guard_default_mode.py
   tests/v1/worker/gpu/test_guard_reader_nonblocking.py
   tests/v1/worker/gpu/test_guard_telemetry_defaults_drain.py
   tests/v1/worker/gpu/test_guard_telemetry_limits.py
@@ -76,13 +90,19 @@ Added (85):
   tests/v1/worker/gpu/test_qsa_ring_skip_telemetry.py
   tests/v1/worker/gpu/test_qsa_ring_tags_gpu.py
   tests/v1/worker/gpu/test_qsa_rope_position_guard.py
+  tests/v1/worker/gpu/test_recoverssm_pp_deferral.py
   tests/v1/worker/test_draft_tokens_handler.py
   tests/v1/worker/test_e2_memstats.py
   tests/v1/worker/test_grammar_fail_closed.py
   tests/v1/worker/test_grammar_invalid_drafts.py
+  vllm/model_executor/layers/mamba/gdn/recoverssm_gdn.py
+  vllm/model_executor/layers/mamba/ops/recoverssm.py
+  vllm/model_executor/layers/mamba/recoverssm_utils.py
   vllm/model_executor/layers/ple_offload_layer.py
   vllm/models/qwen4_exp/nvidia/ops/topk_counters.py
   vllm/models/qwen4_exp/nvidia/ple_pull.py
+  vllm/v1/attention/backends/gdn_recoverssm.py
+  vllm/v1/attention/backends/ple_recoverssm.py
   vllm/v1/core/sched/e2_alloc_log.py
   vllm/v1/e2_guards.py
   vllm/v1/ple_offload/__init__.py
@@ -101,7 +121,7 @@ Added (85):
   vllm_ple_offload_bootstrap/__main__.py
   vllm_ple_test_fault/__init__.py
 
-Modified (68):
+Modified (107):
   csrc/libtorch_stable/moe/marlin_moe_wna16/kernel.h
   csrc/libtorch_stable/moe/marlin_moe_wna16/marlin_template.h
   csrc/libtorch_stable/moe/marlin_moe_wna16/ops.cu
@@ -110,28 +130,53 @@ Modified (68):
   csrc/libtorch_stable/topk.cu
   csrc/libtorch_stable/torch_bindings.cpp
   pyproject.toml
+  tests/compile/fullgraph/test_full_cudagraph.py
   tests/conftest.py
   tests/kernels/mamba/test_precopy_mamba_align.py
   tests/kernels/test_fused_sigmoid_gating_delta_rule.py
   tests/kernels/test_top_k_per_row.py
+  tests/models/kimi_k3/test_kda.py
+  tests/models/kimi_k3/test_kda_metadata.py
+  tests/models/qwen4_exp/test_ple.py
   tests/models/qwen4_exp/test_qsa_pre_indexer.py
   tests/models/qwen4_exp/test_qsa_reference.py
   tests/test_config.py
   tests/test_envs.py
+  tests/v1/attention/test_gdn_metadata_builder.py
+  tests/v1/core/prefix_cache/test_mamba_eagle_resume_checkpoint.py
   tests/v1/core/prefix_cache/test_partial_prefix_cache_hits.py
   tests/v1/core/test_deferred_block_free.py
+  tests/v1/core/test_kv_cache_utils.py
+  tests/v1/core/test_prefix_caching.py
   tests/v1/core/test_scheduler.py
   tests/v1/core/test_single_type_kv_cache_manager.py
+  tests/v1/cudagraph/test_cudagraph_manager.py
   tests/v1/executor/test_executor.py
+  tests/v1/spec_decode/test_dynamic_sd_cug.py
+  tests/v1/spec_decode/test_rejection_sampler_utils.py
+  tests/v1/worker/test_gpu_batch_ordering.py
+  tests/v1/worker/test_gpu_batch_shard.py
+  tests/v1/worker/test_gpu_model_runner_v2_cudagraph_profiling.py
+  tests/v1/worker/test_mamba_hybrid_model_state.py
   tests/v1/worker/test_mamba_utils.py
+  vllm/config/cache.py
   vllm/config/compilation.py
   vllm/config/engram.py
   vllm/config/parallel.py
   vllm/config/vllm.py
+  vllm/env_override.py
   vllm/envs.py
+  vllm/model_executor/layers/mamba/abstract.py
+  vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
   vllm/model_executor/layers/vocab_parallel_embedding.py
   vllm/model_executor/models/config.py
+  vllm/model_executor/models/interfaces.py
+  vllm/models/kimi_k3/nvidia/kda.py
+  vllm/models/kimi_k3/nvidia/kda_metadata.py
+  vllm/models/kimi_k3/nvidia/model.py
+  vllm/models/kimi_k3/nvidia/ops/recoverssm.py
   vllm/models/qwen4_exp/amd/indexer_qsa.py
+  vllm/models/qwen4_exp/amd/ple_layer.py
   vllm/models/qwen4_exp/common/qsa_cache.py
   vllm/models/qwen4_exp/nvidia/indexer_qsa.py
   vllm/models/qwen4_exp/nvidia/model.py
@@ -146,6 +191,10 @@ Modified (68):
   vllm/third_party/flash_linear_attention/ops/fused_recurrent.py
   vllm/third_party/flash_linear_attention/ops/fused_sigmoid_gating.py
   vllm/third_party/flash_linear_attention/ops/kda.py
+  vllm/v1/attention/backends/gdn_attn.py
+  vllm/v1/attention/backends/mamba_attn.py
+  vllm/v1/attention/backends/recoverssm_metadata.py
+  vllm/v1/attention/backends/short_conv_attn.py
   vllm/v1/attention/backends/utils.py
   vllm/v1/core/kv_cache_coordinator.py
   vllm/v1/core/kv_cache_manager.py
@@ -157,30 +206,42 @@ Modified (68):
   vllm/v1/executor/abstract.py
   vllm/v1/executor/multiproc_executor.py
   vllm/v1/executor/uniproc_executor.py
+  vllm/v1/kv_cache_interface.py
+  vllm/v1/worker/gpu/attn_utils.py
   vllm/v1/worker/gpu/block_table.py
   vllm/v1/worker/gpu/cudagraph_utils.py
+  vllm/v1/worker/gpu/input_batch.py
   vllm/v1/worker/gpu/model_runner.py
   vllm/v1/worker/gpu/model_states/interface.py
   vllm/v1/worker/gpu/model_states/mamba_hybrid.py
+  vllm/v1/worker/gpu/model_states/recoverssm.py
+  vllm/v1/worker/gpu/pcp_manager.py
+  vllm/v1/worker/gpu/pp_utils.py
   vllm/v1/worker/gpu/sample/batch_shard.py
+  vllm/v1/worker/gpu/spec_decode/autoregressive/cudagraph_utils.py
+  vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py
+  vllm/v1/worker/gpu/spec_decode/multi_module_mtp/speculator.py
   vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
   vllm/v1/worker/gpu/spec_decode/utils.py
+  vllm/v1/worker/gpu/ubatch_utils.py
   vllm/v1/worker/gpu_model_runner.py
   vllm/v1/worker/gpu_worker.py
   vllm/v1/worker/mamba_utils.py
   vllm/v1/worker/utils.py
   vllm/v1/worker/worker_base.py
 
-Some of these changes are ports of upstream vLLM pull requests, applied ahead of or on top of the base, under their
-Apache-2.0 licence. In the v2.2.0 series they are committed under the maintainer's name, named by PR number in the
-commit messages, and credited to their authors here: #46994 (eastwood-c; MTP under pipeline parallelism, minus its
-ROCm MLA file), #48532 (woosebastian), #50021 (amittell), #54442 (ArcheyChen) and #56802 (Prudctual) (structured
-output under pipeline parallelism, upstream issue #54437), #54793 and #54795 (saichowdary007), #55506 (Karl0007),
-#55557 (semerandre) and #57050 (wzhao18). The v2.0.1 series (release/v2/patches) keeps the upstream authors as the
-patch authors of the five upstream commits it carries.
+Some of these changes are ports of upstream vLLM pull requests, applied on top of the base, under their Apache-2.0
+licence. They are committed under the maintainer's name, named by PR number in the commit messages, and credited to
+their authors here. From the v2.2.0 series: #46994 (eastwood-c; MTP under pipeline parallelism; the PR itself is in the
+v0.30.0 base, and the series applies its stage-ownership pattern to the Qwen4Exp model), #48532 (woosebastian), #50021 (amittell), #54442 (ArcheyChen) and #56802 (Prudctual) (structured output under
+pipeline parallelism, upstream issue #54437), #54793 and #54795 (saichowdary007), #55506 (Karl0007), #55557
+(semerandre) and #57050 (wzhao18). Added in v2.5.1: #51565 (cherry77-cloud), #55390 (Navjot Singh), #57102 (Juntian
+Liu), #58114 (Jiangyun Zhu), #58275 (Andreas Karatzas), #58368 (Netanel Haber), #58400 (Nick Hill), #58762 (Luca
+Motz), #58784 (qizixi) and #58863 (RecoverSSM; Jurgen Schmied and Zihua Wu). The v2.0.1 series (release/v2/patches)
+keeps the upstream authors as the patch authors of the five upstream commits it carries.
 
-This file lists the v2.2.0 delta only. The modified-file list for v2.0.1 (reading aids in release/v2/) is in NOTICE
-at tag v2.0.1; the v1 patches in patches/ name the files they change.
+This file lists the v2.5.1 delta only. The modified-file lists for v2.2.0 and v2.0.1 are in NOTICE at tags v2.2.0 and
+v2.0.1; the v1 patches in patches/ name the files they change.
 
 Model weights are not part of this distribution. Qwen3.8-Flash-Next and its quantised derivatives
 (Intel AutoRound experts, RadixArk FP8 PLE table, our in-place packing) carry the Qwen Community License 1.0

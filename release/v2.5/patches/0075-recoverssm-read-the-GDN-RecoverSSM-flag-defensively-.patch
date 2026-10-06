@@ -1,0 +1,25 @@
+From bfb30213a18ea0c9c68705354f2cb008c2dde428 Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Tue, 29 Sep 2026 18:40:22 -0700
+Subject: [PATCH 75/97] recoverssm: read the GDN RecoverSSM flag defensively in
+ _forward_core (port of upstream #58863, c1d2da8773)
+
+Port of the upstream vLLM change #58863 (Apache-2.0). One check read use_gdn_recoverssm directly; it now uses getattr with a False
+default like its neighbours, so layers built without __init__ in tests work.
+---
+ vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py b/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+index 2d6b675636..80b1344e59 100644
+--- a/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
++++ b/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+@@ -1470,7 +1470,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+         if (
+             spec_sequence_masks is not None
+             and mixed_qkv_spec is not None
+-            and self.use_gdn_recoverssm
++            and getattr(self, "use_gdn_recoverssm", False)
+         ):
+             query_spec, key_spec, value_spec, verify_views = (
+                 self._recoverssm_verify_qkv(mixed_qkv_spec)

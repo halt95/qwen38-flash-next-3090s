@@ -1,0 +1,451 @@
+From c64a07fef7b167c0f603c0f4312d917b8eae5c8f Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Mon, 28 Sep 2026 12:48:52 -0700
+Subject: [PATCH 66/97] cudagraph: allow FULL decode graphs for one-token
+ prompt tails (port of upstream #58400)
+
+Port of the upstream vLLM change #58400 (Apache-2.0). A prompt tail of one token can run under the FULL decode graph. The
+speculative-row rule of v0.30.0 (num_scheduled_tokens == drafts + 1) is kept, because the upstream rule depends
+on a later change not in this base.
+---
+ tests/v1/spec_decode/test_dynamic_sd_cug.py   | 12 ++--
+ tests/v1/worker/test_gpu_batch_ordering.py    | 69 +++++++++++++++++--
+ tests/v1/worker/test_gpu_batch_shard.py       |  1 +
+ .../worker/test_mamba_hybrid_model_state.py   |  1 +
+ vllm/v1/worker/gpu/input_batch.py             |  8 +++
+ vllm/v1/worker/gpu/model_runner.py            | 49 ++++++++++---
+ .../worker/gpu/model_states/mamba_hybrid.py   |  9 ++-
+ vllm/v1/worker/gpu/pcp_manager.py             |  5 +-
+ .../spec_decode/autoregressive/speculator.py  |  2 +-
+ .../multi_module_mtp/speculator.py            |  2 +-
+ vllm/v1/worker/gpu/ubatch_utils.py            |  5 ++
+ vllm/v1/worker/utils.py                       |  6 +-
+ 12 files changed, 140 insertions(+), 29 deletions(-)
+
+diff --git a/tests/v1/spec_decode/test_dynamic_sd_cug.py b/tests/v1/spec_decode/test_dynamic_sd_cug.py
+index a5cbd119bc..1ca8486ec7 100644
+--- a/tests/v1/spec_decode/test_dynamic_sd_cug.py
++++ b/tests/v1/spec_decode/test_dynamic_sd_cug.py
+@@ -128,7 +128,7 @@ def test_dynamic_sd_full_cudagraph_covers_all_uniform_decode_shapes(monkeypatch)
+                 num_reqs,
+                 num_tokens,
+                 max_query_len,
+-                has_prefill=False,
++                decode_graph_eligible=True,
+             )
+ 
+             # The scheduler should mark every one of these shapes as a uniform
+@@ -266,14 +266,14 @@ def test_prompt_chunks_shaped_like_spec_decode_miss_the_full_graph(monkeypatch):
+     # The batch shape is indistinguishable from a full batch of spec decodes.
+     assert (
+         get_uniform_decode_token_count(
+-            num_reqs, num_tokens, decode_query_len, has_prefill=False
++            num_reqs, num_tokens, decode_query_len, decode_graph_eligible=True
+         )
+         == decode_query_len
+     )
+ 
+     # Two of the requests are decode_query_len tokens into a longer prompt.
+     uniform_tok_count = get_uniform_decode_token_count(
+-        num_reqs, num_tokens, decode_query_len, has_prefill=True
++        num_reqs, num_tokens, decode_query_len, decode_graph_eligible=False
+     )
+     assert uniform_tok_count is None
+     desc = manager.dispatch(
+@@ -287,7 +287,7 @@ def test_prompt_chunks_shaped_like_spec_decode_miss_the_full_graph(monkeypatch):
+ 
+     # The same shape with every request decoding still gets its FULL graph.
+     uniform_tok_count = get_uniform_decode_token_count(
+-        num_reqs, num_tokens, decode_query_len, has_prefill=False
++        num_reqs, num_tokens, decode_query_len, decode_graph_eligible=True
+     )
+     assert uniform_tok_count == decode_query_len
+     desc = manager.dispatch(
+@@ -341,7 +341,7 @@ def test_basic_sd_does_not_capture_shorter_full_decode_shapes(monkeypatch):
+                 num_reqs,
+                 num_tokens,
+                 max_query_len,
+-                has_prefill=False,
++                decode_graph_eligible=True,
+             )
+             assert uniform_tok_count == max_query_len
+ 
+@@ -407,7 +407,7 @@ def test_dynamic_sd_only_captures_scheduled_query_lengths(monkeypatch):
+                 num_reqs,
+                 num_tokens,
+                 max_query_len,
+-                has_prefill=False,
++                decode_graph_eligible=True,
+             )
+             assert uniform_tok_count == max_query_len
+ 
+diff --git a/tests/v1/worker/test_gpu_batch_ordering.py b/tests/v1/worker/test_gpu_batch_ordering.py
+index 5037dcc7a9..db9e080e4e 100644
+--- a/tests/v1/worker/test_gpu_batch_ordering.py
++++ b/tests/v1/worker/test_gpu_batch_ordering.py
+@@ -56,6 +56,7 @@ def _make_runner(
+     runner: Any = GPUModelRunner.__new__(GPUModelRunner)
+     runner.decode_query_len = decode_query_len
+     runner.adaptive_verification = None
++    runner.pcp_manager = None
+     runner.req_states = SimpleNamespace(
+         req_id_to_index={req_id: i for i, req_id in enumerate(req_states)},
+         # The runner keeps this as min(num_computed_tokens, prefill_len).
+@@ -128,6 +129,65 @@ def test_prompt_chunk_of_decode_query_len_is_not_uniform_decode():
+     assert _uniform_token_count({"p0": (0, 8)}, 8) is None
+ 
+ 
++def test_one_new_prompt_token_over_context_runs_as_decode():
++    # A prompt tail padded with placeholder drafts and a one-token mid-prompt
++    # chunk both compute like decodes. A fresh one-token prompt and a real
++    # multi-token chunk don't.
++    batch = {"d0": (16, 16), "tail": (128, 129), "mid": (64, 129)}
++    batch.update({"fresh": (0, 1), "chunk": (120, 129)})
++    runner = _make_runner(batch, decode_query_len=4)
++    scheduler_output = SimpleNamespace(
++        num_scheduled_tokens={"d0": 4, "tail": 4, "mid": 1, "fresh": 1, "chunk": 4},
++        total_num_scheduled_tokens=14,
++        scheduled_spec_decode_tokens={"d0": [1, 2, 3], "tail": [-1] * 3},
++    )
++    state, _ = runner.gather_batch_req_state(scheduler_output, False)
++    assert state is not None
++    runs_as_decode = dict(zip(state.req_ids, state.prefill_runs_as_decode_np))
++    assert runs_as_decode == {
++        "d0": False,
++        "tail": True,
++        "mid": True,
++        "fresh": False,
++        "chunk": False,
++    }
++
++
++def test_one_token_prompt_tail_with_prior_context_is_uniform_decode():
++    # Replaying the last prompt token over existing context (full prefix-cache
++    # hit or P/D KV import) computes exactly like a decode.
++    batch = {"d0": (16, 16), "d1": (16, 16), "p0": (128, 129)}
++    assert _uniform_token_count(batch, 1) == 1
++
++    # A fresh 1-token prompt alongside it has no prior state.
++    batch["p1"] = (0, 1)
++    assert _uniform_token_count(batch, 1) is None
++
++    # Only one-token tails qualify, not K+1 chunks with prior context.
++    assert _uniform_token_count({"d0": (16, 16), "p0": (120, 129)}, 8) is None
++
++
++def test_padded_prompt_tail_with_prior_context_is_uniform_decode():
++    # The scheduler pads a one-token prompt tail with K placeholder drafts to
++    # keep the K+1 spec-decode shape; it verifies like any other decode.
++    batch = {"d0": (16, 16), "d1": (16, 16), "p0": (128, 129)}
++    runner = _make_runner(batch, decode_query_len=4)
++    scheduler_output = SimpleNamespace(
++        num_scheduled_tokens={req_id: 4 for req_id in batch},
++        total_num_scheduled_tokens=12,
++        scheduled_spec_decode_tokens={req_id: [-1] * 3 for req_id in batch},
++    )
++    state, uniform_tok_count = runner.gather_batch_req_state(scheduler_output, False)
++    assert state.has_prefill and state.decode_graph_eligible
++    assert uniform_tok_count == 4
++
++    # Without the placeholder drafts, it is a real 4-token prompt chunk.
++    del scheduler_output.scheduled_spec_decode_tokens["p0"]
++    state, uniform_tok_count = runner.gather_batch_req_state(scheduler_output, False)
++    assert not state.decode_graph_eligible
++    assert uniform_tok_count is None
++
++
+ def test_dummy_batches_stay_uniform_decode():
+     # Dummy batches have no request state to consult and must stay classified
+     # by shape alone; rejecting them would make capture and replay disagree.
+@@ -185,6 +245,7 @@ def test_uniform_decode_uses_state_index_not_batch_position():
+     runner: Any = GPUModelRunner.__new__(GPUModelRunner)
+     runner.decode_query_len = 8
+     runner.adaptive_verification = None
++    runner.pcp_manager = None
+     # State arrays in state-index order: a prefilling request, then two decodes.
+     runner.req_states = SimpleNamespace(
+         req_id_to_index={"prefilling": 0, "decode_a": 1, "decode_b": 2},
+@@ -214,11 +275,11 @@ def test_uniform_decode_uses_state_index_not_batch_position():
+ 
+ 
+ def test_uniform_decode_predicate():
+-    # Shape and prefill state must both pass.
+-    assert get_uniform_decode_token_count(2, 16, 8, False) == 8
+-    assert get_uniform_decode_token_count(2, 16, 8, True) is None
++    # Shape and decode-graph eligibility must both pass.
++    assert get_uniform_decode_token_count(2, 16, 8, True) == 8
++    assert get_uniform_decode_token_count(2, 16, 8, False) is None
+     # 12 tokens over 2 requests is no shared query length.
+-    assert get_uniform_decode_token_count(2, 12, 8, False) is None
++    assert get_uniform_decode_token_count(2, 12, 8, True) is None
+ 
+ 
+ def test_no_speculator_dispatches_on_query_length_alone():
+diff --git a/tests/v1/worker/test_gpu_batch_shard.py b/tests/v1/worker/test_gpu_batch_shard.py
+index 1309686d53..64c718790e 100644
+--- a/tests/v1/worker/test_gpu_batch_shard.py
++++ b/tests/v1/worker/test_gpu_batch_shard.py
+@@ -96,6 +96,7 @@ def _make_batch(
+         num_computed_prefill_tokens_np=np.zeros(num_reqs, dtype=np.int32),
+         is_prefilling_np=np.zeros(num_reqs, dtype=np.bool_),
+         has_prefill=False,
++        decode_graph_eligible=True,
+         input_ids=torch.zeros(num_tokens, dtype=torch.int32, device=DEVICE),
+         positions=torch.arange(num_tokens, dtype=torch.int64, device=DEVICE),
+         is_padding=torch.zeros(num_tokens, dtype=torch.bool, device=DEVICE),
+diff --git a/tests/v1/worker/test_mamba_hybrid_model_state.py b/tests/v1/worker/test_mamba_hybrid_model_state.py
+index 0cdd91e0d7..caec567693 100644
+--- a/tests/v1/worker/test_mamba_hybrid_model_state.py
++++ b/tests/v1/worker/test_mamba_hybrid_model_state.py
+@@ -37,6 +37,7 @@ def test_prepare_attn_forwards_positions(monkeypatch: pytest.MonkeyPatch) -> Non
+         seq_lens_cpu_upper_bound=torch.tensor([1537], dtype=torch.int32),
+         seq_lens=torch.tensor([1537], dtype=torch.int32),
+         is_prefilling_np=torch.tensor([False]).numpy(),
++        prefill_runs_as_decode_np=None,
+         dcp_local_seq_lens=None,
+         positions=positions,
+         prompt_lens=torch.tensor([1024], dtype=torch.int32),
+diff --git a/vllm/v1/worker/gpu/input_batch.py b/vllm/v1/worker/gpu/input_batch.py
+index d3c65bd06f..cdeb6e1650 100644
+--- a/vllm/v1/worker/gpu/input_batch.py
++++ b/vllm/v1/worker/gpu/input_batch.py
+@@ -86,6 +86,8 @@ class InputBatch:
+     is_prefilling_np: np.ndarray
+     # == np.any(is_prefilling_np)
+     has_prefill: bool
++    # No prefills, or only prefill rows that run as decodes.
++    decode_graph_eligible: bool
+ 
+     # [num_tokens_after_padding]
+     input_ids: torch.Tensor
+@@ -118,6 +120,11 @@ class InputBatch:
+     # [num_reqs] set only under PCP+DCP (see CommonAttentionMetadata).
+     dcp_local_seq_lens_cpu_upper_bound: torch.Tensor | None = None
+ 
++    # [num_reqs] prefilling rows that schedule one new prompt token (excluding
++    # drafts) over existing context and so compute exactly like decodes.
++    # None if there are no prefills.
++    prefill_runs_as_decode_np: np.ndarray | None = None
++
+     @classmethod
+     def make_dummy(
+         cls,
+@@ -200,6 +207,7 @@ class InputBatch:
+             num_computed_prefill_tokens_np=np.zeros(num_reqs, dtype=np.int32),
+             is_prefilling_np=np.zeros(num_reqs, dtype=np.bool_),
+             has_prefill=False,
++            decode_graph_eligible=True,
+             input_ids=input_ids,
+             positions=positions,
+             is_padding=is_padding,
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 92ae922578..246fe4c632 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -1324,7 +1324,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         if dummy_run:
+             # Dummy batches are uniform by construction.
+             return None, get_uniform_decode_token_count(
+-                num_reqs, num_toks, max_query_len, has_prefill=False
++                num_reqs, num_toks, max_query_len, decode_graph_eligible=True
+             )
+ 
+         draft_tokens = scheduler_output.scheduled_spec_decode_tokens
+@@ -1343,24 +1343,48 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             idx_mapping_np
+         ]
+         is_prefilling_np = num_computed_prefill_tokens_np < prefill_len_np
++        has_prefill = bool(is_prefilling_np.any())
+ 
+-        if self.adaptive_verification is not None and draft_tokens:
+-            num_toks = self.adaptive_verification.get_num_tokens(
+-                num_tokens_per_req, draft_tokens
++        num_draft_tokens_np = None
++        if draft_tokens:
++            num_drafts_iter = (len(draft_tokens.get(req_id, ())) for req_id in req_ids)
++            num_draft_tokens_np = np.fromiter(
++                num_drafts_iter, dtype=np.int32, count=num_reqs
++            )
++            if self.adaptive_verification is not None:
++                num_toks = self.adaptive_verification.get_num_tokens(
++                    num_tokens_per_req, draft_tokens
++                )
++
++        prefill_runs_as_decode_np = None
++        decode_graph_eligible = not has_prefill
++        if has_prefill and self.pcp_manager is None:
++            # One new prompt token over existing context (possibly padded with
++            # placeholder drafts) runs as a decode. PCP partitions prefill rows.
++            num_new_tokens = num_scheduled_tokens
++            if num_draft_tokens_np is not None:
++                num_new_tokens = num_new_tokens - num_draft_tokens_np
++            one_token_ext = (num_new_tokens == 1) & (num_computed_prefill_tokens_np > 0)
++            prefill_runs_as_decode_np = is_prefilling_np & one_token_ext
++            decode_graph_eligible = bool(
++                (prefill_runs_as_decode_np | ~is_prefilling_np).all()
+             )
+ 
+         batch_state = BatchReqState(
+             req_ids=req_ids,
+             num_scheduled_tokens=num_scheduled_tokens,
+             num_tokens=num_toks,
++            num_draft_tokens_np=num_draft_tokens_np,
+             idx_mapping_np=idx_mapping_np,
+             prefill_len_np=prefill_len_np,
+             num_computed_prefill_tokens_np=num_computed_prefill_tokens_np,
+             is_prefilling_np=is_prefilling_np,
+-            has_prefill=bool(is_prefilling_np.any()),
++            has_prefill=has_prefill,
++            prefill_runs_as_decode_np=prefill_runs_as_decode_np,
++            decode_graph_eligible=decode_graph_eligible,
+         )
+         return batch_state, get_uniform_decode_token_count(
+-            num_reqs, num_toks, max_query_len, batch_state.has_prefill
++            num_reqs, num_toks, max_query_len, decode_graph_eligible
+         )
+ 
+     def prepare_inputs(
+@@ -1401,11 +1425,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 num_reqs, dtype=torch.int32, device=self.device
+             )
+         else:
+-            num_draft_tokens_per_req = np.fromiter(
+-                (len(draft_tokens.get(req_id, ())) for req_id in req_ids),
+-                dtype=np.int32,
+-                count=num_reqs,
+-            )
++            num_draft_tokens_per_req = batch_req_state.num_draft_tokens_np
++            if num_draft_tokens_per_req is None:
++                num_draft_tokens_per_req = np.zeros(num_reqs, dtype=np.int32)
+             num_bonus_tokens = self.model_state.num_new_sampled_tokens_per_step
+             total_num_draft_tokens = int(num_draft_tokens_per_req.sum())
+             total_num_logits = num_reqs * num_bonus_tokens + total_num_draft_tokens
+@@ -1543,6 +1565,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             num_computed_prefill_tokens_np=batch_req_state.num_computed_prefill_tokens_np,
+             is_prefilling_np=batch_req_state.is_prefilling_np,
+             has_prefill=batch_req_state.has_prefill,
++            prefill_runs_as_decode_np=batch_req_state.prefill_runs_as_decode_np,
++            decode_graph_eligible=batch_req_state.decode_graph_eligible,
+             input_ids=self.input_buffers.input_ids[:num_tokens_after_padding],
+             positions=self.input_buffers.positions[:num_tokens_after_padding],
+             is_padding=self.input_buffers.is_padding[:num_tokens_after_padding],
+@@ -2597,11 +2621,14 @@ class BatchReqState(NamedTuple):
+     # May be less than scheduler_output.total_num_scheduled_tokens:
+     # adaptive verification trims the draft budget before running.
+     num_tokens: int
++    num_draft_tokens_np: np.ndarray | None  # [num_reqs], None if no drafts
+     idx_mapping_np: np.ndarray  # [num_reqs]
+     prefill_len_np: np.ndarray  # [num_reqs]
+     num_computed_prefill_tokens_np: np.ndarray  # [num_reqs]
+     is_prefilling_np: np.ndarray  # [num_reqs]
+     has_prefill: bool
++    prefill_runs_as_decode_np: np.ndarray | None  # [num_reqs]
++    decode_graph_eligible: bool
+ 
+ 
+ def sort_batch_req_ids(
+diff --git a/vllm/v1/worker/gpu/model_states/mamba_hybrid.py b/vllm/v1/worker/gpu/model_states/mamba_hybrid.py
+index 0a8b5d70ef..6b6e6242f0 100644
+--- a/vllm/v1/worker/gpu/model_states/mamba_hybrid.py
++++ b/vllm/v1/worker/gpu/model_states/mamba_hybrid.py
+@@ -275,10 +275,13 @@ class MambaHybridModelState(DefaultModelState):
+         else:
+             max_seq_len = seq_lens_cpu_upper_bound[:num_reqs].max().item()
+ 
++        is_prefilling_np = input_batch.is_prefilling_np
++        if input_batch.prefill_runs_as_decode_np is not None:
++            # A prompt tail the scheduler padded with placeholder drafts must run
++            # as a spec-decode row: the prefill kernels can't roll them back.
++            is_prefilling_np = is_prefilling_np & ~input_batch.prefill_runs_as_decode_np
+         is_prefilling = torch.zeros(num_reqs, dtype=torch.bool, device="cpu")
+-        is_prefilling[: input_batch.num_reqs] = torch.from_numpy(
+-            input_batch.is_prefilling_np
+-        )
++        is_prefilling[: input_batch.num_reqs] = torch.from_numpy(is_prefilling_np)
+         # During CUDAGraph capture, num_decode_draft_tokens_cpu and num_accepted_tokens
+         # are created by attn_metadata_builder.build_for_cudagraph_capture, so we only
+         # compute them during actual (non-capture) forward execution.
+diff --git a/vllm/v1/worker/gpu/pcp_manager.py b/vllm/v1/worker/gpu/pcp_manager.py
+index 376e0f2510..ea9648d862 100644
+--- a/vllm/v1/worker/gpu/pcp_manager.py
++++ b/vllm/v1/worker/gpu/pcp_manager.py
+@@ -593,6 +593,7 @@ class PCPManager:
+         )
+         local_is_prefilling_np = np.zeros(num_reqs_after_padding, dtype=np.bool_)
+         local_is_prefilling_np[:num_local_reqs] = real_local_is_prefilling_np
++        local_has_prefill = bool(local_is_prefilling_np.any())
+         seq_lens_cpu_upper_bound_np = np.zeros(num_reqs_after_padding, dtype=np.int32)
+         seq_lens_cpu_upper_bound_np[:num_local_reqs] = (
+             local_start_pos_np + local_num_scheduled_tokens
+@@ -643,7 +644,9 @@ class PCPManager:
+             prefill_len_np=local_prefill_len_np,
+             num_computed_prefill_tokens_np=local_num_computed_prefill_tokens_np,
+             is_prefilling_np=local_is_prefilling_np,
+-            has_prefill=bool(local_is_prefilling_np.any()),
++            has_prefill=local_has_prefill,
++            decode_graph_eligible=not local_has_prefill,
++            prefill_runs_as_decode_np=None,
+             input_ids=input_buffers.input_ids[:num_local_tokens_padded],
+             positions=input_buffers.positions[:num_local_tokens_padded],
+             is_padding=is_padding,
+diff --git a/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py b/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py
+index 3d243b6ee5..52d389b5fc 100644
+--- a/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py
+@@ -289,7 +289,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
+             # the target model during FULL cudagraph.
+             num_tokens,
+             max_query_len,
+-            input_batch.has_prefill,
++            input_batch.decode_graph_eligible,
+         )
+         prefill_batch_desc, prefill_batch_sync = dispatch_cg_and_sync_dp(
+             self.prefill_cudagraph_manager,
+diff --git a/vllm/v1/worker/gpu/spec_decode/multi_module_mtp/speculator.py b/vllm/v1/worker/gpu/spec_decode/multi_module_mtp/speculator.py
+index 1c6ae315cf..e755a65980 100644
+--- a/vllm/v1/worker/gpu/spec_decode/multi_module_mtp/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/multi_module_mtp/speculator.py
+@@ -189,7 +189,7 @@ class MultiModuleMTPSpeculator(DraftModelSpeculator):
+         # When all requests are decoding (no true prefills), each has
+         # num_speculative_steps + 1 tokens, enabling FULL graph replay.
+         uniform_token_count = get_uniform_decode_token_count(
+-            num_reqs, num_tokens, max_query_len, input_batch.has_prefill
++            num_reqs, num_tokens, max_query_len, input_batch.decode_graph_eligible
+         )
+         batch_desc, batch_sync = dispatch_cg_and_sync_dp(
+             self.cudagraph_manager,
+diff --git a/vllm/v1/worker/gpu/ubatch_utils.py b/vllm/v1/worker/gpu/ubatch_utils.py
+index e3cade2d0b..a28d1c2616 100644
+--- a/vllm/v1/worker/gpu/ubatch_utils.py
++++ b/vllm/v1/worker/gpu/ubatch_utils.py
+@@ -181,6 +181,11 @@ def _slice_input_batch(
+             req_start:req_stop
+         ],
+         is_prefilling_np=input_batch.is_prefilling_np[req_start:req_stop],
++        prefill_runs_as_decode_np=(
++            None
++            if input_batch.prefill_runs_as_decode_np is None
++            else input_batch.prefill_runs_as_decode_np[req_start:req_stop]
++        ),
+         input_ids=input_batch.input_ids[tok_start:tok_stop],
+         positions=input_batch.positions[tok_start:tok_stop],
+         is_padding=input_batch.is_padding[tok_start:tok_stop],
+diff --git a/vllm/v1/worker/utils.py b/vllm/v1/worker/utils.py
+index 71c1a2d2b5..61698bf236 100644
+--- a/vllm/v1/worker/utils.py
++++ b/vllm/v1/worker/utils.py
+@@ -764,10 +764,12 @@ def is_uniform_query_len(num_reqs: int, num_tokens: int, max_query_len: int) ->
+ 
+ 
+ def get_uniform_decode_token_count(
+-    num_reqs: int, num_tokens: int, max_query_len: int, has_prefill: bool
++    num_reqs: int, num_tokens: int, max_query_len: int, decode_graph_eligible: bool
+ ) -> int | None:
+     """Per-request token count of a uniform decode batch, or None."""
+-    if not has_prefill and is_uniform_query_len(num_reqs, num_tokens, max_query_len):
++    if decode_graph_eligible and is_uniform_query_len(
++        num_reqs, num_tokens, max_query_len
++    ):
+         return max_query_len
+     return None
+ 

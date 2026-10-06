@@ -1,0 +1,76 @@
+From 863ddee0202d82cb432ef14bf28aaf57b7862f5d Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 21:27:02 -0400
+Subject: [PATCH 82/97] recoverssm, tests: CPU harness for the kernel suites on
+ a GPU-less host
+
+tests/merlin_cpu/mk_cpu_tests.sh makes CPU copies of the CUDA-only RecoverSSM kernel tests (device strings and
+skip marks only; it refuses a copy with residual cuda strings). tests/merlin_cpu/triton_interp_fix.py is a pytest
+plugin that works around a Triton 3.7 interpreter bug with non-constexpr arguments.
+---
+ tests/merlin_cpu/mk_cpu_tests.sh      | 25 +++++++++++++++++++++++++
+ tests/merlin_cpu/triton_interp_fix.py | 23 +++++++++++++++++++++++
+ 2 files changed, 48 insertions(+)
+ create mode 100644 tests/merlin_cpu/mk_cpu_tests.sh
+ create mode 100644 tests/merlin_cpu/triton_interp_fix.py
+
+diff --git a/tests/merlin_cpu/mk_cpu_tests.sh b/tests/merlin_cpu/mk_cpu_tests.sh
+new file mode 100644
+index 0000000000..c4df611e0d
+--- /dev/null
++++ b/tests/merlin_cpu/mk_cpu_tests.sh
+@@ -0,0 +1,25 @@
++#!/usr/bin/env bash
++# CPU copies of CUDA-only RecoverSSM kernel tests, for a GPU-less build host.
++# The kernels then run under the Triton interpreter:
++#
++#   tests/merlin_cpu/mk_cpu_tests.sh <tree> <outdir>
++#   cd <tree> && CUDA_VISIBLE_DEVICES= TRITON_INTERPRET=1 PYTHONPATH=.:<dir with triton_interp_fix.py> \
++#     python -m pytest --noconftest -p triton_interp_fix <outdir>/test_*_cpu.py
++#
++# CUDA_VISIBLE_DEVICES= (empty) keeps vllm.triton_utils from disabling Triton when no GPU
++# driver is active; TRITON_INTERPRET=1 runs every kernel on CPU tensors. Only device
++# strings and CUDA skip marks are rewritten; the test bodies are unchanged.
++set -euo pipefail
++tree=$1; out=$2; mkdir -p "$out"
++for f in tests/kernels/mamba/test_recoverssm_gdn.py tests/kernels/mamba/test_recoverssm_ple.py \
++         tests/models/kimi_k3/test_recoverssm_boundary.py; do
++  [ -f "$tree/$f" ] || { echo "skip (absent): $f"; continue; }
++  b=$(basename "$f" .py)
++  sed -e 's/^pytestmark = pytest.mark.skipif(/pytestmark = [] and pytest.mark.skipif(/' \
++      -e 's/device="cuda"/device="cpu"/g' -e "s/device='cuda'/device='cpu'/g" \
++      -e 's/torch.device("cuda")/torch.device("cpu")/g' -e 's/^DEV = "cuda"/DEV = "cpu"/' \
++      -e 's/dev = "cuda"/dev = "cpu"/g' -e 's/\.cuda()/.cpu()/g' \
++      -e 's/current_platform.device_type/"cpu"/g' \
++      "$tree/$f" > "$out/${b}_cpu.py"
++  if grep -nE "\"cuda\"|'cuda'" "$out/${b}_cpu.py"; then echo "residual cuda refs in ${b}_cpu.py" >&2; exit 1; fi
++done
+diff --git a/tests/merlin_cpu/triton_interp_fix.py b/tests/merlin_cpu/triton_interp_fix.py
+new file mode 100644
+index 0000000000..542d946d1c
+--- /dev/null
++++ b/tests/merlin_cpu/triton_interp_fix.py
+@@ -0,0 +1,23 @@
++"""pytest plugin (-p triton_interp_fix): Triton 3.7 interpreter shim for CPU runs.
++
++The interpreter converts a non-constexpr Python bool argument with an int32
++numpy array and then rejects it against the int1 type ("numpy data itemsize
++(32 bits) exceeds dtype primitive_bitwidth (1 bits)"). Kernels on the stock
++reference paths (e.g. ple_conv) pass such bools. Convert them as np.bool_.
++Harness-only: it changes nothing in the code under test."""
++
++import numpy as np
++import triton.language as tl
++from triton.runtime import interpreter as _interp
++
++_orig = _interp._implicit_cvt
++
++
++def _implicit_cvt(arg):
++    if isinstance(arg, bool):
++        handle = _interp.TensorHandle(np.array([arg], dtype=np.bool_), tl.int1)
++        return tl.tensor(handle, tl.int1)
++    return _orig(arg)
++
++
++_interp._implicit_cvt = _implicit_cvt

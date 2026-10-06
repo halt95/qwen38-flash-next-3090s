@@ -1,0 +1,215 @@
+From 382c59e275ef1326e67fd9df83345bd8861cf455 Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Mon, 28 Sep 2026 13:07:15 -0700
+Subject: [PATCH 67/97] spec-decode: reject draft slots that were never
+ proposed (port of upstream #58784)
+
+Port of the upstream vLLM change #58784 (Apache-2.0). Draft slots the drafter never filled are rejected instead of being verified.
+---
+ .../test_rejection_sampler_utils.py           | 80 +++++++++++++++++++
+ .../gpu/spec_decode/rejection_sampler.py      | 80 ++++++++++++++++++-
+ 2 files changed, 158 insertions(+), 2 deletions(-)
+
+diff --git a/tests/v1/spec_decode/test_rejection_sampler_utils.py b/tests/v1/spec_decode/test_rejection_sampler_utils.py
+index a64b0eb6e9..02aa542c79 100644
+--- a/tests/v1/spec_decode/test_rejection_sampler_utils.py
++++ b/tests/v1/spec_decode/test_rejection_sampler_utils.py
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
+ import math
++from types import SimpleNamespace
+ 
+ import pytest
+ import torch
+@@ -10,6 +11,10 @@ from vllm.v1.watermarking import GumbelWatermarker
+ from vllm.v1.watermarking.spec_decode import watermarked_rejection_sample
+ from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
+ from vllm.v1.worker.gpu.sample.watermark import philox_gumbel_sample
++from vllm.v1.worker.gpu.spec_decode.rejection_sampler import (
++    RejectionSampler,
++    gather_draft_sampled,
++)
+ from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
+     rejection_sample,
+ )
+@@ -675,6 +680,81 @@ def test_placeholder_blocks_later_draft_tokens(use_block_verification: bool):
+     )
+ 
+ 
++def test_verify_rejects_unproposed_drafts():
++    """Zero drafts padded onto a step starting in the prefill must be rejected."""
++    torch.manual_seed(0)
++    device = "cuda"
++    num_trials = 256
++    K = 8
++
++    # Row 0: token 0 is very unlikely. Rows >= 1 follow the zero inputs and
++    # predict token 0. The never-written draft logits row is uniform.
++    target_logits_1d = torch.randn(VOCAB_SIZE, device=device)
++    target_logits_1d[0] = -20.0
++    inputs = _build_rejection_sample_inputs(
++        target_logits_1d,
++        torch.zeros(VOCAB_SIZE, device=device),
++        K,
++        temperature=1.0,
++        num_trials=num_trials,
++    )
++    target_rest = torch.randn(VOCAB_SIZE, device=device)
++    target_rest[0] = 20.0
++    inputs["target_logits"].view(num_trials, K + 1, VOCAB_SIZE)[:, 1:] = target_rest
++    inputs["draft_sampled"].view(num_trials, K + 1)[:, 1:] = 0
++
++    # Each request's first logit is the last prefill token, as in the first
++    # decode step after a P/D remote KV load.
++    first_pos = inputs["pos"].view(num_trials, K + 1)[:, 0]
++    prefill_len = first_pos + 1
++    rejection_sampler = object.__new__(RejectionSampler)
++    rejection_sampler.sampler = SimpleNamespace(
++        apply_sampling_params=lambda logits, *args: logits,
++        sampling_states=SimpleNamespace(
++            temperature=SimpleNamespace(gpu=inputs["temperature"]),
++            seeds=SimpleNamespace(gpu=inputs["seed"]),
++        ),
++        use_fp64_gumbel=False,
++    )
++    rejection_sampler.num_speculative_steps = K
++    rejection_sampler.synthetic_conditional_rates = None
++    rejection_sampler.use_block_verification = True
++    rejection_sampler.watermark_key = None
++
++    def verify() -> tuple[torch.Tensor, torch.Tensor]:
++        draft_sampled, pos = gather_draft_sampled(
++            inputs["draft_sampled"],
++            inputs["pos"],
++            torch.arange(num_trials * (K + 1), device=device),
++            inputs["expanded_idx_mapping"],
++            inputs["expanded_local_pos"],
++            prefill_len,
++        )
++        _, sampled, num_sampled = rejection_sampler._verify(
++            inputs["target_logits"],
++            inputs["draft_logits"],
++            draft_sampled,
++            pos,
++            inputs["cu_num_logits"],
++            inputs["idx_mapping"],
++            None,
++            inputs["expanded_idx_mapping"],
++            inputs["expanded_local_pos"],
++            None,
++        )
++        return sampled, num_sampled
++
++    sampled, num_sampled = verify()
++    assert (num_sampled == 1).all()
++    # Resampled from the target at row 0, not from a residual.
++    assert (sampled[:, 0] != 0).all()
++
++    # Once past the prefill, block verification accepts the same zero drafts.
++    prefill_len.copy_(first_pos)
++    _, num_sampled = verify()
++    assert (num_sampled == K + 1).all()
++
++
+ @pytest.mark.parametrize(
+     "num_speculative_steps,temperature",
+     [
+diff --git a/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py b/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
+index 6c07e6a63b..af7be08fc9 100644
+--- a/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
++++ b/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
+@@ -74,6 +74,76 @@ def _flatten_sampled_kernel(
+         tl.store(flat_sampled_ptr + start_idx + i, token_id)
+ 
+ 
++@triton.jit
++def _gather_draft_sampled_kernel(
++    # [num_logits]
++    draft_sampled_ptr,
++    # [num_logits]
++    pos_ptr,
++    # [num_tokens]
++    input_ids_ptr,
++    # [num_tokens]
++    positions_ptr,
++    # [num_logits]
++    logits_indices_ptr,
++    # [num_logits]
++    expanded_idx_mapping_ptr,
++    # [num_logits]
++    expanded_local_pos_ptr,
++    # [max_num_reqs]
++    prefill_len_ptr,
++    num_logits,
++    BLOCK_SIZE: tl.constexpr,
++):
++    block = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
++    mask = block < num_logits
++    token_idx = tl.load(logits_indices_ptr + block, mask=mask)
++    token_id = tl.load(input_ids_ptr + token_idx, mask=mask)
++    pos = tl.load(positions_ptr + token_idx, mask=mask)
++    req_state_idx = tl.load(expanded_idx_mapping_ptr + block, mask=mask)
++    local_pos = tl.load(expanded_local_pos_ptr + block, mask=mask)
++    prefill_len = tl.load(prefill_len_ptr + req_state_idx, mask=mask)
++    # Drafts are only proposed after sampling past the prefill, so any draft
++    # slots in a step starting within the prefill are placeholders (e.g. the
++    # padded first step after a P/D remote KV load).
++    is_placeholder = (local_pos > 0) & (pos - local_pos < prefill_len)
++    token_id = tl.where(is_placeholder, -1, token_id)
++    tl.store(draft_sampled_ptr + block, token_id, mask=mask)
++    tl.store(pos_ptr + block, pos, mask=mask)
++
++
++def gather_draft_sampled(
++    input_ids: torch.Tensor,
++    positions: torch.Tensor,
++    logits_indices: torch.Tensor,
++    expanded_idx_mapping: torch.Tensor,
++    expanded_local_pos: torch.Tensor,
++    prefill_len: torch.Tensor,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """Gather the input token and position of each logits row.
++
++    Draft rows of requests that have not yet sampled past their prefill are
++    set to -1 so that the rejection kernels reject them.
++    """
++    num_logits = logits_indices.shape[0]
++    draft_sampled = input_ids.new_empty(num_logits)
++    pos = positions.new_empty(num_logits)
++    BLOCK_SIZE = 1024
++    _gather_draft_sampled_kernel[(triton.cdiv(num_logits, BLOCK_SIZE),)](
++        draft_sampled,
++        pos,
++        input_ids,
++        positions,
++        logits_indices,
++        expanded_idx_mapping,
++        expanded_local_pos,
++        prefill_len,
++        num_logits,
++        BLOCK_SIZE=BLOCK_SIZE,
++    )
++    return draft_sampled, pos
++
++
+ class RejectionSampler:
+     def __init__(
+         self,
+@@ -300,8 +370,14 @@ class RejectionSampler:
+         # that num_nans is computed before applying penalties and temperature.
+         num_nans = get_num_nans(logits) if self.sampler.compute_nans else None
+ 
+-        draft_sampled = input_batch.input_ids[input_batch.logits_indices]
+-        pos = input_batch.positions[input_batch.logits_indices]
++        draft_sampled, pos = gather_draft_sampled(
++            input_batch.input_ids,
++            input_batch.positions,
++            input_batch.logits_indices,
++            input_batch.expanded_idx_mapping,
++            input_batch.expanded_local_pos,
++            self.sampler.req_states.prefill_len.gpu,
++        )
+ 
+         # Marking a draft invalid (`is_valid_draft = draft_sampled >= 0`) pins the
+         # accepted length before it reaches a permissive bitmask row. Only

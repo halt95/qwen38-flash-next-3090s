@@ -1,0 +1,161 @@
+From 2201e51936c20f436851d94bd44a1467e256c279 Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 06:23:33 -0400
+Subject: [PATCH 87/97] sched: don't double-count the checkpoint of a
+ prefix-hit admission
+
+The admission gate reserved one retained-checkpoint block per Mamba group for every request not holding one. A
+follow-up turn with a prefix hit already brings that block, so it was counted twice; the gate now counts it once.
+---
+ .../core/test_mamba_checkpoint_retention.py   | 78 +++++++++++++++++++
+ vllm/v1/core/kv_cache_coordinator.py          |  2 +-
+ vllm/v1/core/single_type_kv_cache_manager.py  | 23 +++++-
+ 3 files changed, 100 insertions(+), 3 deletions(-)
+
+diff --git a/tests/v1/core/test_mamba_checkpoint_retention.py b/tests/v1/core/test_mamba_checkpoint_retention.py
+index 1a4ebe51a4..9d0d440631 100644
+--- a/tests/v1/core/test_mamba_checkpoint_retention.py
++++ b/tests/v1/core/test_mamba_checkpoint_retention.py
+@@ -561,3 +561,81 @@ def test_mtp_chunked_prefill_aligned_prompt_retains_newest_boundary_only(
+     _, num_hit, _ = manager.get_computed_blocks(sibling)
+     assert num_hit == (3 * BLOCK if retain else 0)
+     pool.free_blocks(burst)
++
++
++# --------------------------------------------------------------------------
++# 5. A follow-up turn's admission must not double-count its checkpoint.
++# --------------------------------------------------------------------------
++def _followup_after_finish(manager: KVCacheManager):
++    a = _request("A", _tokens(1, 150))
++    _prefill(manager, a)
++    _decode(manager, a, steps=4)
++    manager.free(a)
++    a2 = _request("A2", list(a.all_token_ids) + _tokens(3, 40))
++    computed, num_hit, _ = manager.get_computed_blocks(a2)
++    assert num_hit == 96
++    return a2, computed, num_hit
++
++
++def _admission_need(manager, req, computed, num_hit) -> int:
++    return manager.coordinator.get_num_blocks_to_allocate(
++        request_id=req.request_id,
++        num_tokens=req.num_tokens,
++        new_computed_blocks=computed.blocks,
++        num_encoder_tokens=0,
++        total_computed_tokens=num_hit,
++        num_local_computed_tokens=num_hit,
++        num_tokens_main_model=req.num_tokens,
++        apply_admission_cap=True,
++    )
++
++
++def test_hit_admission_reserves_no_extra_checkpoint_block(retain):
++    """The hit state IS the block the follow-up will hold as its checkpoint,
++    and get_num_blocks_to_allocate already counts it, so the full-sequence
++    gate must add nothing for it -- with retention on or off."""
++    manager = _manager(num_blocks=64)
++    a2, computed, num_hit = _followup_after_finish(manager)
++    assert _admission_need(manager, a2, computed, num_hit) == _managers_need(
++        manager, a2, computed, num_hit
++    )
++
++
++def _managers_need(manager, req, computed, num_hit) -> int:
++    """The per-group estimates alone, without the retained-checkpoint term."""
++    return sum(
++        mgr.get_num_blocks_to_allocate(
++            req.request_id, req.num_tokens, computed.blocks[gid], num_hit,
++            num_hit, req.num_tokens, apply_admission_cap=True,
++        )
++        for gid, mgr in enumerate(manager.coordinator.single_type_managers)
++    )
++
++
++def test_hit_followup_is_admitted_when_it_exactly_fits(retain):
++    """Leave exactly the follow-up's real need free (uncached blocks only are
++    taken, so its cache stays intact). It must be admitted with its hit. The
++    previous version reserved one more block per Mamba group here
++    and refused it -- the run that failing control is measured on."""
++    manager = _manager(num_blocks=64)
++    pool = manager.block_pool
++    a2, computed, num_hit = _followup_after_finish(manager)
++    need = _managers_need(manager, a2, computed, num_hit)
++    uncached = sum(
++        b.block_hash is None for b in pool.free_block_queue.get_all_free_blocks()
++    )
++    surplus = pool.get_num_free_blocks() - need
++    assert 0 < surplus <= uncached
++    held = pool.get_new_blocks(surplus)
++    assert pool.get_num_free_blocks() == need
++    num_new = _split(a2, a2.num_tokens - num_hit, num_hit)
++    blocks = manager.allocate_slots(
++        a2,
++        num_new,
++        num_new_computed_tokens=num_hit,
++        new_computed_blocks=computed,
++        num_lookahead_tokens=NUM_SPEC,
++        full_sequence_must_fit=True,
++    )
++    assert blocks is not None
++    pool.free_blocks(held)
+diff --git a/vllm/v1/core/kv_cache_coordinator.py b/vllm/v1/core/kv_cache_coordinator.py
+index ca8c86ee87..4b2839da20 100644
+--- a/vllm/v1/core/kv_cache_coordinator.py
++++ b/vllm/v1/core/kv_cache_coordinator.py
+@@ -236,7 +236,7 @@ class KVCacheCoordinator(ABC):
+                     # the free queue that check reads.
+                     num_blocks_to_allocate += (
+                         manager.get_num_retained_checkpoint_blocks_to_reserve(
+-                            request_id, num_tokens_main_model
++                            request_id, num_tokens_main_model, new_computed_blocks[i]
+                         )
+                     )
+         return num_blocks_to_allocate
+diff --git a/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/v1/core/single_type_kv_cache_manager.py
+index b88330d9e5..0ec6bca049 100644
+--- a/vllm/v1/core/single_type_kv_cache_manager.py
++++ b/vllm/v1/core/single_type_kv_cache_manager.py
+@@ -607,7 +607,10 @@ class SingleTypeKVCacheManager(ABC):
+         return []
+ 
+     def get_num_retained_checkpoint_blocks_to_reserve(
+-        self, request_id: str, num_tokens: int
++        self,
++        request_id: str,
++        num_tokens: int,
++        new_computed_blocks: Sequence[KVCacheBlock] = (),
+     ) -> int:
+         """Blocks the admission gate must add for checkpoints this request
+         will hold outside its block table (0 for every manager but align-mode
+@@ -1607,7 +1610,10 @@ class MambaManager(SingleTypeKVCacheManager):
+         return [] if held is None else [held[1]]
+ 
+     def get_num_retained_checkpoint_blocks_to_reserve(
+-        self, request_id: str, num_tokens: int
++        self,
++        request_id: str,
++        num_tokens: int,
++        new_computed_blocks: Sequence[KVCacheBlock] = (),
+     ) -> int:
+         # A request that already holds a checkpoint only ever swaps it. One
+         # that does not will hold one once a hashed state retires, which needs
+@@ -1618,6 +1624,19 @@ class MambaManager(SingleTypeKVCacheManager):
+             or num_tokens <= self.block_size
+         ):
+             return 0
++        # A prefix hit already brings the block that becomes the held
++        # checkpoint -- the hit state, counted by get_num_blocks_to_allocate as
++        # an evictable computed block (or already referenced elsewhere) -- and
++        # the same holds for a hashed state still in the request's table.
++        # Reserving another one double-counts every hit admission by one block
++        # per group, which only delays the follow-up turns the fix is for.
++        if any(not blk.is_null for blk in new_computed_blocks):
++            return 0
++        if any(
++            not blk.is_null and blk.block_hash is not None
++            for blk in self.req_to_blocks.get(request_id, ())
++        ):
++            return 0
+         return 1
+ 
+     @classmethod

@@ -1,0 +1,245 @@
+From 81647fece6786b88a7557239d7487366ca06c3cd Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 04:05:07 -0500
+Subject: [PATCH 62/97] cudagraph: capture prefill kernels for mixed FULL
+ graphs (port of upstream #58275)
+
+Port of the upstream vLLM change #58275 (Apache-2.0). Mixed prefill/decode batches under FULL CUDA graphs capture the prefill kernels
+they run.
+---
+ .../compile/fullgraph/test_full_cudagraph.py  | 40 +++++----
+ tests/v1/cudagraph/test_cudagraph_manager.py  | 86 +++++++++++++++++++
+ vllm/v1/worker/gpu/cudagraph_utils.py         |  6 +-
+ .../autoregressive/cudagraph_utils.py         |  1 +
+ 4 files changed, 117 insertions(+), 16 deletions(-)
+
+diff --git a/tests/compile/fullgraph/test_full_cudagraph.py b/tests/compile/fullgraph/test_full_cudagraph.py
+index c2af7be048..5d010aaa7c 100644
+--- a/tests/compile/fullgraph/test_full_cudagraph.py
++++ b/tests/compile/fullgraph/test_full_cudagraph.py
+@@ -37,7 +37,7 @@ def temporary_environ(env_vars):
+ model_backends_full_cudagraph = []
+ 
+ # deepseek-ai/DeepSeek-V2-Lite with MLA
+-MLA_backends = ["FlashMLA", "FlashAttentionMLA", "CutlassMLA"]
++MLA_backends = ["FlashMLA", "FlashAttentionMLA", "CutlassMLA", "FlashInferMLA"]
+ for mla_backend in MLA_backends:
+     model_backends_full_cudagraph.append(
+         ("deepseek-ai/DeepSeek-V2-Lite", backend_configs[mla_backend])
+@@ -54,27 +54,28 @@ for backend_config in other_backend_configs:
+ @pytest.fixture(scope="class")
+ def llm_pair(request):
+     model, backend_config, use_inductor_graph_partition = request.param
+-    backend_config.comp_config["use_inductor_graph_partition"] = (
+-        use_inductor_graph_partition
+-    )
+-
+     if use_inductor_graph_partition and not is_torch_equal_or_newer("2.9.0.dev"):
+         pytest.skip("Inductor graph partition only supported in torch>=2.9")
+ 
++    backend = AttentionBackendEnum[backend_config.attention_config["backend"]]
++    if current_platform.is_rocm() and backend not in (
++        AttentionBackendEnum.TRITON_ATTN,
++        AttentionBackendEnum.ROCM_ATTN,
++    ):
++        pytest.skip(f"{backend_config.name} is a CUDA-only attention backend")
++    if backend == AttentionBackendEnum.ROCM_ATTN and not current_platform.is_rocm():
++        pytest.skip("ROCM_ATTN requires ROCm")
++
+     # Dynamically skip test if GPU capability is not met
+-    if (
+-        backend_config.specific_gpu_arch
+-        and backend_config.specific_gpu_arch != current_platform.get_device_capability()
++    if backend_config.specific_gpu_arch and (
++        not current_platform.is_cuda()
++        or backend_config.specific_gpu_arch != current_platform.get_device_capability()
+     ):
+         if backend_config.specific_gpu_arch == (9, 0):
+             pytest.skip("Only Hopper GPUs support FA3 and FlashMLA")
+         elif backend_config.specific_gpu_arch == (10, 0):
+             pytest.skip("Only Blackwell GPUs support Cutlass MLA")
+ 
+-    # FlashInfer is not supported on ROCm
+-    if backend_config == AttentionBackendEnum.FLASHINFER and current_platform.is_rocm():
+-        pytest.skip("FlashInfer is not supported on ROCm")
+-
+     env_vars = {
+         # Force native sampler to avoid potential nondeterminism in FlashInfer
+         # when per-request generators are not used in V1.
+@@ -87,7 +88,11 @@ def llm_pair(request):
+             trust_remote_code=True,
+             max_model_len=1024,
+             max_num_seqs=128,
+-            compilation_config=CompilationConfig(**backend_config.comp_config),
++            attention_config=backend_config.attention_config,
++            compilation_config=CompilationConfig(
++                **backend_config.comp_config,
++                use_inductor_graph_partition=use_inductor_graph_partition,
++            ),
+             generation_config="vllm",
+             seed=42,
+         )
+@@ -97,8 +102,10 @@ def llm_pair(request):
+             trust_remote_code=True,
+             max_model_len=1024,
+             max_num_seqs=128,
++            attention_config=backend_config.attention_config,
+             compilation_config=CompilationConfig(
+-                cudagraph_mode=CUDAGraphMode.PIECEWISE
++                cudagraph_mode=CUDAGraphMode.PIECEWISE,
++                use_inductor_graph_partition=use_inductor_graph_partition,
+             ),
+             generation_config="vllm",
+             seed=42,
+@@ -118,7 +125,10 @@ def llm_pair(request):
+ @pytest.mark.parametrize(
+     "llm_pair",
+     [
+-        pytest.param((model, backend_config, use_inductor_graph_partition))
++        pytest.param(
++            (model, backend_config, use_inductor_graph_partition),
++            id=f"{backend_config.name}-partition={use_inductor_graph_partition}",
++        )
+         for model, backend_config in model_backends_full_cudagraph
+         for use_inductor_graph_partition in [True, False]
+     ],
+diff --git a/tests/v1/cudagraph/test_cudagraph_manager.py b/tests/v1/cudagraph/test_cudagraph_manager.py
+index c907be36b8..76c4732158 100644
+--- a/tests/v1/cudagraph/test_cudagraph_manager.py
++++ b/tests/v1/cudagraph/test_cudagraph_manager.py
+@@ -22,6 +22,9 @@ from vllm.v1.worker.gpu import cudagraph_utils as gpu_cudagraph_utils
+ from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
+ from vllm.v1.worker.gpu.input_batch import InputBuffers
+ from vllm.v1.worker.gpu.pcp_manager import PCPManager
++from vllm.v1.worker.gpu.spec_decode.autoregressive.cudagraph_utils import (
++    SpeculatorCudaGraphManager,
++)
+ 
+ pytestmark = pytest.mark.cpu_test
+ 
+@@ -165,6 +168,89 @@ def test_piecewise_capture_uses_pcp_dummy_slot_mappings():
+     block_tables.get_dummy_slot_mappings.assert_not_called()
+ 
+ 
++@pytest.mark.parametrize(
++    "full_cudagraph,max_query_len,expected_max_query_len",
++    [(False, None, None), (True, None, 8), (True, 1, 1), (True, 3, 3)],
++)
++def test_capture_query_length_covers_replay_batches(
++    full_cudagraph, max_query_len, expected_max_query_len
++):
++    """Mixed FULL graphs must capture prefill kernels as well as decode kernels."""
++    num_tokens = num_reqs = 8
++    buffers = InputBuffers(num_reqs, num_tokens, torch.device("cpu"))
++    block_tables = MagicMock()
++    block_tables.cp_size = 1
++    block_tables.get_dummy_block_tables.return_value = ()
++    block_tables.get_dummy_slot_mappings.return_value = torch.empty(
++        0, num_tokens, dtype=torch.int64
++    )
++    model_state = MagicMock()
++    kv_cache_config = KVCacheConfig(
++        num_blocks=0, kv_cache_tensors=[], kv_cache_groups=[]
++    )
++
++    gpu_cudagraph_utils.prepare_inputs_to_capture(
++        num_reqs,
++        num_tokens,
++        model_state,
++        buffers,
++        block_tables,
++        [],
++        kv_cache_config,
++        full_cudagraph=full_cudagraph,
++        max_query_len=max_query_len,
++    )
++
++    batch = model_state.prepare_attn.call_args.args[0]
++    assert batch.num_scheduled_tokens.max() == 1
++    assert batch.max_query_len == expected_max_query_len
++
++
++@pytest.mark.parametrize(
++    "uniform_token_count,max_query_len,expected_max_query_len",
++    [(1, None, 1), (None, 3, 3), (None, None, 8)],
++)
++def test_speculator_capture_preserves_decode_query_bounds(
++    monkeypatch, uniform_token_count, max_query_len, expected_max_query_len
++):
++    """Draft decode graphs keep narrow queries while mixed graphs cover prefill."""
++    num_tokens = num_reqs = 8
++    desc = BatchExecutionDescriptor(
++        CUDAGraphMode.FULL,
++        num_tokens,
++        num_reqs,
++        uniform_token_count=uniform_token_count,
++        max_query_len=max_query_len,
++    )
++    manager = SpeculatorCudaGraphManager.__new__(SpeculatorCudaGraphManager)
++    manager.max_num_reqs = num_reqs
++    manager.dp_size = 1
++    buffers = InputBuffers(num_reqs, num_tokens, torch.device("cpu"))
++    block_tables = MagicMock()
++    block_tables.cp_size = 1
++    block_tables.get_dummy_block_tables.return_value = ()
++    block_tables.get_dummy_slot_mappings.return_value = torch.empty(
++        0, num_tokens, dtype=torch.int64
++    )
++    model_state = MagicMock()
++    kv_cache_config = KVCacheConfig(
++        num_blocks=0, kv_cache_tensors=[], kv_cache_groups=[]
++    )
++
++    def capture(self, create_forward_fn, progress_bar_desc):
++        for warmup in (True, False):
++            create_forward_fn(desc, warmup)(desc.cg_mode)
++
++    monkeypatch.setattr(gpu_cudagraph_utils.CudaGraphManager, "capture", capture)
++    manager.capture(
++        MagicMock(), model_state, buffers, block_tables, [], kv_cache_config
++    )
++
++    assert model_state.prepare_attn.call_count == 2
++    for call in model_state.prepare_attn.call_args_list:
++        assert call.args[0].max_query_len == expected_max_query_len
++
++
+ _DECODE_QUERY_LEN = 3
+ 
+ 
+diff --git a/vllm/v1/worker/gpu/cudagraph_utils.py b/vllm/v1/worker/gpu/cudagraph_utils.py
+index 91d4d92da3..921c562024 100644
+--- a/vllm/v1/worker/gpu/cudagraph_utils.py
++++ b/vllm/v1/worker/gpu/cudagraph_utils.py
+@@ -818,7 +818,7 @@ class ModelCudaGraphManager(CudaGraphManager):
+                 attn_groups,
+                 kv_cache_config,
+                 full_cudagraph=desc.cg_mode == CUDAGraphMode.FULL,
+-                max_query_len=desc.max_query_len,
++                max_query_len=desc.max_query_len or desc.uniform_token_count,
+                 pcp_manager=pcp_manager,
+             )
+ 
+@@ -889,6 +889,10 @@ def prepare_inputs_to_capture(
+     max_query_len: int | None = None,
+     pcp_manager: "PCPManager | None" = None,
+ ) -> AttentionState:
++    if full_cudagraph and max_query_len is None:
++        # Mixed graphs can replay a single prefill spanning the entire batch,
++        # even when the dummy batch distributes one token to each request.
++        max_query_len = num_tokens
+     input_batch = InputBatch.make_dummy(
+         num_reqs, num_tokens, input_buffers, max_query_len=max_query_len
+     )
+diff --git a/vllm/v1/worker/gpu/spec_decode/autoregressive/cudagraph_utils.py b/vllm/v1/worker/gpu/spec_decode/autoregressive/cudagraph_utils.py
+index ef3b6e2ed5..fe3bdef269 100644
+--- a/vllm/v1/worker/gpu/spec_decode/autoregressive/cudagraph_utils.py
++++ b/vllm/v1/worker/gpu/spec_decode/autoregressive/cudagraph_utils.py
+@@ -57,6 +57,7 @@ class SpeculatorCudaGraphManager(CudaGraphManager):
+                 attn_groups,
+                 kv_cache_config,
+                 full_cudagraph=desc.cg_mode == CUDAGraphMode.FULL,
++                max_query_len=desc.max_query_len or desc.uniform_token_count,
+             )
+ 
+             return lambda cg_mode: forward_fn(

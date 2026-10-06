@@ -1,0 +1,1725 @@
+From 096b04c159339f58061e381b418924c8de9bb7c4 Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 09:50:32 -0400
+Subject: [PATCH 88/97] kv: side-cache layout -- fold the PLE state into a GDN
+ group, pack QSA rings
+
+The packed pool strides every block by the widest group, and every group draws whole blocks. The PLE short-conv
+state now shares a GDN cache group, and the QSA raw-key rings are packed as equal slots inside shared blocks, so
+neither holds a whole block per request. VLLM_E2_SIDE_CACHE_LAYOUT (default 1) selects the old layout with 0.
+On its own the layout raises the Flash-Next pool from 806,792 to 853,994 tokens at the same budget.
+---
+ tests/test_envs.py                           |  23 +
+ tests/v1/core/test_side_cache_layout.py      | 882 +++++++++++++++++++
+ tests/v1/test_pp_kv_projection.py            |  20 +-
+ vllm/envs.py                                 |  15 +
+ vllm/v1/core/kv_cache_coordinator.py         |  12 +
+ vllm/v1/core/kv_cache_utils.py               | 335 ++++++-
+ vllm/v1/core/sched/scheduler.py              |   4 +
+ vllm/v1/core/single_type_kv_cache_manager.py | 112 ++-
+ vllm/v1/kv_cache_interface.py                |  23 +-
+ vllm/v1/worker/gpu/model_runner.py           |   1 +
+ vllm/v1/worker/gpu_model_runner.py           |   1 +
+ vllm/v1/worker/utils.py                      |  11 +
+ 12 files changed, 1426 insertions(+), 13 deletions(-)
+ create mode 100644 tests/v1/core/test_side_cache_layout.py
+
+diff --git a/tests/test_envs.py b/tests/test_envs.py
+index bcd7b3359b..af5e39d388 100644
+--- a/tests/test_envs.py
++++ b/tests/test_envs.py
+@@ -621,6 +621,10 @@ _FORK_HASHED = [
+     # PLE pull transport: selects a different PLE module class and captured
+     # forward, so it is hashed. Strict "0"/"1" parser (envs._e2_strict_switch).
+     ("VLLM_E2_PLE_PULL_TRANSPORT", "1", True),
++    # v2.5 side-cache layout: changes the ring views' block stride and which
++    # block table the PLE state is read through, so ON/OFF must not share an
++    # AOT cache. Strict "0"/"1", default ON; "0" selects the old layout.
++    ("VLLM_E2_SIDE_CACHE_LAYOUT", "0", False),
+ ]
+ 
+ _FORK_IGNORED = [
+@@ -1065,6 +1069,7 @@ _MUST_BE_READ = {
+     "VLLM_E2_PLE_FLAG_CHECK": "vllm/v1/ple_offload/connector.py",
+     "VLLM_E2_MAMBA_SLOT_OWNERSHIP": "vllm/v1/worker/mamba_utils.py",
+     "VLLM_E2_MAMBA_RETAIN_CHECKPOINT": "vllm/v1/core/single_type_kv_cache_manager.py",
++    "VLLM_E2_SIDE_CACHE_LAYOUT": "vllm/v1/core/kv_cache_utils.py",
+ }
+ _INERT_NO_READ_SITE = ["VLLM_PLE_FP8_GLOBAL_SCALE"]
+ 
+@@ -1128,3 +1133,21 @@ def test_mamba_retain_checkpoint_switch_defaults_on_and_is_strict(
+         monkeypatch.setenv(name, bad)
+         with pytest.raises(ValueError, match=name):
+             _fresh_env_value(name)
++
++
++def test_side_cache_layout_switch_defaults_on_and_is_strict(
++    monkeypatch: pytest.MonkeyPatch,
++):
++    """Unset is ON (the layout fix ships enabled); "0" is the only way back to
++    the old one-group-each layout, and a misspelt value is a boot error."""
++    name = "VLLM_E2_SIDE_CACHE_LAYOUT"
++    monkeypatch.delenv(name, raising=False)
++    assert _fresh_env_value(name) is True
++    monkeypatch.setenv(name, "1")
++    assert _fresh_env_value(name) is True
++    monkeypatch.setenv(name, "0")
++    assert _fresh_env_value(name) is False
++    for bad in ("off", "false", "", " 1"):
++        monkeypatch.setenv(name, bad)
++        with pytest.raises(ValueError, match=name):
++            _fresh_env_value(name)
+diff --git a/tests/v1/core/test_side_cache_layout.py b/tests/v1/core/test_side_cache_layout.py
+new file mode 100644
+index 0000000000..9ebba77657
+--- /dev/null
++++ b/tests/v1/core/test_side_cache_layout.py
+@@ -0,0 +1,882 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""v2.5 side-cache layout (``VLLM_E2_SIDE_CACHE_LAYOUT``, default ON).
++
++Flash-Next's packed block-outermost KV pool strides every block by the widest
++group (12,902,400 B on PP1 at FP32 SSM state) and every group draws whole
++blocks from it. The TP-replicated PLE short-conv state (one layer, 2 + K blocks
++per request in align mode) and the QSA raw-key ring (one block per request)
++hold ~1.2 MB of real state but took 6 of the 103 blocks a 262K request needs.
++The layout fix folds the PLE group into a GDN group that has a spare page on
++every PP stage, and packs several requests' rings into one pool block.
++
++What these tests pin (CPU only):
++
++1. Pool size. On the reference host's per-layer specs (TP2 x PP2, partition 25/23, MTP
++   K=3, fp8 KV, BLNHC, pin 4.1e9) the block count and both stages' strides are
++   unchanged and a 262K request needs 97 blocks instead of 103 at FP32 state
++   (173 instead of 179 at FP16). FAILING CONTROL: switch "0" reproduces the
++   logged pools (806,792 and 894,804 tokens) block for block.
++2. Allocation / eviction through ``KVCacheManager`` as the scheduler drives it
++   (aligned prefill chunks, MTP K=3 decode with draft acceptance, finish,
++   preemption, the deferred ``pop_blocks_for_free`` path, prefix hits with the
++   retained checkpoints). The PLE state's block table evolves exactly as
++   it did in its own group, hits are identical, and N rings share one pool
++   block. FAILING CONTROLS: with the switch off the same pool cannot admit the
++   extra request, and every ring takes its own block.
++3. Worker views. The ring slots and the folded PLE page lie inside their pool
++   block and overlap nothing they must not, and the KV zeroer zeroes exactly
++   the same bytes of every block in both layouts. FAILING CONTROL: a zeroer
++   built without the slot-group skip zeroes different bytes.
++"""
++
++from dataclasses import replace
++from types import SimpleNamespace
++
++import pytest
++import torch
++
++from vllm import envs
++from vllm.model_executor.layers.mamba.mamba_utils import MambaStateShapeCalculator
++from vllm.sampling_params import SamplingParams
++from vllm.utils.hashing import sha256
++from vllm.utils.math_utils import cdiv
++from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
++from vllm.v1.core import kv_cache_utils as ku
++from vllm.v1.core.block_pool import BlockPool
++from vllm.v1.core.kv_cache_manager import KVCacheManager
++from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
++from vllm.v1.core.sched.scheduler import Scheduler
++from vllm.v1.core.single_type_kv_cache_manager import (
++    CircularBufferManager,
++    RingSlotPool,
++)
++from vllm.v1.kv_cache_interface import (
++    CircularBufferSpec,
++    FullAttentionSpec,
++    KVCacheLayout,
++    MambaSpec,
++    MLAAttentionSpec,
++    UniformTypeKVCacheSpecs,
++    get_kv_quant_mode,
++)
++from vllm.v1.request import Request
++
++pytestmark = pytest.mark.cpu_test
++
++SWITCH = "VLLM_E2_SIDE_CACHE_LAYOUT"
++TP = 2
++K = 3  # MTP num_speculative_tokens, as deployed
++PIN = 4_100_000_000  # --kv-cache-memory on every rank
++MAX_LEN = 262_144
++
++
++def _set_switch(monkeypatch, value: str) -> None:
++    monkeypatch.setenv(SWITCH, value)
++    if hasattr(envs.__getattr__, "cache_clear"):
++        envs.__getattr__.cache_clear()
++
++
++@pytest.fixture(params=["1", "0"], ids=["layout-on", "layout-off-control"])
++def layout(request, monkeypatch) -> bool:
++    _set_switch(monkeypatch, request.param)
++    return request.param == "1"
++
++
++@pytest.fixture(autouse=True)
++def _init_hash():
++    init_none_hash(sha256)
++
++
++# ---------------------------------------------------------------------------
++# Flash-Next per-layer specs (the reference fixture, in align mode, any block size
++# and SSM dtype). Boot log: "Setting attention block size to 3200 tokens" at FP32
++# state, 1664 at FP16; every Mamba page padded to the attention page.
++# ---------------------------------------------------------------------------
++def _flash_next_specs(
++    block: int = 3200,
++    ssm_dtype: torch.dtype = torch.float32,
++    *,
++    tiny_state: bool = False,
++) -> tuple[dict, dict]:
++    attn_page = block * 1 * 256 * 2  # fp8 K+V, 1 KV head per TP rank
++    main = FullAttentionSpec(
++        block_size=block,
++        num_kv_heads=2 // TP,
++        head_size=256,
++        head_size_v=256,
++        dtype=torch.uint8,
++        kv_quant_mode=get_kv_quant_mode("fp8_e4m3"),
++    )
++    ring = CircularBufferSpec(
++        block_size=8, num_kv_heads=1, head_size=144, head_size_v=0, dtype=torch.bfloat16
++    )
++    comp = MLAAttentionSpec(
++        block_size=block,
++        num_kv_heads=1,
++        head_size=128,
++        dtype=torch.bfloat16,
++        tokens_per_state=4,
++    )
++    if tiny_state:
++        # Small blocks for scheduler tests: the real states exceed the page.
++        gdn_shapes: tuple = ((4,),)
++        gdn_dtypes: tuple = (torch.float32,)
++        ple_shapes: tuple = ((2,),)
++    else:
++        gdn_shapes = tuple(
++            MambaStateShapeCalculator.gated_delta_net_state_shape(
++                TP, 16, 48, 128, 128, 4, K
++            )
++        )
++        gdn_dtypes = (torch.bfloat16, ssm_dtype)
++        ple_shapes = tuple(
++            MambaStateShapeCalculator.short_conv_state_shape(
++                tp_world_size=1, intermediate_size=10240, conv_kernel=10, num_spec=K
++            )
++        )
++    gdn = MambaSpec(
++        shapes=gdn_shapes,
++        dtypes=gdn_dtypes,
++        block_size=block,
++        page_size_padded=attn_page,
++        mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
++        mamba_cache_mode="align",
++        num_speculative_blocks=K,
++    )
++    ple = MambaSpec(
++        shapes=ple_shapes,
++        dtypes=(torch.bfloat16,),
++        block_size=block,
++        page_size_padded=attn_page,
++        mamba_type=MambaAttentionBackendEnum.SHORT_CONV,
++        mamba_cache_mode="align",
++        tp_replicated=True,
++        num_speculative_blocks=K,
++    )
++
++    def qsa(prefix: str, specs: dict) -> None:
++        specs[f"{prefix}.self_attn.indexer.raw_key_cache"] = ring
++        specs[f"{prefix}.self_attn.indexer.compressed_key_cache"] = comp
++        specs[f"{prefix}.self_attn.attn"] = main
++
++    def stage(lo: int, hi: int, mtp: bool) -> dict:
++        specs: dict = {}
++        for i in range(lo, hi):
++            prefix = f"language_model.model.layers.{i}"
++            if i == 2:
++                specs[f"{prefix}.ple"] = ple
++            if i % 4 == 3:
++                qsa(prefix, specs)
++            else:
++                specs[f"{prefix}.linear_attn"] = gdn
++        if mtp:
++            qsa("mtp.layers.48", specs)
++        return specs
++
++    return stage(0, 25, False), stage(25, 48, True)
++
++
++def _vllm_config(
++    *,
++    override: int | None = None,
++    max_num_seqs: int = 8,
++    kv_transfer_config=None,
++    max_model_len: int = MAX_LEN,
++):
++    cache = SimpleNamespace(
++        kv_cache_layout="BLNHC",
++        num_gpu_blocks_override=override,
++        prefix_cache_retention_interval=0,
++        mamba_cache_mode="align",
++        get_resolved_kv_cache_layout=lambda: KVCacheLayout.BLNHC,
++    )
++    return SimpleNamespace(
++        cache_config=cache,
++        speculative_config=SimpleNamespace(
++            num_speculative_tokens=K,
++            method="mtp",
++            use_multi_module_mtp=lambda: False,
++            use_eagle=lambda: True,
++            use_eagle_block_drop=lambda: True,
++        ),
++        scheduler_config=SimpleNamespace(
++            disable_hybrid_kv_cache_manager=False,
++            max_num_encoder_input_tokens=0,
++            max_num_seqs=max_num_seqs,
++        ),
++        attention_config=SimpleNamespace(hisparse_config=None),
++        model_config=SimpleNamespace(
++            original_max_model_len=max_model_len,
++            max_model_len=max_model_len,
++            hf_config=SimpleNamespace(model_type="qwen4_exp"),
++            get_total_num_hidden_layers=lambda: 48,
++        ),
++        device_config=SimpleNamespace(device_type="cuda"),
++        parallel_config=SimpleNamespace(
++            pipeline_parallel_size=2, decode_context_parallel_size=1
++        ),
++        kv_transfer_config=kv_transfer_config,
++    )
++
++
++def _configs(block=3200, ssm_dtype=torch.float32, *, pin=PIN, **kw):
++    pp0, pp1 = _flash_next_specs(block, ssm_dtype, tiny_state=kw.pop("tiny", False))
++    cfg = _vllm_config(**kw)
++    specs = [pp0, pp0, pp1, pp1]  # TP2 x PP2
++    return cfg, specs, ku.get_kv_cache_configs(cfg, specs, [pin] * 4)
++
++
++def _first_spec(group):
++    spec = group.kv_cache_spec
++    return spec.first_spec if isinstance(spec, UniformTypeKVCacheSpecs) else spec
++
++
++def _request_blocks(cfg, config) -> int:
++    """Blocks one max_model_len request holds, as the boot's capacity line
++    counts them (shared ring pages excluded)."""
++    total = 0
++    for group in config.kv_cache_groups:
++        if group.slots_per_block > 1:
++            continue
++        total += cdiv(
++            group.kv_cache_spec.max_memory_usage_bytes(cfg),
++            group.kv_cache_spec.page_size_bytes,
++        )
++    return total
++
++
++# ---------------------------------------------------------------------------
++# 1. Pool size (blocks freed per request), FP32 and FP16 state.
++# ---------------------------------------------------------------------------
++# (block, ssm dtype, stage strides, blocks, per-request OFF, ON, pool OFF, ON)
++_POOL_CASES = {
++    "fp32": (
++        3200,
++        torch.float32,
++        (11_468_800, 12_902_400),
++        317,
++        103,
++        97,
++        806_792,
++        853_994,
++    ),
++    "fp16": (
++        1664,
++        torch.float16,
++        (5_963_776, 6_709_248),
++        611,
++        179,
++        173,
++        894_804,
++        924_322,
++    ),
++}
++
++
++@pytest.mark.parametrize("case", sorted(_POOL_CASES))
++def test_pool_blocks_per_request(case, layout):
++    block, dtype, strides, blocks, req_off, req_on, pool_off, pool_on = _POOL_CASES[
++        case
++    ]
++    cfg, specs, configs = _configs(block, dtype)
++    for rank, config in enumerate(configs):
++        # The pool itself does not move: same block count, same stride on
++        # both stages (PP1 binds), so not one byte of pin is spent.
++        assert config.num_blocks == blocks, f"rank {rank}"
++        assert (
++            ku._get_kv_cache_bytes_per_block(config.kv_cache_groups)
++            == strides[rank // 2]
++        )
++    per_request = _request_blocks(cfg, configs[0])
++    capacity, _ = ku.get_kv_cache_capacity(cfg, configs[0])
++    if layout:
++        assert per_request == req_on
++        assert req_off - per_request == 6  # 5 PLE + 1 ring blocks freed
++        assert capacity == pool_on
++    else:
++        # FAILING CONTROL: the old layout, exactly as the reference host logged it
++        # ("GPU KV cache size: 806,792 tokens" / "894,804 tokens").
++        assert per_request == req_off
++        assert capacity == pool_off
++    # Every rank agrees, and so does the scheduler's config, which is what
++    # update_kv_cache_capacity logs at boot ("GPU KV cache size: N tokens").
++    assert {ku.get_kv_cache_capacity(cfg, c)[0] for c in configs} == {capacity}
++    sched = ku.generate_scheduler_kv_cache_config(configs)
++    assert ku.get_kv_cache_capacity(cfg, sched)[0] == capacity
++
++
++def test_ple_rides_in_a_gdn_group_with_a_spare_page(layout):
++    _, specs, configs = _configs()
++    ple = "language_model.model.layers.2.ple"
++    for rank, config in enumerate(configs):
++        tensor_layers = sorted(n for t in config.kv_cache_tensors for n in t.layers)
++        assert tensor_layers == sorted(specs[rank]), f"rank {rank}"
++        owner = [g for g in config.kv_cache_groups if ple in g.layer_names]
++        mamba_groups = [
++            g for g in config.kv_cache_groups if isinstance(_first_spec(g), MambaSpec)
++        ]
++        if rank >= 2:
++            assert not owner  # PLE lives on PP0 only
++        if layout:
++            assert len(mamba_groups) == 3
++            assert all(g.layer_names for g in config.kv_cache_groups)
++            if rank < 2:
++                [group] = owner
++                gdn = [n for n in group.layer_names if n.endswith("linear_attn")]
++                assert len(gdn) == 6 and group.layer_names[-1] == ple
++        else:
++            # FAILING CONTROL: its own group, empty on PP1 (the reference shape).
++            assert len(mamba_groups) == 4
++            if rank < 2:
++                assert owner[0].layer_names == [ple]
++
++
++def test_ring_slots_divide_both_stage_strides():
++    _, _, configs = _configs()
++    rings = [
++        (rank, g)
++        for rank, c in enumerate(configs)
++        for g in c.kv_cache_groups
++        if isinstance(_first_spec(g), CircularBufferSpec)
++    ]
++    assert {g.slots_per_block for _, g in rings} == {800}
++    for rank, config in enumerate(configs):
++        stride = ku._get_kv_cache_bytes_per_block(config.kv_cache_groups)
++        for tensor in config.kv_cache_tensors:
++            if tensor.slots_per_block > 1:
++                assert tensor.block_stride * tensor.slots_per_block == stride
++                assert tensor.block_stride % 256 == 0
++                assert tensor.block_stride >= len(tensor.layers) * 2304
++                assert config.num_blocks_of(tensor) == config.num_blocks * 800
++
++
++def test_kv_connector_keeps_the_old_layout(monkeypatch):
++    """NIXL / offload / P/D address groups themselves: layout stays off."""
++    _set_switch(monkeypatch, "1")
++    cfg, _, configs = _configs(kv_transfer_config=SimpleNamespace())
++    assert _request_blocks(cfg, configs[0]) == 103
++    assert all(g.slots_per_block == 1 for g in configs[0].kv_cache_groups)
++
++
++def test_fold_never_widens_a_stage(monkeypatch):
++    """The PP-aware target choice. Folding into GDN group 0 (7 pages on PP0)
++    would widen PP0's block to 8 pages; the pass must pick a 6-page group.
++    CONTROL: the forced group-0 fold really does widen PP0."""
++    _set_switch(monkeypatch, "0")
++    pp0, pp1 = _flash_next_specs()
++    specs = [pp0, pp0, pp1, pp1]
++    merged: dict = {}
++    for s in specs:
++        merged.update(s)
++    groups = ku.get_kv_cache_groups(_vllm_config(), merged)
++    base = ku._worker_strides(groups, specs)
++    folded, notes = ku._fold_replicated_mamba_groups(groups, specs)
++    assert ku._worker_strides(folded, specs) == base
++    assert len(folded) == len(groups) - 1 and "into Mamba group 1" in notes[0]
++
++    ple_index = next(
++        i
++        for i, g in enumerate(groups)
++        if any(n.endswith(".ple") for n in g.layer_names)
++    )
++    g0 = groups[0]
++    forced = UniformTypeKVCacheSpecs(
++        block_size=g0.kv_cache_spec.block_size,
++        kv_cache_specs={
++            **g0.kv_cache_spec.kv_cache_specs,
++            **groups[ple_index].kv_cache_spec.kv_cache_specs,
++        },
++    )
++    wrong = [
++        replace(
++            g0,
++            layer_names=g0.layer_names + groups[ple_index].layer_names,
++            kv_cache_spec=forced,
++        )
++    ]
++    wrong += [g for i, g in enumerate(groups) if i not in (0, ple_index)]
++    widened = ku._worker_strides(wrong, specs)
++    assert widened[0] == base[0] + 1_638_400  # PP0: 8 pages instead of 7
++
++
++# ---------------------------------------------------------------------------
++# 2. Allocation / eviction through KVCacheManager (tiny states, block 32).
++# ---------------------------------------------------------------------------
++BLOCK = 32
++PLE = "language_model.model.layers.2.ple"
++
++
++SCHED_MAX_LEN = 512  # small, so small test pools pass the boot memory check
++
++
++def _manager(num_blocks: int) -> KVCacheManager:
++    _, _, configs = _configs(
++        BLOCK, tiny=True, override=num_blocks, max_model_len=SCHED_MAX_LEN
++    )
++    config = ku.generate_scheduler_kv_cache_config(configs)
++    return KVCacheManager(
++        replace(config, prefix_cache_retention_interval=0),
++        max_model_len=SCHED_MAX_LEN,
++        scheduler_block_size=BLOCK,
++        hash_block_size=BLOCK,
++        enable_caching=True,
++        use_eagle=True,
++    )
++
++
++def _group_of(manager: KVCacheManager, layer: str) -> int:
++    return next(
++        i
++        for i, g in enumerate(manager.kv_cache_config.kv_cache_groups)
++        if layer in g.layer_names
++    )
++
++
++def _ring_gid(manager: KVCacheManager) -> int:
++    return next(
++        i
++        for i, m in enumerate(manager.coordinator.single_type_managers)
++        if type(m) is CircularBufferManager
++    )
++
++
++def _ring(manager: KVCacheManager) -> CircularBufferManager:
++    mgr = manager.coordinator.single_type_managers[_ring_gid(manager)]
++    assert isinstance(mgr, CircularBufferManager)
++    return mgr
++
++
++def _request(rid: str, tokens: list[int]) -> Request:
++    params = SamplingParams(max_tokens=4096)
++    params.update_from_generation_config({}, eos_token_id=100000)
++    return Request(
++        request_id=rid,
++        prompt_token_ids=tokens,
++        sampling_params=params,
++        pooling_params=None,
++        block_hasher=get_request_block_hasher(BLOCK, sha256),
++    )
++
++
++def _tokens(seed: int, n: int) -> list[int]:
++    return [seed * 10000 + i for i in range(n)]
++
++
++def _split(request: Request, num_new: int, num_local_hit: int = 0) -> int:
++    stub = SimpleNamespace(
++        block_size=BLOCK,
++        cache_config=SimpleNamespace(block_size=BLOCK),
++        use_eagle_block_drop=True,
++        max_num_scheduled_tokens=8192,
++        scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
++        mamba_partial_cache_hit=False,
++        mamba_fine_grained_prefix_cache=False,
++        hash_block_size=BLOCK,
++        mamba_has_prefill_checkpoint_blocks=False,
++        mamba_prefill_checkpoint_alignment=None,
++    )
++    return Scheduler._mamba_block_aligned_split(stub, request, num_new, num_local_hit)
++
++
++def _prefill(manager, request, budget=40, trace=None, may_stall=False) -> int | None:
++    """Prefill in scheduler-sized chunks; None if admission is refused (or,
++    with ``may_stall``, if a later chunk does not fit -- the request is then
++    freed, as a scheduler would preempt it)."""
++    computed, num_hit, _ = manager.get_computed_blocks(request)
++    first = True
++    while request.num_computed_tokens < request.num_tokens:
++        start = request.num_computed_tokens + (num_hit if first else 0)
++        num_new = _split(
++            request, min(request.num_tokens - start, budget), num_hit if first else 0
++        )
++        blocks = manager.allocate_slots(
++            request,
++            num_new,
++            num_new_computed_tokens=num_hit if first else 0,
++            new_computed_blocks=computed if first else None,
++            num_lookahead_tokens=K,
++            full_sequence_must_fit=first,
++        )
++        if blocks is None:
++            if not first:
++                assert may_stall, "a later prefill chunk did not fit"
++                manager.free(request)
++            return None
++        request.num_computed_tokens = start + num_new
++        manager.new_step_starts()
++        first = False
++        if trace is not None:
++            trace()
++    return num_hit
++
++
++def _decode(manager, request, steps, accepted=lambda step: 0, trace=None) -> None:
++    next_tok = 50000 + len(request.output_token_ids)
++    if request.num_computed_tokens == request.num_tokens:
++        request.append_output_token_ids(next_tok)
++        next_tok += 1
++    for step in range(steps):
++        request.spec_token_ids = [next_tok + i for i in range(K)]
++        assert manager.allocate_slots(request, 1 + K, num_lookahead_tokens=K)
++        n_acc = accepted(step)
++        request.spec_token_ids = []
++        request.num_computed_tokens += 1 + n_acc
++        request.append_output_token_ids(list(range(next_tok, next_tok + n_acc + 1)))
++        next_tok += n_acc + 1
++        manager.new_step_starts()
++        if trace is not None:
++            trace()
++
++
++def _pattern(blocks) -> tuple:
++    """A block table with ids renamed by first appearance (null = -1), so two
++    layouts can be compared position by position."""
++    names: dict[int, int] = {}
++    return tuple(
++        -1 if b.is_null else names.setdefault(b.block_id, len(names)) for b in blocks
++    )
++
++
++def _trajectory(manager: KVCacheManager, accept_seed: int = 7) -> list:
++    """Run A (prefill + MTP decode across block boundaries, varying accepts),
++    finish it, resume it as A2 (prefix hit), run cold B beside it, free B via
++    the deferred path, resume it as B2, and record, after every step, the
++    block-table pattern of the attention group, of the PLE layer's group and
++    of every GDN group, the ring table width, and every hit length."""
++    groups = manager.kv_cache_config.kv_cache_groups
++    ple_gid = _group_of(manager, PLE)
++    gdn_gids = [
++        i
++        for i, g in enumerate(groups)
++        if any(n.endswith("linear_attn") for n in g.layer_names)
++    ]
++    attn_gid = _group_of(manager, "language_model.model.layers.3.self_attn.attn")
++    ring_gid = _ring_gid(manager)
++    log: list = []
++    live: list[Request] = []
++
++    def trace():
++        for req in live:
++            blocks = manager.coordinator.get_blocks(req.request_id)
++            if not blocks[attn_gid]:
++                continue
++            log.append(
++                (
++                    req.request_id,
++                    _pattern(blocks[attn_gid]),
++                    _pattern(blocks[ple_gid]),
++                    tuple(sorted(_pattern(blocks[g]) for g in gdn_gids)),
++                    len(blocks[ring_gid]),
++                )
++            )
++
++    a = _request("A", _tokens(1, 150))
++    live.append(a)
++    log.append(("hitA", _prefill(manager, a, trace=trace)))
++    _decode(manager, a, 30, accepted=lambda s: (s * accept_seed) % 4, trace=trace)
++    manager.free(a)
++    live.remove(a)
++    a2 = _request("A2", list(a.all_token_ids) + _tokens(3, 40))
++    live.append(a2)
++    log.append(("hitA2", _prefill(manager, a2, trace=trace)))
++    b = _request("B", _tokens(4, 120))
++    live.append(b)
++    log.append(("hitB", _prefill(manager, b, trace=trace)))
++    _decode(manager, a2, 6, accepted=lambda s: s % 4, trace=trace)
++    _decode(manager, b, 3, trace=trace)
++    popped = manager.pop_blocks_for_free(b)  # deferred free (the block-free fence)
++    live.remove(b)
++    manager.block_pool.free_blocks(popped)  # the scheduler's fenced drain
++    b2 = _request("B2", list(b.all_token_ids) + _tokens(5, 10))
++    live.append(b2)
++    log.append(("hitB2", _prefill(manager, b2, trace=trace)))
++    for req in (a2, b2):
++        manager.free(req)
++    return log
++
++
++def test_ple_block_table_and_hits_match_the_old_layout(monkeypatch):
++    """The PLE layer's block table (null/live positions, which entries share a
++    block across steps) and every hybrid hit length are the same as when it
++    had its own group: its kernels index the same state positions, so its
++    outputs cannot change. A large pool keeps eviction out of the comparison.
++    The retained checkpoints are on (the default) in both runs."""
++    runs = {}
++    for value in ("0", "1"):
++        _set_switch(monkeypatch, value)
++        manager = _manager(num_blocks=400)
++        assert envs.VLLM_E2_MAMBA_RETAIN_CHECKPOINT
++        runs[value] = _trajectory(manager)
++        # Nothing leaked: only the null block is not free.
++        assert manager.block_pool.get_num_free_blocks() == 399
++    assert len(runs["1"]) > 50
++    assert runs["1"] == runs["0"]
++    hits = {
++        e[0]: e[1] for e in runs["1"] if isinstance(e[0], str) and e[0][:3] == "hit"
++    }
++    assert hits["hitA"] == 0 and hits["hitB"] == 0
++    assert hits["hitA2"] > 0 and hits["hitB2"] > 0  # real hits were compared
++    # CONTROL: the comparison is not vacuous -- a different accept pattern
++    # gives different tables, and the comparator sees it.
++    manager = _manager(num_blocks=400)
++    assert _trajectory(manager, accept_seed=1) != runs["1"]
++
++
++def _held(manager: KVCacheManager) -> set[int]:
++    ids: set[int] = set()
++    for mgr in manager.coordinator.single_type_managers:
++        pool = getattr(mgr, "slot_pool", None)
++        if pool is not None:
++            ids |= set(pool._pages)
++            continue
++        for blocks in mgr.req_to_blocks.values():
++            ids |= {b.block_id for b in blocks if not b.is_null}
++        held = getattr(mgr, "_retained_checkpoints", {})
++        ids |= {blk.block_id for _, blk in held.values()}
++    return ids
++
++
++def _owner_count(manager: KVCacheManager) -> int:
++    """Owner references to pool blocks, counting shared prefix blocks once
++    per holder. Equal to len(_held) iff no block has two exclusive owners."""
++    total = 0
++    for mgr in manager.coordinator.single_type_managers:
++        pool = getattr(mgr, "slot_pool", None)
++        if pool is not None:
++            total += pool.num_pages
++            continue
++        total += len(
++            {
++                b.block_id
++                for blocks in mgr.req_to_blocks.values()
++                for b in blocks
++                if not b.is_null
++            }
++        )
++        total += len(getattr(mgr, "_retained_checkpoints", {}))
++    return total
++
++
++def test_rings_share_one_pool_block_and_pool_partitions(layout):
++    manager = _manager(num_blocks=400)
++    pool = manager.block_pool
++    ring = _ring(manager)
++    reqs = [_request(f"R{i}", _tokens(10 + i, 70)) for i in range(5)]
++    for req in reqs:
++        assert _prefill(manager, req) == 0
++        _decode(manager, req, 2)
++        # Partition: every non-null block is free XOR held, by one owner.
++        assert pool.get_num_free_blocks() + len(_held(manager)) == 399
++        assert _owner_count(manager) == len(_held(manager))
++    ring_ids = [ring.get_ring_block_ids(r.request_id)[0] for r in reqs]
++    assert len(set(ring_ids)) == 5
++    claimed = manager.take_new_ring_block_ids()
++    assert claimed == ring_ids  # tag clears name exactly the claimed ids
++    if layout:
++        slots = ring.slot_pool.slots_per_block
++        assert slots > 5
++        assert ring.slot_pool.num_pages == 1  # five rings, one pool block
++        assert len({rid // slots for rid in ring_ids}) == 1
++        assert sorted(rid % slots for rid in ring_ids) == [0, 1, 2, 3, 4]
++    else:
++        # FAILING CONTROL: one pool block per ring.
++        assert ring.slot_pool is None
++        assert all(pool.blocks[rid].ref_cnt == 1 for rid in ring_ids)
++    # Free in a mixed order, one through the deferred path.
++    manager.free(reqs[1])
++    popped = manager.pop_blocks_for_free(reqs[3])
++    if layout:
++        # The popped slot is not reusable before the fence: still live.
++        assert ring.slot_pool.num_live_slots == 4
++    manager.block_pool.free_blocks(popped)
++    if layout:
++        assert ring.slot_pool.num_live_slots == 3
++        # A new request reuses the lowest free slot of the same page.
++        r5 = _request("R5", _tokens(30, 70))
++        _prefill(manager, r5)
++        assert ring.get_ring_block_ids("R5") == [ring_ids[1]]
++        manager.free(r5)
++    for req in (reqs[0], reqs[2], reqs[4]):
++        manager.free(req)
++    assert pool.get_num_free_blocks() == 399
++    if layout:
++        assert ring.slot_pool.num_pages == 0
++
++
++def _running_footprint(value: str, prompt: int) -> int:
++    with pytest.MonkeyPatch.context() as mp:
++        _set_switch(mp, value)
++        manager = _manager(num_blocks=400)
++        req = _request("X", _tokens(99, prompt))
++        _prefill(manager, req)
++        _decode(manager, req, 3)
++        return 399 - manager.block_pool.get_num_free_blocks()
++
++
++def test_freed_blocks_admit_requests_the_old_layout_refuses(layout):
++    """Admission under pool pressure, through the full-sequence gate. The
++    per-request footprint is measured, not assumed; the pool is sized to six
++    requests of the NEW footprint plus less than one request's saving. ON
++    admits all six; the old layout cannot."""
++    on, off = _running_footprint("1", 160), _running_footprint("0", 160)
++    # 2 + K PLE state blocks (retained checkpoint included) and the ring block,
++    # minus the one shared ring page the new layout holds for everyone.
++    assert off - on == (2 + K) + 1 - 1
++    n = 6
++    margin = off - on - 1
++    manager = _manager(num_blocks=1 + n * on + margin)  # + the null block
++    admitted = []
++    for i in range(n):
++        req = _request(f"C{i}", _tokens(200 + i, 160))
++        if _prefill(manager, req, may_stall=True) is None:
++            break
++        _decode(manager, req, 3)
++        admitted.append(req)
++    if layout:
++        assert len(admitted) == n
++    else:
++        # FAILING CONTROL: the same pool fits fewer conversations.
++        assert len(admitted) < n
++    for req in admitted:
++        manager.free(req)
++    assert manager.block_pool.get_num_free_blocks() == n * on + margin
++
++
++def test_ring_slot_pool_unit():
++    pool = BlockPool(num_gpu_blocks=6, enable_caching=True, hash_block_size=16)
++    slots = RingSlotPool(pool, slots_per_block=3)
++    got = slots.get_new_blocks(4)
++    assert [b.block_id // 3 for b in got] == [got[0].block_id // 3] * 3 + [
++        got[3].block_id // 3
++    ]
++    assert slots.num_pages == 2 and pool.get_num_free_blocks() == 3
++    # Routed through the main pool's free path (as the scheduler drain does).
++    pool.free_blocks([got[3]])
++    assert slots.num_pages == 1 and pool.get_num_free_blocks() == 4
++    pool.free_blocks(got[:2])
++    assert slots.has_free_slot() and slots.num_pages == 1
++    with pytest.raises(AssertionError):
++        slots.free_blocks([got[0]])  # double free is loud
++    pool.free_blocks([got[2]])
++    assert slots.num_pages == 0 and pool.get_num_free_blocks() == 5
++
++
++# ---------------------------------------------------------------------------
++# 3. Worker views and KV zeroing (CPU allocation of a 3-block pool).
++# ---------------------------------------------------------------------------
++def _views(monkeypatch, value: str, rank: int):
++    from vllm.v1.worker.utils import allocate_kv_cache
++
++    _set_switch(monkeypatch, value)
++    # 24 blocks (~300 MB on CPU): one 3200-token request (22 blocks in the old
++    # layout) must still pass the boot's memory check.
++    _, _, configs = _configs(override=24, max_model_len=3200)
++    config = configs[rank]
++    caches = allocate_kv_cache(config, torch.device("cpu"), KVCacheLayout.BLNHC)
++    return config, caches
++
++
++def _byte_range(view: torch.Tensor, index: int, base: int) -> tuple[int, int]:
++    page = view[index]
++    start = page.data_ptr() - base
++    span = page.element_size() * (
++        1 + sum((s - 1) * st for s, st in zip(page.shape, page.stride()))
++    )
++    return start, start + span
++
++
++@pytest.mark.parametrize("rank", [0, 2], ids=["pp0", "pp1"])
++def test_slot_and_ple_views_stay_inside_their_block(monkeypatch, rank):
++    config, caches = _views(monkeypatch, "1", rank)
++    stride = ku._get_kv_cache_bytes_per_block(config.kv_cache_groups)
++    base = min(v.data_ptr() for v in caches.values())
++    rings = sorted(n for n in caches if n.endswith("raw_key_cache"))
++    slots = 800
++    assert all(caches[n].shape[0] == 24 * slots for n in rings)
++    for pool_block in (1, 2):
++        spans = []
++        for slot in (0, 1, slots - 1):
++            for name in rings:
++                lo, hi = _byte_range(caches[name], pool_block * slots + slot, base)
++                assert pool_block * stride <= lo < hi <= (pool_block + 1) * stride
++                spans.append((lo, hi))
++        spans.sort()
++        assert all(a[1] <= b[0] for a, b in zip(spans, spans[1:])), "slots overlap"
++    if rank == 0:
++        group = next(g for g in config.kv_cache_groups if PLE in g.layer_names)
++        lo, hi = _byte_range(caches[PLE], 1, base)
++        assert stride <= lo < hi <= 2 * stride
++        for name in group.layer_names[:-1]:  # the GDN layers of that group
++            for state in (
++                caches[name] if isinstance(caches[name], list) else [caches[name]]
++            ):
++                glo, ghi = _byte_range(state, 1, base)
++                assert ghi <= lo or glo >= hi, f"PLE page overlaps {name}"
++
++
++def _zeroed_offsets(config, caches, skip: bool) -> tuple[set, int]:
++    """Block-relative byte ranges the KV zeroer would clear, from its own
++    segment table (built on CPU tensors; the kernel is not launched)."""
++    from vllm.v1.worker.utils import KVBlockZeroer
++
++    groups = []
++    for gid, group in enumerate(config.kv_cache_groups):
++        for name in group.layer_names:
++            spec = group.kv_cache_spec
++            if isinstance(spec, UniformTypeKVCacheSpecs):
++                spec = spec.kv_cache_specs[name]
++            groups.append(
++                SimpleNamespace(
++                    kv_cache_spec=spec, kv_cache_group_id=gid, layer_names=[name]
++                )
++            )
++    kernel_block_sizes = [_first_spec(g).block_size for g in config.kv_cache_groups]
++    ctx = {name: SimpleNamespace(kv_cache=view) for name, view in caches.items()}
++    zeroer = KVBlockZeroer(
++        torch.device("cpu"),
++        attn_groups_iter=iter(groups),
++        kernel_block_sizes=kernel_block_sizes,
++        static_forward_context=ctx,
++        num_blocks=config.num_blocks,
++        skip_kv_cache_group_ids=config.slot_packed_group_ids if skip else (),
++    )
++    addrs, strides, pages, *_ = zeroer._meta
++    num_segments = len(addrs)
++    base = min(v.data_ptr() for v in caches.values())
++    stride = ku._get_kv_cache_bytes_per_block(config.kv_cache_groups)
++    covered: list[tuple[int, int]] = []
++    for addr, page in zip(addrs.tolist(), pages.tolist()):
++        lo = (addr - base) % stride
++        covered.append((lo, lo + 4 * page))
++    # Merge into a canonical union of intervals.
++    covered.sort()
++    merged: list[list[int]] = []
++    for lo, hi in covered:
++        if merged and lo <= merged[-1][1]:
++            merged[-1][1] = max(merged[-1][1], hi)
++        else:
++            merged.append([lo, hi])
++    return {tuple(m) for m in merged}, num_segments
++
++
++@pytest.mark.parametrize("rank", [0, 2], ids=["pp0", "pp1"])
++def test_zeroed_bytes_per_block_are_unchanged(monkeypatch, rank):
++    old_config, old_caches = _views(monkeypatch, "0", rank)
++    new_config, new_caches = _views(monkeypatch, "1", rank)
++    old, old_segments = _zeroed_offsets(old_config, old_caches, skip=True)
++    new, new_segments = _zeroed_offsets(new_config, new_caches, skip=True)
++    assert new == old
++    # The old ring segments were redundant (inside the first attention page);
++    # the new table drops exactly those.
++    assert new_segments <= old_segments
++    # FAILING CONTROL: without the slot-group skip every ring slot becomes a
++    # segment. On PP0 that zeroes bytes the old layout never zeroed (past the
++    # attention pages, inside the 7th GDN page); on PP1 the attention pages
++    # already cover the block, so it is "only" 5,600 redundant segments.
++    unskipped, unskipped_segments = _zeroed_offsets(new_config, new_caches, skip=False)
++    assert unskipped_segments > new_segments + 4000  # ~800 per ring layer
++    if rank == 0:
++        assert unskipped != old
++    else:
++        assert unskipped == old
+diff --git a/tests/v1/test_pp_kv_projection.py b/tests/v1/test_pp_kv_projection.py
+index 2f8cc59cdb..cbf5956680 100644
+--- a/tests/v1/test_pp_kv_projection.py
++++ b/tests/v1/test_pp_kv_projection.py
+@@ -170,10 +170,22 @@ def _allocate_lookup(config) -> None:
+         )
+ 
+ 
+-def test_flash_next_pp1_has_an_empty_uniform_group():
++def _side_cache_layout(monkeypatch, value: str) -> None:
++    monkeypatch.setenv("VLLM_E2_SIDE_CACHE_LAYOUT", value)
++    from vllm import envs
++
++    if hasattr(envs.__getattr__, "cache_clear"):
++        envs.__getattr__.cache_clear()
++
++
++def test_flash_next_pp1_has_an_empty_uniform_group(monkeypatch):
+     """Guard that the shape really exercises the path (else the test below
+     could not fail): PP1 projects the PLE group to zero layers while keeping
+-    the global UniformTypeKVCacheSpecs."""
++    the global UniformTypeKVCacheSpecs. v2.5: that shape exists only with the
++    side-cache layout off (VLLM_E2_SIDE_CACHE_LAYOUT=0, or an engine it does
++    not apply to); with it on the PLE state rides in a GDN group, so no group
++    projects empty (test_side_cache_layout.py)."""
++    _side_cache_layout(monkeypatch, "0")
+     _, configs = _worker_configs()
+     for rank in (2, 3):
+         empty = [g for g in configs[rank].kv_cache_groups if not g.layer_names]
+@@ -186,7 +198,9 @@ def test_flash_next_pp1_has_an_empty_uniform_group():
+         assert all(g.layer_names for g in configs[rank].kv_cache_groups)
+ 
+ 
+-def test_flash_next_pp1_every_tensor_is_grouped():
++@pytest.mark.parametrize("layout", ["0", "1"])
++def test_flash_next_pp1_every_tensor_is_grouped(monkeypatch, layout):
++    _side_cache_layout(monkeypatch, layout)
+     specs, configs = _worker_configs()
+     for rank, config in enumerate(configs):
+         tensor_layers = [n for t in config.kv_cache_tensors for n in t.layers]
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 4159f34944..7401ed7ff3 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -452,6 +452,16 @@ if TYPE_CHECKING:
+     # for A/B. AOT: no. CAPTURE: no -- scheduler-side block bookkeeping only;
+     # the worker sees the same block tables either way.
+     VLLM_E2_MAMBA_RETAIN_CHECKPOINT: bool = True
++    # v2.5 side-cache layout (Flash-Next PLE + QSA ring): stop charging each
++    # tiny side cache a whole packed pool block per request. The TP-replicated
++    # PLE short-conv state group is folded into a GDN group that has a spare
++    # page on every PP stage, and the one-block-per-request QSA ring group packs
++    # several requests' rings into one pool block. Strict "0"/"1", default ON;
++    # "0" restores the old one-group-each layout for A/B. Read in
++    # vllm/v1/core/kv_cache_utils.py (get_kv_cache_configs). AOT: yes, hashed --
++    # it changes the ring views' block stride and which block table the PLE
++    # state is read through, so ON and OFF must not share a compile cache.
++    VLLM_E2_SIDE_CACHE_LAYOUT: bool = True
+     # Opt-out for the fork startup guards in vllm/v1/e2_guards.py, read at
+     # Qwen4ExpForCausalLM construction. AOT: no. CAPTURE: no -- it changes
+     # nothing itself; it only permits a boot whose identity IS different
+@@ -2615,6 +2625,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     "VLLM_E2_MAMBA_RETAIN_CHECKPOINT": lambda: _e2_strict_switch(
+         "VLLM_E2_MAMBA_RETAIN_CHECKPOINT", default=True
+     ),
++    # Side-cache layout (v2.5; PLE state folded into a GDN group + QSA ring slot
++    # packing), default ON. Strict "0"/"1"; read once per get_kv_cache_configs call.
++    "VLLM_E2_SIDE_CACHE_LAYOUT": lambda: _e2_strict_switch(
++        "VLLM_E2_SIDE_CACHE_LAYOUT", default=True
++    ),
+     # Seconds between `topk-exact-counters` lines from each GPU worker
+     # (0, the default, disables the reader entirely). The line reports the
+     # medium-path exact-restart counters; see
+diff --git a/vllm/v1/core/kv_cache_coordinator.py b/vllm/v1/core/kv_cache_coordinator.py
+index 4b2839da20..7537ccd698 100644
+--- a/vllm/v1/core/kv_cache_coordinator.py
++++ b/vllm/v1/core/kv_cache_coordinator.py
+@@ -14,6 +14,7 @@ from vllm.v1.core.kv_cache_utils import (
+     dcp_world_size_for_kv_cache_spec,
+ )
+ from vllm.v1.core.single_type_kv_cache_manager import (
++    CircularBufferManager,
+     CrossAttentionManager,
+     MambaManager,
+     SingleTypeKVCacheManager,
+@@ -151,6 +152,17 @@ class KVCacheCoordinator(ABC):
+             )
+             for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups)
+         )
++        # v2.5 side-cache layout: a slot-packed ring group shares each pool
++        # block between several requests (kv_cache_utils._choose_ring_slots).
++        for kv_cache_group, manager in zip(
++            self.kv_cache_config.kv_cache_groups, self.single_type_managers
++        ):
++            if kv_cache_group.slots_per_block > 1:
++                assert type(manager) is CircularBufferManager, (
++                    f"slot packing is only defined for the QSA ring, got "
++                    f"{type(manager).__name__}"
++                )
++                manager.enable_slot_packing(kv_cache_group.slots_per_block)
+         # Match Mamba checkpoints to Eagle's attention replay boundary.
+         if use_eagle:
+             for manager in self.single_type_managers:
+diff --git a/vllm/v1/core/kv_cache_utils.py b/vllm/v1/core/kv_cache_utils.py
+index ad179e628d..2d81658792 100644
+--- a/vllm/v1/core/kv_cache_utils.py
++++ b/vllm/v1/core/kv_cache_utils.py
+@@ -1082,7 +1082,19 @@ def get_max_concurrency_for_kv_cache_config(
+     """
+     num_blocks_per_request = 0
+     host_blocks_per_request = 0
++    # v2.5 side-cache layout: a slot-packed ring group shares each pool block
++    # between `slots_per_block` requests, so it costs cdiv(max_num_seqs, slots)
++    # blocks for the whole pool instead of one block per request.
++    shared_blocks = 0
++    max_num_seqs = getattr(
++        getattr(vllm_config, "scheduler_config", None), "max_num_seqs", 1
++    )
++    if not isinstance(max_num_seqs, int) or max_num_seqs < 1:
++        max_num_seqs = 1
+     for group in kv_cache_config.kv_cache_groups:
++        if group.slots_per_block > 1 and not group.host_resident:
++            shared_blocks += cdiv(max_num_seqs, group.slots_per_block)
++            continue
+         required = cdiv(
+             group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
+             group.kv_cache_spec.page_size_bytes,
+@@ -1091,7 +1103,9 @@ def get_max_concurrency_for_kv_cache_config(
+             host_blocks_per_request += required
+         else:
+             num_blocks_per_request += required
+-    limits = [kv_cache_config.num_blocks / num_blocks_per_request]
++    limits = [
++        max(kv_cache_config.num_blocks - shared_blocks, 0) / num_blocks_per_request
++    ]
+     if host_blocks_per_request:
+         assert kv_cache_config.hisparse_host_num_blocks is not None
+         limits.append(
+@@ -1779,14 +1793,36 @@ def get_kv_cache_config_from_groups(
+         elif group.layer_names:
+             layers_by_spec[group_spec].extend(group.layer_names)
+ 
++        # v2.5 side-cache layout: a slot-packed group views every pool block as
++        # `slots` equal slots, so its block stride is one slot and its view has
++        # num_blocks * slots blocks. Pages of its layers must fit in one slot.
++        slots = group.slots_per_block
++        group_block_stride = interleaved_block_stride
++        group_num_blocks = num_blocks
++        if slots > 1:
++            assert layout.is_block_outermost, (
++                "Slot-packed KV cache groups need a block-outermost layout"
++            )
++            assert bytes_per_block % slots == 0, (bytes_per_block, slots)
++            group_block_stride = bytes_per_block // slots
++            group_num_blocks = num_blocks * slots
++            group_bytes = sum(
++                spec.page_size_bytes * len(names)
++                for spec, names in layers_by_spec.items()
++            )
++            assert group_bytes <= group_block_stride, (
++                f"slot-packed group needs {group_bytes} B per slot, slot is "
++                f"{group_block_stride} B"
++            )
++
+         byte_offset = 0
+         for spec, layer_names in layers_by_spec.items():
+             layer_stride, block_stride, _, _, _ = compute_layout_strides(
+                 spec,
+-                num_blocks,
++                group_num_blocks,
+                 len(layer_names),
+                 layout,
+-                fixed_strides=(None, interleaved_block_stride, None, None, None),
++                fixed_strides=(None, group_block_stride, None, None, None),
+             )
+             offset = (
+                 byte_offset
+@@ -1800,6 +1836,7 @@ def get_kv_cache_config_from_groups(
+                     layer_stride=layer_stride,
+                     block_stride=block_stride,
+                     offset=offset,
++                    slots_per_block=slots,
+                 )
+             )
+             byte_offset += len(layer_names) * spec.page_size_bytes
+@@ -2650,6 +2687,289 @@ def _project_kv_cache_groups_to_worker(
+     return projected_groups
+ 
+ 
++# ---------------------------------------------------------------------------
++# v2.5 side-cache layout (VLLM_E2_SIDE_CACHE_LAYOUT, default ON).
++#
++# The packed block-outermost layout strides every pool block by the widest
++# group, and every group draws whole blocks from the one pool. Flash-Next has
++# two side caches whose real state is tiny next to that stride (12.9 MB on the
++# binding PP stage): the TP-replicated PLE short-conv state (one layer, 2 + K
++# blocks per request in align mode, a 1.6 MB padded page) and the QSA raw-key
++# ring (one block per request, 16 KB for all of a stage's layers). Together
++# they hold 6 of the 103 blocks a 262K request needs. Two layout-only changes
++# remove that cost without changing any value a kernel reads:
++#
++# 1. PLE fold. The replicated Mamba group joins a sharded Mamba group with the
++#    same scheduling parameters whose block has a spare page on every worker
++#    (Flash-Next: a GDN group holds 6 of PP0's 7 pages), so the PLE state rides
++#    in that group's blocks under the block table it would have had on its
++#    own. No worker's stride changes, so the pool block count does not change.
++# 2. Ring slot packing. The ring group splits every pool block into S equal
++#    slots and the ring manager hands out slots; a pool block goes back to the
++#    pool when its last slot is released. The ring then costs cdiv(requests, S)
++#    blocks in all instead of one per request.
++#
++# Off (=0) restores one group each, block for block.
++# ---------------------------------------------------------------------------
++
++# Slot stride alignment for packed ring views (bytes) and the largest S tried.
++_RING_SLOT_ALIGN = 256
++_RING_MAX_SLOTS = 1024
++
++
++def _side_cache_layout_enabled(vllm_config: VllmConfig) -> bool:
++    """Whether the v2.5 side-cache layout may apply to this engine.
++
++    KV connectors (NIXL, offload, P/D) address groups and blocks themselves
++    (the NIXL worker requires exactly one single-layer replicated group), and
++    HiSparse has its own pool layout, so those engines keep the old layout.
++    """
++    if not envs.VLLM_E2_SIDE_CACHE_LAYOUT:
++        return False
++    if getattr(vllm_config, "kv_transfer_config", None) is not None:
++        return False
++    attention_config = getattr(vllm_config, "attention_config", None)
++    if getattr(attention_config, "hisparse_config", None) is not None:
++        return False
++    parallel_config = getattr(vllm_config, "parallel_config", None)
++    if getattr(parallel_config, "decode_context_parallel_size", 1) not in (1, None):
++        return False
++    try:
++        layout = vllm_config.cache_config.get_resolved_kv_cache_layout()
++    except ValueError:
++        # Unresolved layout: only reachable from callers that bypass the
++        # engine core; nothing to pack without a block-outermost layout.
++        return False
++    return bool(layout.is_block_outermost)
++
++
++def _group_layer_specs(group: KVCacheGroupSpec) -> list[KVCacheSpec]:
++    spec = group.kv_cache_spec
++    if isinstance(spec, UniformTypeKVCacheSpecs):
++        return [spec.kv_cache_specs[name] for name in group.layer_names]
++    return [spec] * len(group.layer_names)
++
++
++def _mamba_schedule_key(spec: MambaSpec) -> tuple:
++    """Everything the scheduler's MambaManager and the worker's align-mode
++    bookkeeping read from a group's spec. Two Mamba groups with equal keys get
++    identical block tables for every request."""
++    return (
++        spec.block_size,
++        spec.page_size_bytes,
++        spec.num_speculative_blocks,
++        spec.num_prefill_checkpoint_blocks,
++        spec.prefill_checkpoint_alignment,
++        spec.mamba_cache_mode,
++    )
++
++
++def _worker_strides(
++    groups: list[KVCacheGroupSpec], worker_specs: list[dict[str, KVCacheSpec]]
++) -> list[int]:
++    """Pool block bytes of every worker for this global grouping."""
++    strides = []
++    for spec in worker_specs:
++        projected = _project_kv_cache_groups_to_worker(groups, spec)
++        if not any(g.layer_names for g in projected):
++            strides.append(0)
++            continue
++        strides.append(_get_kv_cache_bytes_per_block(projected))
++    return strides
++
++
++def _fold_replicated_mamba_groups(
++    groups: list[KVCacheGroupSpec],
++    worker_specs: list[dict[str, KVCacheSpec]],
++) -> tuple[list[KVCacheGroupSpec], list[str]]:
++    """Fold each TP-replicated Mamba group into a compatible sharded one.
++
++    A target holds only sharded Mamba layers with the same scheduling key and
++    EAGLE flag, and the merged group must not widen the block of any worker
++    (checked on every worker's projection, so PP stages are covered). Among
++    valid targets the lowest index wins. Returns the new group list and one
++    log note per replicated group.
++    """
++    groups = list(groups)
++    notes: list[str] = []
++    base_strides = _worker_strides(groups, worker_specs)
++    index = 0
++    while index < len(groups):
++        source = groups[index]
++        layer_specs = _group_layer_specs(source)
++        if not (
++            layer_specs
++            and all(
++                isinstance(spec, MambaSpec) and spec.tp_replicated
++                for spec in layer_specs
++            )
++            and len({_mamba_schedule_key(spec) for spec in layer_specs}) == 1
++        ):
++            index += 1
++            continue
++        key = _mamba_schedule_key(cast(MambaSpec, layer_specs[0]))
++        chosen = None
++        for target_index, target in enumerate(groups):
++            if target_index == index or target.is_eagle_group != source.is_eagle_group:
++                continue
++            target_specs = _group_layer_specs(target)
++            if not target_specs or not all(
++                isinstance(spec, MambaSpec)
++                and not spec.tp_replicated
++                and _mamba_schedule_key(spec) == key
++                for spec in target_specs
++            ):
++                continue
++            merged_specs: dict[str, KVCacheSpec] = dict(
++                zip(target.layer_names, target_specs)
++            )
++            merged_specs.update(zip(source.layer_names, layer_specs))
++            # Built directly: is_uniform_type rejects mixed tp_replicated on
++            # purpose (NIXL), and connectors never reach this path.
++            merged = KVCacheGroupSpec(
++                target.layer_names + source.layer_names,
++                UniformTypeKVCacheSpecs(
++                    block_size=target_specs[0].block_size,
++                    kv_cache_specs=merged_specs,
++                ),
++                is_eagle_group=target.is_eagle_group,
++            )
++            trial = [
++                merged if i == target_index else g
++                for i, g in enumerate(groups)
++                if i != index
++            ]
++            strides = _worker_strides(trial, worker_specs)
++            if all(new <= old for new, old in zip(strides, base_strides)):
++                chosen = (target_index, merged, trial)
++                break
++        if chosen is None:
++            notes.append(
++                f"replicated Mamba group {index} ({len(source.layer_names)} "
++                "layer(s)) kept separate: no sharded group has a spare page on "
++                "every worker"
++            )
++            index += 1
++            continue
++        target_index, merged, trial = chosen
++        notes.append(
++            f"folded replicated Mamba group {index} "
++            f"({', '.join(source.layer_names)}) into Mamba group "
++            f"{target_index} (now {len(merged.layer_names)} layers); per-worker "
++            f"block bytes unchanged {sorted(set(base_strides))}"
++        )
++        groups = trial
++        # The group after the folded one now sits at `index`.
++    return groups, notes
++
++
++def _is_ring_group(group: KVCacheGroupSpec) -> bool:
++    spec = group.kv_cache_spec
++    layer_specs = (
++        list(spec.kv_cache_specs.values())
++        if isinstance(spec, UniformTypeKVCacheSpecs)
++        else [spec]
++    )
++    return bool(layer_specs) and all(
++        type(layer_spec) is CircularBufferSpec for layer_spec in layer_specs
++    )
++
++
++def _choose_ring_slots(
++    projected_groups_per_worker: list[list[KVCacheGroupSpec]],
++) -> dict[int, int]:
++    """Slots per pool block for every ring group (group index -> S >= 2).
++
++    S must cut every worker's block stride into equal slots that are
++    `_RING_SLOT_ALIGN`-aligned and hold that worker's ring pages; the largest
++    such S up to `_RING_MAX_SLOTS` is taken. Block ids are global, so S is the
++    same on every worker. A ring group with no valid S keeps one pool block
++    per request.
++    """
++    chosen: dict[int, int] = {}
++    if not projected_groups_per_worker or not projected_groups_per_worker[0]:
++        return chosen
++    num_groups = len(projected_groups_per_worker[0])
++    strides = [
++        _get_kv_cache_bytes_per_block(groups)
++        if any(g.layer_names for g in groups)
++        else 0
++        for groups in projected_groups_per_worker
++    ]
++    for group_index in range(num_groups):
++        if not _is_ring_group(projected_groups_per_worker[0][group_index]):
++            continue
++        needs = []
++        for groups, stride in zip(projected_groups_per_worker, strides):
++            group = groups[group_index]
++            if not group.layer_names:
++                continue
++            ring_bytes = sum(spec.page_size_bytes for spec in _group_layer_specs(group))
++            needs.append((stride, ring_bytes))
++        if not needs:
++            continue
++        for slots in range(_RING_MAX_SLOTS, 1, -1):
++            if all(
++                stride % slots == 0
++                and (stride // slots) % _RING_SLOT_ALIGN == 0
++                and stride // slots >= ring_bytes
++                for stride, ring_bytes in needs
++            ):
++                chosen[group_index] = slots
++                break
++    return chosen
++
++
++def _apply_side_cache_layout(
++    vllm_config: VllmConfig,
++    global_kv_cache_groups: list[KVCacheGroupSpec],
++    kv_cache_specs: list[dict[str, KVCacheSpec]],
++) -> tuple[list[KVCacheGroupSpec], list[list[KVCacheGroupSpec]]]:
++    """Fold side Mamba groups, project per worker, then pick ring slots.
++
++    Returns the (possibly folded) global groups and every worker's projection,
++    with `slots_per_block` set on packed ring groups.
++    """
++    relevant = any(
++        (isinstance(spec, MambaSpec) and spec.tp_replicated)
++        or type(spec) is CircularBufferSpec
++        for worker_spec in kv_cache_specs
++        for spec in worker_spec.values()
++    )
++    enabled = relevant and _side_cache_layout_enabled(vllm_config)
++    notes: list[str] = []
++    if enabled:
++        global_kv_cache_groups, notes = _fold_replicated_mamba_groups(
++            global_kv_cache_groups, kv_cache_specs
++        )
++    projected = [
++        _project_kv_cache_groups_to_worker(global_kv_cache_groups, worker_spec)
++        for worker_spec in kv_cache_specs
++    ]
++    if enabled and all(
++        _glm5_next_tensor_layout(groups) is None for groups in projected if groups
++    ):
++        for group_index, slots in _choose_ring_slots(projected).items():
++            for groups in projected:
++                groups[group_index].slots_per_block = slots
++            notes.append(
++                f"QSA ring group {group_index} packs {slots} requests per pool block"
++            )
++    if relevant and envs.VLLM_E2_SIDE_CACHE_LAYOUT and not enabled:
++        notes.append(
++            "not applicable to this engine (KV connector, HiSparse, DCP or a "
++            "layer-outermost layout)"
++        )
++    if relevant:
++        # The A/B evidence line: boot logs must show which arm ran.
++        logger.info(
++            "Side-cache layout: %s (VLLM_E2_SIDE_CACHE_LAYOUT)%s",
++            "on" if enabled else "off",
++            "".join(f"; {note}" for note in notes),
++        )
++    return global_kv_cache_groups, projected
++
++
+ def get_kv_cache_configs(
+     vllm_config: VllmConfig,
+     kv_cache_specs: list[dict[str, KVCacheSpec]],
+@@ -2725,10 +3045,11 @@ def get_kv_cache_configs(
+     # If original_max_model_len was -1, automatically
+     # determine the maximum model length that fits in available GPU memory.
+     # We use per-worker projected groups to account for PP sharding.
+-    projected_groups_per_worker = [
+-        _project_kv_cache_groups_to_worker(global_kv_cache_groups, worker_spec)
+-        for worker_spec in kv_cache_specs
+-    ]
++    # v2.5: the side-cache layout (PLE fold, ring slots) is applied here, where
++    # every worker's layers are known, so no PP stage's block can widen.
++    global_kv_cache_groups, projected_groups_per_worker = _apply_side_cache_layout(
++        vllm_config, global_kv_cache_groups, kv_cache_specs
++    )
+ 
+     # If `num_gpu_blocks_override` is set, the cache size that will actually
+     # be allocated is decoupled from the profiled `available_memory`:
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 1402e8ec3d..dc8f03367a 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -1554,6 +1554,10 @@ class Scheduler(SchedulerInterface):
+         pending = set(block_ids)
+         owners: dict[int, set[str]] = {}
+         for mgr in self.kv_cache_manager.coordinator.single_type_managers:
++            if getattr(mgr, "slot_pool", None) is not None:
++                # v2.5 slot-packed ring: its block ids are slot ids, not pool
++                # block ids, and its pages are never zeroed.
++                continue
+             for req_id, blocks in mgr.req_to_blocks.items():
+                 for blk in blocks:
+                     if blk.block_id in pending:
+diff --git a/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/v1/core/single_type_kv_cache_manager.py
+index 0ec6bca049..ca390ef2d6 100644
+--- a/vllm/v1/core/single_type_kv_cache_manager.py
++++ b/vllm/v1/core/single_type_kv_cache_manager.py
+@@ -1227,16 +1227,119 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
+         return 0
+ 
+ 
++class _RingSlotPage:
++    """One pool block shared by up to ``slots`` requests' rings."""
++
++    __slots__ = ("block", "free_slots", "live")
++
++    def __init__(self, block: KVCacheBlock, slots: int) -> None:
++        self.block = block
++        # Highest first, so pop() hands out the lowest free slot.
++        self.free_slots = list(range(slots - 1, -1, -1))
++        self.live = 0
++
++
++class RingSlotPool:
++    """v2.5 side-cache layout: ring blocks as slots of shared pool blocks.
++
++    The QSA ring needs one block per request for the request's lifetime, but
++    its pages for every layer of a stage are ~16 KB against a 12.9 MB pool
++    block. This pool takes whole blocks from the main ``BlockPool`` and cuts
++    each into ``slots_per_block`` slots; a slot's block id is
++    ``pool_block_id * slots_per_block + slot``, which is exactly the index of
++    the slot in the worker's ring view (``KVCacheTensor.slots_per_block``).
++
++    The slot blocks it hands out carry ``pool=self``, so every existing free
++    path -- ``SingleTypeKVCacheManager.free``, the coordinator's deferred
++    ``pop_blocks_for_free`` and the scheduler's fenced drain, which all call
++    ``BlockPool.free_blocks`` -- routes them back here, at the time the old
++    per-request block would have gone back (the deferred free is kept). A pool
++    block returns to the main pool when its last slot is freed. Rings are never
++    prefix-cached, so a slot block carries no hash.
++    """
++
++    def __init__(self, block_pool: BlockPool, slots_per_block: int) -> None:
++        assert slots_per_block > 1
++        self.block_pool = block_pool
++        self.slots_per_block = slots_per_block
++        # Pool block id -> page, in claim order (the oldest page fills first).
++        self._pages: dict[int, _RingSlotPage] = {}
++
++    @property
++    def num_pages(self) -> int:
++        """Pool blocks currently held for rings."""
++        return len(self._pages)
++
++    @property
++    def num_live_slots(self) -> int:
++        return sum(page.live for page in self._pages.values())
++
++    def has_free_slot(self) -> bool:
++        return any(page.free_slots for page in self._pages.values())
++
++    def get_new_blocks(self, num_blocks: int) -> list[KVCacheBlock]:
++        out: list[KVCacheBlock] = []
++        for _ in range(num_blocks):
++            page = next((p for p in self._pages.values() if p.free_slots), None)
++            if page is None:
++                (pool_block,) = self.block_pool.get_new_blocks(1)
++                page = _RingSlotPage(pool_block, self.slots_per_block)
++                self._pages[pool_block.block_id] = page
++            slot = page.free_slots.pop()
++            page.live += 1
++            out.append(
++                KVCacheBlock(
++                    page.block.block_id * self.slots_per_block + slot,
++                    ref_cnt=1,
++                    pool=self,  # type: ignore[arg-type]
++                )
++            )
++        return out
++
++    def free_blocks(self, ordered_blocks) -> None:
++        released: list[KVCacheBlock] = []
++        for block in ordered_blocks:
++            assert block.pool is self, "not a ring slot of this pool"
++            block.ref_cnt -= 1
++            assert block.ref_cnt == 0, "ring slots have a single owner"
++            page_id, slot = divmod(block.block_id, self.slots_per_block)
++            page = self._pages[page_id]
++            assert slot not in page.free_slots, f"slot {block.block_id} freed twice"
++            page.free_slots.append(slot)
++            page.free_slots.sort(reverse=True)
++            page.live -= 1
++            if page.live == 0:
++                del self._pages[page_id]
++                released.append(page.block)
++        if released:
++            self.block_pool.free_blocks(released)
++
++
+ class CircularBufferManager(FullAttentionManager):
+     """Claims the ring's single block per request; prefix caching disabled."""
+ 
+     supports_fine_grained_hash_lookup: ClassVar[bool] = False
+ 
++    # v2.5 side-cache layout: set by the coordinator for a slot-packed group.
++    _slot_pool: RingSlotPool | None = None
++
++    def enable_slot_packing(self, slots_per_block: int) -> None:
++        """Claim ring slots of shared pool blocks instead of whole blocks."""
++        assert not self.req_to_blocks, "enable slot packing before any claim"
++        self._slot_pool = RingSlotPool(self.block_pool, slots_per_block)
++
++    @property
++    def slot_pool(self) -> RingSlotPool | None:
++        return self._slot_pool
++
+     def _claim_ring_block(self, request_id: str) -> list[KVCacheBlock]:
+         req_blocks = self.req_to_blocks[request_id]
+         if req_blocks:
+             return []
+-        new_blocks = self.block_pool.get_new_blocks(1)
++        if self._slot_pool is not None:
++            new_blocks = self._slot_pool.get_new_blocks(1)
++        else:
++            new_blocks = self.block_pool.get_new_blocks(1)
+         req_blocks.extend(new_blocks)
+         if self._record_new_block_ids:
+             self.new_block_ids.extend(block.block_id for block in new_blocks)
+@@ -1281,7 +1384,12 @@ class CircularBufferManager(FullAttentionManager):
+         num_tokens_main_model: int,
+         apply_admission_cap: bool = False,
+     ) -> int:
+-        return 0 if self.req_to_blocks.get(request_id) else 1
++        if self.req_to_blocks.get(request_id):
++            return 0
++        # A free slot in a page the ring already holds costs no pool block.
++        if self._slot_pool is not None and self._slot_pool.has_free_slot():
++            return 0
++        return 1
+ 
+     def allocate_new_blocks(
+         self, request_id: str, num_tokens: int, num_tokens_main_model: int
+diff --git a/vllm/v1/kv_cache_interface.py b/vllm/v1/kv_cache_interface.py
+index 8cd867eb9c..8931b95025 100644
+--- a/vllm/v1/kv_cache_interface.py
++++ b/vllm/v1/kv_cache_interface.py
+@@ -1380,6 +1380,11 @@ class KVCacheTensor:
+     block_stride: int
+     offset: int = 0  # byte offset of layers[0]'s block 0
+     host_resident: bool = False
++    # v2.5 side-cache layout: a slot-packed ring tensor views every pool block
++    # as ``slots_per_block`` equal slots (``block_stride`` is then one slot), so
++    # its block ids are ``pool_block * slots_per_block + slot``. 1 = one view
++    # block per pool block, the ordinary case.
++    slots_per_block: int = 1
+ 
+ 
+ class KVCacheGroupRole(str, Enum):
+@@ -1408,6 +1413,10 @@ class KVCacheGroupSpec:
+     # source group after a connector load.
+     enable_kv_transfer: bool = True
+     role: KVCacheGroupRole = KVCacheGroupRole.DEFAULT
++    # v2.5 side-cache layout: > 1 when this one-block-per-request ring group
++    # shares each pool block between that many requests (see
++    # ``CircularBufferManager.enable_slot_packing``); 1 = one pool block each.
++    slots_per_block: int = 1
+ 
+ 
+ @dataclass
+@@ -1494,6 +1503,18 @@ class KVCacheConfig:
+             )
+         return tuple(block_ids[group_id] for group_id in self.transfer_group_ids)
+ 
++    @property
++    def slot_packed_group_ids(self) -> tuple[int, ...]:
++        """Groups whose blocks are slots of shared pool blocks (v2.5 side-cache
++        layout). Their views are not one block per pool block, so whole-block
++        zeroing must skip them; their bytes lie inside pool blocks the ring
++        manager owns and that no other group writes."""
++        return tuple(
++            group_id
++            for group_id, group in enumerate(self.kv_cache_groups)
++            if group.slots_per_block > 1
++        )
++
+     @property
+     def host_group_ids(self) -> tuple[int, ...]:
+         return tuple(
+@@ -1505,7 +1526,7 @@ class KVCacheConfig:
+     def num_blocks_of(self, tensor: KVCacheTensor) -> int:
+         """Number of blocks addressable by the pool backing ``tensor``."""
+         if not tensor.host_resident:
+-            return self.num_blocks
++            return self.num_blocks * tensor.slots_per_block
+         assert self.hisparse_host_num_blocks is not None
+         return self.hisparse_host_num_blocks
+ 
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 1876f4b347..d2bb0021eb 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -843,6 +843,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             kernel_block_sizes=self.kernel_block_sizes,
+             static_forward_context=self.compilation_config.static_forward_context,
+             num_blocks=self.kv_cache_config.num_blocks,
++            skip_kv_cache_group_ids=self.kv_cache_config.slot_packed_group_ids,
+         )
+ 
+     @torch.inference_mode()
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index 910c72c55c..010f110653 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -1173,6 +1173,7 @@ class GPUModelRunner(
+             runner_only_attn_layers=self.runner_only_attn_layers,
+             static_forward_context=self.compilation_config.static_forward_context,
+             num_blocks=self.kv_cache_config.num_blocks,
++            skip_kv_cache_group_ids=self.kv_cache_config.slot_packed_group_ids,
+         )
+ 
+     def _zero_block_ids(self, block_ids: list[int]) -> None:
+diff --git a/vllm/v1/worker/utils.py b/vllm/v1/worker/utils.py
+index 61698bf236..c09a0f7f11 100644
+--- a/vllm/v1/worker/utils.py
++++ b/vllm/v1/worker/utils.py
+@@ -138,6 +138,7 @@ class KVBlockZeroer:
+         static_forward_context: dict[str, Any],
+         num_blocks: int,
+         runner_only_attn_layers: set[str] | None = None,
++        skip_kv_cache_group_ids: Iterable[int] = (),
+     ) -> None:
+         """Precompute the absolute-address table for the Triton zeroing kernel.
+ 
+@@ -156,6 +157,13 @@ class KVBlockZeroer:
+         physical block stride and zeroed page span remain independent.
+ 
+         Only AttentionSpec layers are processed; Mamba layers are skipped.
++
++        ``skip_kv_cache_group_ids`` (v2.5 side-cache layout): slot-packed ring
++        groups, whose views hold several slots per pool block. Their claims
++        never enter whole-block zeroing (the ring-tag path clears their tag words instead),
++        and with one view block per pool block their pages sat inside the
++        first attention page, so skipping them leaves the zeroed bytes of
++        every block unchanged.
+         """
+         self.device = device
+         # Bounds-guard instrumentation: pool bound for the guard in _zero_kv_blocks_kernel.
+@@ -174,12 +182,15 @@ class KVBlockZeroer:
+         seg_block_strides: list[int] = []
+         seg_page_sizes: list[int] = []
+ 
++        skip_group_ids = set(skip_kv_cache_group_ids)
+         for group in attn_groups_iter:
+             spec = group.kv_cache_spec
+             if not isinstance(spec, AttentionSpec):
+                 continue
+             if group.kv_cache_group_id >= len(kernel_block_sizes):
+                 continue
++            if group.kv_cache_group_id in skip_group_ids:
++                continue
+             kernel_bs = kernel_block_sizes[group.kv_cache_group_id]
+             assert spec.block_size % kernel_bs == 0
+             for layer_name in group.layer_names:

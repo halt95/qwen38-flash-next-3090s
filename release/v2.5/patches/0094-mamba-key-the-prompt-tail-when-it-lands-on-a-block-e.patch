@@ -1,0 +1,243 @@
+From bfb212412ee600ad752b9cbb78beb374217bc414 Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 02:49:51 -0400
+Subject: [PATCH 94/97] mamba: key the prompt tail when it lands on a block end
+
+With a hash unit finer than the block, the prompt's tail key lands
+exactly on a block end once every block/unit turns. The tail key is the
+position the next turn resumes at: the last unit boundary, one unit
+lower under the eagle drop. It is then a full-block key, so the
+partial-tail registration does nothing, and under retention interval 0
+the mask kept only the replay boundary one block below it. That state
+was never hashed. The next turn therefore resumed one block lower after
+a cold turn, or one turn lower (at the held source) after a partial-tail
+resume, re-prefilling the previous turn's extension.
+
+MambaManager.cache_blocks now adds that block-aligned tail to the
+reachable boundaries, so the block ending there is hashed like any
+boundary state, retired into the held checkpoint and freed last. At the
+block unit the tail is the replay boundary itself and nothing changes.
+When the hash unit is below the Mamba block, MambaManager logs one
+startup line saying the block-aligned tail key is hashed.
+
+Tests: a cold and a partial-tail-resume case whose tail lands on a block
+end, under a concurrent burst, with the no-leak check. Both fail on the
+previous commit (the tail state is not keyed and the next turn resumes
+lower). A block-unit case asserts the hashed set is exactly the replay
+boundary.
+---
+ .../test_partial_prefix_cache_hits.py         | 130 +++++++++++++++++-
+ vllm/v1/core/single_type_kv_cache_manager.py  |  35 +++++
+ 2 files changed, 161 insertions(+), 4 deletions(-)
+
+diff --git a/tests/v1/core/prefix_cache/test_partial_prefix_cache_hits.py b/tests/v1/core/prefix_cache/test_partial_prefix_cache_hits.py
+index ee876b0f5d..5247e08fcb 100644
+--- a/tests/v1/core/prefix_cache/test_partial_prefix_cache_hits.py
++++ b/tests/v1/core/prefix_cache/test_partial_prefix_cache_hits.py
+@@ -2679,16 +2679,16 @@ def _tail_position(num_prompt_tokens: int) -> int:
+     return num_prompt_tokens // TAIL_HASH * TAIL_HASH - TAIL_HASH
+ 
+ 
+-def _tail_followup(prev, user_tokens: int, seed: int):
++def _tail_followup(prev, user_tokens: int, seed: int, aligned_tail: bool = False):
+     """The next turn: the previous turn's prompt + its output + new text,
+     sized so that its tail lands strictly inside a block above the last
+-    cacheable block end (the deployed case; a block-aligned tail is a
+-    full-block key, not a partial one)."""
++    cacheable block end (the common case), or -- ``aligned_tail`` -- exactly
++    on a block end (a full-block key, not a partial one)."""
+     while True:
+         prompt = len(prev.all_token_ids) + user_tokens
+         tail = _tail_position(prompt)
+         last_block_end = prompt - prompt % TAIL_BLOCK - TAIL_BLOCK
+-        if tail % TAIL_BLOCK != 0 and last_block_end < tail:
++        if (tail % TAIL_BLOCK == 0) is aligned_tail and last_block_end < tail:
+             break
+         user_tokens += 1
+     return make_request(
+@@ -3031,3 +3031,125 @@ def test_consumer_hold_follows_the_producers_moved_tail(tail_retain):
+     manager.free(consumer)
+     _tail_drain_copies(manager)
+     _tail_assert_pool_clean(manager, num_blocks)
++
++
++@pytest.mark.parametrize("resume", ["cold", "partial-tail"])
++def test_block_aligned_tail_key_is_hashed_and_held(tail_retain, resume):
++    """The prompt's tail key can land exactly on a block end (1 in
++    block/unit turns). It is then a full-block key: `_cache_partial_tail_block`
++    registers nothing, and under retention interval 0 the mask kept only the
++    replay boundary one block below it, so that state was never hashed. The
++    next turn then resumed one block (cold) or one turn (partial-tail resume:
++    at the held source) lower. Now the tail block is hashed, retired into the
++    hold like any boundary state, survives a concurrent burst, and the next
++    turn resumes at the tail itself. At the block unit nothing changes: the
++    tail is the replay boundary.
++    """
++    num_blocks = 96
++    manager = _tail_manager(num_blocks)
++    pool = manager.block_pool
++    mamba = _tail_mamba(manager)
++
++    if resume == "cold":
++        # 136 tokens: tail 128 = 4 blocks exactly; replay boundary 96.
++        a1 = make_request("A1", _tail_tokens(1, 136), TAIL_HASH, sha256)
++        below = 3 * TAIL_BLOCK
++        assert _tail_prefill(manager, a1) == 0
++    else:
++        a0 = make_request("A0", _tail_tokens(1, 150), TAIL_HASH, sha256)
++        _tail_prefill(manager, a0)
++        _tail_decode(manager, a0, steps=4)
++        manager.free(a0)
++        _tail_drain_copies(manager)
++        a1 = _tail_followup(a0, 13, seed=2, aligned_tail=True)
++        below = _tail_position(a0.num_prompt_tokens)  # the held source
++        assert _tail_prefill(manager, a1) == below
++        assert below % TAIL_BLOCK != 0
++    tail = _tail_position(a1.num_prompt_tokens)
++    assert tail % TAIL_BLOCK == 0 and tail > below
++    _tail_decode(manager, a1, steps=4)
++
++    # The tail state is keyed (without the block-end tail key the next turn
++    # resumed at `below` instead).
++    cached = pool.get_cached_block(a1.block_hashes[tail // TAIL_HASH - 1], [TAIL_MAMBA])
++    assert cached is not None, f"tail state@{tail} is not keyed (block-end tail)"
++    [tail_block] = cached
++    assert tail_block.block_hash_num_tokens == tail
++    if tail_retain:
++        assert mamba._retained_checkpoints[a1.request_id] == (tail, tail_block)
++        assert tail_block.ref_cnt == 1
++    else:
++        assert tail_block.ref_cnt == 0
++
++    # Concurrent prefills pop every free block while A1 decodes.
++    taken = pool.get_new_blocks(pool.get_num_free_blocks())
++    assert (tail_block.block_hash is not None) is tail_retain
++    pool.free_blocks(taken)
++
++    manager.free(a1)
++    _tail_drain_copies(manager)
++    a2 = _tail_followup(a1, 20, seed=3)
++    _, num_hit, _ = manager.get_computed_blocks(a2)
++    assert num_hit == (tail if tail_retain else 0)
++
++    _tail_prefill(manager, a2)
++    _tail_decode(manager, a2, steps=2)
++    manager.free(a2)
++    _tail_drain_copies(manager)
++    _tail_assert_pool_clean(manager, num_blocks)
++
++
++def test_block_unit_replay_boundary_is_unchanged():
++    """At the block unit (U = block) the tail helper is inert and the hashed
++    boundary set is exactly the replay boundary, as before."""
++    hash_block_size = block_size = 32
++    kv_cache_config = KVCacheConfig(
++        num_blocks=64,
++        kv_cache_tensors=[],
++        kv_cache_groups=[
++            KVCacheGroupSpec(
++                ["full"],
++                FullAttentionSpec(
++                    block_size=block_size, num_kv_heads=1, head_size=1, dtype=torch.float32
++                ),
++            ),
++            KVCacheGroupSpec(
++                ["mamba"],
++                MambaSpec(
++                    block_size=block_size,
++                    shapes=(1, 1),
++                    dtypes=(torch.float32,),
++                    mamba_cache_mode="align",
++                    num_speculative_blocks=TAIL_SPEC,
++                ),
++            ),
++        ],
++    )
++    manager = make_kv_cache_manager(
++        kv_cache_config=kv_cache_config,
++        max_model_len=8192,
++        enable_caching=True,
++        hash_block_size=hash_block_size,
++        use_eagle=True,
++        retention_interval=0,
++    )
++    mamba = manager.coordinator.single_type_managers[TAIL_MAMBA]
++    # 136 tokens: tail key 96 (eagle) = the replay boundary; the scheduler
++    # cuts the prefill there (last cacheable block end), then the rest.
++    request = make_request("R", _tail_tokens(1, 136), hash_block_size, sha256)
++    [boundary] = set(manager.coordinator.get_replay_boundaries(request))
++    assert boundary == 96
++    if hasattr(mamba, "_block_aligned_prompt_tail"):
++        assert mamba._block_aligned_prompt_tail(request) == 0
++    for chunk in (96, 40):
++        assert manager.allocate_slots(request, chunk, num_lookahead_tokens=TAIL_SPEC)
++        request.num_computed_tokens += chunk
++        manager.new_step_starts()
++    hashed = [
++        i * block_size
++        for i in range(1, 136 // block_size + 1)
++        if manager.block_pool.get_cached_block(
++            request.block_hashes[i - 1], [TAIL_MAMBA]
++        )
++    ]
++    assert hashed == [boundary]
+diff --git a/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/v1/core/single_type_kv_cache_manager.py
+index 649f0a476f..cf2b716078 100644
+--- a/vllm/v1/core/single_type_kv_cache_manager.py
++++ b/vllm/v1/core/single_type_kv_cache_manager.py
+@@ -1710,6 +1710,17 @@ class MambaManager(SingleTypeKVCacheManager):
+                 self.block_pool.hash_block_size,
+                 self.block_size,
+             )
++        if (
++            self.mamba_cache_mode == "align"
++            and self.enable_caching
++            and self.block_size > self.block_pool.hash_block_size
++        ):
++            logger.info_once(
++                "Mamba align: a prompt tail key that lands on a block end is "
++                "hashed too (hash unit %d, block %d)",
++                self.block_pool.hash_block_size,
++                self.block_size,
++            )
+ 
+     def _retire_state_blocks(
+         self, request_id: str, retired: list[tuple[int, KVCacheBlock]]
+@@ -2356,6 +2367,14 @@ class MambaManager(SingleTypeKVCacheManager):
+         replay_boundaries: Sequence[int],
+     ) -> None:
+         num_cached_blocks_before = self.num_cached_block.get(request.request_id, 0)
++        tail = self._block_aligned_prompt_tail(request)
++        if tail:
++            # With a hash unit finer than the block, the prompt's tail
++            # key (where the next turn resumes; `_cache_partial_tail_block`)
++            # can land exactly on a block end. It is then a full-block key,
++            # not a partial one, and the replay-boundary mask alone (one block
++            # below it under the eagle drop) would never hash that state.
++            replay_boundaries = (*replay_boundaries, tail)
+         super().cache_blocks(
+             request,
+             num_tokens,
+@@ -2397,6 +2416,22 @@ class MambaManager(SingleTypeKVCacheManager):
+     def new_step_starts(self) -> None:
+         self.cached_blocks_this_step.clear()
+ 
++    def _block_aligned_prompt_tail(self, request: Request) -> int:
++        """The prompt's tail key when it falls on a block end, else 0.
++
++        Only with a hash unit finer than the block (at the block unit the
++        tail IS the replay boundary, which the mask already keeps). The key
++        is placed exactly as `_cache_partial_tail_block` places a sub-block
++        tail, eagle shift included.
++        """
++        hash_block_size = self.block_pool.hash_block_size
++        if self.mamba_cache_mode != "align" or self.block_size <= hash_block_size:
++            return 0
++        tail = request.num_prompt_tokens // hash_block_size * hash_block_size
++        if self.drop_eagle_checkpoint_block:
++            tail = max(tail - hash_block_size, 0)
++        return tail if tail % self.block_size == 0 else 0
++
+     def _cache_partial_tail_block(
+         self,
+         request: Request,

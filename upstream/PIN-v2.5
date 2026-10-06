@@ -1,0 +1,62 @@
+# Flash-Next v2.5.1: the vLLM source this repo serves with (the published form of the tree the reference host serves;
+# CHANGELOG.md, "Published source versus the qualified tree").
+#   base: vllm-project/vllm tag v0.30.0 (ced6857afa, the public release; no nightly and no community branch)
+#   + 97 commits (release/v2.5/patches: v2.2.0's 58 + 39 for v2.5, reading aid; the series is linear and replays with
+#     `git am --keep-non-patch` onto v0.30.0 to the same tree), committed under the maintainer's identity; upstream ports are
+#     credited by PR number in the messages and by author in NOTICE
+#   The bundle is the source artefact; scripts/build-v2.5.sh verifies commit AND tree.
+repo=https://github.com/vllm-project/vllm.git
+base_commit=ced6857afa0ea7b2e3f0846a62e1394e90f15607
+# bundle prerequisites: the public v0.30.0 commit only (fetched by full SHA at depth 1)
+prereqs="ced6857afa0ea7b2e3f0846a62e1394e90f15607"
+bundle=v2.5.1-from-upstream-v0.30.0.bundle
+bundle_sha256=d904e4685877e56b57c9a23a621b537239ba6316ad238c3848c5f03437d03d7c
+# the bundle carries one branch head (not a tag); build-v2.5.sh fetches it and checks out the commit
+ref=refs/heads/v2.5.1-public
+# the release name the build script prints; the source is identified by commit and tree, not by a tag
+tag=v2.5.1
+commit=96a0d13b6e98ad4ef86e66a3f6ddb5dd9199a591
+# git tree hash of the release source (content-only, stable); build-v2.5.sh checks it after checkout
+tree=0df6d7ef38f8ac927bb8feb7dc9887c2c94e3901
+# The tree the release was qualified on (not published) differs from this one in comments, docstrings, log/error
+# text and test labels, identifier renames (the MERLIN_* switch prefix and a few test-helper names), development
+# notes not shipped (two in v2.2.0, one more in v2.5.1) and renamed test/probe files (CHANGELOG.md, "What changed in
+# v2.5.1", and docs/history.md for v2.2.0).
+# Compiled ops: UNCHANGED from v2.2.0. The 39 commits after v2.2.0 change no compiled code (vllm/ and tests/, plus
+# comment-only edits in three C/CUDA files; no CMake or build file), so the two own extensions and the artifacts tarball below are v2.2.0's, byte for byte.
+# (v2.2.0 notes, still true:) Unlike v2.0.1, the v2.2.0 delta changes csrc (the top-k kernels and the Marlin MoE split-K
+# switch), so two extensions are built from this tree for sm_86; every other build product is the stock
+# vLLM 0.30.0 wheel's, byte for byte (checked on the reference host). build-artifacts.list enumerates all 23 paths.
+own_extensions="vllm/_C_stable_libtorch.abi3.so vllm/_moe_C_stable_libtorch.abi3.so"
+own_C_sha256=6cb8bc7770112a9b31cf0b721a3b3c858a37f0104d06d355afb7ff02b041b4d4
+own_moe_C_sha256=66acb123e71ba0c7b6e1573418b241c93aa83b3f6d7efa3ef4a9ed4ebf191526
+# both built from this tree in the Ubuntu 22.04 root described below. Device code (cuobjdump -sass, per-build
+# anonymous-namespace hashes normalised) is identical to the qualified builds for every kernel this release
+# changes and every kernel on this model's path; 24 upstream kernels on paths this model does not use
+# (MiniMax-M3 / Kimi-K3 fused ops, DeepGEMM fp8 silu-mul quant, fp8 MoE finalize) differ, most likely because of
+# the host toolchain (gcc 11 here, gcc 14 on the reference host), which was not isolated as the cause.
+# the reference build: an Ubuntu 22.04 root (glibc 2.35, gcc 11.4, so the products need glibc >= 2.34), cmake + ninja,
+# TORCH_CUDA_ARCH_LIST=8.6, CUDA 13.3 (nvcc V13.3.33), Release, build dir outside the tree; targets _C_stable_libtorch
+# and _moe_C_stable_libtorch. A local rebuild is not expected to be byte-identical.
+build_cuda=13.3
+build_arch=8.6
+stock_wheel_version=0.30.0
+stock_wheel_url=https://files.pythonhosted.org/packages/1a/25/f5087a8f382e197a73672768b389d020b9d92e38371c3b0fc6dd883bbb34/vllm-0.30.0-cp38-abi3-manylinux_2_28_x86_64.whl
+stock_wheel_sha256=ef52ee58c410ead0b8afb190838fa4cbcb52075596f67862a03859d984966ac4
+# The stock 0.30.0 wheel's build products plus the two extensions built from this tree in the Ubuntu 22.04 root
+# (not the reference host's serving builds), as one tarball (241 MB, 2,005 files; not in git):
+artifacts_tar=build-artifacts-sm86-py313-cu130-v2.2.0.tar.gz
+artifacts_sha256=cdca5ffcb3003d15e00896f0969134e16d7bfbe0a3c6dfe10698bec32573f592
+# python / torch / runtime the reference venv pins (release/v2.5/requirements-pinned.txt is the full set; the
+# only change from v2.2.0 is transformers 5.17.0 -> 5.18.0)
+python=3.13
+torch=2.13.0
+torch_cuda=13.0
+triton=3.7.1
+flashinfer=0.6.18.post1
+# runtime kernel compilation (FlashInfer JIT, Triton launchers): the CUDA 13.0 nvcc/crt/nvvm/cccl wheels in
+# requirements-pinned.txt (PTX a CUDA >= 13.0 driver accepts); serve-v2.5.sh points CUDA_HOME at them
+jit_cuda=13.0
+# build-time tools installed next to the pins (not runtime dependencies)
+build_tools_pip="pip==26.2.1"
+build_tools="setuptools-rust==1.13.0 setuptools-scm==10.3.4 vcs-versioning==2.5.0 semantic-version==2.10.0"

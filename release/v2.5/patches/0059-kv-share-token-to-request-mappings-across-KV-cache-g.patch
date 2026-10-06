@@ -1,0 +1,40 @@
+From d9827c4d713d899908c4fbf61d26fe2f06e78240 Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Thu, 17 Sep 2026 20:14:36 -0700
+Subject: [PATCH 59/97] kv: share token-to-request mappings across KV cache
+ groups (port of upstream #57102)
+
+Port of the upstream vLLM change #57102 (Apache-2.0). KV cache groups that use the same token-to-request mapping now share one
+instead of rebuilding it per group.
+---
+ vllm/v1/worker/gpu/attn_utils.py | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/vllm/v1/worker/gpu/attn_utils.py b/vllm/v1/worker/gpu/attn_utils.py
+index eccfdbabcd..89f54d4d11 100644
+--- a/vllm/v1/worker/gpu/attn_utils.py
++++ b/vllm/v1/worker/gpu/attn_utils.py
+@@ -426,6 +426,7 @@ def build_attn_metadata(
+         seq_lens_cpu_upper_bound = seq_lens_cpu_upper_bound[:num_reqs]
+ 
+     attn_metadata: dict[str, Any] = {}
++    token_to_req_indices: torch.Tensor | None = None
+     num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
+     for i in range(num_kv_cache_groups):
+         if not attn_groups[i]:
+@@ -472,6 +473,7 @@ def build_attn_metadata(
+             mm_req_doc_ranges=mm_req_doc_ranges,
+             rswa_prefix_lens=rswa_prefix_lens,
+             req_idx=req_idx,
++            _token_to_req_indices_cache=token_to_req_indices,
+             **common_attn_metadata_extra_kwargs,
+         )
+ 
+@@ -497,6 +499,7 @@ def build_attn_metadata(
+                 )
+             for layer_name in attn_group.layer_names:
+                 attn_metadata[layer_name] = metadata
++        token_to_req_indices = common_attn_metadata._token_to_req_indices_cache
+     return attn_metadata
+ 
+ 

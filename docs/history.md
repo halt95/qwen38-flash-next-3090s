@@ -1,13 +1,15 @@
 # Release history
 
-Earlier release notes, moved here from the [README](../README.md). The current release is v2.2.0; its notes are in the
-README's [What changed in v2.2.0](../README.md#what-changed-in-v220).
+Earlier release notes, moved here from the [README](../README.md). The current release is v2.5.1; its notes are in
+[CHANGELOG.md](../CHANGELOG.md#what-changed-in-v251).
 
-## The releases in brief (v2.2.0, v2.0.1, v2)
+## The releases in brief (v2.5.1, v2.2.0, v2.0.1, v2)
+
+**v2.5.1** (2026-10-06) makes agent follow-up turns resume from cache: a follow-up resumes on a 64-token grid instead of the 4,096-token block, and the Gated-DeltaNet checkpoint and cached prefix a conversation needs are held until its next turn is admitted. It also increases the KV pool to 924,993 tokens, measures three 262,144-token sessions resident at once, updates combining-mark tokenization, supports prompts with up to 42 images, and aligns unset environment variables with the shipped launcher. Single-stream decode is about 3 % slower than v2.2.0; eight-concurrent-request throughput is effectively unchanged. v2.5.0 was not published. See [What changed in v2.5.1](../CHANGELOG.md#what-changed-in-v251).
 
 **v2.2.0** (2026-09-25) moves the same shape onto vLLM 0.30.0 (the public `v0.30.0`
 tag plus 58 commits) and is a reliability release, at parity with v2:
-[greedy repeatability, any-rank fault detection and faster shutdown](../README.md#what-changed-in-v220). **v2.0.1** (2026-09-18) is
+[greedy repeatability, any-rank fault detection and faster shutdown](#what-changed-in-v220). **v2.0.1** (2026-09-18) is
 the v2 shape plus one engine fix, [structured output under concurrency](#what-changed-in-v201). **v2**
 (2026-09-17) keeps everything the [v1 release](#v1-the-tp4-lane) established (calibrated FP8 KV for the
 sparse-attention layers, full cudagraphs, three-token speculative decoding) and changes the shape: **tensor
@@ -21,6 +23,124 @@ prefill 10–26 % faster. The v2-versus-v1 table below comes from the pre-regist
 ([`benchmarks/2026-09-17/BENCH-CARD.md`](../benchmarks/2026-09-17/BENCH-CARD.md)); v2.0.1 was requalified against those
 medians (maintainer-reported); capacity, memory, fault and prefix-cache figures are maintainer-reported from the
 campaign's close records, which are not published.
+## What changed in v2.2.0
+
+**v2.2.0 is rebased on vLLM 0.30.0 and needs the new runtime.** v2.0.x ran on a 0.28-era nightly plus a community
+branch; v2.2.0 is the public `v0.30.0` tag plus 58 commits. It cannot be dropped into a v2.0.x environment: it needs
+the vLLM 0.30.0 runtime (python 3.13, torch 2.13.0 with CUDA 13.0, triton 3.7.1, flashinfer 0.6.18.post1), its own two
+compiled extensions and a new compile cache. Unchanged: the checkpoint, `config.json`, the KV-scale sidecar, the serving
+shape (TP2 × PP2 + EP, MTP K=3) and the 806,792-token pool. Build it with `scripts/build-v2.2.sh`, serve it with
+`scripts/serve-v2.2.sh` ([Build and serve](https://github.com/halt95/qwen38-flash-next-3090s/blob/v2.2.0/README.md#build-and-serve)).
+
+**Published source versus the qualified tree.** The published source is the qualified tree with internal working
+labels and dates (task, run and design-note references) removed from comments, docstrings, log text, commit messages
+and file names. It differs from that tree only in: comments, docstrings, log/error message text, test-only labels in
+test data and one reader-thread name; identifier renames, namely the fork's switch prefix, published as `MERLIN_*`
+(environment variable names, the C++ `getenv` names, the build defines and helper functions derived from them, and the
+test helpers), and a few test and helper names (`medium_*`, `tiedet_*`, `largedet_*`, `REPLAY_SENTINEL_*`, `pre_tag`,
+the `isolated`-process tests and their constants, `_gpu_host_tier`, one test's report-directory variable); two
+internal design notes that are not shipped; nineteen test and probe files renamed (one test import follows a rename).
+With those renames mapped back, Python is AST-identical once docstrings and the changed string constants (log/error
+text, the thread name, test labels) are normalised, C++ is token-identical outside comments and string literals, and
+every file present in both trees keeps its line count. Both compiled extensions are rebuilt from the published source;
+their device code matches the qualified builds instruction for instruction for every kernel the release changes and
+every kernel on this model's path, identified by kernel name (`cuobjdump -sass`, after normalising per-build symbol
+hashes). 24 upstream kernels on paths this model does not use differ (MiniMax-M3 / Kimi-K3 fused ops, the DeepGEMM fp8
+silu-mul quant and the fp8 MoE finalize); the likely cause, not isolated, is the older host compiler of the build root
+(Ubuntu 22.04, gcc 11, chosen so that the extensions load on glibc 2.34). The unit tests give the same per-test results
+on both trees.
+
+It is a **reliability release, at parity with v2, not faster**: decode lands at 0.973–1.040 of v2 in every cell of
+the ladder (v2.2.0: one release-candidate boot; v2: five-boot gate medians; no confidence interval is claimed).
+Per-step time is 0.9–2.5 % higher in every cell, a combined difference of the determinism path, the 0.30 base and the
+instrumentation: v2.2.0 was measured with the guard reader in `warn` and both logging counters on, v2 with the readers
+off, and those readers cost ~0.3–0.5 ms per step in the v2 campaign ([Benchmarks](reference.md#benchmarks)). The switches alone
+cost 1.2–2.2 % at 65K–262K on one tree; tokens per step are equal or higher in six of the eight cells
+([`benchmarks/2026-09-24/BENCH-CARD.md`](../benchmarks/2026-09-24/BENCH-CARD.md)).
+
+![v2.2.0 prefill and decode over context depth, with step time](../benchmarks/2026-09-24/flashnext-v2.2.0-ctx-pp-tg-itl.png)
+
+Cold prefill runs 5,123–5,410 t/s from 10K to 200K tokens. Decode with thinking on (`reasoning_effort` low, 512 tokens) is 153.5–186.7 t/s (median of three
+different prompts per depth; one boot). Step time moves little with depth (18.8 → 19.4 ms), and most of the decode
+spread tracks how many drafted tokens each text accepts (2.77–3.58 per step) rather than context length.
+
+**Greedy output repeats within one compile cache.** Four switches remove three sources of run-to-run variation in
+T=0 decoding: `MERLIN_FULL_K=1` (Marlin MoE split-K reduction order), `MERLIN_QSA_SORT=1` (order of the blocks the
+sparse-attention top-k selects), `MERLIN_TIE_DET=1` and `MERLIN_TIE_RECENT=1` (how ties at the top-k cutoff are broken
+and which are kept). On release candidates, with prefix caching off and thinking off, 8 identical T=0 requests gave
+**1 distinct output** in every sampled cell from 3,960 to 261,802 prompt tokens; with the switches off, the deep cells
+gave 4 to 8 distinct outputs of 8. These are sampled results, not a batch-invariance guarantee, and they hold only
+within one compile cache (Known behaviours). The top-k kernel also emits its selection in canonical order itself
+(`MERLIN_TOPK_SORTED_EMIT=1`): output-identical to the Python sort it replaces, and 1.9–3.0 % lower median step time
+in one boot per arm.
+
+**A fail-closed fault on any GPU rank now stops the engine.** A fail-closed PLE fault on a non-zero tensor-parallel rank
+used to hang the engine: that worker's exit pipes had been inherited by a `torch_shm_manager` helper that outlived it,
+so the executor never saw the death and blocked in an RPC until its 300 s timeout
+(`VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS`). The defect is in v2.0.x as well; no
+earlier fault campaign exercised that case. v2.2.0 adds a per-worker fault pipe (the worker writes one byte before
+`os._exit`), a pidfd exit monitor with the sentinel as fallback, covering the whole initialisation window, and
+close-on-exec on the inherited pipes. Measured on the final tree: an injected fail-closed fault on rank 1 is detected at
++0.000 s, workers are gone in 3.0–3.5 s and the client gets HTTP 500 `EngineDeadError`. This covers fail-closed PLE
+faults and worker exits; a GPU that hangs without exiting is not covered by these measurements.
+
+Separately, drain-order fixes shorten orderly shutdown from ~9.0 s to 2.65–3.55 s: a late SIGTERM during teardown is
+survived, workers exit right after their orderly shutdown, and a failure that races shutdown still exits 1. These
+shutdown figures come from release candidates before the final tree, which also changes the fault-detection path and
+parts of the same teardown code.
+
+**Other fixes.**
+
+- The rare illegal-address engine death (Known behaviours) is contained: every sparse-attention raw-key ring row is
+  tagged and validated before pooling, so a stale or uncommitted row is no longer read as a key or a RoPE position. A
+  mismatched row is counted at an always-fatal guard site: with the shipped `GUARD=warn` the engine stops with a named
+  cause instead of an illegal-address fault (the failure boundary is the engine, not the request). With `GUARD=off`,
+  the code default, the row is masked and counted, nothing reads the counter, and the affected group's compressed
+  slot is left unwritten, so that setting is not a silent-safe alternative. A seeded replay faults on the old tree
+  and is caught on the new one. The fault is contained, not proven absent: the check did not fire in the release
+  candidates' 90-minute soak (12,115 requests) or three 15-minute stress runs, but the original fault was seen only
+  twice in the whole campaign, so no rate is claimed.
+- A hang in the PLE fatal path is fixed: the traceback formatter no longer runs exception-defined code before `os._exit`.
+- The PLE pull operator resolves live pointers by layer name, so the compile cache no longer bakes addresses in.
+- Carried or re-ported onto 0.30: #54793 / #54795 (PP), #54442 / #56802 (structured output under concurrency, the
+  v2.0.1 fix), #46994 (MTP under PP), #57050, #48532, #50021, #55506, #55557.
+
+**Serve-command changes against v2.0.1** (all in `scripts/serve-v2.2.sh`):
+
+- `VLLM_PLE_CPU_OFFLOAD=1` becomes **`VLLM_E2_PLE_PULL_TRANSPORT=1`**. vLLM 0.30 reuses the old name for its own PLE
+  backend with the opposite default; the tree refuses to boot with both on.
+- `VLLM_USE_BREAKABLE_CUDAGRAPH=0`, exactly `"0"`: 0.30 would otherwise switch this architecture to breakable graphs
+  and turn compilation off. The tree's profile guard refuses anything but the qualified shape.
+- The four determinism switches and `MERLIN_TOPK_SORTED_EMIT=1`. They are compile factors: changing one costs a fresh
+  compile.
+- `VLLM_E2_GUARD_MODE=warn`: bounds-guard telemetry on. Hits are reported, and the designated fatal sites (among them
+  the ring-row validation site) stop the engine with a named cause instead of masking the row silently. The code
+  default is `off` in v2.2.0 (a comment in the tree says otherwise; the comment is wrong); `warn` since v2.5.
+- **A first-serve toolchain.** FlashInfer compiles its prefill, sampling and top-k kernels on the first request and
+  Triton compiles its launchers, so serving needs a C/C++ compiler, ninja, the Python 3.13 headers and an nvcc no newer
+  than the driver. `build-v2.2.sh` installs the CUDA 13.0 nvcc/crt/nvvm/cccl wheels into the venv (PTX any CUDA 13.0+
+  driver accepts) and the `lib64` and unversioned library links FlashInfer and cmake look for; `serve-v2.2.sh` points
+  `CUDA_HOME` at them and checks compiler, ninja, headers and nvcc-versus-driver before starting. On Debian/Ubuntu:
+  `apt install gcc g++ ninja-build` (RHEL 9: `dnf install gcc gcc-c++`, with `ninja-build` from CRB or EPEL), plus the Python 3.13 headers (`python3.13-dev` on Debian 13, or from the deadsnakes
+  PPA on Ubuntu; uv and pyenv Pythons ship them; see Requirements). Two differences from the reference host: it compiles these kernels
+  with its system CUDA 13.3 toolkit (`CUDA_HOME=/usr/local/cuda`; set `CUDA_HOME` to do the same), and its venv
+  carries CUDA 13.4 toolkit wheels it does not use, which `requirements-pinned.txt` replaces with the 13.0 ones (four
+  pins: nvcc, crt, nvvm, cccl). Every other pin is the reference venv's.
+- The two logging-only counters (exact-restart counters every 30 s, FP8 KV clip counter every 300 s) are **off by
+  default** (`COUNTERS=1` opts in). The reference host ran them, and the published numbers were measured with them on,
+  but the clip counter's reader starts before cudagraph capture and can overlap it on a fresh-compile boot. The clip
+  counter is a compile factor, so the default is a different compiled variant from the measured one: on the final
+  tree it was booted only on the rented host without peer-to-peer (three boots, [Build and serve](https://github.com/halt95/qwen38-flash-next-3090s/blob/v2.2.0/README.md#build-and-serve);
+  correct answers, no performance comparison).
+- Inherited fork knobs (test-only fault injectors, diagnostics, timeouts, a correctness switch turned off by hand) are
+  cleared before the qualified values are set.
+- A **new** `VLLM_CACHE_ROOT`: 0.28-era compile artefacts do not carry over. First boot ~6 min, later boots ~3 min.
+  The kernels FlashInfer compiles on the first request are cached outside it, under `~/.cache/flashinfer`
+  (`FLASHINFER_WORKSPACE_BASE` replaces `~` in that path; the container sets it under `/cache`).
+- Keep model runner V2 (the 0.30 default).
+
+Rollback is pointing the entry back at the v2.0.x tree, environment and cache; nothing in the checkpoint changed.
+
 
 ## v2 against v1 at a glance
 
@@ -36,7 +156,7 @@ campaign's close records, which are not published.
 | MTP tokens per step, thinking on, same depths | 3.02 / 3.07 / 3.13 / 3.28 | 3.00 / 3.04 / 3.17 / 3.24† |
 | prefill, 10K / 100K / 261K prompt | **4,944 / 5,282 / 5,122** tok/s | 4,498 / 4,194 / — |
 | time to first token, cold, 4K / 32K / 131K / 261K | 0.91 / 6.19 / 24.77 / 50.68 s | 0.97 / 7.16 / 31.94 / — s |
-| quality vs the BF16 teacher (mean absolute per-token log-probability difference, teacher-forced, against this checkpoint served with a BF16 KV cache; 24 held-out prompts, 5 boots; lower is closer; [definition](../README.md#benchmarks)) | 0.0365–0.0378 | 0.0378–0.0385 |
+| quality vs the BF16 teacher (mean absolute per-token log-probability difference, teacher-forced, against this checkpoint served with a BF16 KV cache; 24 held-out prompts, 5 boots; lower is closer; [definition](reference.md#benchmarks)) | 0.0365–0.0378 | 0.0378–0.0385 |
 | tool-call structure (150 cases) / exact recall (160 cases) | 130/150 / 160/160 | reference quant 125/150 / 160/160 (parity band, ≥ ref − 2) |
 | vision | on, 2 images per request | on |
 
@@ -74,7 +194,7 @@ grammar rejection and no terminated request anywhere in the run. No throughput r
 reference host's two-boot ladder across 4K, 32K, 131K and 261K in both thinking modes, v2.0.1 lands between 0.978 and
 1.028 of the v2 median, with median inter-token latency within 0.21 ms and tokens per step unchanged. The
 prefix-cache equivalence block was re-run too and fails identically on v2 and v2.0.1 (same three cells, same cache-hit
-total, 51/51 answers correct on both): that is the open [prefix-cache loss](../README.md#known-behaviours-of-the-qwen38-flash-next-architecture-in-vllm),
+total, 51/51 answers correct on both): that is the open [prefix-cache loss](reference.md#known-behaviours-of-the-qwen38-flash-next-architecture-in-vllm),
 unchanged by this fix.
 
 Nothing else about the release changes: same checkpoint, same serve command, same KV budget, same pool of 806,792
@@ -87,7 +207,7 @@ for [issue #54437](https://github.com/vllm-project/vllm/issues/54437)) are the i
 ## v2.0.1 build and serve
 
 The v2.0.1 files, still in this repository (the v2.2.0 files are in the README's
-[Build and serve](../README.md#build-and-serve)):
+[Build and serve](https://github.com/halt95/qwen38-flash-next-3090s/blob/v2.2.0/README.md#build-and-serve)):
 
 | path | what |
 |---|---|
@@ -102,7 +222,7 @@ The v2.0.1 files, still in this repository (the v2.2.0 files are in the README's
 (`release/v2/v2.0.1-combined.diff`) contain internal working notes from the private development process: host names,
 reviewer and tool-lane names, references to operator rulings, and scratch paths, in patch subjects, commit message
 bodies and code comments. They are kept byte-identical because their hashes are published (`SHA256SUMS.v2.0.1`,
-`PACKAGE-MANIFEST.md`) and the same text is in the commits of the v2.0.1 bundle. The v2.2.0 series (`release/v2.2/`) was cleaned of such notes before publication (README, "Published source
+`PACKAGE-MANIFEST.md`) and the same text is in the commits of the v2.0.1 bundle. The v2.2.0 series (`release/v2.2/`) was cleaned of such notes before publication ([What changed in v2.2.0](#what-changed-in-v220), "Published source
 versus the qualified tree").
 
 Reproduction of v2 on the reference host from the bundle (maintainer-reported): commit and tree equal to

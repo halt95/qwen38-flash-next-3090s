@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Container entrypoint for Flash-Next v2.2.0: checks the mounted checkpoint, adds the one config key if it is
-# missing (and the mount is writable), warns when no GPU is visible, then execs scripts/serve-v2.2.sh (which also
+# Container entrypoint for Flash-Next v2.5.1: checks the mounted checkpoint, adds the one config key if it is
+# missing (and the mount is writable), warns when no GPU is visible, then execs scripts/serve-v2.5.sh (which also
 # warns about host RAM and /dev/shm). Extra arguments go to `vllm serve`.
 #
-#   docker run ... qwen38-flash-next-3090s:v2.2.0 [/path/inside/container/to/checkpoint] [extra vllm args]
+#   docker run ... qwen38-flash-next-3090s:v2.5.1 [/path/inside/container/to/checkpoint] [extra vllm args]
 #
 # A first argument that starts with `-` is a vllm argument: the default checkpoint path is used.
 set -euo pipefail
@@ -31,4 +31,4 @@ if ! command -v nvidia-smi >/dev/null 2>&1 || ! nvidia-smi -L >/dev/null 2>&1; t
   echo "WARNING: no NVIDIA GPU visible in the container (docker run --gpus all; nvidia-container-toolkit on the host,"
   echo "         registered with: sudo nvidia-ctk runtime configure --runtime=docker && sudo systemctl restart docker)"
 fi
-exec "$HERE/scripts/serve-v2.2.sh" "$CKPT" "$@"
+exec "$HERE/scripts/serve-v2.5.sh" "$CKPT" "$@"

@@ -1,0 +1,43 @@
+From c7da5be0920e0cbe42860525d1b4ed6f3f7e9f50 Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 05:39:19 -0400
+Subject: [PATCH 70/97] qsa: keep the clip-counter start line's log token
+
+The post-capture start line keeps the token "QSA clip counter armed (read interval Ns)" that log checks look for;
+the previous change had reworded it. A source test pins the token.
+---
+ tests/models/qwen4_exp/test_qsa_clip_reader_lifecycle.py | 3 +++
+ vllm/models/qwen4_exp/nvidia/qsa.py                      | 5 ++++-
+ 2 files changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/tests/models/qwen4_exp/test_qsa_clip_reader_lifecycle.py b/tests/models/qwen4_exp/test_qsa_clip_reader_lifecycle.py
+index a81feb7761..7de02bcd32 100644
+--- a/tests/models/qwen4_exp/test_qsa_clip_reader_lifecycle.py
++++ b/tests/models/qwen4_exp/test_qsa_clip_reader_lifecycle.py
+@@ -161,6 +161,9 @@ def test_source_pins():
+     fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_qsa_clip_count")
+     assert "threading.Thread" not in ast.unparse(fn), "the clip reader must not be started from the forward"
+     assert "register_post_capture_hook(_qsa_clip_start_reader)" in qsa
++    # the serving smoke greps r"QSA clip counter armed \(read interval [0-9.]+s\)" (an earlier wording of this line
++    # failed it); the post-capture start line must keep that token.
++    assert "QSA clip counter armed (read interval %.0fs)" in qsa
+     gtree = ast.parse(_src(_GT_PATH))
+     sr = next(n for n in ast.walk(gtree) if isinstance(n, ast.FunctionDef) and n.name == "start_reader")
+     stmts = [s for s in sr.body if not (isinstance(s, ast.Expr) and isinstance(s.value, ast.Constant))]
+diff --git a/vllm/models/qwen4_exp/nvidia/qsa.py b/vllm/models/qwen4_exp/nvidia/qsa.py
+index 467f7ad418..a10f0a7c6a 100644
+--- a/vllm/models/qwen4_exp/nvidia/qsa.py
++++ b/vllm/models/qwen4_exp/nvidia/qsa.py
+@@ -241,8 +241,11 @@ def _qsa_clip_start_reader() -> None:
+             name="qsa-clip-reader",
+             daemon=True,
+         ).start()
++    # The leading "QSA clip counter armed (read interval Ns)" is the token the serving smoke greps
++    # (v2.2.0 logged it from the first forward); keep it verbatim when editing this line.
+     logger.info(
+-        "QSA clip counter reader started after capture (read interval %.0fs, %d layer(s) registered)",
++        "QSA clip counter armed (read interval %.0fs); reader started after capture "
++        "(%d layer(s) registered)",
+         _qsa_clip_interval,
+         len(_qsa_clip_counters),
+     )

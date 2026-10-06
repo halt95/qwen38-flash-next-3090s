@@ -1,0 +1,780 @@
+From be68b5c43071aaa28d5813053c5130ff984b7fe1 Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 02:49:51 -0400
+Subject: [PATCH 93/97] mamba: hold the partial-tail CoW checkpoint until the
+ request is freed
+
+With --prefix-match-unit below the block size, a follow-up turn that
+resumes at a partial tail (mid-block) never hashes a block-boundary GDN
+state. Under retention interval 0 the only boundary kept is the replay
+boundary, which lies below the resume point. The request's own tail is
+published on its running block and moved into a CoW block by the next
+chunk, and the scheduler releases both copy endpoints once the copy has
+run. That block then sat at ref 0 in the free queue for the rest of the
+request, ahead of its attention blocks, and concurrent prefills popped
+it. The hybrid hit is the shortest group's, so the next turn resumed at
+0. Under a long-context multi-turn agent load, 7 of 61 follow-ups at
+unit 64 (6 at 256/512/1024) came back with cached_tokens 0 on 80-100K
+prompts whose whole attention prefix was still cached. Every one
+followed a partial-tail resume, none followed a block-aligned one, and
+unit 4096 never missed.
+
+The existing retention (VLLM_E2_MAMBA_RETAIN_CHECKPOINT) only held
+hashed blocks retired from the table, so it never covered that copy.
+Now, under the same switch:
+
+- The running-request CoW branch holds the moved tail block in
+  _retained_checkpoints with a ref of its own; the copy retention pair
+  is unchanged. The new-request branch holds the hit source after
+  _apply_cow for the same reason: a request that stops before its own
+  tail still leaves the state it resumed from.
+- _retained_checkpoints is keyed by block_hash_num_tokens instead of
+  block index, so a sub-block tail key orders correctly against full
+  block states; _retire_state_blocks uses the same key. The newest
+  position supersedes and releases the older one, so a request still
+  holds at most one block per group.
+- When a producer moves its tail hashes into its CoW block, another
+  request holding that source (a sibling that resumed at the tail while
+  it was the producer's live block) follows the hashes to the copy.
+- Admission reserves one extra block per Mamba group for a partial-tail
+  hit: the held source and the moved tail coexist at the tail step.
+
+The hold is released on every free path (finish, abort, preemption,
+deferred pop_blocks_for_free) by the coordinator, last, after the
+request's attention blocks, as before. When the hold is active (switch
+on, hash unit below the Mamba block) MambaManager logs one startup line
+saying so, with the hash unit and block size.
+
+Tests (CPU): a replay of the miss that fails on v2.5.0 with the
+retention switch on (next-turn hit 0 instead of the tail) and passes
+here; the structural variant; admission accounting; no-leak checks for
+a request freed with its copy still queued, in both release orders; and
+the moved-hash follow. The retention suite's one block-index assertion
+now reads the token position.
+---
+ .../test_partial_prefix_cache_hits.py         | 499 ++++++++++++++++++
+ .../core/test_mamba_checkpoint_retention.py   |   5 +-
+ vllm/v1/core/kv_cache_coordinator.py          |   5 +-
+ vllm/v1/core/single_type_kv_cache_manager.py  | 111 +++-
+ 4 files changed, 606 insertions(+), 14 deletions(-)
+
+diff --git a/tests/v1/core/prefix_cache/test_partial_prefix_cache_hits.py b/tests/v1/core/prefix_cache/test_partial_prefix_cache_hits.py
+index 4798e0cde2..ee876b0f5d 100644
+--- a/tests/v1/core/prefix_cache/test_partial_prefix_cache_hits.py
++++ b/tests/v1/core/prefix_cache/test_partial_prefix_cache_hits.py
+@@ -2532,3 +2532,502 @@ def test_boundary_states_offered_past_prompt_for_resumed_prefill():
+     offered = [b for _, _, b in drain_boundary_state_offloads(manager).get("0", [])]
+     assert 2 * block_size in offered
+     assert req0.num_prompt_tokens < 2 * block_size
++
++
++# ---------------------------------------------------------------------------
++# A partial-tail resume must leave its own tail checkpoint referenced
++# (the tail-CoW total miss, measured at --prefix-match-unit 64/256/512/1024).
++# ---------------------------------------------------------------------------
++TAIL_BLOCK = 32  # mamba block
++TAIL_HASH = 8  # prefix-match unit (full attention hashes at the unit)
++TAIL_SPEC = 3  # MTP K=3, as deployed
++TAIL_SWITCH = "VLLM_E2_MAMBA_RETAIN_CHECKPOINT"
++TAIL_ATTN = 0  # group ids
++TAIL_MAMBA = 1
++
++
++@pytest.fixture(params=["1", "0"], ids=["retain-on", "retain-off-control"])
++def tail_retain(request, monkeypatch) -> bool:
++    from vllm import envs
++
++    monkeypatch.setenv(TAIL_SWITCH, request.param)
++    if hasattr(envs.__getattr__, "cache_clear"):
++        envs.__getattr__.cache_clear()
++    return request.param == "1"
++
++
++def _tail_manager(num_blocks: int, use_eagle: bool = True):
++    """Full attention at the hash unit + one align-mode Mamba group at the
++    block, eagle/MTP drop on, retention interval 0 (the deployed default)."""
++    kv_cache_config = KVCacheConfig(
++        num_blocks=num_blocks,
++        kv_cache_tensors=[],
++        kv_cache_groups=[
++            KVCacheGroupSpec(
++                ["full"],
++                FullAttentionSpec(
++                    block_size=TAIL_HASH,
++                    num_kv_heads=1,
++                    head_size=1,
++                    dtype=torch.float32,
++                ),
++            ),
++            KVCacheGroupSpec(
++                ["mamba"],
++                MambaSpec(
++                    block_size=TAIL_BLOCK,
++                    shapes=(1, 1),
++                    dtypes=(torch.float32,),
++                    mamba_cache_mode="align",
++                    num_speculative_blocks=TAIL_SPEC,
++                ),
++            ),
++        ],
++    )
++    manager = make_kv_cache_manager(
++        kv_cache_config=kv_cache_config,
++        max_model_len=8192,
++        enable_caching=True,
++        hash_block_size=TAIL_HASH,
++        use_eagle=use_eagle,
++        retention_interval=0,
++    )
++    assert manager.coordinator.enable_partial_hash_hits
++    return manager
++
++
++def _tail_split(
++    request, num_new: int, num_local_hit: int = 0, use_eagle: bool = True
++) -> int:
++    """The real ``Scheduler._mamba_block_aligned_split`` on a stub self."""
++    stub = SimpleNamespace(
++        block_size=TAIL_BLOCK,
++        cache_config=SimpleNamespace(block_size=TAIL_BLOCK),
++        use_eagle_block_drop=use_eagle,
++        max_num_scheduled_tokens=8192,
++        scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
++        mamba_partial_cache_hit=True,
++        mamba_fine_grained_prefix_cache=False,
++        hash_block_size=TAIL_HASH,
++        mamba_has_prefill_checkpoint_blocks=False,
++        mamba_prefill_checkpoint_alignment=None,
++    )
++    return Scheduler._mamba_block_aligned_split(stub, request, num_new, num_local_hit)
++
++
++def _tail_drain_copies(manager) -> None:
++    """What the scheduler does once a step's CoW copies have run: release
++    both endpoints' copy retentions."""
++    _, retained = manager.take_kv_cache_block_copies()
++    manager.block_pool.free_blocks(retained)
++
++
++def _tail_prefill(manager, request) -> int:
++    """Prefill to the prompt end in the chunks the scheduler would cut
++    (block ends, the partial-tail stop); returns the admitted hit length."""
++    computed_blocks, num_hit, _ = manager.get_computed_blocks(request)
++    first = True
++    while request.num_computed_tokens < request.num_tokens:
++        start = request.num_computed_tokens + (num_hit if first else 0)
++        num_new = _tail_split(
++            request, request.num_tokens - start, num_hit if first else 0
++        )
++        assert num_new > 0
++        blocks = manager.allocate_slots(
++            request,
++            num_new,
++            num_new_computed_tokens=num_hit if first else 0,
++            new_computed_blocks=computed_blocks if first else None,
++            num_lookahead_tokens=TAIL_SPEC,
++        )
++        assert blocks is not None, "prefill chunk did not fit"
++        request.num_computed_tokens = start + num_new
++        manager.new_step_starts()
++        _tail_drain_copies(manager)
++        first = False
++    return num_hit
++
++
++def _tail_decode(manager, request, steps: int) -> None:
++    """MTP K=3 decode steps, no drafts accepted."""
++    next_tok = 50000 + len(request.output_token_ids)
++    if request.num_computed_tokens == request.num_tokens:
++        request.append_output_token_ids(next_tok)
++        next_tok += 1
++    for _ in range(steps):
++        assert request.num_computed_tokens == request.num_tokens - 1
++        request.spec_token_ids = [next_tok + i for i in range(TAIL_SPEC)]
++        blocks = manager.allocate_slots(
++            request, 1 + TAIL_SPEC, num_lookahead_tokens=TAIL_SPEC
++        )
++        assert blocks is not None, "decode step did not fit"
++        request.spec_token_ids = []
++        request.num_computed_tokens += 1
++        request.append_output_token_ids([next_tok])
++        next_tok += 1
++        manager.new_step_starts()
++        _tail_drain_copies(manager)
++
++
++def _tail_tokens(seed: int, n: int) -> list[int]:
++    return [seed * 10000 + i for i in range(n)]
++
++
++def _tail_position(num_prompt_tokens: int) -> int:
++    """Where the prompt's partial-tail state is keyed (eagle shifts it one
++    unit below the last hash boundary)."""
++    return num_prompt_tokens // TAIL_HASH * TAIL_HASH - TAIL_HASH
++
++
++def _tail_followup(prev, user_tokens: int, seed: int):
++    """The next turn: the previous turn's prompt + its output + new text,
++    sized so that its tail lands strictly inside a block above the last
++    cacheable block end (the deployed case; a block-aligned tail is a
++    full-block key, not a partial one)."""
++    while True:
++        prompt = len(prev.all_token_ids) + user_tokens
++        tail = _tail_position(prompt)
++        last_block_end = prompt - prompt % TAIL_BLOCK - TAIL_BLOCK
++        if tail % TAIL_BLOCK != 0 and last_block_end < tail:
++            break
++        user_tokens += 1
++    return make_request(
++        prev.request_id + "+",
++        list(prev.all_token_ids) + _tail_tokens(seed, user_tokens),
++        TAIL_HASH,
++        sha256,
++    )
++
++
++def _tail_mamba(manager):
++    return manager.coordinator.single_type_managers[TAIL_MAMBA]
++
++
++def _tail_free_ids(manager) -> set[int]:
++    return {b.block_id for b in manager.block_pool.free_block_queue.get_all_free_blocks()}
++
++
++def _tail_assert_pool_clean(manager, num_blocks: int) -> None:
++    pool = manager.block_pool
++    assert pool.get_num_free_blocks() == num_blocks - 1  # all but the null block
++    assert all(blk.ref_cnt == 0 for blk in pool.blocks[1:])
++    mamba = _tail_mamba(manager)
++    assert not mamba._retained_checkpoints
++    assert not mamba._partial_hit_reqs
++    assert not mamba.req_to_blocks
++
++
++def test_partial_tail_resume_next_turn_hits_after_concurrent_allocation(tail_retain):
++    """Behaviour only (the observed miss): A1 resumed at A0's partial
++    tail; while A1 decodes, concurrent prefills pop every free block; A1
++    finishes; A2 must resume at A1's tail. Before the fix A2's hit is 0 --
++    a total miss on a prompt whose whole attention prefix is still cached."""
++    manager = _tail_manager(96)
++    pool = manager.block_pool
++    a0 = make_request("A0", _tail_tokens(1, 150), TAIL_HASH, sha256)
++    _tail_prefill(manager, a0)
++    _tail_decode(manager, a0, steps=4)
++    manager.free(a0)
++    _tail_drain_copies(manager)
++
++    a1 = _tail_followup(a0, 26, seed=2)
++    num_hit = _tail_prefill(manager, a1)
++    assert num_hit == _tail_position(a0.num_prompt_tokens)  # a partial tail
++    assert num_hit % TAIL_BLOCK != 0
++    _tail_decode(manager, a1, steps=4)
++    pool.free_blocks(pool.get_new_blocks(pool.get_num_free_blocks()))  # burst
++    manager.free(a1)
++    _tail_drain_copies(manager)
++
++    a2 = _tail_followup(a1, 20, seed=3)
++    _, num_hit, _ = manager.get_computed_blocks(a2)
++    assert all(
++        pool.get_cached_block(a1.block_hashes[i], [TAIL_ATTN])
++        for i in range(a1.num_prompt_tokens // TAIL_HASH)
++    )
++    assert num_hit == (_tail_position(a1.num_prompt_tokens) if tail_retain else 0)
++
++
++def test_partial_tail_resume_keeps_its_own_tail_under_concurrent_allocation(
++    tail_retain,
++):
++    """Turn 0 (A0) is a cold prefill; turn 1 (A1) resumes at A0's partial tail
++    (mid-block). A1 hashes no boundary state -- its replay boundary is below
++    its resume point -- so its own tail, moved into a CoW block by the chunk
++    after the tail stop, is the only GDN state its next turn can hit. Before
++    the fix the scheduler's post-copy release left that block at ref 0 in the
++    free queue while A1 still decoded; a concurrent prefill popped it and the
++    next turn (A2) got a TOTAL miss although every attention block of A1 was
++    still cached. With retention on, A1 holds the moved tail until it is
++    freed and A2 resumes at it. ``retain-off-control`` is the old behaviour
++    (and v2.5.0 fails the retain-on case the same way).
++    """
++    num_blocks = 96
++    manager = _tail_manager(num_blocks)
++    pool = manager.block_pool
++    mamba = _tail_mamba(manager)
++
++    a0 = make_request("A0", _tail_tokens(1, 150), TAIL_HASH, sha256)
++    assert _tail_prefill(manager, a0) == 0
++    _tail_decode(manager, a0, steps=4)
++    manager.free(a0)
++    _tail_drain_copies(manager)
++
++    # A1 resumes at A0's tail: a sub-block hit, so its first chunk copies the
++    # hit state into a private block (CoW).
++    a1 = _tail_followup(a0, 26, seed=2)
++    a1_tail = _tail_position(a1.num_prompt_tokens)
++    num_hit = _tail_prefill(manager, a1)
++    assert num_hit == _tail_position(a0.num_prompt_tokens)
++    assert num_hit % TAIL_BLOCK != 0
++    [tail_block] = pool.get_cached_block(
++        a1.block_hashes[a1_tail // TAIL_HASH - 1], [TAIL_MAMBA]
++    )
++    # The tail state was moved out of A1's table into the CoW block, and A1
++    # keyed no full-block boundary state of its own.
++    assert tail_block not in mamba.req_to_blocks.get(a1.request_id, [])
++    assert tail_block.block_hash_num_tokens == a1_tail
++    for position in range(TAIL_BLOCK, a1_tail, TAIL_BLOCK):
++        if position > num_hit:
++            assert (
++                pool.get_cached_block(
++                    a1.block_hashes[position // TAIL_HASH - 1], [TAIL_MAMBA]
++                )
++                is None
++            )
++    _tail_decode(manager, a1, steps=4)
++
++    if tail_retain:
++        assert mamba._retained_checkpoints[a1.request_id] == (a1_tail, tail_block)
++        assert tail_block.ref_cnt == 1
++        assert tail_block.block_id not in _tail_free_ids(manager)
++    else:
++        # The exposure: cached-free while A1 still runs.
++        assert tail_block.ref_cnt == 0 and tail_block.block_hash is not None
++        assert tail_block.block_id in _tail_free_ids(manager)
++
++    # A burst of concurrent prefills pops every free block while A1 decodes.
++    taken = pool.get_new_blocks(pool.get_num_free_blocks())
++    assert (tail_block.block_hash is not None) is tail_retain
++    pool.free_blocks(taken)
++
++    # A1 finishes; its next turn arrives.
++    manager.free(a1)
++    _tail_drain_copies(manager)
++    a2 = _tail_followup(a1, 20, seed=3)
++    _, num_hit, _ = manager.get_computed_blocks(a2)
++    # Every attention block of A1's prompt is still cached in both worlds.
++    assert all(
++        pool.get_cached_block(a1.block_hashes[i], [TAIL_ATTN])
++        for i in range(a1.num_prompt_tokens // TAIL_HASH)
++    )
++    if tail_retain:
++        assert num_hit == a1_tail
++    else:
++        # FAILING CONTROL: total miss with the whole attention prefix cached.
++        assert num_hit == 0
++
++    # The next turn runs to completion on what it got; nothing leaks.
++    _tail_prefill(manager, a2)
++    _tail_decode(manager, a2, steps=2)
++    manager.free(a2)
++    _tail_drain_copies(manager)
++    _tail_assert_pool_clean(manager, num_blocks)
++
++
++def test_partial_tail_hit_admission_reserves_the_tail_swap(tail_retain):
++    """Full-sequence admission of a partial-tail follow-up reserves one block
++    per Mamba group above the per-step estimate (the held hit source and the
++    moved tail coexist for the swap); a block-aligned follow-up reserves none.
++    """
++    num_blocks = 96
++    manager = _tail_manager(num_blocks)
++    a0 = make_request("A0", _tail_tokens(1, 150), TAIL_HASH, sha256)
++    _tail_prefill(manager, a0)
++    _tail_decode(manager, a0, steps=2)
++    manager.free(a0)
++    _tail_drain_copies(manager)
++
++    a1 = _tail_followup(a0, 26, seed=2)
++    computed, num_hit, _ = manager.get_computed_blocks(a1)
++    assert num_hit % TAIL_BLOCK != 0
++
++    def need(apply_admission_cap: bool) -> int:
++        return manager.coordinator.get_num_blocks_to_allocate(
++            request_id=a1.request_id,
++            num_tokens=a1.num_tokens,
++            new_computed_blocks=computed.blocks,
++            num_encoder_tokens=0,
++            total_computed_tokens=num_hit,
++            num_local_computed_tokens=num_hit,
++            num_tokens_main_model=a1.num_tokens,
++            apply_admission_cap=apply_admission_cap,
++        )
++
++    assert need(True) == need(False) + (1 if tail_retain else 0)
++
++
++@pytest.mark.parametrize("deferred", [False, True], ids=["free", "pop_blocks_for_free"])
++@pytest.mark.parametrize("stop_at", ["after-hit-copy", "after-tail-copy"])
++def test_partial_tail_resume_freed_with_queued_copy_leaks_nothing(
++    tail_retain, deferred, stop_at
++):
++    """A request that resumed at a partial tail is freed (finish, abort or
++    preemption) while its CoW copy is still queued -- before the scheduler
++    has released the copy retentions. Whatever order the retentions and the
++    request's hold are released in, every block ends at ref 0 and the pool
++    returns to baseline; the superseded hit source ages instead of leaking.
++    """
++    num_blocks = 96
++    manager = _tail_manager(num_blocks)
++    pool = manager.block_pool
++    mamba = _tail_mamba(manager)
++
++    a0 = make_request("A0", _tail_tokens(1, 150), TAIL_HASH, sha256)
++    _tail_prefill(manager, a0)
++    _tail_decode(manager, a0, steps=2)
++    manager.free(a0)
++    _tail_drain_copies(manager)
++
++    a1 = _tail_followup(a0, 26, seed=2)
++    a1_tail = _tail_position(a1.num_prompt_tokens)
++    computed_blocks, num_hit, _ = manager.get_computed_blocks(a1)
++    assert 0 < num_hit < a1_tail and num_hit % TAIL_BLOCK != 0
++    [source] = pool.get_cached_block(
++        a0.block_hashes[num_hit // TAIL_HASH - 1], [TAIL_MAMBA]
++    )
++    assert source.ref_cnt == 0
++
++    # First chunk: the hit source is copied into A1's private block.
++    num_new = _tail_split(a1, a1.num_tokens - num_hit, num_hit)
++    assert manager.allocate_slots(
++        a1, num_new, num_hit, computed_blocks, num_lookahead_tokens=TAIL_SPEC
++    )
++    a1.num_computed_tokens = num_hit + num_new
++    manager.new_step_starts()
++    if tail_retain:
++        assert mamba._retained_checkpoints[a1.request_id] == (num_hit, source)
++    if stop_at == "after-tail-copy":
++        _tail_drain_copies(manager)
++        # Run to the chunk that moves A1's own tail into a CoW block.
++        while a1.num_computed_tokens <= a1_tail:
++            num_new = _tail_split(a1, a1.num_tokens - a1.num_computed_tokens)
++            assert manager.allocate_slots(a1, num_new, num_lookahead_tokens=TAIL_SPEC)
++            a1.num_computed_tokens += num_new
++            manager.new_step_starts()
++            if a1.num_computed_tokens <= a1_tail:
++                _tail_drain_copies(manager)
++        [tail_block] = pool.get_cached_block(
++            a1.block_hashes[a1_tail // TAIL_HASH - 1], [TAIL_MAMBA]
++        )
++        if tail_retain:
++            assert mamba._retained_checkpoints[a1.request_id] == (a1_tail, tail_block)
++            assert source.ref_cnt == 0  # superseded: ages, not leaked
++            assert source.block_hash is not None
++
++    # Freed with the copy still queued.
++    if deferred:
++        pool.free_blocks(manager.pop_blocks_for_free(a1))
++    else:
++        manager.free(a1)
++    assert a1.request_id not in mamba._retained_checkpoints
++    assert all(blk.ref_cnt >= 0 for blk in pool.blocks[1:])
++    # The copy's retentions are released afterwards.
++    _tail_drain_copies(manager)
++    assert source.ref_cnt == 0
++    _tail_assert_pool_clean(manager, num_blocks)
++
++
++def test_consumer_hold_follows_the_producers_moved_tail(tail_retain):
++    """Without the eagle drop a sibling can resume at a producer's tail while
++    that tail is still the producer's LIVE running block (published at the
++    tail stop, hit before the producer's next chunk). The consumer's hold
++    then pins the producer's block; when the producer's next chunk moves the
++    hashes into its CoW block, the hold must follow them -- it pins the
++    hashed state, never another request's running block -- and both
++    requests must still free cleanly.
++    """
++    num_blocks = 96
++    manager = _tail_manager(num_blocks, use_eagle=False)
++    pool = manager.block_pool
++    mamba = _tail_mamba(manager)
++
++    producer = make_request("P", _tail_tokens(1, 150), TAIL_HASH, sha256)
++    tail = producer.num_prompt_tokens // TAIL_HASH * TAIL_HASH  # 144, no shift
++    computed, num_hit, _ = manager.get_computed_blocks(producer)
++    while producer.num_computed_tokens < tail:
++        # The real split gets the whole remainder and stops at the tail.
++        num_new = _tail_split(
++            producer, producer.num_tokens - producer.num_computed_tokens, use_eagle=False
++        )
++        assert producer.num_computed_tokens + num_new <= tail
++        assert manager.allocate_slots(
++            producer,
++            num_new,
++            num_new_computed_tokens=num_hit,
++            new_computed_blocks=computed,
++            num_lookahead_tokens=TAIL_SPEC,
++        )
++        producer.num_computed_tokens += num_new
++        computed, num_hit = None, 0
++        manager.new_step_starts()
++        _tail_drain_copies(manager)
++    [live] = pool.get_cached_block(
++        producer.block_hashes[tail // TAIL_HASH - 1], [TAIL_MAMBA]
++    )
++    assert live in mamba.req_to_blocks["P"]  # the tail is keyed on the live block
++
++    consumer = make_request(
++        "C", list(producer.prompt_token_ids) + _tail_tokens(2, 30), TAIL_HASH, sha256
++    )
++    c_computed, c_hit, _ = manager.get_computed_blocks(consumer)
++    assert c_hit == tail
++    num_new = _tail_split(
++        consumer, consumer.num_tokens - c_hit, c_hit, use_eagle=False
++    )
++    assert manager.allocate_slots(
++        consumer, num_new, c_hit, c_computed, num_lookahead_tokens=TAIL_SPEC
++    )
++    consumer.num_computed_tokens = c_hit + num_new
++    if tail_retain:
++        assert mamba._retained_checkpoints["C"] == (tail, live)
++
++    # The producer's next chunk moves the tail hashes into its CoW block.
++    manager.new_step_starts()
++    _tail_drain_copies(manager)
++    num_new = _tail_split(
++        producer, producer.num_tokens - producer.num_computed_tokens, use_eagle=False
++    )
++    assert manager.allocate_slots(producer, num_new, num_lookahead_tokens=TAIL_SPEC)
++    producer.num_computed_tokens += num_new
++    [moved] = pool.get_cached_block(
++        producer.block_hashes[tail // TAIL_HASH - 1], [TAIL_MAMBA]
++    )
++    assert moved is not live and live.block_hash is None
++    if tail_retain:
++        assert mamba._retained_checkpoints["C"] == (tail, moved)
++        assert mamba._retained_checkpoints["P"] == (tail, moved)
++    manager.new_step_starts()
++    _tail_drain_copies(manager)
++    # The live block is referenced by the producer's table alone again.
++    assert live.ref_cnt == 1
++
++    _tail_decode(manager, producer, steps=2)
++    manager.free(producer)
++    _tail_drain_copies(manager)
++    while consumer.num_computed_tokens < consumer.num_tokens:
++        num_new = _tail_split(
++            consumer,
++            consumer.num_tokens - consumer.num_computed_tokens,
++            use_eagle=False,
++        )
++        assert manager.allocate_slots(
++            consumer, num_new, num_lookahead_tokens=TAIL_SPEC
++        )
++        consumer.num_computed_tokens += num_new
++        manager.new_step_starts()
++        _tail_drain_copies(manager)
++    _tail_decode(manager, consumer, steps=2)
++    manager.free(consumer)
++    _tail_drain_copies(manager)
++    _tail_assert_pool_clean(manager, num_blocks)
+diff --git a/tests/v1/core/test_mamba_checkpoint_retention.py b/tests/v1/core/test_mamba_checkpoint_retention.py
+index 9d0d440631..502e68b03e 100644
+--- a/tests/v1/core/test_mamba_checkpoint_retention.py
++++ b/tests/v1/core/test_mamba_checkpoint_retention.py
+@@ -548,8 +548,9 @@ def test_mtp_chunked_prefill_aligned_prompt_retains_newest_boundary_only(
+         [hi] = pool.get_cached_block(hi_hash, [gid])
+         assert _hashed_cached(manager, lo)  # superseded / never held: ages
+         if retain:
+-            idx, held = _mamba(manager, gid)._retained_checkpoints["A"]
+-            assert idx == 2 and held is hi
++            # Keyed by the hashed token position, not block index.
++            position, held = _mamba(manager, gid)._retained_checkpoints["A"]
++            assert position == 3 * BLOCK and held is hi
+             assert hi.ref_cnt == 1
+         else:
+             assert _hashed_cached(manager, hi)
+diff --git a/vllm/v1/core/kv_cache_coordinator.py b/vllm/v1/core/kv_cache_coordinator.py
+index 7537ccd698..b58aa966ff 100644
+--- a/vllm/v1/core/kv_cache_coordinator.py
++++ b/vllm/v1/core/kv_cache_coordinator.py
+@@ -248,7 +248,10 @@ class KVCacheCoordinator(ABC):
+                     # the free queue that check reads.
+                     num_blocks_to_allocate += (
+                         manager.get_num_retained_checkpoint_blocks_to_reserve(
+-                            request_id, num_tokens_main_model, new_computed_blocks[i]
++                            request_id,
++                            num_tokens_main_model,
++                            new_computed_blocks[i],
++                            num_local_computed_tokens,
+                         )
+                     )
+         return num_blocks_to_allocate
+diff --git a/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/v1/core/single_type_kv_cache_manager.py
+index ca390ef2d6..649f0a476f 100644
+--- a/vllm/v1/core/single_type_kv_cache_manager.py
++++ b/vllm/v1/core/single_type_kv_cache_manager.py
+@@ -611,6 +611,7 @@ class SingleTypeKVCacheManager(ABC):
+         request_id: str,
+         num_tokens: int,
+         new_computed_blocks: Sequence[KVCacheBlock] = (),
++        num_local_computed_tokens: int = 0,
+     ) -> int:
+         """Blocks the admission gate must add for checkpoints this request
+         will hold outside its block table (0 for every manager but align-mode
+@@ -1673,7 +1674,24 @@ class MambaManager(SingleTypeKVCacheManager):
+             and self.enable_caching
+             and envs.VLLM_E2_MAMBA_RETAIN_CHECKPOINT
+         )
+-        # {request_id: (logical block index, block)}
++        # {request_id: (hashed token position, block)}: the newest hashed
++        # state the request resumed from or produced, held with one ref of
++        # its own (ordered by ``block_hash_num_tokens`` rather than
++        # block index so a sub-block partial-tail key sorts correctly against
++        # full-block boundary states).
++        #
++        # With ``--prefix-match-unit`` below the block size a request
++        # that resumed at a partial tail (mid-block) never hashes a boundary
++        # state: the replay boundary lies below its resume point. Its only
++        # reusable GDN state is its own partial-tail checkpoint, which the
++        # next chunk moves into a CoW block in no block table; the scheduler
++        # drops the copy's retention refs once the copy has run, so that
++        # block sat at ref 0 in the free queue for the rest of the request,
++        # ahead of its attention blocks, and concurrent prefills evicted it
++        # (measured: 7/61 follow-ups with cached_tokens 0 at unit 64, every
++        # one after a partial-tail resume; none at unit 4096). The CoW paths
++        # therefore hold their hashed endpoint here too: the moved tail for
++        # a running request, and the hit source a new request copies from.
+         self._retained_checkpoints: dict[str, tuple[int, KVCacheBlock]] = {}
+         if self.mamba_cache_mode == "align" and self.enable_caching:
+             # The A/B evidence line: boot logs must show which arm ran.
+@@ -1682,6 +1700,16 @@ class MambaManager(SingleTypeKVCacheManager):
+                 "(VLLM_E2_MAMBA_RETAIN_CHECKPOINT)",
+                 "on" if self._retain_checkpoint else "off",
+             )
++        if (
++            self._retain_checkpoint
++            and self.block_size > self.block_pool.hash_block_size
++        ):
++            logger.info_once(
++                "Mamba align: each request holds its partial-tail CoW checkpoint "
++                "until it is freed (hash unit %d, block %d)",
++                self.block_pool.hash_block_size,
++                self.block_size,
++            )
+ 
+     def _retire_state_blocks(
+         self, request_id: str, retired: list[tuple[int, KVCacheBlock]]
+@@ -1696,13 +1724,16 @@ class MambaManager(SingleTypeKVCacheManager):
+         """
+         if self._retain_checkpoint:
+             newest: tuple[int, KVCacheBlock] | None = None
+-            for idx, block in retired:
+-                if block.block_hash is not None and (
+-                    newest is None or idx > newest[0]
+-                ):
+-                    newest = (idx, block)
++            for _, block in retired:
++                if block.block_hash is None:
++                    continue
++                position = block.block_hash_num_tokens
++                assert position is not None
++                if newest is None or position > newest[0]:
++                    newest = (position, block)
+             held = self._retained_checkpoints.get(request_id)
+             if newest is not None and (held is None or newest[0] > held[0]):
++                # The retired block's table ref becomes the hold's ref.
+                 self._retained_checkpoints[request_id] = newest
+                 retired = [entry for entry in retired if entry[1] is not newest[1]]
+                 if held is not None:
+@@ -1711,6 +1742,43 @@ class MambaManager(SingleTypeKVCacheManager):
+         if retired:
+             self.block_pool.free_blocks([block for _, block in retired])
+ 
++    def _hold_checkpoint(self, request_id: str, block: KVCacheBlock) -> bool:
++        """Hold ``block`` (a hashed state outside the request's table) as the
++        request's prefix checkpoint, taking one extra ref for the hold.
++
++        Only the newest position is held: an older one is left alone (it ages
++        from wherever it is), a superseded one is released here. The hold's
++        ref is returned by ``pop_retained_checkpoints`` -> ``free_blocks``.
++        Returns whether the block is now held.
++        """
++        if not self._retain_checkpoint or block.is_null or block.block_hash is None:
++            return False
++        position = block.block_hash_num_tokens
++        assert position is not None
++        held = self._retained_checkpoints.get(request_id)
++        if held is not None and (held[1] is block or held[0] >= position):
++            return False
++        self.block_pool.touch([block])
++        self._retained_checkpoints[request_id] = (position, block)
++        if held is not None:
++            self.block_pool.free_blocks([held[1]])
++        return True
++
++    def _follow_moved_hash(
++        self, owner_id: str, source_block: KVCacheBlock, cow_block: KVCacheBlock
++    ) -> None:
++        """``owner_id`` just moved ``source_block``'s hashes to ``cow_block``
++        and keeps writing ``source_block``. A request that resumed at that
++        tail while it was still the owner's live block holds the source for
++        those hashes; move its hold to the copy, so it pins the hashed state
++        and not another request's running block.
++        """
++        for request_id, (position, block) in list(self._retained_checkpoints.items()):
++            if request_id != owner_id and block is source_block:
++                self.block_pool.touch([cow_block])
++                self._retained_checkpoints[request_id] = (position, cow_block)
++                self.block_pool.free_blocks([source_block])
++
+     def pop_retained_checkpoints(self, request_id: str) -> list[KVCacheBlock]:
+         if self.mamba_cache_mode != "align":
+             return []
+@@ -1722,16 +1790,25 @@ class MambaManager(SingleTypeKVCacheManager):
+         request_id: str,
+         num_tokens: int,
+         new_computed_blocks: Sequence[KVCacheBlock] = (),
++        num_local_computed_tokens: int = 0,
+     ) -> int:
+         # A request that already holds a checkpoint only ever swaps it. One
+         # that does not will hold one once a hashed state retires, which needs
+         # at least one state block behind the running one.
+-        if (
+-            not self._retain_checkpoint
+-            or request_id in self._retained_checkpoints
+-            or num_tokens <= self.block_size
+-        ):
++        if not self._retain_checkpoint or request_id in self._retained_checkpoints:
+             return 0
++        # A sub-block (partial-tail) hit holds the hit source only
++        # until the request's own tail is moved into a CoW block that is held
++        # in its place; at that step both are referenced, so the request's
++        # lifetime peak is one block above what the hit brought (whatever the
++        # prompt length: the tail CoW happens inside the first block too).
++        if self._has_partial_local_hit(new_computed_blocks, num_local_computed_tokens):
++            return 1
++        if num_tokens <= self.block_size:
++            # No state block retires behind the running one, but a prompt
++            # whose tail is keyed inside the block still moves that tail into
++            # a held CoW block when the hash unit is finer than the block.
++            return int(self.block_pool.hash_block_size < self.block_size)
+         # A prefix hit already brings the block that becomes the held
+         # checkpoint -- the hit state, counted by get_num_blocks_to_allocate as
+         # an evictable computed block (or already referenced elsewhere) -- and
+@@ -2166,6 +2243,7 @@ class MambaManager(SingleTypeKVCacheManager):
+                         # overwrites source_block.
+                         assert req_blocks[block_idx] is source_block
+                         self.block_pool.move_block_hashes(source_block, cow_block)
++                        self._follow_moved_hash(request_id, source_block, cow_block)
+                         self._pending_cow_copies.append((source_block, cow_block))
+                         source_block.ref_cnt += 1
+                         producer_tail = self._producer_partial_tail_reqs.pop(
+@@ -2189,9 +2267,20 @@ class MambaManager(SingleTypeKVCacheManager):
+                             # The moved entry is only filled by this step's
+                             # copy, so defer same-step hits on it.
+                             self.cached_blocks_this_step.add(cow_block.block_hash)
++                        # The moved tail is the request's newest
++                        # reusable state and lives in no block table; hold it
++                        # past the copy's retention so the request's next
++                        # turn can resume at it (see __init__).
++                        self._hold_checkpoint(request_id, cow_block)
+                     else:
+                         self._apply_cow(request_id, block_idx, source_block, cow_block)
+                         returned_blocks = [cow_block] + returned_blocks
++                        # The hit source keeps the hash while the
++                        # request advances its private copy; hold it until
++                        # the request's own tail supersedes it, so a request
++                        # that stops early (preempted, aborted, block-aligned
++                        # prompt) still leaves the state it resumed from.
++                        self._hold_checkpoint(request_id, source_block)
+                 req_blocks.extend(new_blocks)
+                 self._allocated_block_reqs.add(request_id)
+                 self._partial_hit_reqs.pop(request_id, None)

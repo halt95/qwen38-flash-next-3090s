@@ -1,16 +1,16 @@
-# Flash-Next v2.2.0 on 4x RTX 3090 with one command:
+# Flash-Next v2.5.1 on 4x RTX 3090 with one command:
 #   MODEL_DIR=/path/to/Qwen3.8-Flash-Next-W4A16-Merlin docker compose up -d
 # then talk to http://localhost:8000/v1 (OpenAI-compatible; model name "flash-next").
-# First start compiles the cudagraphs (~6 min) into the flash-next-cache-v2.2 volume, and the first request FlashInfer's
+# First start compiles the cudagraphs (~6 min) into the flash-next-cache-v2.5 volume, and the first request FlashInfer's
 # kernels (the image points FlashInfer's and Triton's caches into the same volume); later starts are fast (~3 min).
 # Needs Docker Compose v2 and nvidia-container-toolkit registered with Docker (nvidia-ctk runtime configure --runtime=docker).
 services:
   flash-next:
-    image: qwen38-flash-next-3090s:v2.2.0
+    image: qwen38-flash-next-3090s:v2.5.1
     build:
       context: .
       # args:
-      #   BUNDLE_URL: https://github.com/halt95/qwen38-flash-next-3090s/releases/download/v2.2.0/v2.2.0-from-upstream-v0.30.0.bundle.gz
+      #   BUNDLE_URL: https://github.com/halt95/qwen38-flash-next-3090s/releases/download/v2.5.1/v2.5.1-from-upstream-v0.30.0.bundle.gz
       #   ARTIFACTS_URL: https://github.com/halt95/qwen38-flash-next-3090s/releases/download/v2.2.0/build-artifacts-sm86-py313-cu130-v2.2.0.tar.gz
     deploy:
       resources:
@@ -36,8 +36,8 @@ services:
       # AUTO_TOPO: "1"                   # opt-in topology selector (docs/topology-selector.md); the image has no numactl, so binding is skipped
     volumes:
       - "${MODEL_DIR:?set MODEL_DIR to the Qwen3.8-Flash-Next-W4A16-Merlin directory}:/models/Qwen3.8-Flash-Next-W4A16-Merlin"
-      - flash-next-cache-v2.2:/cache
+      - flash-next-cache-v2.5:/cache
     restart: unless-stopped
     stop_grace_period: 70s     # serve passes --shutdown-timeout 60; Docker's 10 s default would kill a draining server
 volumes:
-  flash-next-cache-v2.2: {}
+  flash-next-cache-v2.5: {}

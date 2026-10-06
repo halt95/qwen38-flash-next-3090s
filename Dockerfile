@@ -1,54 +1,54 @@
-# Flash-Next v2.2.0 in one image: Qwen3.8-Flash-Next-W4A16-Merlin at 262K per request, 806,792-token KV pool,
-# 4x RTX 3090, on vLLM 0.30.0. The image runs scripts/build-v2.2.sh (public v0.30.0 + the v2.2.0 bundle, commit AND tree
-# hash asserted, pinned venv, the two v2.2 extensions from the build-artifacts asset, hash-checked) and starts
-# scripts/serve-v2.2.sh through scripts/docker-entrypoint.sh.
+# Flash-Next v2.5.1 in one image: Qwen3.8-Flash-Next-W4A16-Merlin at 262K per request, 924,993-token KV pool,
+# 4x RTX 3090, on vLLM 0.30.0. The image runs scripts/build-v2.5.sh (public v0.30.0 + the v2.5.1 bundle, commit AND tree
+# hash asserted, pinned venv, the two own extensions built for v2.2.0 (unchanged in v2.5.1) from the build-artifacts asset, hash-checked) and starts
+# scripts/serve-v2.5.sh through scripts/docker-entrypoint.sh.
 #
-#   docker build -t qwen38-flash-next-3090s:v2.2.0 .
+#   docker build -t qwen38-flash-next-3090s:v2.5.1 .
 #   docker run --gpus all --stop-timeout 70 --shm-size=8g --ulimit memlock=-1 -p 8000:8000 \
 #     -v /path/to/Qwen3.8-Flash-Next-W4A16-Merlin:/models/Qwen3.8-Flash-Next-W4A16-Merlin \
-#     -v flash-next-cache-v2.2:/cache qwen38-flash-next-3090s:v2.2.0
+#     -v flash-next-cache-v2.5:/cache qwen38-flash-next-3090s:v2.5.1
 #
 # The two release assets are fetched at build time (BUNDLE_URL ~0.7 MB, ARTIFACTS_URL ~241 MB), or taken from the build
-# context if you put v2.2.0-from-upstream-v0.30.0.bundle (or the downloaded .bundle.gz) and
-# build-artifacts-sm86-py313-cu130-v2.2.0.tar.gz next to this Dockerfile. build-v2.2.sh asserts both sha256s from
-# upstream/PIN-v2.2.
+# context if you put v2.5.1-from-upstream-v0.30.0.bundle (or the downloaded .bundle.gz) and
+# build-artifacts-sm86-py313-cu130-v2.2.0.tar.gz next to this Dockerfile. build-v2.5.sh asserts both sha256s from
+# upstream/PIN-v2.5.
 #
 # Runtime kernel compilation. The build needs no compiler, but the FIRST SERVE does: FlashInfer compiles its prefill,
 # sampling and top-k kernels and Triton compiles its launchers against Python.h. So the image carries a C/C++ compiler
 # and ninja (the python:3.13 base image ships the Python headers), and the venv carries the CUDA 13.0
 # nvcc/crt/nvvm/cccl wheels (PTX any CUDA >= 13.0 driver accepts; an unpinned toolkit resolves to a newer CUDA whose
-# PTX an older driver rejects with "Unsupported .version"); build-v2.2.sh adds the lib64 / unversioned library links
-# FlashInfer links against, and serve-v2.2.sh points CUDA_HOME at that toolkit and checks it against the driver
+# PTX an older driver rejects with "Unsupported .version"); build-v2.5.sh adds the lib64 / unversioned library links
+# FlashInfer links against, and serve-v2.5.sh points CUDA_HOME at that toolkit and checks it against the driver
 # before starting. (Reported on the v2.0.1 image by a user on a headless host.)
 #
 # Host needs: the NVIDIA driver (CUDA >= 13.0; the release is qualified with peer-to-peer working across the four cards, and
-# also runs without it, with lower prefill: README, "Build and serve"), nvidia-container-toolkit registered with Docker
+# also runs without it, with lower prefill: docs/reference.md, "Build and serve"), nvidia-container-toolkit registered with Docker
 # (nvidia-ctk runtime configure --runtime=docker, then restart docker),
 # host RAM: 96 GB is the qualified allocation; the measured resident floor is ~69 GiB (~48 GiB n-gram table + ~4.2 GiB
 # pinned embeddings + ~16 GiB workers/engine/shared segments), the rest being reclaimable page cache. /dev/shm >= 1 GB (--shm-size).
 FROM python:3.13-slim-bookworm
-ARG BUNDLE_URL=https://github.com/halt95/qwen38-flash-next-3090s/releases/download/v2.2.0/v2.2.0-from-upstream-v0.30.0.bundle.gz
+ARG BUNDLE_URL=https://github.com/halt95/qwen38-flash-next-3090s/releases/download/v2.5.1/v2.5.1-from-upstream-v0.30.0.bundle.gz
 ARG ARTIFACTS_URL=https://github.com/halt95/qwen38-flash-next-3090s/releases/download/v2.2.0/build-artifacts-sm86-py313-cu130-v2.2.0.tar.gz
 ENV DEBIAN_FRONTEND=noninteractive PIP_NO_CACHE_DIR=1
 RUN apt-get update && apt-get install -y --no-install-recommends git curl ca-certificates tar gzip procps \
        gcc g++ build-essential ninja-build \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /opt/flash-next
-# the repo files build-v2.2.sh / serve-v2.2.sh need (see .dockerignore for what is left out)
+# the repo files build-v2.5.sh / serve-v2.5.sh need (see .dockerignore for what is left out)
 COPY . /opt/flash-next/
-# (a .bundle.gz from the build context is decompressed by build-v2.2.sh)
-RUN if [ ! -f v2.2.0-from-upstream-v0.30.0.bundle ] && [ ! -f v2.2.0-from-upstream-v0.30.0.bundle.gz ]; then \
-      curl -fsSL "$BUNDLE_URL" | gunzip > v2.2.0-from-upstream-v0.30.0.bundle; fi \
+# (a .bundle.gz from the build context is decompressed by build-v2.5.sh)
+RUN if [ ! -f v2.5.1-from-upstream-v0.30.0.bundle ] && [ ! -f v2.5.1-from-upstream-v0.30.0.bundle.gz ]; then \
+      curl -fsSL "$BUNDLE_URL" | gunzip > v2.5.1-from-upstream-v0.30.0.bundle; fi \
     && if [ ! -f build-artifacts-sm86-py313-cu130-v2.2.0.tar.gz ]; then \
       curl -fsSL -o build-artifacts-sm86-py313-cu130-v2.2.0.tar.gz "$ARTIFACTS_URL"; fi \
     && chmod +x scripts/*.sh scripts/make-e1-config.py \
-    && BUNDLE=/opt/flash-next/v2.2.0-from-upstream-v0.30.0.bundle \
+    && BUNDLE=/opt/flash-next/v2.5.1-from-upstream-v0.30.0.bundle \
        ARTIFACTS=/opt/flash-next/build-artifacts-sm86-py313-cu130-v2.2.0.tar.gz \
-       bash scripts/build-v2.2.sh /opt/vllm-v2.2 /opt/venv-v2.2 \
+       bash scripts/build-v2.5.sh /opt/vllm-v2.5 /opt/venv-v2.5 \
     && rm -f build-artifacts-sm86-py313-cu130-v2.2.0.tar.gz && rm -rf /root/.cache
-ENV TREE=/opt/vllm-v2.2 VENV=/opt/venv-v2.2 HOST=0.0.0.0 PORT=8000 CACHE_ROOT=/cache \
-    CUDA_HOME=/opt/venv-v2.2/lib/python3.13/site-packages/nvidia/cu13
-ENV PATH="/opt/venv-v2.2/lib/python3.13/site-packages/nvidia/cu13/bin:$PATH"
+ENV TREE=/opt/vllm-v2.5 VENV=/opt/venv-v2.5 HOST=0.0.0.0 PORT=8000 CACHE_ROOT=/cache \
+    CUDA_HOME=/opt/venv-v2.5/lib/python3.13/site-packages/nvidia/cu13
+ENV PATH="/opt/venv-v2.5/lib/python3.13/site-packages/nvidia/cu13/bin:$PATH"
 # FlashInfer caches its JIT kernels under $FLASHINFER_WORKSPACE_BASE/.cache/flashinfer (default: the home directory,
 # i.e. the container's writable layer, lost when the container is re-created); Triton's own cache defaults to
 # ~/.triton/cache (vLLM moves it into the compile cache while it compiles). Both go to the /cache volume.

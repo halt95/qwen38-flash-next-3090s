@@ -1,0 +1,588 @@
+From 0bb87f8f09b3f5d04ff7baa09baac81ecfbc7b46 Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 02:49:52 -0400
+Subject: [PATCH 95/97] scheduler: pin a waiting request's prefix-cache hit
+ until it is admitted
+
+A follow-up turn that waits for admission holds no reference on its
+cached prefix. With a prefix unit finer than the block, its whole hit
+depends on every one of those blocks: the resume key sits in the top
+attention block, and the only GDN state is the held tail. So the first
+of them that another request's allocation popped from the free queue
+turned the next turn into a cold prefill; that was usually its own top
+block, which is freed first. Under a long-context multi-turn agent load
+(8 conversations, 80-100K-token prompts) this gave 4-5 total misses per
+300 s at unit 64/512 and none at unit 4096. All of them happened while
+the pool was at 88-99 % with one or two conversations waiting, and the
+conversation that missed was usually the next victim too.
+
+Now the manager can pin a waiter's hit:
+
+- pin_waiting_hit looks the request up and takes a ref on every
+  non-null hit block in every group. It also pins the block holding the
+  EAGLE/MTP proof unit: one unit past the key, dropped from the returned
+  hit, and a different block when the key ends a block. The pinned
+  blocks stay out of the free queue.
+- release_pinned_hit drops a pin; yield_pinned_hits drops the most
+  recently pinned waiters' first.
+- allocate_slots releases the request's pin when it succeeds (its table
+  holds the hit from then on), free releases it (abort, finish), and
+  reset_prefix_cache yields every pin before resetting.
+
+Pinned blocks are referenced, so admission and the watermark see them
+as used.
+
+The scheduler pins the front of the waiting queue after each scheduling
+pass: arrival order, at most MAX_PINNED_WAITERS = 8, only requests that
+have not computed anything yet, never with a KV connector. It does this
+also while the running set is full, when a waiter is not even looked
+up. A pin never costs anyone blocks. A running request that fails to
+allocate yields one waiter's pin and retries before any preemption
+victim is chosen. A head-of-line waiter whose admission fails yields the
+pins of the waiters behind it and retries once. When pins are active
+the scheduler logs one startup line saying so, with the bound, the hash
+unit and the block size.
+
+On a closed-loop CPU model of that load (6-8 conversations, 1-2
+waiting, pool 88-100 %), total misses went from 3/1/1/5 to 2/0/0/0 with
+every waiter pinned. The remaining two sit at 99.2 % use, where the
+running set needed the pinned blocks themselves (two yields, 65
+blocks). Unit 4096 is unaffected except where a waiter was losing its
+boundary block.
+
+Tests:
+- A pinned waiter survives another follow-up's admission and a burst,
+  and resumes at its tail (a total miss without the pin).
+- Pool full and a running request needs a block: the pin yields, nobody
+  is preempted, and the waiter is still admitted later.
+- Pins are released on abort, admission, yield and reset without
+  leaks; the bound is respected; yield order is newest first.
+- The scheduler's pass pins in arrival order up to the bound and skips
+  partly computed requests and connector setups.
+---
+ .../test_partial_prefix_cache_hits.py         | 223 +++++++++++++++++-
+ vllm/v1/core/kv_cache_manager.py              | 112 +++++++++
+ vllm/v1/core/sched/scheduler.py               |  70 ++++++
+ 3 files changed, 401 insertions(+), 4 deletions(-)
+
+diff --git a/tests/v1/core/prefix_cache/test_partial_prefix_cache_hits.py b/tests/v1/core/prefix_cache/test_partial_prefix_cache_hits.py
+index 5247e08fcb..f5de3e7c59 100644
+--- a/tests/v1/core/prefix_cache/test_partial_prefix_cache_hits.py
++++ b/tests/v1/core/prefix_cache/test_partial_prefix_cache_hits.py
+@@ -2556,7 +2556,9 @@ def tail_retain(request, monkeypatch) -> bool:
+     return request.param == "1"
+ 
+ 
+-def _tail_manager(num_blocks: int, use_eagle: bool = True):
++def _tail_manager(
++    num_blocks: int, use_eagle: bool = True, attn_block: int = TAIL_HASH
++):
+     """Full attention at the hash unit + one align-mode Mamba group at the
+     block, eagle/MTP drop on, retention interval 0 (the deployed default)."""
+     kv_cache_config = KVCacheConfig(
+@@ -2566,7 +2568,7 @@ def _tail_manager(num_blocks: int, use_eagle: bool = True):
+             KVCacheGroupSpec(
+                 ["full"],
+                 FullAttentionSpec(
+-                    block_size=TAIL_HASH,
++                    block_size=attn_block,
+                     num_kv_heads=1,
+                     head_size=1,
+                     dtype=torch.float32,
+@@ -2679,7 +2681,9 @@ def _tail_position(num_prompt_tokens: int) -> int:
+     return num_prompt_tokens // TAIL_HASH * TAIL_HASH - TAIL_HASH
+ 
+ 
+-def _tail_followup(prev, user_tokens: int, seed: int, aligned_tail: bool = False):
++def _tail_followup(
++    prev, user_tokens: int, seed: int, aligned_tail: bool = False, suffix: str = "+"
++):
+     """The next turn: the previous turn's prompt + its output + new text,
+     sized so that its tail lands strictly inside a block above the last
+     cacheable block end (the common case), or -- ``aligned_tail`` -- exactly
+@@ -2692,7 +2696,7 @@ def _tail_followup(prev, user_tokens: int, seed: int, aligned_tail: bool = False
+             break
+         user_tokens += 1
+     return make_request(
+-        prev.request_id + "+",
++        prev.request_id + suffix,
+         list(prev.all_token_ids) + _tail_tokens(seed, user_tokens),
+         TAIL_HASH,
+         sha256,
+@@ -3153,3 +3157,214 @@ def test_block_unit_replay_boundary_is_unchanged():
+         )
+     ]
+     assert hashed == [boundary]
++
++
++# ---------------------------------------------------------------------------
++# A waiting follow-up's prefix-cache hit is pinned until admission.
++# ---------------------------------------------------------------------------
++def _pinned(manager) -> dict:
++    return getattr(manager, "_pinned_hits", {})
++
++
++def _tail_run(manager, request, decode_steps: int = 2) -> int:
++    hit = _tail_prefill(manager, request)
++    _tail_decode(manager, request, steps=decode_steps)
++    return hit
++
++
++def test_pinned_waiter_survives_concurrent_allocation(tail_retain):
++    """A1 finished and its next turn A2 waits (a slot is busy). Another
++    follow-up B is admitted meanwhile and its CoW/growth allocations pop the
++    free queue. Unpinned (the previous commit): A1's top attention block goes first
++    and A2 is a total miss. Pinned: A2's hit (attention prefix + the GDN
++    hold) is referenced, B's allocations take other blocks, A2 resumes at
++    A1's tail; the pin is released by A2's own admission and nothing leaks.
++    """
++    num_blocks = 64
++    manager = _tail_manager(num_blocks, attn_block=TAIL_BLOCK)
++    pool = manager.block_pool
++
++    a0 = make_request("A0", _tail_tokens(1, 150), TAIL_HASH, sha256)
++    _tail_run(manager, a0)
++    b0 = make_request("B0", _tail_tokens(2, 150), TAIL_HASH, sha256)
++    _tail_run(manager, b0)
++    manager.free(a0)
++    _tail_drain_copies(manager)
++    a1 = _tail_followup(a0, 26, seed=3)
++    _tail_run(manager, a1)
++    manager.free(a1)
++    _tail_drain_copies(manager)
++    manager.free(b0)
++    _tail_drain_copies(manager)
++
++    # A2 arrives and must wait; B1 (older in the queue) is admitted.
++    a2 = _tail_followup(a1, 20, seed=4)
++    a1_tail = _tail_position(a1.num_prompt_tokens)
++    pinned = manager.pin_waiting_hit(a2) if hasattr(manager, "pin_waiting_hit") else 0
++    assert pinned == (
++        len([b for g in manager.get_computed_blocks(a2)[0].blocks for b in g if not b.is_null])
++    )
++    assert manager.pin_waiting_hit(a2) == 0  # idempotent
++    hold = _tail_mamba(manager)
++    hit_blocks = _pinned(manager)[a2.request_id]
++    assert all(b.ref_cnt == 1 for b in hit_blocks)
++    assert set(b.block_id for b in hit_blocks).isdisjoint(_tail_free_ids(manager))
++
++    # Pool pressure from B1's admission and a burst: everything free goes.
++    b1 = _tail_followup(b0, 26, seed=5)
++    _tail_run(manager, b1)
++    taken = pool.get_new_blocks(pool.get_num_free_blocks())
++    assert all(b.block_hash is not None for b in hit_blocks)
++    pool.free_blocks(taken)
++
++    # A2 is admitted: its hit is intact; the admission releases the pin.
++    computed, num_hit, _ = manager.get_computed_blocks(a2)
++    assert num_hit == a1_tail
++    _tail_prefill(manager, a2)
++    assert a2.request_id not in _pinned(manager)
++    # Still cached: A2's table or CoW sources, never evicted.
++    assert all(b.block_hash is not None for b in hit_blocks)
++    _tail_decode(manager, a2, steps=2)
++    manager.free(a2)
++    manager.free(b1)
++    _tail_drain_copies(manager)
++    _tail_assert_pool_clean(manager, num_blocks)
++    del hold
++
++
++def test_pins_yield_before_a_running_request_fails_and_waiter_is_admitted_later(
++    tail_retain,
++):
++    """Pool exactly full: a running request needs a block, the free queue is
++    empty, the only reclaimable blocks are a waiter's pin. The pin yields
++    (``yield_pinned_hits``), the running request allocates without anyone
++    being preempted, and the waiter is still admitted when a slot frees
++    (possibly with a smaller hit). Nothing leaks."""
++    num_blocks = 48
++    manager = _tail_manager(num_blocks, attn_block=TAIL_BLOCK)
++    pool = manager.block_pool
++
++    a0 = make_request("A0", _tail_tokens(1, 150), TAIL_HASH, sha256)
++    _tail_run(manager, a0)
++    manager.free(a0)
++    _tail_drain_copies(manager)
++    a1 = _tail_followup(a0, 26, seed=3)
++    a1_tail = _tail_position(a1.num_prompt_tokens)
++    assert manager.pin_waiting_hit(a1) > 0
++    pinned_ids = {b.block_id for b in _pinned(manager)[a1.request_id]}
++
++    # R runs and consumes the whole free queue (a cold prefill), then needs
++    # more: the pin is the only thing left to reclaim.
++    r = make_request("R", _tail_tokens(7, 2 * TAIL_BLOCK), TAIL_HASH, sha256)
++    _tail_run(manager, r, decode_steps=0)
++    taken = pool.get_new_blocks(pool.get_num_free_blocks())
++    assert pool.get_num_free_blocks() == 0
++    r.append_output_token_ids(777)
++    r.spec_token_ids = [778, 779, 780]
++    blocks = manager.allocate_slots(r, 1 + TAIL_SPEC, num_lookahead_tokens=TAIL_SPEC)
++    if blocks is None:
++        # The scheduler's step: yield pins, retry, no preemption.
++        released = manager.yield_pinned_hits()
++        assert released == len(pinned_ids)
++        assert a1.request_id not in _pinned(manager)
++        blocks = manager.allocate_slots(r, 1 + TAIL_SPEC, num_lookahead_tokens=TAIL_SPEC)
++    assert blocks is not None
++    r.spec_token_ids = []
++    r.num_computed_tokens += 1
++    manager.new_step_starts()
++    _tail_drain_copies(manager)
++    pool.free_blocks(taken)
++
++    # Slot frees: the waiter is admitted (hit may have shrunk, never stuck).
++    manager.free(r)
++    _tail_drain_copies(manager)
++    computed, num_hit, _ = manager.get_computed_blocks(a1)
++    assert 0 <= num_hit <= a1_tail
++    _tail_run(manager, a1)
++    manager.free(a1)
++    _tail_drain_copies(manager)
++    _tail_assert_pool_clean(manager, num_blocks)
++    assert not _pinned(manager)
++
++
++def test_pin_released_on_abort_admission_and_yield_without_leak(tail_retain):
++    num_blocks = 64
++    manager = _tail_manager(num_blocks, attn_block=TAIL_BLOCK)
++    pool = manager.block_pool
++    a0 = make_request("A0", _tail_tokens(1, 150), TAIL_HASH, sha256)
++    _tail_run(manager, a0)
++    manager.free(a0)
++    _tail_drain_copies(manager)
++    free_baseline = pool.get_num_free_blocks()
++
++    # Abort while pinned.
++    w1 = _tail_followup(a0, 20, seed=3, suffix="w1")
++    assert manager.pin_waiting_hit(w1) > 0
++    assert pool.get_num_free_blocks() < free_baseline
++    manager.free(w1)  # abort path
++    assert not _pinned(manager) and pool.get_num_free_blocks() == free_baseline
++
++    # Bound: at most MAX_PINNED_WAITERS pins; one more is refused.
++    w2 = _tail_followup(a0, 21, seed=4, suffix="w2")
++    w3 = _tail_followup(a0, 22, seed=5, suffix="w3")
++    assert manager.pin_waiting_hit(w2) > 0
++    assert manager.pin_waiting_hit(w3) > 0
++    extra = [
++        _tail_followup(a0, 24 + i, seed=10 + i, suffix=f"x{i}")
++        for i in range(manager.MAX_PINNED_WAITERS - 1)
++    ]
++    for req in extra[:-1]:
++        assert manager.pin_waiting_hit(req) > 0
++    assert manager.pin_waiting_hit(extra[-1]) == 0
++    assert manager.num_pinned_waiters == manager.MAX_PINNED_WAITERS
++    # Yield one at a time, newest first, keeping the head.
++    assert manager.yield_pinned_hits(keep=w2.request_id, limit=1) > 0
++    assert list(_pinned(manager))[-1] == extra[-3].request_id
++    assert manager.yield_pinned_hits(keep=w2.request_id) > 0
++    assert list(_pinned(manager)) == [w2.request_id]
++    # Admission releases the head's pin; the hit it brought is referenced.
++    _tail_run(manager, w2)
++    assert not _pinned(manager)
++    manager.free(w2)
++    _tail_drain_copies(manager)
++    assert pool.get_num_free_blocks() == free_baseline
++    # reset_prefix_cache yields pins first and succeeds.
++    assert manager.pin_waiting_hit(w3) > 0
++    assert manager.reset_prefix_cache()
++    assert not _pinned(manager)
++    _tail_assert_pool_clean(manager, num_blocks)
++
++
++def test_scheduler_pins_the_front_of_the_waiting_queue(tail_retain):
++    """The scheduler's pass pins waiting follow-ups in arrival order up to
++    the manager's bound, skips requests that are not fresh lookups (partly
++    computed, async KV) and does nothing with a connector or caching off."""
++    manager = _tail_manager(96, attn_block=TAIL_BLOCK)
++    a0 = make_request("A0", _tail_tokens(1, 150), TAIL_HASH, sha256)
++    _tail_run(manager, a0)
++    manager.free(a0)
++    _tail_drain_copies(manager)
++    waiters = [
++        _tail_followup(a0, 20 + i, seed=30 + i, suffix=f"q{i}")
++        for i in range(manager.MAX_PINNED_WAITERS + 2)
++    ]
++    waiters[1].num_computed_tokens = 8  # resumed async load: not a lookup
++    cold = make_request("COLD", _tail_tokens(9, 40), TAIL_HASH, sha256)
++    stub = SimpleNamespace(
++        kv_cache_manager=manager, connector=None, waiting=[cold, *waiters]
++    )
++    Scheduler._pin_waiting_hits(stub)
++    pinned = list(_pinned(manager))
++    assert waiters[1].request_id not in pinned
++    assert cold.request_id not in pinned  # nothing cached for it
++    assert pinned[0] == waiters[0].request_id
++    assert len(pinned) == manager.MAX_PINNED_WAITERS
++    assert waiters[-1].request_id not in pinned  # over the bound
++    # A second pass is idempotent; with a connector it is a no-op.
++    Scheduler._pin_waiting_hits(stub)
++    assert list(_pinned(manager)) == pinned
++    manager.yield_pinned_hits()
++    stub.connector = object()
++    Scheduler._pin_waiting_hits(stub)
++    assert not _pinned(manager)
++    _tail_assert_pool_clean(manager, 96)
+diff --git a/vllm/v1/core/kv_cache_manager.py b/vllm/v1/core/kv_cache_manager.py
+index c0b94f0ad7..dac8b8f298 100644
+--- a/vllm/v1/core/kv_cache_manager.py
++++ b/vllm/v1/core/kv_cache_manager.py
+@@ -226,6 +226,21 @@ class KVCacheManager:
+             tuple(() for _ in range(self.num_kv_cache_groups))
+         )
+ 
++        # Prefix-cache hits pinned for requests waiting for admission
++        # ({request_id: blocks}). A waiting follow-up turn holds no ref on its
++        # cached prefix, and with a prefix unit finer than the block its
++        # whole hit depends on every one of those blocks (the resume key sits
++        # in the top block); under pool pressure other requests' allocations
++        # popped them from the free queue and the turn re-prefilled from 0
++        # (under a long-context multi-turn agent load: 4-5 total misses per
++        # 300 s at unit 64/512, none at 4096). Pinned blocks stay out of the
++        # free queue, so they count against admission and the watermark like
++        # any referenced block; they
++        # are released on admission (the table takes over), on free, and
++        # whenever a running request would otherwise fail to allocate
++        # (``yield_pinned_hits``), so a pin never causes a preemption.
++        self._pinned_hits: dict[str, list[KVCacheBlock]] = {}
++
+     @property
+     def usage(self) -> float:
+         """Get the KV cache usage.
+@@ -585,6 +600,7 @@ class KVCacheManager:
+         # P/D: delay caching blocks if we have to recv from
+         # remote. Update state for locally cached blocks.
+         if delay_cache_blocks:
++            self.release_pinned_hit(request.request_id)
+             return self.create_kv_cache_blocks(new_blocks)
+ 
+         # NOTE(woosuk): We want to commit (cache) up to num_local_computed_tokens
+@@ -598,6 +614,8 @@ class KVCacheManager:
+         )
+         self.coordinator.cache_blocks(request, num_tokens_to_cache)
+ 
++        # Admitted: the table now references the hit, the pin is redundant.
++        self.release_pinned_hit(request.request_id)
+         return self.create_kv_cache_blocks(new_blocks)
+ 
+     def free(self, request: Request) -> None:
+@@ -608,8 +626,100 @@ class KVCacheManager:
+         Args:
+             request: The request to free the blocks.
+         """
++        self.release_pinned_hit(request.request_id)
+         self.coordinator.free(request.request_id)
+ 
++    # Waiting requests whose prefix-cache hit is pinned at once (arrival
++    # order). Pins never block anyone (they yield before a running request
++    # fails to allocate), so the bound only caps the lookup work per step.
++    MAX_PINNED_WAITERS = 8
++
++    @property
++    def num_pinned_waiters(self) -> int:
++        return len(self._pinned_hits)
++
++    @property
++    def num_pinned_blocks(self) -> int:
++        return sum(len(blocks) for blocks in self._pinned_hits.values())
++
++    def pin_waiting_hit(self, request: Request) -> int:
++        """Pin the request's current prefix-cache hit while it waits for
++        admission: every non-null hit block in every group (the attention
++        prefix up to the key and the GDN state it resumes from) takes a ref
++        and leaves the free queue. Idempotent. Returns the number of blocks
++        pinned now (0 if nothing hit, already pinned, caching is off, or the
++        waiter bound is reached)."""
++        request_id = request.request_id
++        if (
++            request_id in self._pinned_hits
++            or not self.enable_caching
++            or not self.prefix_cache_lookup_enabled(request)
++            or len(self._pinned_hits) >= self.MAX_PINNED_WAITERS
++        ):
++            return 0
++        computed, num_hit, _ = self.get_computed_blocks(request)
++        blocks = [
++            block
++            for group in computed.blocks
++            for block in group
++            if not block.is_null
++        ]
++        if num_hit == 0 or not blocks:
++            return 0
++        # The EAGLE/MTP proof: fine-grained attention hits match one hash
++        # unit past the key and drop it, so the hit also depends on the block
++        # holding that unit -- a different block when the key ends a block
++        # (and never part of the returned hit). Pin it too.
++        unit = self.block_pool.hash_block_size
++        proof_idx = num_hit // unit
++        if proof_idx < len(request.block_hashes):
++            seen = {block.block_id for block in blocks}
++            for group_id in range(self.num_kv_cache_groups):
++                cached = self.block_pool.get_cached_block(
++                    request.block_hashes[proof_idx], [group_id]
++                )
++                if cached and cached[0].block_id not in seen:
++                    seen.add(cached[0].block_id)
++                    blocks.append(cached[0])
++        self.block_pool.touch(blocks)
++        self._pinned_hits[request_id] = blocks
++        return len(blocks)
++
++    def pinned_hit_blocks(self, request_id: str) -> list[KVCacheBlock]:
++        """The blocks pinned for ``request_id`` (empty if none)."""
++        return list(self._pinned_hits.get(request_id, ()))
++
++    def release_pinned_hit(self, request_id: str) -> int:
++        """Drop the request's pin (admission, abort, finish). Returns the
++        number of blocks released."""
++        blocks = self._pinned_hits.pop(request_id, None)
++        if not blocks:
++            return 0
++        # Reversed: the prefix stays an eviction candidate longer than the
++        # tail, as after a free.
++        self.block_pool.free_blocks(reversed(blocks))
++        return len(blocks)
++
++    def yield_pinned_hits(
++        self, keep: str | None = None, limit: int | None = None
++    ) -> int:
++        """Drop pins (except ``keep``'s) so a running request can allocate,
++        or a waiter ahead in line can be admitted: the most recently pinned
++        waiters first, at most ``limit`` of them per call (all by default;
++        the scheduler passes 1 and retries, so a decode step that needs a
++        block costs one waiter its pin, not every waiter). Returns the number
++        of blocks released; 0 means there was nothing to yield."""
++        released = 0
++        yielded = 0
++        for request_id in reversed(list(self._pinned_hits)):
++            if request_id == keep:
++                continue
++            if limit is not None and yielded >= limit:
++                break
++            released += self.release_pinned_hit(request_id)
++            yielded += 1
++        return released
++
+     def remove_skipped_blocks(
+         self,
+         request_id: str,
+@@ -661,6 +771,8 @@ class KVCacheManager:
+             bool: True if the prefix cache is successfully reset,
+             False otherwise.
+         """
++        # Pinned waiters' hits are about to be invalidated anyway.
++        self.yield_pinned_hits()
+         if not self.coordinator.reset_prefix_cache():
+             return False
+         if self.log_stats:
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index dc8f03367a..fea77b1f9a 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -348,6 +348,8 @@ class Scheduler(SchedulerInterface):
+         if self.connector is not None:
+             self.connector.bind_kv_cache_manager(self.kv_cache_manager)
+ 
++        self._log_prefix_cache_features()
++
+         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
+         self.use_v2_model_runner = vllm_config.use_v2_model_runner
+         # Scheduler iteration counter. Drives the V2+PP+async decode-throttle
+@@ -559,6 +561,45 @@ class Scheduler(SchedulerInterface):
+         end = min((s for s in stops if start < s < end), default=end)
+         return max(end - start, 0)
+ 
++    def _log_prefix_cache_features(self) -> None:
++        """One startup line per prefix-cache retention feature that is active
++        (nothing when it is off)."""
++        manager = self.kv_cache_manager
++        if manager.enable_caching and self.connector is None:
++            logger.info(
++                "Prefix cache: waiting requests' cached prefixes are pinned "
++                "until admission (up to %d waiters; hash unit %d, block %d)",
++                manager.MAX_PINNED_WAITERS,
++                self.hash_block_size,
++                self.block_size,
++            )
++
++    def _pin_waiting_hits(self) -> None:
++        """Pin the prefix-cache hits of the requests at the front of the
++        waiting queue (arrival order, bounded by the manager) so the
++        admissions and decode growth of other requests cannot evict them
++        while they wait -- also while the running set is full, when they are
++        not even looked up. Released on admission, free, and whenever a
++        running request would otherwise fail to allocate.
++        """
++        manager = self.kv_cache_manager
++        if (
++            not manager.enable_caching
++            or self.connector is not None
++            or manager.num_pinned_waiters >= manager.MAX_PINNED_WAITERS
++        ):
++            return
++        for request in self.waiting:
++            if manager.num_pinned_waiters >= manager.MAX_PINNED_WAITERS:
++                break
++            if (
++                request.num_computed_tokens != 0
++                or request.status
++                not in (RequestStatus.WAITING, RequestStatus.PREEMPTED)
++            ):
++                continue
++            manager.pin_waiting_hit(request)
++
+     def _get_local_prefix_cache_hit(
+         self, request: Request
+     ) -> tuple[KVCacheBlocks, int, int, bool]:
+@@ -776,6 +817,12 @@ class Scheduler(SchedulerInterface):
+                     ):
+                         break
+ 
++                    # Waiting requests' pinned prefix hits yield
++                    # before anyone is preempted (a pin never costs a running
++                    # request its blocks); retry with them in the free queue.
++                    if self.kv_cache_manager.yield_pinned_hits(limit=1):
++                        continue
++
+                     # The request cannot be scheduled.
+                     # Preempt the lowest-priority request.
+                     if self.policy == SchedulingPolicy.PRIORITY:
+@@ -1211,6 +1258,26 @@ class Scheduler(SchedulerInterface):
+                     has_scheduled_reqs=bool(self.running),
+                 )
+ 
++                if new_blocks is None and self.kv_cache_manager.yield_pinned_hits(
++                    keep=request_id
++                ):
++                    # Pins of waiters behind this one yield to it
++                    # (arrival order); its own pin stays, those blocks are
++                    # its hit. One retry with them back in the free queue.
++                    new_blocks = self.kv_cache_manager.allocate_slots(
++                        request,
++                        num_new_tokens,
++                        num_new_computed_tokens=num_new_local_computed_tokens,
++                        new_computed_blocks=new_computed_blocks,
++                        num_lookahead_tokens=effective_lookahead_tokens,
++                        num_external_computed_tokens=num_external_computed_tokens,
++                        delay_cache_blocks=load_kv_async,
++                        num_encoder_tokens=num_encoder_tokens,
++                        full_sequence_must_fit=self.scheduler_reserve_full_isl,
++                        reserved_blocks=reserved_blocks,
++                        has_scheduled_reqs=bool(self.running),
++                    )
++
+                 if new_blocks is None:
+                     # The request cannot be scheduled.
+ 
+@@ -1338,6 +1405,9 @@ class Scheduler(SchedulerInterface):
+             if step_skipped_waiting:
+                 self.skipped_waiting.prepend_requests(step_skipped_waiting)
+ 
++            # Whoever is still waiting keeps its prefix-cache hit.
++            self._pin_waiting_hits()
++
+             # DP prefill balancing: on a step that admitted prefills (release),
+             # record whether it was capacity-bound.
+             if not defer_prefills:

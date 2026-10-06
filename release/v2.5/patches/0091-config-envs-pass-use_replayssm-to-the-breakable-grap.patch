@@ -1,0 +1,216 @@
+From 18a7052f3228eff3030c2ff6ee676eae80adc513 Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Mon, 5 Oct 2026 00:13:13 -0400
+Subject: [PATCH 91/97] config, envs: pass use_replayssm to the breakable-graph
+ fallback; register VLLM_FAIL_ON_PROFILING_KV_LEAK
+
+CompilationConfig.resolve_cudagraph_mode_and_sizes read self.cache_config.use_replayssm, but CompilationConfig has
+no cache_config, so with VLLM_USE_BREAKABLE_CUDAGRAPH=1 the fallback branch raised AttributeError. Both model
+runners now pass cache_config.use_replayssm as an argument. The shipped launchers set VLLM_USE_BREAKABLE_CUDAGRAPH=0
+and never reach this branch.
+
+VLLM_FAIL_ON_PROFILING_KV_LEAK was read with a raw os.getenv, so setting it printed the unknown-variable warning. It
+is now registered in vllm.envs with the same spellings (unset fails the boot; 0, false or no warn instead), listed
+as an ignored compile factor and read through vllm.envs. Tests cover both.
+---
+ tests/config/test_recoverssm_config.py | 27 ++++++++++++++++++++++++++
+ tests/test_envs.py                     | 19 ++++++++++++++++++
+ vllm/config/compilation.py             |  4 +++-
+ vllm/envs.py                           | 13 +++++++++++++
+ vllm/v1/worker/gpu/cudagraph_utils.py  |  6 ++----
+ vllm/v1/worker/gpu/model_runner.py     |  1 +
+ vllm/v1/worker/gpu_model_runner.py     |  1 +
+ 7 files changed, 66 insertions(+), 5 deletions(-)
+
+diff --git a/tests/config/test_recoverssm_config.py b/tests/config/test_recoverssm_config.py
+index 352b8bfc7c..50d5aa0096 100644
+--- a/tests/config/test_recoverssm_config.py
++++ b/tests/config/test_recoverssm_config.py
+@@ -197,5 +197,32 @@ def test_never_support_falls_back_to_piecewise_with_breakable_cudagraphs(
+         AttentionCGSupport.NEVER,
+         "GDNRecoverSSMAttentionBackend",
+         uniform_decode_query_len=4,
++        use_replayssm=True,
+     )
+     assert resolved.name == expected
++
++
++def test_breakable_fallback_needs_replayssm_and_never_reads_cache_config(monkeypatch):
++    """The breakable-graph branch reads the RecoverSSM flag from its argument:
++    CompilationConfig has no cache_config, and reading one raised AttributeError
++    whenever VLLM_USE_BREAKABLE_CUDAGRAPH=1. Without RecoverSSM the branch is not
++    taken, so the unsupported FULL decode mode falls back to NONE."""
++    from vllm.config.compilation import (
++        CompilationConfig,
++        CompilationMode,
++        CUDAGraphMode,
++    )
++
++    monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", "1")
++    compilation_config = CompilationConfig(
++        mode=CompilationMode.NONE,
++        cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
++        splitting_ops=[],
++    )
++    assert not hasattr(compilation_config, "cache_config")
++    resolved = compilation_config.resolve_cudagraph_mode_and_sizes(
++        AttentionCGSupport.NEVER,
++        "GDNRecoverSSMAttentionBackend",
++        uniform_decode_query_len=4,
++    )
++    assert resolved.name == "NONE"
+diff --git a/tests/test_envs.py b/tests/test_envs.py
+index af5e39d388..4871fda569 100644
+--- a/tests/test_envs.py
++++ b/tests/test_envs.py
+@@ -655,6 +655,8 @@ _FORK_IGNORED = [
+     # Mamba prefix-checkpoint retention (v2.5): scheduler-side, default ON; "0"
+     # turns it off. Read in single_type_kv_cache_manager.py (MambaManager).
+     ("VLLM_E2_MAMBA_RETAIN_CHECKPOINT", "0", False),
++    # Profiling-teardown leak policy: fails the boot unless "0"/"false"/"no".
++    ("VLLM_FAIL_ON_PROFILING_KV_LEAK", "no", False),
+     # Medium-path counter reader: a host-side log cadence, and the older slot-count
+     # fallback that this build never consults. Registered and ignored; before
+     # the read-site census neither classification was asserted anywhere.
+@@ -1070,6 +1072,7 @@ _MUST_BE_READ = {
+     "VLLM_E2_MAMBA_SLOT_OWNERSHIP": "vllm/v1/worker/mamba_utils.py",
+     "VLLM_E2_MAMBA_RETAIN_CHECKPOINT": "vllm/v1/core/single_type_kv_cache_manager.py",
+     "VLLM_E2_SIDE_CACHE_LAYOUT": "vllm/v1/core/kv_cache_utils.py",
++    "VLLM_FAIL_ON_PROFILING_KV_LEAK": "vllm/v1/worker/gpu/cudagraph_utils.py",
+ }
+ _INERT_NO_READ_SITE = ["VLLM_PLE_FP8_GLOBAL_SCALE"]
+ 
+@@ -1151,3 +1154,19 @@ def test_side_cache_layout_switch_defaults_on_and_is_strict(
+         monkeypatch.setenv(name, bad)
+         with pytest.raises(ValueError, match=name):
+             _fresh_env_value(name)
++
++
++def test_fail_on_profiling_kv_leak_is_registered_and_defaults_to_fail(
++    monkeypatch: pytest.MonkeyPatch,
++):
++    """Registered (no unknown-variable warning), unset fails the boot, and the three
++    documented spellings downgrade it to a warning."""
++    name = "VLLM_FAIL_ON_PROFILING_KV_LEAK"
++    assert name in envs.environment_variables
++    monkeypatch.delenv(name, raising=False)
++    assert _fresh_env_value(name) is True
++    for off in ("0", "false", "No"):
++        monkeypatch.setenv(name, off)
++        assert _fresh_env_value(name) is False
++    monkeypatch.setenv(name, "1")
++    assert _fresh_env_value(name) is True
+diff --git a/vllm/config/compilation.py b/vllm/config/compilation.py
+index bd63f994b8..8538c17ffb 100644
+--- a/vllm/config/compilation.py
++++ b/vllm/config/compilation.py
+@@ -1401,6 +1401,7 @@ class CompilationConfig:
+         max_num_reqs: int | None = None,
+         is_profiling: bool = False,
+         piecewise_capture_available: bool = True,
++        use_replayssm: bool = False,
+     ) -> CUDAGraphMode:
+         from vllm.v1.attention.backend import AttentionCGSupport
+ 
+@@ -1454,7 +1455,8 @@ class CompilationConfig:
+                 )
+             ) or (
+                 envs.VLLM_USE_BREAKABLE_CUDAGRAPH
+-                and self.cache_config.use_replayssm
++                # CompilationConfig has no cache_config; the runner passes the flag.
++                and use_replayssm
+             ):
+                 # Breakable CUDA graphs break at the attention kernels at runtime,
+                 # with or without torch.compile.
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 7b556188b6..4a409746ad 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -465,6 +465,11 @@ if TYPE_CHECKING:
+     # it changes the ring views' block stride and which block table the PLE
+     # state is read through, so ON and OFF must not share a compile cache.
+     VLLM_E2_SIDE_CACHE_LAYOUT: bool = True
++    # Profiling-teardown leak policy (vllm/v1/worker/gpu/cudagraph_utils.py): a profiling
++    # KV cache still allocated after teardown fails the boot by default; "0", "false" or
++    # "no" downgrade it to a warning while diagnosing. AOT: no. CAPTURE: no -- it only
++    # decides whether a host-side check raises.
++    VLLM_FAIL_ON_PROFILING_KV_LEAK: bool = True
+     # Opt-out for the fork startup guards in vllm/v1/e2_guards.py, read at
+     # Qwen4ExpForCausalLM construction. AOT: no. CAPTURE: no -- it changes
+     # nothing itself; it only permits a boot whose identity IS different
+@@ -2633,6 +2638,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     "VLLM_E2_SIDE_CACHE_LAYOUT": lambda: _e2_strict_switch(
+         "VLLM_E2_SIDE_CACHE_LAYOUT", default=True
+     ),
++    # Profiling-teardown leak policy: fail the boot unless "0"/"false"/"no".
++    "VLLM_FAIL_ON_PROFILING_KV_LEAK": lambda: os.getenv(
++        "VLLM_FAIL_ON_PROFILING_KV_LEAK", "1"
++    ).strip().lower()
++    not in ("0", "false", "no"),
+     # Seconds between `topk-exact-counters` lines from each GPU worker
+     # (0, the default, disables the reader entirely). The line reports the
+     # medium-path exact-restart counters; see
+@@ -2900,6 +2910,9 @@ def compile_factors() -> dict[str, object]:
+         # compiled and the worker's tables are identical in both worlds, so an
+         # A/B flip must reuse the same AOT cache.
+         "VLLM_E2_MAMBA_RETAIN_CHECKPOINT",
++        # Boot-failure policy of a host-side profiling-teardown check; read by no
++        # compiled code.
++        "VLLM_FAIL_ON_PROFILING_KV_LEAK",
+         # Logging cadence for an already-compiled kernel's counters: it gates a
+         # host-side timer and a snapshot op, and is read by no compiled code, so
+         # hashing it would invalidate every compile cache for a log interval.
+diff --git a/vllm/v1/worker/gpu/cudagraph_utils.py b/vllm/v1/worker/gpu/cudagraph_utils.py
+index 00eee6b58e..63b9811f40 100644
+--- a/vllm/v1/worker/gpu/cudagraph_utils.py
++++ b/vllm/v1/worker/gpu/cudagraph_utils.py
+@@ -3,7 +3,6 @@
+ import contextlib
+ import gc
+ import itertools
+-import os
+ from collections import defaultdict
+ from collections.abc import Callable, Iterable, Iterator
+ from contextlib import ExitStack
+@@ -15,6 +14,7 @@ import torch
+ import torch.nn as nn
+ from tqdm import tqdm
+ 
++import vllm.envs as envs
+ from vllm.compilation.breakable_cudagraph import (
+     BreakableCUDAGraphWrapper,
+     is_breakable_cudagraph_enabled,
+@@ -1196,8 +1196,6 @@ def _teardown_profiling_state(runner: "GPUModelRunner") -> None:
+             # Fail boot by default: this memory is absent from the real KV
+             # pool and can invalidate capacity planning. Operators may opt out
+             # temporarily while diagnosing with VLLM_FAIL_ON_PROFILING_KV_LEAK=0.
+-            if os.getenv("VLLM_FAIL_ON_PROFILING_KV_LEAK", "1").lower() not in (
+-                "0", "false", "no"
+-            ):
++            if envs.VLLM_FAIL_ON_PROFILING_KV_LEAK:
+                 raise RuntimeError(message)
+             logger.warning(message)
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index d2bb0021eb..bc0e37c3d9 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -787,6 +787,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             max_num_reqs=self.max_num_reqs,
+             is_profiling=is_profiling,
+             piecewise_capture_available=piecewise_capture_available,
++            use_replayssm=self.cache_config.use_replayssm,
+         )
+         self.cudagraph_manager = ModelCudaGraphManager(
+             self.vllm_config,
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index 010f110653..a9dc8024fc 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -7221,6 +7221,7 @@ class GPUModelRunner(
+             kv_cache_config=self.kv_cache_config,
+             max_num_reqs=self.max_num_reqs,
+             is_profiling=is_profiling,
++            use_replayssm=self.cache_config.use_replayssm,
+         )
+         # Trigger cudagraph dispatching keys initialization after
+         # resolved cudagraph mode.

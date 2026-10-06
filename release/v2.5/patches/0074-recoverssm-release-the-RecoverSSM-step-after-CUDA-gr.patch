@@ -1,0 +1,87 @@
+From 9c61aee3b6d91be6eef93a43f856f63634b37e0e Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Tue, 29 Sep 2026 18:16:59 -0700
+Subject: [PATCH 74/97] recoverssm: release the RecoverSSM step after CUDA
+ graph memory profiling (port of upstream #58863, fdcc43cf3e)
+
+Port of the upstream vLLM change #58863 (Apache-2.0). The step recorded during graph-capture dummy runs held the profiling KV cache
+alive after profiling; it is now released at teardown.
+---
+ ...gpu_model_runner_v2_cudagraph_profiling.py | 33 +++++++++++++++++++
+ vllm/v1/worker/gpu/cudagraph_utils.py         |  5 +++
+ vllm/v1/worker/gpu/model_states/recoverssm.py |  5 +++
+ 3 files changed, 43 insertions(+)
+
+diff --git a/tests/v1/worker/test_gpu_model_runner_v2_cudagraph_profiling.py b/tests/v1/worker/test_gpu_model_runner_v2_cudagraph_profiling.py
+index 74191206d3..c912053e30 100644
+--- a/tests/v1/worker/test_gpu_model_runner_v2_cudagraph_profiling.py
++++ b/tests/v1/worker/test_gpu_model_runner_v2_cudagraph_profiling.py
+@@ -439,3 +439,36 @@ def test_teardown_profiling_state_clears_mamba_align_metadata(monkeypatch):
+     assert runner.model_state._mamba_ctx is None
+     assert runner.model_state._mamba_group_ids == []
+     assert runner.model_state._mamba_spec is None
++
++
++def test_teardown_profiling_state_releases_recoverssm_step(monkeypatch):
++    """The recorded RecoverSSM step must not outlive the profiling KV cache.
++
++    PIECEWISE capture runs are prepared with ``for_capture=False``, so
++    ``RecoverSSMState`` records their step. Its metadata holds commit contexts
++    that reference the profiling KV cache; keeping it alive past teardown keeps
++    that cache allocated and the real KV cache allocation runs out of memory.
++    """
++    from vllm.v1.worker.gpu.model_states.recoverssm import RecoverSSMState
++
++    recoverssm = RecoverSSMState()
++    recoverssm._step = (object(),)  # type: ignore[assignment]
++    runner: Any = mrv2.GPUModelRunner.__new__(mrv2.GPUModelRunner)
++    runner.compilation_config = SimpleNamespace(static_forward_context={})
++    runner.model_state = SimpleNamespace(
++        supports_mm_inputs=False, recoverssm=recoverssm
++    )
++    runner.cache_config = SimpleNamespace(num_gpu_blocks=1)
++    runner.kv_caches = []
++    runner.attn_groups = []
++    runner.kv_cache_config = SimpleNamespace()
++    runner.cudagraph_manager = object()
++    runner.lora_config = None
++    runner.maybe_remove_all_loras = lambda _: None
++
++    monkeypatch.setattr(cgu.torch.accelerator, "synchronize", lambda: None)
++    monkeypatch.setattr(cgu.torch.accelerator, "empty_cache", lambda: None)
++
++    cgu._teardown_profiling_state(runner)
++
++    assert recoverssm._step is None
+diff --git a/vllm/v1/worker/gpu/cudagraph_utils.py b/vllm/v1/worker/gpu/cudagraph_utils.py
+index a143a3da25..b28286a251 100644
+--- a/vllm/v1/worker/gpu/cudagraph_utils.py
++++ b/vllm/v1/worker/gpu/cudagraph_utils.py
+@@ -1114,6 +1114,11 @@ def _teardown_profiling_state(runner: "GPUModelRunner") -> None:
+     torch.accelerator.synchronize()
+     if hasattr(runner.model_state, "_mamba_ctx"):
+         runner.model_state._mamba_ctx = None
++    # A PIECEWISE profiling capture records its RecoverSSM step (only FULL
++    # captures skip it), and that step's commit contexts reference the
++    # profiling KV cache.
++    if (recoverssm := getattr(runner.model_state, "recoverssm", None)) is not None:
++        recoverssm.reset()
+     # Invalidate the align-mode Mamba group metadata cached from the
+     # profiling KVCacheConfig: the real (e.g. PP-projected) config may
+     # place Mamba layers into a different group layout, so it must be
+diff --git a/vllm/v1/worker/gpu/model_states/recoverssm.py b/vllm/v1/worker/gpu/model_states/recoverssm.py
+index b02a6c19aa..3cfbecea26 100644
+--- a/vllm/v1/worker/gpu/model_states/recoverssm.py
++++ b/vllm/v1/worker/gpu/model_states/recoverssm.py
+@@ -16,6 +16,11 @@ class RecoverSSMState:
+     def __init__(self) -> None:
+         self._step: tuple[RecoverSSMMetadata, ...] | None = None
+ 
++    def reset(self) -> None:
++        """Drop the recorded step. Its metadata holds the commit contexts, which
++        reference the KV cache tensors they were built for."""
++        self._step = None
++
+     def record_step(
+         self,
+         attn_metadata: dict[str, Any],

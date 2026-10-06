@@ -1,0 +1,954 @@
+From 708305cf1c9b0e470325cba9f4717a61d4441b4f Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 04:09:20 -0400
+Subject: [PATCH 86/97] sched: keep the running request's Mamba prefix
+ checkpoint referenced until it finishes
+
+In Mamba align mode a state block leaves the block table once the request has computed one block past it. When
+that block is hashed it is the request's prefix checkpoint, and releasing it let a long concurrent session evict
+it, so the next turn re-prefilled the whole conversation. The manager now keeps the newest hashed checkpoint
+referenced until the request finishes, and admission reserves that block. VLLM_E2_MAMBA_RETAIN_CHECKPOINT
+(default 1) switches it off. Scheduler tests cover eviction, admission, preemption and freeing.
+---
+ tests/test_envs.py                            |  23 +
+ .../core/test_mamba_checkpoint_retention.py   | 563 ++++++++++++++++++
+ tests/v1/core/test_prefix_caching.py          |  22 +-
+ vllm/envs.py                                  |  25 +-
+ vllm/v1/core/kv_cache_coordinator.py          |  22 +
+ vllm/v1/core/single_type_kv_cache_manager.py  | 109 +++-
+ 6 files changed, 753 insertions(+), 11 deletions(-)
+ create mode 100644 tests/v1/core/test_mamba_checkpoint_retention.py
+
+diff --git a/tests/test_envs.py b/tests/test_envs.py
+index 9ddb51e877..bcd7b3359b 100644
+--- a/tests/test_envs.py
++++ b/tests/test_envs.py
+@@ -648,6 +648,9 @@ _FORK_IGNORED = [
+     # test_read_site_status_matches_the_tables pins that the readers exist.
+     ("VLLM_E2_PLE_FLAG_CHECK", "1", "warn"),
+     ("VLLM_E2_MAMBA_SLOT_OWNERSHIP", " RAISE ", "raise"),
++    # Mamba prefix-checkpoint retention (v2.5): scheduler-side, default ON; "0"
++    # turns it off. Read in single_type_kv_cache_manager.py (MambaManager).
++    ("VLLM_E2_MAMBA_RETAIN_CHECKPOINT", "0", False),
+     # Medium-path counter reader: a host-side log cadence, and the older slot-count
+     # fallback that this build never consults. Registered and ignored; before
+     # the read-site census neither classification was asserted anywhere.
+@@ -1061,6 +1064,7 @@ def test_census_discriminates_both_worlds():
+ _MUST_BE_READ = {
+     "VLLM_E2_PLE_FLAG_CHECK": "vllm/v1/ple_offload/connector.py",
+     "VLLM_E2_MAMBA_SLOT_OWNERSHIP": "vllm/v1/worker/mamba_utils.py",
++    "VLLM_E2_MAMBA_RETAIN_CHECKPOINT": "vllm/v1/core/single_type_kv_cache_manager.py",
+ }
+ _INERT_NO_READ_SITE = ["VLLM_PLE_FP8_GLOBAL_SCALE"]
+ 
+@@ -1105,3 +1109,22 @@ def test_read_site_scan_discriminates_both_worlds():
+     assert "VLLM_E2_PLE_FLAG_CHECK" not in _read_sites(mention)
+     assert _read_sites(via_envs)["VLLM_E2_PLE_FLAG_CHECK"] == {"a.py"}
+     assert _read_sites(via_getenv)["VLLM_PLE_FP8_GLOBAL_SCALE"] == {"a.py"}
++
++
++def test_mamba_retain_checkpoint_switch_defaults_on_and_is_strict(
++    monkeypatch: pytest.MonkeyPatch,
++):
++    """Unset is ON (the fix ships enabled); "0" is the only way to the old
++    release-on-retire behaviour, and a misspelt value is a boot error rather
++    than a silent arm flip."""
++    name = "VLLM_E2_MAMBA_RETAIN_CHECKPOINT"
++    monkeypatch.delenv(name, raising=False)
++    assert _fresh_env_value(name) is True
++    monkeypatch.setenv(name, "1")
++    assert _fresh_env_value(name) is True
++    monkeypatch.setenv(name, "0")
++    assert _fresh_env_value(name) is False
++    for bad in ("off", "false", "", " 0"):
++        monkeypatch.setenv(name, bad)
++        with pytest.raises(ValueError, match=name):
++            _fresh_env_value(name)
+diff --git a/tests/v1/core/test_mamba_checkpoint_retention.py b/tests/v1/core/test_mamba_checkpoint_retention.py
+new file mode 100644
+index 0000000000..1a4ebe51a4
+--- /dev/null
++++ b/tests/v1/core/test_mamba_checkpoint_retention.py
+@@ -0,0 +1,563 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Align-mode Mamba prefix-checkpoint retention (v2.5, HF discussion #2).
++
++In align mode a recurrent-state block leaves the request's block table as soon
++as the request has computed one block past it (``remove_skipped_blocks``). When
++that block is hashed it is the request's GDN prefix checkpoint (under
++``prefix_cache_retention_interval=0``, the prompt's replay boundary), and the
++old code returned it to the free queue there and then -- mid-request, long
++before the request's own attention blocks, which stay referenced until it
++finishes. Other requests' prefills pop the free queue from the head, so the
++checkpoint was evicted first; the hybrid hit is the shortest group's, so that
++one block zeroed the next turn's reuse (measured: FP32 state, 8 x ~80K agent
++conversations, cached fraction 0.000 with 0 preemptions).
++
++``VLLM_E2_MAMBA_RETAIN_CHECKPOINT=1`` (default) keeps the newest hashed retired
++state referenced until the request is freed, then releases it after the
++request's attention blocks. ``=0`` is the old behaviour and is the FAILING
++control in every test below.
++
++These tests drive ``KVCacheManager`` through the calls the scheduler makes:
++``get_computed_blocks`` -> ``allocate_slots`` per step (chunk ends from the real
++``Scheduler._mamba_block_aligned_split``, MTP lookahead slots, draft tokens) ->
++``free`` / ``pop_blocks_for_free``. CPU only.
++"""
++
++from collections.abc import Callable
++from dataclasses import replace
++from types import SimpleNamespace
++
++import pytest
++import torch
++
++from vllm import envs
++from vllm.sampling_params import SamplingParams
++from vllm.utils.hashing import sha256
++from vllm.v1.core.kv_cache_manager import KVCacheManager
++from vllm.v1.core.kv_cache_utils import (
++    KVCacheBlock,
++    get_request_block_hasher,
++    init_none_hash,
++)
++from vllm.v1.core.sched.scheduler import Scheduler
++from vllm.v1.core.single_type_kv_cache_manager import MambaManager
++from vllm.v1.kv_cache_interface import (
++    FullAttentionSpec,
++    KVCacheConfig,
++    KVCacheGroupSpec,
++    MambaSpec,
++)
++from vllm.v1.request import Request
++
++pytestmark = pytest.mark.cpu_test
++
++BLOCK = 32
++NUM_SPEC = 3  # MTP K=3, as deployed
++SWITCH = "VLLM_E2_MAMBA_RETAIN_CHECKPOINT"
++# Group 0 = full attention; groups 1, 2 = two GDN-like align-mode Mamba groups
++# (the deployment has several; a hit needs the checkpoint in EVERY one).
++ATTN = 0
++MAMBA_GROUPS = (1, 2)
++
++
++@pytest.fixture(autouse=True)
++def _init_hash():
++    init_none_hash(sha256)
++
++
++@pytest.fixture(params=["1", "0"], ids=["retain-on", "retain-off-control"])
++def retain(request, monkeypatch) -> bool:
++    monkeypatch.setenv(SWITCH, request.param)
++    if hasattr(envs.__getattr__, "cache_clear"):
++        envs.__getattr__.cache_clear()
++    return request.param == "1"
++
++
++def _config(num_blocks: int) -> KVCacheConfig:
++    mamba = MambaSpec(
++        block_size=BLOCK,
++        shapes=((1, 1),),
++        dtypes=(torch.float32,),
++        mamba_cache_mode="align",
++        num_speculative_blocks=NUM_SPEC,
++    )
++    return KVCacheConfig(
++        num_blocks=num_blocks,
++        kv_cache_tensors=[],
++        kv_cache_groups=[
++            KVCacheGroupSpec(
++                ["attn"],
++                FullAttentionSpec(
++                    block_size=BLOCK, num_kv_heads=1, head_size=1, dtype=torch.float16
++                ),
++            ),
++            KVCacheGroupSpec(["gdn_a"], mamba),
++            KVCacheGroupSpec(["gdn_b"], mamba),
++        ],
++    )
++
++
++def _manager(num_blocks: int, num_prefill_lookahead: int = 0) -> KVCacheManager:
++    # retention interval 0 = the deployed default (cache.py): keep only the
++    # replay-boundary (and shared-prefix) states.
++    config = replace(_config(num_blocks), prefix_cache_retention_interval=0)
++    return KVCacheManager(
++        config,
++        max_model_len=8192,
++        scheduler_block_size=BLOCK,
++        hash_block_size=BLOCK,
++        enable_caching=True,
++        use_eagle=True,
++        num_prefill_lookahead=num_prefill_lookahead,
++    )
++
++
++def _mamba(manager: KVCacheManager, gid: int) -> MambaManager:
++    mgr = manager.coordinator.single_type_managers[gid]
++    assert isinstance(mgr, MambaManager)
++    return mgr
++
++
++def _request(rid: str, tokens: list[int]) -> Request:
++    params = SamplingParams(max_tokens=4096)
++    params.update_from_generation_config({}, eos_token_id=100000)
++    return Request(
++        request_id=rid,
++        prompt_token_ids=tokens,
++        sampling_params=params,
++        pooling_params=None,
++        block_hasher=get_request_block_hasher(BLOCK, sha256),
++    )
++
++
++def _split(request: Request, num_new: int, num_local_hit: int = 0) -> int:
++    """The real `Scheduler._mamba_block_aligned_split` on a stub self."""
++    stub = SimpleNamespace(
++        block_size=BLOCK,
++        cache_config=SimpleNamespace(block_size=BLOCK),
++        use_eagle_block_drop=True,
++        max_num_scheduled_tokens=8192,
++        scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
++        mamba_partial_cache_hit=False,
++        mamba_fine_grained_prefix_cache=False,
++        hash_block_size=BLOCK,
++        mamba_has_prefill_checkpoint_blocks=False,
++        mamba_prefill_checkpoint_alignment=None,
++    )
++    return Scheduler._mamba_block_aligned_split(stub, request, num_new, num_local_hit)
++
++
++def _prefill(manager: KVCacheManager, request: Request, budget: int = 8192) -> int:
++    """Prefill to the end of the prompt in scheduler-sized chunks; returns the
++    local prefix-hit length the request was admitted with."""
++    computed_blocks, num_hit, _ = manager.get_computed_blocks(request)
++    first = True
++    while request.num_computed_tokens < request.num_tokens:
++        start = request.num_computed_tokens + (num_hit if first else 0)
++        remaining = request.num_tokens - start
++        num_new = _split(
++            request, min(remaining, budget), num_hit if first else 0
++        )
++        assert num_new > 0
++        blocks = manager.allocate_slots(
++            request,
++            num_new,
++            num_new_computed_tokens=num_hit if first else 0,
++            new_computed_blocks=computed_blocks if first else None,
++            num_lookahead_tokens=NUM_SPEC,
++        )
++        assert blocks is not None, "prefill chunk did not fit"
++        request.num_computed_tokens = start + num_new
++        manager.new_step_starts()
++        first = False
++    return num_hit
++
++
++def _decode(
++    manager: KVCacheManager,
++    request: Request,
++    steps: int,
++    accepted: Callable[[int], int] = lambda step: 0,
++    on_step: Callable[[], None] | None = None,
++) -> None:
++    """MTP K=3 decode: each step schedules the last token + K drafts and
++    reserves K lookahead slots; ``accepted(step)`` drafts are accepted."""
++    next_tok = 50000 + len(request.output_token_ids)
++    if request.num_computed_tokens == request.num_tokens:
++        request.append_output_token_ids(next_tok)  # sampled by the prefill
++        next_tok += 1
++    for step in range(steps):
++        assert request.num_computed_tokens == request.num_tokens - 1
++        request.spec_token_ids = [next_tok + i for i in range(NUM_SPEC)]
++        blocks = manager.allocate_slots(
++            request, 1 + NUM_SPEC, num_lookahead_tokens=NUM_SPEC
++        )
++        assert blocks is not None, "decode step did not fit"
++        n_acc = accepted(step)
++        request.spec_token_ids = []
++        request.num_computed_tokens += 1 + n_acc
++        request.append_output_token_ids(list(range(next_tok, next_tok + n_acc + 1)))
++        next_tok += n_acc + 1
++        manager.new_step_starts()
++        if on_step is not None:
++            on_step()
++
++
++def _tokens(seed: int, n: int) -> list[int]:
++    return [seed * 10000 + i for i in range(n)]
++
++
++def _hashed_cached(manager: KVCacheManager, block: KVCacheBlock) -> bool:
++    return block.block_hash is not None and block.ref_cnt == 0
++
++
++def _free_queue_ids(manager: KVCacheManager) -> list[int]:
++    return [b.block_id for b in manager.block_pool.free_block_queue.get_all_free_blocks()]
++
++
++def _replay_checkpoint(manager: KVCacheManager, request: Request, gid: int):
++    """The group's state block hashed at the request's replay boundary."""
++    [boundary] = set(manager.coordinator.get_replay_boundaries(request))
++    block_hash = request.block_hashes[boundary // BLOCK - 1]
++    cached = manager.block_pool.get_cached_block(block_hash, [gid])
++    assert cached is not None, "the replay checkpoint was never registered"
++    return boundary, cached[0]
++
++
++# --------------------------------------------------------------------------
++# 1. The multi-turn eviction scenario (Hugging Face discussion #2).
++# --------------------------------------------------------------------------
++def test_concurrent_prefill_cannot_evict_running_requests_checkpoint(retain):
++    """Conversation A decodes; conversation D finishes meanwhile; a cold
++    prefill B then needs a few more blocks than the uncached free ones. LRU
++    order decides the victim: with the old release-on-retire, A's checkpoint
++    (released early in A's decode) is the OLDEST cached free block, so B takes
++    it and A's next turn gets no reuse at all although A's whole attention
++    prefix survives. With retention, B takes D's least-recent blocks instead
++    and A's next turn resumes at its replay boundary.
++    """
++    manager = _manager(num_blocks=64)
++    pool = manager.block_pool
++
++    # A: 150-token prompt -> replay boundary 96 (eagle drop): state block 2.
++    a = _request("A", _tokens(1, 150))
++    assert _prefill(manager, a) == 0
++    _decode(manager, a, steps=4)  # first decode step retires state@96
++    ckpts = {gid: _replay_checkpoint(manager, a, gid)[1] for gid in MAMBA_GROUPS}
++    for gid, block in ckpts.items():
++        assert block.block_hash is not None
++        if retain:
++            assert block.ref_cnt == 1, "checkpoint must stay referenced"
++            assert block.block_id not in _free_queue_ids(manager)
++        else:
++            # The exposure the fix removes: cached-free while A still runs.
++            assert _hashed_cached(manager, block)
++
++    # D: a short conversation that runs and finishes while A decodes.
++    d = _request("D", _tokens(2, 200))
++    _prefill(manager, d)
++    _decode(manager, d, steps=2)
++    manager.free(d)
++
++    uncached_free = sum(
++        blk.block_hash is None
++        for blk in pool.free_block_queue.get_all_free_blocks()
++    )
++    cached_free = pool.get_num_free_blocks() - uncached_free
++    # Precondition: the two worlds differ only by A's checkpoints being in the
++    # free queue (off) or held (on); the uncached supply is identical.
++    assert cached_free >= 4
++
++    # B: a cold prefill that pops every uncached free block plus two cached.
++    taken = pool.get_new_blocks(uncached_free + 2)
++
++    a_ckpt_lost = any(blk.block_hash is None for blk in ckpts.values())
++    assert a_ckpt_lost is (not retain)
++    pool.free_blocks(taken)
++
++    # A finishes; its next turn (prompt + output + new user text) arrives.
++    manager.free(a)
++    a2 = _request("A2", list(a.all_token_ids) + _tokens(3, 40))
++    _, num_hit, _ = manager.get_computed_blocks(a2)
++    if retain:
++        assert num_hit == 96
++    else:
++        # FAILING CONTROL: every attention block of A is still cached, yet
++        # the hybrid hit is zero because one Mamba group lost its state.
++        assert all(
++            pool.get_cached_block(a.block_hashes[i], [ATTN]) for i in range(3)
++        )
++        assert num_hit == 0
++
++
++def test_real_cold_prefill_evicts_checkpoint_only_without_retention(retain):
++    """Same scenario with B as a real request prefilled through allocate_slots
++    (attention + both Mamba groups + MTP scratch), not a raw pool pop."""
++    manager = _manager(num_blocks=48)
++    a = _request("A", _tokens(1, 150))
++    _prefill(manager, a)
++    _decode(manager, a, steps=4)
++
++    d = _request("D", _tokens(2, 200))
++    _prefill(manager, d)
++    _decode(manager, d, steps=2)
++    manager.free(d)
++
++    pool = manager.block_pool
++    cached_free = [
++        b for b in pool.free_block_queue.get_all_free_blocks() if b.block_hash
++    ]
++    # B (448 tokens, sized on this 48-block pool) needs more than the
++    # uncached supply but fits in what is free in both worlds.
++    b = _request("B", _tokens(4, 448))
++    _prefill(manager, b)
++    _decode(manager, b, steps=1)
++    # Precondition, both worlds: B's prefill did reach the cached blocks.
++    evicted = [blk for blk in cached_free if blk.block_hash is None]
++    assert evicted
++
++    manager.free(a)
++    a2 = _request("A2", list(a.all_token_ids) + _tokens(3, 40))
++    _, num_hit, _ = manager.get_computed_blocks(a2)
++    assert num_hit == (96 if retain else 0)
++
++
++# --------------------------------------------------------------------------
++# 2. Accounting.
++# --------------------------------------------------------------------------
++def _held_blocks(manager: KVCacheManager) -> set[int]:
++    held: set[int] = set()
++    for mgr in manager.coordinator.single_type_managers:
++        for blocks in mgr.req_to_blocks.values():
++            held.update(b.block_id for b in blocks if not b.is_null)
++        if isinstance(mgr, MambaManager):
++            held.update(b.block_id for _, b in mgr._retained_checkpoints.values())
++    return held
++
++
++def test_retained_checkpoint_is_counted_by_the_pool_and_admission(retain):
++    manager = _manager(num_blocks=64)
++    pool = manager.block_pool
++    a = _request("A", _tokens(1, 150))
++    _prefill(manager, a)
++
++    def check_pool():
++        # Every block is free, in a table, or retained -- never two of these.
++        held = _held_blocks(manager)
++        free = set(_free_queue_ids(manager))
++        assert not held & free
++        assert len(held) + len(free) == pool.num_gpu_blocks - 1  # null block
++        for gid in MAMBA_GROUPS:
++            # Referenced hashed states outside A's table: at most the one
++            # retained checkpoint, and none at all without retention.
++            mgr = _mamba(manager, gid)
++            in_table = {b.block_id for b in mgr.req_to_blocks["A"]}
++            outside = [
++                bid
++                for bid in held - in_table
++                if pool.blocks[bid].block_hash is not None
++                and bid in {b.block_id for _, b in mgr._retained_checkpoints.values()}
++            ]
++            assert len(outside) <= (1 if retain else 0)
++
++    _decode(manager, a, steps=6, on_step=check_pool)
++    for gid in MAMBA_GROUPS:
++        assert ("A" in _mamba(manager, gid)._retained_checkpoints) is retain
++
++    # Admission (full-sequence gate): a fresh request reserves one retained
++    # checkpoint per Mamba group; a request already holding one does not.
++    fresh = _request("F", _tokens(5, 150))
++    empty = manager.empty_kv_cache_blocks.blocks
++
++    def admission(req: Request, computed: int) -> int:
++        return manager.coordinator.get_num_blocks_to_allocate(
++            request_id=req.request_id,
++            num_tokens=req.num_tokens,
++            new_computed_blocks=empty,
++            num_encoder_tokens=0,
++            total_computed_tokens=computed,
++            num_local_computed_tokens=computed,
++            num_tokens_main_model=req.num_tokens,
++            apply_admission_cap=True,
++        )
++
++    def per_step(req: Request) -> int:
++        return manager.coordinator.get_num_blocks_to_allocate(
++            request_id=req.request_id,
++            num_tokens=req.num_tokens,
++            new_computed_blocks=empty,
++            num_encoder_tokens=0,
++            total_computed_tokens=0,
++            num_local_computed_tokens=0,
++            num_tokens_main_model=req.num_tokens,
++        )
++
++    extra = len(MAMBA_GROUPS) if retain else 0
++    assert admission(fresh, 0) == per_step(fresh) + extra
++    # A already retains: only a swap remains, so no extra reservation.
++    assert admission(a, a.num_computed_tokens) == per_step_running(manager, a)
++
++
++def per_step_running(manager: KVCacheManager, req: Request) -> int:
++    return manager.coordinator.get_num_blocks_to_allocate(
++        request_id=req.request_id,
++        num_tokens=req.num_tokens,
++        new_computed_blocks=manager.empty_kv_cache_blocks.blocks,
++        num_encoder_tokens=0,
++        total_computed_tokens=req.num_computed_tokens,
++        num_local_computed_tokens=req.num_computed_tokens,
++        num_tokens_main_model=req.num_tokens,
++        apply_admission_cap=False,
++    )
++
++
++def test_admission_refuses_a_request_whose_checkpoints_would_overcommit(retain):
++    """Size the pool so the full-sequence gate passes by exactly the retained
++    blocks' margin: with retention it must refuse (the request would hold
++    those blocks for its lifetime), without it admit."""
++    req = _request("R", _tokens(6, 150))
++    probe = _manager(num_blocks=256)
++    need = probe.coordinator.get_num_blocks_to_allocate(
++        request_id="R",
++        num_tokens=req.num_tokens,
++        new_computed_blocks=probe.empty_kv_cache_blocks.blocks,
++        num_encoder_tokens=0,
++        total_computed_tokens=0,
++        num_local_computed_tokens=0,
++        num_tokens_main_model=req.num_tokens,
++        apply_admission_cap=True,
++    )
++    # The managers' own estimate excludes the retained term, so the pool size
++    # is the same in both worlds.
++    base_need = sum(
++        mgr.get_num_blocks_to_allocate(
++            "R", req.num_tokens, [], 0, 0, req.num_tokens, apply_admission_cap=True
++        )
++        for mgr in probe.coordinator.single_type_managers
++    )
++    assert need == base_need + (len(MAMBA_GROUPS) if retain else 0)
++    manager = _manager(num_blocks=base_need + 1)  # + null block
++    admitted = manager.allocate_slots(req, BLOCK, full_sequence_must_fit=True)
++    assert (admitted is None) is retain
++
++
++# --------------------------------------------------------------------------
++# 3. Finish path.
++# --------------------------------------------------------------------------
++@pytest.mark.parametrize("deferred", [False, True], ids=["free", "pop_blocks_for_free"])
++def test_finish_releases_checkpoint_after_attention_blocks(retain, deferred):
++    manager = _manager(num_blocks=64)
++    pool = manager.block_pool
++    a = _request("A", _tokens(1, 150))
++    _prefill(manager, a)
++    _decode(manager, a, steps=4)
++    attn_ids = [b.block_id for b in manager.coordinator.single_type_managers[
++        ATTN].req_to_blocks["A"]]
++    ckpt_ids = {
++        gid: _replay_checkpoint(manager, a, gid)[1].block_id for gid in MAMBA_GROUPS
++    }
++    queue_before = _free_queue_ids(manager)
++
++    if deferred:
++        # Async-connector path: the scheduler holds the list, frees it later.
++        blocks = manager.pop_blocks_for_free(a)
++        if retain:
++            assert [b.block_id for b in blocks[-2:]] == list(ckpt_ids.values())
++        pool.free_blocks(blocks)
++    else:
++        manager.free(a)
++
++    for gid, bid in ckpt_ids.items():
++        mgr = _mamba(manager, gid)
++        assert "A" not in mgr._retained_checkpoints  # nothing leaks
++        block = pool.blocks[bid]
++        assert block.ref_cnt == 0 and block.block_hash is not None  # evictable
++    queue = _free_queue_ids(manager)
++    pos = {bid: i for i, bid in enumerate(queue)}
++    newest_attn = max(pos[b] for b in attn_ids if pool.blocks[b].block_hash)
++    if retain:
++        # Freed last: the checkpoints are the request's most recent entries,
++        # so its attention prefix is evicted before them, never after.
++        assert all(pos[bid] > newest_attn for bid in ckpt_ids.values())
++        assert all(bid not in queue_before for bid in ckpt_ids.values())
++    else:
++        # Control: they were already queued mid-request, ahead of attention.
++        assert all(bid in queue_before for bid in ckpt_ids.values())
++        assert all(pos[bid] < newest_attn for bid in ckpt_ids.values())
++
++    # Both worlds: with nothing evicted, the next turn hits.
++    a2 = _request("A2", list(a.all_token_ids) + _tokens(3, 40))
++    assert manager.get_computed_blocks(a2)[1] == 96
++
++
++@pytest.mark.parametrize("drop_release", [False, True], ids=["real", "leak-control"])
++def test_preempted_request_releases_its_checkpoint(retain, drop_release, monkeypatch):
++    """free() is also the preemption path. Control: if the retained
++    checkpoint were not handed back on free, the pool would lose one block per
++    Mamba group per request -- and the test must see that."""
++    if drop_release:
++        monkeypatch.setattr(MambaManager, "pop_retained_checkpoints", lambda *a: [])
++    manager = _manager(num_blocks=64)
++    a = _request("A", _tokens(1, 150))
++    _prefill(manager, a)
++    _decode(manager, a, steps=2)
++    manager.free(a)  # the scheduler's preemption path
++    leaked = 63 - manager.block_pool.get_num_free_blocks()  # 63 = all but null
++    assert leaked == (len(MAMBA_GROUPS) if retain and drop_release else 0)
++
++
++# --------------------------------------------------------------------------
++# 4. MTP K=3 + chunked prefill on a block-aligned boundary.
++# --------------------------------------------------------------------------
++@pytest.mark.parametrize("num_prefill_lookahead", [0, NUM_SPEC])
++def test_mtp_chunked_prefill_aligned_prompt_retains_newest_boundary_only(
++    retain, num_prefill_lookahead
++):
++    """128-token prompt = 4 blocks exactly: under the EAGLE/MTP drop BOTH
++    64 (identical resend) and 96 (longer sibling) are replay boundaries, so
++    two hashed states retire. Chunks of 40 tokens are cut to block ends by the
++    real split; decode accepts 0..3 drafts per step and crosses several block
++    boundaries, relocating the K=3 scratch blocks. At most one checkpoint is
++    held per group at every step, it is the newest (state@96), and state@64
++    goes back to the free queue still hashed. Then every free block is popped
++    while the request still runs (a burst of concurrent prefills) and the
++    longer sibling asks for the prefix after the request finishes.
++    """
++    manager = _manager(num_blocks=96, num_prefill_lookahead=num_prefill_lookahead)
++    pool = manager.block_pool
++    a = _request("A", _tokens(7, 4 * BLOCK))
++    _prefill(manager, a, budget=40)
++
++    def at_most_one():
++        for gid in MAMBA_GROUPS:
++            held = _mamba(manager, gid)._retained_checkpoints
++            assert len(held) <= 1
++            if held:
++                idx, block = held["A"]
++                assert block.block_hash is not None and block.ref_cnt >= 1
++
++    _decode(
++        manager, a, steps=24, accepted=lambda s: s % (NUM_SPEC + 1), on_step=at_most_one
++    )
++    assert a.num_computed_tokens > 5 * BLOCK  # decode crossed two block ends
++
++    lo_hash, hi_hash = a.block_hashes[1], a.block_hashes[2]  # state@64, @96
++    for gid in MAMBA_GROUPS:
++        [lo] = pool.get_cached_block(lo_hash, [gid])
++        [hi] = pool.get_cached_block(hi_hash, [gid])
++        assert _hashed_cached(manager, lo)  # superseded / never held: ages
++        if retain:
++            idx, held = _mamba(manager, gid)._retained_checkpoints["A"]
++            assert idx == 2 and held is hi
++            assert hi.ref_cnt == 1
++        else:
++            assert _hashed_cached(manager, hi)
++
++    # Burst: concurrent prefills drain the whole free queue while A runs.
++    burst = pool.get_new_blocks(pool.get_num_free_blocks())
++    manager.free(a)
++    sibling = _request("S", list(a.all_token_ids)[: 4 * BLOCK] + _tokens(8, BLOCK))
++    _, num_hit, _ = manager.get_computed_blocks(sibling)
++    assert num_hit == (3 * BLOCK if retain else 0)
++    pool.free_blocks(burst)
+diff --git a/tests/v1/core/test_prefix_caching.py b/tests/v1/core/test_prefix_caching.py
+index fa70126e41..5cd93df3b0 100644
+--- a/tests/v1/core/test_prefix_caching.py
++++ b/tests/v1/core/test_prefix_caching.py
+@@ -1033,8 +1033,17 @@ def test_hisparse_events_report_host_and_device_placement():
+     assert removed.group_idx == 0
+ 
+ 
+-def test_mamba_boundary_handoffs_do_not_pin_obsolete_blocks():
+-    """Draining unused connector offers must not retain old recurrent states."""
++@pytest.mark.parametrize("retain_checkpoint", ["1", "0"])
++def test_mamba_boundary_handoffs_do_not_pin_obsolete_blocks(
++    retain_checkpoint: str, monkeypatch: pytest.MonkeyPatch
++):
++    """Draining unused connector offers must not retain old recurrent states.
++
++    v2.5: with checkpoint retention on (the default) the request keeps
++    exactly ONE retired hashed state referenced -- the newest -- and nothing
++    older; with it off every retired state is released.
++    """
++    monkeypatch.setenv("VLLM_E2_MAMBA_RETAIN_CHECKPOINT", retain_checkpoint)
+     manager = make_kv_cache_manager(
+         KVCacheConfig(
+             num_blocks=16,
+@@ -1067,7 +1076,14 @@ def test_mamba_boundary_handoffs_do_not_pin_obsolete_blocks():
+         manager.remove_skipped_blocks(request.request_id, end, 64)
+         manager.new_step_starts()
+ 
+-    assert all(block.ref_cnt == 0 for block in old_blocks[:-1])
++    # old_blocks[-1] is the running state; [-2] the newest retired one.
++    if retain_checkpoint == "1":
++        assert all(block.ref_cnt == 0 for block in old_blocks[:-2])
++        assert old_blocks[-2].ref_cnt == 1
++        mamba = manager.coordinator.single_type_managers[0]
++        assert mamba._retained_checkpoints[request.request_id][1] is old_blocks[-2]
++    else:
++        assert all(block.ref_cnt == 0 for block in old_blocks[:-1])
+ 
+ 
+ def test_hisparse_prefix_hit_adopts_gpu_shadow_pages():
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 4356854f8d..4159f34944 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -444,6 +444,14 @@ if TYPE_CHECKING:
+     # AOT: no. CAPTURE: no -- strictly host-side. off|warn|raise (1 = warn).
+     # the mamba slot-ownership check, v1/worker/mamba_utils.py:74.
+     VLLM_E2_MAMBA_SLOT_OWNERSHIP: str = "off"
++    # v2.5: keep each running request's newest hashed align-mode Mamba
++    # state (its prefix-cache checkpoint) referenced until the request ends,
++    # instead of returning it to the free queue the moment decode passes it
++    # (single_type_kv_cache_manager.MambaManager._retire_state_blocks). Strict
++    # "0"/"1", default ON; "0" restores the old release-on-retire behaviour
++    # for A/B. AOT: no. CAPTURE: no -- scheduler-side block bookkeeping only;
++    # the worker sees the same block tables either way.
++    VLLM_E2_MAMBA_RETAIN_CHECKPOINT: bool = True
+     # Opt-out for the fork startup guards in vllm/v1/e2_guards.py, read at
+     # Qwen4ExpForCausalLM construction. AOT: no. CAPTURE: no -- it changes
+     # nothing itself; it only permits a boot whose identity IS different
+@@ -921,15 +929,17 @@ def _resolve_rust_cli_path() -> str | None:
+     return raw
+ 
+ 
+-def _e2_strict_switch(name: str) -> bool:
++def _e2_strict_switch(name: str, default: bool = False) -> bool:
+     """Parse a fork on/off switch that accepts exactly ``"0"`` and ``"1"``.
+ 
+-    Unset means off. Anything else -- ``"true"``, ``"yes"``, ``""``, ``" 1"``,
++    Unset means ``default`` (off unless the knob says otherwise). Anything else -- ``"true"``, ``"yes"``, ``""``, ``" 1"``,
+     ``"01"`` -- is a boot error: a switch that selects a different transport
+     must not be satisfiable by a spelling nobody meant.
+     """
+     raw = os.environ.get(name)
+-    if raw is None or raw == "0":
++    if raw is None:
++        return default
++    if raw == "0":
+         return False
+     if raw == "1":
+         return True
+@@ -2600,6 +2610,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     "VLLM_E2_MAMBA_SLOT_OWNERSHIP": lambda: _e2_diagnostic_mode(
+         "VLLM_E2_MAMBA_SLOT_OWNERSHIP"
+     ),
++    # Mamba prefix-checkpoint retention (v2.5; default ON, "0" turns it off).
++    # Strict "0"/"1"; read when each MambaManager is constructed.
++    "VLLM_E2_MAMBA_RETAIN_CHECKPOINT": lambda: _e2_strict_switch(
++        "VLLM_E2_MAMBA_RETAIN_CHECKPOINT", default=True
++    ),
+     # Seconds between `topk-exact-counters` lines from each GPU worker
+     # (0, the default, disables the reader entirely). The line reports the
+     # medium-path exact-restart counters; see
+@@ -2863,6 +2878,10 @@ def compile_factors() -> dict[str, object]:
+         # configuration factor and is hashed conservatively.
+         "VLLM_E2_PLE_FLAG_CHECK",
+         "VLLM_E2_MAMBA_SLOT_OWNERSHIP",
++        # Scheduler-side block retention (v2.5). The scheduler is never
++        # compiled and the worker's tables are identical in both worlds, so an
++        # A/B flip must reuse the same AOT cache.
++        "VLLM_E2_MAMBA_RETAIN_CHECKPOINT",
+         # Logging cadence for an already-compiled kernel's counters: it gates a
+         # host-side timer and a snapshot op, and is read by no compiled code, so
+         # hashing it would invalidate every compile cache for a log interval.
+diff --git a/vllm/v1/core/kv_cache_coordinator.py b/vllm/v1/core/kv_cache_coordinator.py
+index e3f31a673c..ca8c86ee87 100644
+--- a/vllm/v1/core/kv_cache_coordinator.py
++++ b/vllm/v1/core/kv_cache_coordinator.py
+@@ -228,6 +228,17 @@ class KVCacheCoordinator(ABC):
+                     num_tokens_main_model,
+                     apply_admission_cap=apply_admission_cap,
+                 )
++                if apply_admission_cap:
++                    # Full-sequence admission: a retained Mamba checkpoint is
++                    # held outside the block table for the request's
++                    # lifetime, so reserve it here (v2.5). Per-step
++                    # allocation needs no term: a held block is simply not in
++                    # the free queue that check reads.
++                    num_blocks_to_allocate += (
++                        manager.get_num_retained_checkpoint_blocks_to_reserve(
++                            request_id, num_tokens_main_model
++                        )
++                    )
+         return num_blocks_to_allocate
+ 
+     def allocate_new_computed_blocks(
+@@ -386,8 +397,15 @@ class KVCacheCoordinator(ABC):
+         Args:
+             request_id: The request ID.
+         """
++        # Retained Mamba checkpoints go back last, after every group's table,
++        # so a finished request's checkpoint is never evicted ahead of the
++        # attention prefix it resumes (v2.5).
++        retained: list[KVCacheBlock] = []
+         for manager in self.single_type_managers:
++            retained.extend(manager.pop_retained_checkpoints(request_id))
+             manager.free(request_id)
++        if retained:
++            self.block_pool.free_blocks(retained)
+ 
+     def pop_blocks_for_free(self, request_id: str) -> list[KVCacheBlock]:
+         """
+@@ -405,12 +423,16 @@ class KVCacheCoordinator(ABC):
+             reversed, then concatenated group by group).
+         """
+         blocks: list[KVCacheBlock] = []
++        retained: list[KVCacheBlock] = []
+         for manager in self.single_type_managers:
++            retained.extend(manager.pop_retained_checkpoints(request_id))
+             # Reverse within each group so the concatenation is already in
+             # eviction order, matching `free()`, which frees each group in its
+             # own reversed `free_blocks()` call. Reversing the flat list
+             # instead would emit whole groups in the wrong order.
+             blocks.extend(reversed(manager.pop_blocks_for_free(request_id)))
++        # Retained checkpoints last, as in `free()`.
++        blocks.extend(retained)
+         return blocks
+ 
+     def get_num_common_prefix_blocks(self, running_request_id: str) -> list[int]:
+diff --git a/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/v1/core/single_type_kv_cache_manager.py
+index 76ba6916b6..b88330d9e5 100644
+--- a/vllm/v1/core/single_type_kv_cache_manager.py
++++ b/vllm/v1/core/single_type_kv_cache_manager.py
+@@ -6,6 +6,7 @@ from collections import defaultdict
+ from collections.abc import Sequence
+ from typing import TYPE_CHECKING, ClassVar
+ 
++from vllm import envs
+ from vllm.distributed.kv_events import MEDIUM_CPU
+ from vllm.logger import init_logger
+ from vllm.utils.math_utils import cdiv
+@@ -597,6 +598,22 @@ class SingleTypeKVCacheManager(ABC):
+         # Free blocks in reverse order so that the tail blocks are freed first.
+         self.block_pool.free_blocks(reversed(self.pop_blocks_for_free(request_id)))
+ 
++    def pop_retained_checkpoints(self, request_id: str) -> list[KVCacheBlock]:
++        """Pop the prefix-cache checkpoints held for ``request_id`` outside its
++        block table, without freeing them. Only align-mode Mamba holds any
++        (see ``MambaManager._retire_state_blocks``). The coordinator frees them
++        after every group's table, so they are the request's last blocks to
++        become eviction candidates."""
++        return []
++
++    def get_num_retained_checkpoint_blocks_to_reserve(
++        self, request_id: str, num_tokens: int
++    ) -> int:
++        """Blocks the admission gate must add for checkpoints this request
++        will hold outside its block table (0 for every manager but align-mode
++        Mamba with retention on)."""
++        return 0
++
+     @abstractmethod
+     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
+         """
+@@ -1528,6 +1545,80 @@ class MambaManager(SingleTypeKVCacheManager):
+             # connector; a request that finishes first hands off this table
+             # source directly.
+             self._producer_partial_tail_reqs: dict[str, tuple[KVCacheBlock, int]] = {}
++        # v2.5. In align mode a state block leaves the block table (it is
++        # nulled and released) as soon as the request computes one block past
++        # it -- `_remove_blocks_in_range` / `remove_skipped_blocks`. When that
++        # block carries a prefix-cache hash it is the request's GDN checkpoint
++        # (the replay boundary under retention interval 0), and releasing it
++        # mid-request puts it in the free queue AHEAD of the request's own
++        # attention blocks, which stay referenced until finish. Concurrent
++        # prefills then pop it first; since the hybrid hit is the shortest
++        # group's, that single block zeroes the next turn's reuse. With
++        # retention on, the newest hashed retired state stays referenced here
++        # (at most one per request per group) and is released only when the
++        # request is freed, after its attention blocks (coordinator.free).
++        self._retain_checkpoint: bool = (
++            self.mamba_cache_mode == "align"
++            and self.enable_caching
++            and envs.VLLM_E2_MAMBA_RETAIN_CHECKPOINT
++        )
++        # {request_id: (logical block index, block)}
++        self._retained_checkpoints: dict[str, tuple[int, KVCacheBlock]] = {}
++        if self.mamba_cache_mode == "align" and self.enable_caching:
++            # The A/B evidence line: boot logs must show which arm ran.
++            logger.info_once(
++                "Mamba align prefix-checkpoint retention: %s "
++                "(VLLM_E2_MAMBA_RETAIN_CHECKPOINT)",
++                "on" if self._retain_checkpoint else "off",
++            )
++
++    def _retire_state_blocks(
++        self, request_id: str, retired: list[tuple[int, KVCacheBlock]]
++    ) -> None:
++        """Release align-mode state blocks the request no longer reads.
++
++        ``retired`` holds (logical index, block) pairs already nulled out of
++        the block table, in the eviction order the caller wants. With
++        retention on, the newest hashed one is kept referenced as the request's
++        checkpoint instead, and the checkpoint it supersedes (if any) is
++        released now -- so the request never holds more than one.
++        """
++        if self._retain_checkpoint:
++            newest: tuple[int, KVCacheBlock] | None = None
++            for idx, block in retired:
++                if block.block_hash is not None and (
++                    newest is None or idx > newest[0]
++                ):
++                    newest = (idx, block)
++            held = self._retained_checkpoints.get(request_id)
++            if newest is not None and (held is None or newest[0] > held[0]):
++                self._retained_checkpoints[request_id] = newest
++                retired = [entry for entry in retired if entry[1] is not newest[1]]
++                if held is not None:
++                    # Superseded: it ages from here like any cached free block.
++                    retired.append(held)
++        if retired:
++            self.block_pool.free_blocks([block for _, block in retired])
++
++    def pop_retained_checkpoints(self, request_id: str) -> list[KVCacheBlock]:
++        if self.mamba_cache_mode != "align":
++            return []
++        held = self._retained_checkpoints.pop(request_id, None)
++        return [] if held is None else [held[1]]
++
++    def get_num_retained_checkpoint_blocks_to_reserve(
++        self, request_id: str, num_tokens: int
++    ) -> int:
++        # A request that already holds a checkpoint only ever swaps it. One
++        # that does not will hold one once a hashed state retires, which needs
++        # at least one state block behind the running one.
++        if (
++            not self._retain_checkpoint
++            or request_id in self._retained_checkpoints
++            or num_tokens <= self.block_size
++        ):
++            return 0
++        return 1
+ 
+     @classmethod
+     def find_longest_cache_hit(
+@@ -1678,15 +1769,14 @@ class MambaManager(SingleTypeKVCacheManager):
+         last_block = min(last_block, len(blocks))
+         if first_block >= last_block:
+             return
+-        freed: list[KVCacheBlock] = []
++        freed: list[tuple[int, KVCacheBlock]] = []
+         # Mamba prefill leaves null gaps between states awaiting retirement.
+         for i in range(last_block - 1, first_block - 1, -1):
+             if blocks[i].is_null:
+                 continue
+-            freed.append(blocks[i])
++            freed.append((i, blocks[i]))
+             blocks[i] = self._null_block
+-        if freed:
+-            self.block_pool.free_blocks(freed)
++        self._retire_state_blocks(request_id, freed)
+         self._num_retired_blocks[request_id] = last_block
+ 
+     def remove_skipped_blocks(
+@@ -1716,8 +1806,11 @@ class MambaManager(SingleTypeKVCacheManager):
+             ):
+                 blocks = self.req_to_blocks[request_id]
+                 if blocks[last_state_block_idx] != self._null_block:
+-                    self.block_pool.free_blocks([blocks[last_state_block_idx]])
++                    block = blocks[last_state_block_idx]
+                     blocks[last_state_block_idx] = self._null_block
++                    self._retire_state_blocks(
++                        request_id, [(last_state_block_idx, block)]
++                    )
+ 
+     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
+         """
+@@ -2022,6 +2115,12 @@ class MambaManager(SingleTypeKVCacheManager):
+                 for entry in self._pending_boundary_state_offloads
+                 if entry[0] != request_id
+             ]
++            # The coordinator pops the retained checkpoint first and frees it
++            # after every group. A direct caller still gets it back, first in
++            # allocation order, so the caller's reversed free releases it last.
++            retained = self.pop_retained_checkpoints(request_id)
++            if retained:
++                return retained + super().pop_blocks_for_free(request_id)
+         return super().pop_blocks_for_free(request_id)
+ 
+     def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:

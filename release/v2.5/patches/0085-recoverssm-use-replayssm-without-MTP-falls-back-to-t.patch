@@ -1,0 +1,78 @@
+From 3b6e69b21334569cf17f79ed3b0f44c8dbd942fb Mon Sep 17 00:00:00 2001
+From: halt95 <halt95@users.noreply.github.com>
+Date: Sun, 4 Oct 2026 07:33:26 -0400
+Subject: [PATCH 85/97] recoverssm: --use-replayssm without MTP falls back to
+ the stock GDN path
+
+On Qwen4Exp the flag selects RecoverSSM, which needs speculative decoding. With num_speculative_tokens=0 the
+validator refused to start; it now logs a warning, clears use_replayssm (the no-flag path) and continues, so one
+launch line serves with and without MTP. Other architectures keep the error. Config tests cover both.
+---
+ tests/config/test_recoverssm_config.py | 27 +++++++++++++++++++++++---
+ vllm/config/vllm.py                    | 14 +++++++++----
+ 2 files changed, 34 insertions(+), 7 deletions(-)
+
+diff --git a/tests/config/test_recoverssm_config.py b/tests/config/test_recoverssm_config.py
+index 2fba7ebca0..352b8bfc7c 100644
+--- a/tests/config/test_recoverssm_config.py
++++ b/tests/config/test_recoverssm_config.py
+@@ -122,9 +122,30 @@ def test_flag_unset_keeps_the_stock_path():
+     assert not uses_recoverssm(cfg.cache_config, 3)
+ 
+ 
+-def test_qwen4exp_replayssm_requires_speculative_decoding():
+-    with pytest.raises(ValueError, match="requires speculative decoding"):
+-        _validator()(_config(TARGET, num_spec=0))
++@pytest.mark.parametrize(
++    "arch", ["Qwen4ExpForConditionalGeneration", "Qwen4ExpForCausalLM"]
++)
++def test_qwen4exp_replayssm_without_spec_falls_back_to_stock(arch):
++    # Fork (v2.5): no speculative decoding -> the flag is dropped, not refused.
++    cfg = _config(arch, num_spec=0)
++    _validator()(cfg)
++    assert cfg.cache_config.use_replayssm is False
++    assert cfg.cache_config.use_recoverssm is False
++    assert not uses_recoverssm(cfg.cache_config, 0)
++    # The fallback is the stock path: the RecoverSSM runtime checks no longer apply.
++    pp2 = _config(
++        arch, num_spec=0, mamba_config__backend="flashinfer", use_v2_model_runner=False
++    )
++    _validator()(pp2)
++    assert pp2.cache_config.use_replayssm is False
++
++
++def test_fallback_is_qwen4exp_only():
++    # Other ReplaySSM architectures keep their plain ReplaySSM path without drafts.
++    cfg = _config("NemotronHForCausalLM", num_spec=0, use_v2_model_runner=False)
++    _validator()(cfg)
++    assert cfg.cache_config.use_replayssm is True
++    assert cfg.cache_config.use_recoverssm is False
+ 
+ 
+ def test_architecture_without_replayssm_support_is_rejected():
+diff --git a/vllm/config/vllm.py b/vllm/config/vllm.py
+index d07579ea42..2538e80730 100644
+--- a/vllm/config/vllm.py
++++ b/vllm/config/vllm.py
+@@ -3240,11 +3240,17 @@ class VllmConfig:
+             and not self.cache_config.use_recoverssm
+         ):
+             # Qwen4Exp's GDN and PLE layers have no plain ReplaySSM path; with them the
+-            # flag selects RecoverSSM, which needs speculative decoding.
+-            raise ValueError(
+-                "--use-replayssm on Qwen4Exp selects GDN RecoverSSM and requires "
+-                "speculative decoding (num_speculative_tokens > 0)"
++            # flag selects RecoverSSM, which needs speculative decoding. Fork (v2.5):
++            # without speculative decoding there are no drafts to recover from, so the
++            # flag falls back to the stock path (as if it were not passed) instead of
++            # refusing to start; one launch line then serves with and without MTP.
++            logger.warning(
++                "--use-replayssm on Qwen4Exp selects GDN RecoverSSM, which needs "
++                "speculative decoding; num_speculative_tokens=0, so the stock GDN "
++                "path is used (as without --use-replayssm)"
+             )
++            self.cache_config.use_replayssm = False
++            return self
+         if self.cache_config.use_recoverssm:
+             if self.model_config is not None and self.model_config.architecture not in (
+                 "KimiLinearForCausalLM",
