@@ -1,0 +1,150 @@
+From 507def4e3aac7518fa85726c2185cba2b259af39 Mon Sep 17 00:00:00 2001
+From: CoolShades <5731515+CoolShades@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 22:19:21 +0100
+Subject: [PATCH] guard_telemetry: skip reader polls while the engine is idle
+
+The bounds-guard reader issues a side-stream device->host copy of the
+counters every VLLM_E2_GUARD_INTERVAL (0.05 s) forever, including when no
+request is in flight. That periodic device work keeps every GPU out of its
+idle P-state: on 4x RTX 3090 with GUARD=warn (the v2.5 default) all four
+cards sit in P2 at 1695/9501 MHz, 450 W total, vs 86 W in P8 with GUARD=off.
+
+The counters can only move inside execute_model, and check_pending() runs at
+the top of every execute_model, so it now bumps a step counter that the
+reader uses as an activity signal. The reader keeps its cadence while steps
+arrive and for VLLM_E2_GUARD_IDLE_TAIL seconds (default 2 s) after the last
+one, never skips while a count increase awaits its confirming copy, and
+issues no device work at all once idle. A runner that never calls
+check_pending (V1) never enables the skip. VLLM_E2_GUARD_IDLE_TAIL=inf
+restores always-poll; VLLM_E2_GUARD_STATS=<s> logs polls vs idle skips.
+
+Measured on the same boot: idle 85-88 W (P8); under load 598-599 polls per
+30 s (full cadence, 0 skips) over ~61k steps; prefill/decode and an 80-request
+chat replay unchanged; 0 Xid, 0 guard warnings.
+
+Refs halt95/qwen38-flash-next-3090s#2
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ vllm/v1/worker/guard_telemetry.py | 82 +++++++++++++++++++++++++++++--
+ 1 file changed, 78 insertions(+), 4 deletions(-)
+
+diff --git a/vllm/v1/worker/guard_telemetry.py b/vllm/v1/worker/guard_telemetry.py
+index 19cf966..199c3eb 100644
+--- a/vllm/v1/worker/guard_telemetry.py
++++ b/vllm/v1/worker/guard_telemetry.py
+@@ -250,6 +250,46 @@ def _parse_interval(text: str) -> float:
+ 
+ _INTERVAL = _parse_interval(os.environ.get("VLLM_E2_GUARD_INTERVAL", "0.05"))
+ 
++
++def _parse_seconds(name: str, default: str, allow_inf: bool) -> float:
++    """A non-negative number of seconds (inf allowed when allow_inf), or ValueError at import."""
++    text = os.environ.get(name, default)
++    try:
++        value = float(text)
++    except ValueError as exc:
++        raise ValueError(f"{name} must be seconds, got {text!r}") from exc
++    if math.isnan(value) or value < 0 or (math.isinf(value) and not allow_inf):
++        raise ValueError(f"{name} must be a number >= 0, got {text!r}")
++    return value
++
++
++# IDLE SKIP. The counters can only move while a guarded kernel runs, i.e. inside
++# execute_model, and check_pending() runs at the top of every execute_model -- so it
++# doubles as an activity signal (_step_seq). Once no step has started for
++# _IDLE_TAIL seconds, and no count increase is waiting for its confirming copy, the
++# reader stops issuing side-stream copies until the next step starts.
++#
++# Why: without it the reader issues a device->host copy every _INTERVAL forever,
++# idle or not, and that keeps every GPU out of its idle P-state. Measured on 4x RTX
++# 3090 with no requests in flight: guard=warn 450 W total, all four in P2 at
++# 1695/9501 MHz; guard=off (no reader) 86 W, P8 at 210/405 MHz.
++#
++# Detection is unchanged while serving: every step resets the tail. When activity
++# resumes, the first copy consumed is the one issued on the last polled tick
++# (counters are monotone, so nothing is lost) and the next tick reads fresh values:
++# at most one extra _INTERVAL of latency on the first step after an idle period.
++# The tail (default 2 s = 40 ticks at 0.05 s) covers asynchronously queued GPU work
++# of the last steps and the one-tick confirm delay.
++#
++# A runner that never calls check_pending (the V1 runner -- see WHICH RUNNER
++# above) never sets _activity_tracked, so the skip never engages there.
++# VLLM_E2_GUARD_IDLE_TAIL=inf restores the always-poll behaviour.
++# VLLM_E2_GUARD_STATS=<seconds> logs polls vs idle skips at that cadence (0 = off).
++_IDLE_TAIL = _parse_seconds("VLLM_E2_GUARD_IDLE_TAIL", "2.0", allow_inf=True)
++_STATS_EVERY = _parse_seconds("VLLM_E2_GUARD_STATS", "0", allow_inf=False)
++_step_seq = 0
++_activity_tracked = False
++
+ _buffers: dict[torch.device, torch.Tensor] = {}
+ # Devices the reader has given up on. They stay in _buffers: see _reader.
+ _read_disabled: set[torch.device] = set()
+@@ -535,18 +575,49 @@ def start_reader() -> None:
+     _reader_started = True
+     threading.Thread(target=_reader, name="bounds-guard-reader", daemon=True).start()
+     logger.info(
+-        "bounds-guard reader started (mode=%s, interval=%.3gs).",
++        "bounds-guard reader started (mode=%s, interval=%.3gs, idle tail=%gs).",
+         _MODE,
+         _INTERVAL,
++        _IDLE_TAIL,
+     )
+ 
+ 
+ def _reader() -> None:
+-    """Off-engine-thread cadence reader; drain() is the only other counter read."""
++    """Off-engine-thread cadence reader; drain() is the only other counter read.
++
++    Idle skip: see _IDLE_TAIL. A skipped tick issues no device work at all.
++    """
++    last_seq = -1
++    last_active = time.monotonic()
++    polled = skipped = 0
++    stats_t0 = last_active
+     while True:
+         try:
+             time.sleep(_INTERVAL)
+-            _poll_once()
++            now = time.monotonic()
++            seq = _step_seq
++            if seq != last_seq:
++                last_seq, last_active = seq, now
++            if (
++                _activity_tracked
++                and not _confirm_pending
++                and now - last_active > _IDLE_TAIL
++            ):
++                skipped += 1
++            else:
++                _poll_once()
++                polled += 1
++            if _STATS_EVERY and now - stats_t0 >= _STATS_EVERY:
++                logger.info(
++                    "bounds-guard reader: %d polls, %d idle skips in the last %.0fs "
++                    "(steps seen: %d)",
++                    polled,
++                    skipped,
++                    now - stats_t0,
++                    seq,
++                )
++                polled = skipped = 0
++                stats_t0 = now
+         except Exception:  # noqa: BLE001 -- the daemon itself must survive
+             # A reader that dies is an instrument
+             # that is not there, and _ALWAYS_FATAL_SITES depends on it. Arm
+@@ -709,7 +780,10 @@ def check_pending() -> None:
+     targeted repro where losing the group is acceptable and stopping is the
+     point.
+     """
+-    global _pending
++    global _pending, _step_seq, _activity_tracked
++    # Activity signal for the reader's idle skip (see _IDLE_TAIL): one int per step.
++    _step_seq += 1
++    _activity_tracked = True
+     if _pending is None:
+         return
+     msg = _pending
+-- 
+2.43.0
+
